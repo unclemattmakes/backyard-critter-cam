@@ -27,7 +27,8 @@ class Config:
     frame_width: int = 1280         # Requested width  (the webcam may snap to the nearest).
     frame_height: int = 720         # Requested height (the webcam may snap to the nearest).
     # CAP_DSHOW = DirectShow backend: fast init on Windows and avoids the slow MSMF path.
-    # Turn off only if you ever run this off-Windows (then OpenCV picks a backend).
+    # DirectShow is Windows-only, so this is automatically ignored off-Windows (Linux/macOS get
+    # CAP_ANY and OpenCV picks the native backend) -- see capture_backend() in backyard_cam.py.
     use_dshow_backend: bool = True
     camera_warmup_frames: int = 5   # Throwaway reads so exposure / auto-white-balance settle.
     # Manual exposure / gain. None = let the camera auto-expose (default). Set a number to
@@ -86,7 +87,10 @@ class Config:
     #   MDV6-yolov9-e / MDV6-yolov10-e                  -> heavy, 1280px, more accurate
     # yolov10-c is NMS-free and quick -> sensible default for a live rig on a laptop GPU.
     model_version: str = "MDV6-yolov10-c"
-    device: str = "cuda"                # CUDA is REQUIRED; the app errors clearly if absent.
+    # 'cuda' (default): require an NVIDIA GPU and fail loud if it can't compute (catches a
+    # wrong-arch torch build). 'cpu': no GPU needed, slower -- fine here because the motion gate
+    # only wakes the detector on real motion. 'auto': GPU if usable, else CPU. (--device overrides.)
+    device: str = "cuda"
     # A detection must score at least this to come back from the detector (passed as
     # MegaDetector's det_conf_thres) -- so weaker boxes are never drawn or saved.
     min_confidence: float = 0.25

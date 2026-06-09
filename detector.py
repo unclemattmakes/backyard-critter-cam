@@ -92,6 +92,37 @@ def verify_cuda() -> str:
     return torch.cuda.get_device_name(0)
 
 
+def resolve_device(device: str) -> tuple[str, str]:
+    """Resolve a requested device into a concrete ``(device, label)`` pair, applying the rig's
+    policy. ``device`` is one of:
+
+      'cuda' (default) -- REQUIRE a working NVIDIA GPU; raise CudaUnavailableError with an
+                          actionable fix if torch can't actually compute on it. Preserves the
+                          original fail-loud behaviour, so a wrong-arch torch build (the
+                          Blackwell sm_120 trap) never limps along silently on the main rig.
+      'cpu'            -- force CPU inference. No GPU needed; slower per frame, but the motion
+                          gate only wakes the detector on real motion (rate-limited), so a
+                          backyard rig stays usable on a laptop CPU.
+      'auto'           -- use the GPU when it genuinely computes, else fall back to CPU with a
+                          one-line note (handy on a box where CUDA may or may not be set up).
+
+    Returns (device, label): device is 'cuda' or 'cpu'; label is a human-readable name for the
+    startup banner (the GPU model, or 'CPU').
+    """
+    device = (device or "cuda").strip().lower()
+    if device == "cpu":
+        return "cpu", "CPU"
+    if device == "cuda":
+        return "cuda", verify_cuda()          # raises with an actionable fix if it can't compute
+    if device == "auto":
+        try:
+            return "cuda", verify_cuda()
+        except CudaUnavailableError as e:
+            print(f"  [device] no usable GPU ({str(e).splitlines()[0]}) -- running on CPU.")
+            return "cpu", "CPU"
+    raise ValueError(f"Unknown device '{device}'. Use 'cuda', 'cpu', or 'auto'.")
+
+
 def _ensure_weights(version: str, weights_dir: Path) -> Path:
     """Return the local path to the weight file, downloading it once if missing."""
     if version not in MDV6_WEIGHTS:
@@ -127,18 +158,19 @@ class Detector:
         min_confidence: float = 0.25,
         weights_dir: Path | None = None,
     ):
-        self.gpu_name = verify_cuda()
-        self.device = device
+        # Resolve 'cuda' / 'cpu' / 'auto' to a concrete device. 'cuda' still fails loud if the
+        # GPU can't compute; 'cpu' and 'auto' make the rig runnable without an NVIDIA GPU.
+        self.device, self.device_name = resolve_device(device)
         self.min_confidence = float(min_confidence)
 
         weights_path = _ensure_weights(model_version, weights_dir or (config.ROOT / "weights"))
 
         # Imported here (not at module top) so a missing/broken torch surfaces via the clear
-        # verify_cuda() message above rather than an opaque import error.
+        # resolve_device()/verify_cuda() message above rather than an opaque import error.
         from ultralytics import YOLO
 
         self.model = YOLO(str(weights_path))
-        self.model.to(device)  # park the weights on the GPU so the first detect() is warm.
+        self.model.to(self.device)  # park the weights on the chosen device (first detect() warm).
 
         # Prefer the class names baked into the weights; fall back to the MD defaults.
         names = getattr(self.model, "names", None)
