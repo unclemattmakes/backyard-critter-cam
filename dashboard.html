@@ -420,7 +420,10 @@ function timeAgo(iso){
 function renderLatest(d){
   const el=$('#latest'); if(!el) return;
   if(!d){ el.innerHTML='<p class="empty" style="padding:20px">No visitors logged yet.</p>'; el.onclick=null; return; }
-  const name=d.species||d.detection_class||'unknown', latin=d.species?latinOf(d.species):'';
+  // No species yet => the live rig saved it but the classifier (classify.py --watch) hasn't
+  // named it. Show "Identifying…" rather than the coarse detector label ("animal").
+  const name=d.species||(d.detection_class==='animal'?'Identifying…':(d.detection_class||'unknown'));
+  const latin=d.species?latinOf(d.species):'';
   const conf=(d.species_confidence!=null)?d.species_confidence:null;
   el.innerHTML=`
     <div class="latest-eyebrow lbl">Most Recent Visitor</div>
