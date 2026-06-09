@@ -258,6 +258,14 @@ The schema and module layout are arranged so each phase is an addition, not a re
 
 ---
 
+## License
+
+Copyright © 2026 Matt Scott. Licensed under the **GNU Affero General Public License v3.0** — see [LICENSE](LICENSE).
+
+The rig runs MegaDetector v6 through [Ultralytics](https://github.com/ultralytics/ultralytics), which is **AGPL-3.0**, so this project is AGPL-3.0 as well. Note the network-use clause: if you run a modified version as a network service (for example, exposing the dashboard to others), you must offer those users the corresponding source.
+
+---
+
 ## Troubleshooting
 
 - **`[CUDA ERROR] ... no kernel image is available` / capability sm_120:** your torch is the
