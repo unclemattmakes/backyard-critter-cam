@@ -151,6 +151,9 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 elif path == "/api/visits":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.visits_page(cfg, day=(q.get("day") or [None])[0]))
+                elif path == "/api/digest":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(stats.period_digest(cfg, edition=(q.get("edition") or ["auto"])[0]))
                 elif path == "/snapshot.jpg":
                     frame, _ = frame_buffer.get()
                     if frame is None:

@@ -10,7 +10,8 @@ phase-3 individual IDs).
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+import math
 
 import db
 
@@ -221,3 +222,324 @@ def visits_page(cfg, day=None, limit=300) -> dict:
             "rep_crop": ((v.get("rep_crop") or "").replace("\\", "/") or None),
         })
     return {"visits": out, "total": len(visits)}
+
+
+# ---------------------------------------------------------------------------
+# Period digest -- "The Dispatch": a summary of the most-recently-COMPLETED
+# sun-defined period. Shown in the MORNING it summarizes the NIGHT just past;
+# shown in the EVENING it summarizes the DAY just past. One artifact, two
+# editions. Pure data over the same detections table; reuses compute_visits so
+# it counts VISITS, not crops (see PLAN.md). Sun boundaries come from
+# daynight.sun_times (astral); everything degrades to fixed clock hours if
+# lat/lon or astral are missing, so the digest always renders.
+# ---------------------------------------------------------------------------
+
+# Moon: astral.moon.phase() returns 0..27.99 (0/28 = new, 7 = first quarter,
+# 14 = full, 21 = last quarter). Upper edge -> (name, emoji glyph).
+_MOON_PHASES = [
+    (1.75, "New Moon", "\U0001F311"), (5.25, "Waxing Crescent", "\U0001F312"),
+    (8.75, "First Quarter", "\U0001F313"), (12.25, "Waxing Gibbous", "\U0001F314"),
+    (15.75, "Full Moon", "\U0001F315"), (19.25, "Waning Gibbous", "\U0001F316"),
+    (22.75, "Last Quarter", "\U0001F317"), (26.25, "Waning Crescent", "\U0001F318"),
+    (28.01, "New Moon", "\U0001F311"),
+]
+
+_SUN_CACHE: dict = {}   # (date.toordinal(), lat, lon) -> (dawn, dusk); stable per date, so memoize.
+
+# Human-correction labels that aren't actual visitors -- false triggers (patio bricks, a blurry
+# smear), the feeding station, or Matt himself. Excluded from the digest's roll / plate / novelty
+# so "who visited" stays about animals. Genuine rare species (Douglas squirrel, Anna's hummingbird)
+# are NOT here -- they're real and SHOULD surface. The unclassified coarse label 'animal' is kept
+# in the roll (a real critter, just unnamed) but excluded from novelty/quiet headlines.
+_NON_CRITTER = {
+    # seen in this DB (human corrections of false triggers / the feeder / Matt himself)
+    "bricks", "brick", "blur", "blurry", "cat food", "catfood", "food", "homeowner",
+    "door", "porch", "broom", "chair",
+    # likely future static-object corrections + generic non-visitors
+    "fence", "wall", "table", "plant", "pot", "hose", "shadow", "reflection", "leaf", "leaves",
+    "rock", "stick", "sticks", "ground", "tree", "bush", "person", "people", "human", "vehicle",
+    "car", "unknown", "unidentified", "nothing", "empty", "none", "background", "n/a", "na", "",
+}
+
+
+def _web(p):
+    return p.replace("\\", "/") if p else None
+
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _sun(cfg, d):
+    """(dawn, dusk) tz-aware datetimes for calendar date `d`. Uses daynight.sun_times when
+    lat/lon (and astral) are available, else a fixed 06:00/18:00 local fallback."""
+    lat, lon = getattr(cfg, "latitude", None), getattr(cfg, "longitude", None)
+    key = (d.toordinal(), lat, lon)
+    if key in _SUN_CACHE:
+        return _SUN_CACHE[key]
+    base = datetime.combine(d, time(12, 0)).astimezone()
+    res = None
+    if lat is not None and lon is not None:
+        try:
+            import daynight
+            st = daynight.sun_times(lat, lon, base)
+            res = (st["dawn"], st["dusk"])
+        except Exception:
+            res = None
+    if res is None:
+        tz = base.tzinfo
+        res = (datetime.combine(d, time(6, 0), tzinfo=tz),
+               datetime.combine(d, time(18, 0), tzinfo=tz))
+    _SUN_CACHE[key] = res
+    return res
+
+
+def _iter_completed(cfg, now, max_back=40):
+    """All completed sun-periods, newest-first: each is (start, end, label, anchor_date).
+    A 'day' anchored on date d is [dawn(d), dusk(d)]; a 'night' anchored on d is the night
+    that ENDS on the morning of d, i.e. [dusk(d-1), dawn(d)]."""
+    res, today = [], now.date()
+    for back in range(0, max_back + 1):
+        d = today - timedelta(days=back)
+        dawn_d, dusk_d = _sun(cfg, d)
+        _, dusk_p = _sun(cfg, d - timedelta(days=1))
+        for c in ((dawn_d, dusk_d, "day", d), (dusk_p, dawn_d, "night", d)):
+            if c[1] <= now:                      # only COMPLETED periods
+                res.append(c)
+    res.sort(key=lambda c: c[1], reverse=True)
+    seen, out = set(), []
+    for c in res:
+        k = (c[0].isoformat(), c[1].isoformat())
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
+def _prior_windows(cfg, label, anchor, k=12):
+    """The k periods of the SAME type immediately before `anchor` (newest-first),
+    each (start, end, date) -- the baseline for streaks and quiet-regular flags."""
+    out, d = [], anchor
+    while len(out) < k:
+        d = d - timedelta(days=1)
+        dawn_d, dusk_d = _sun(cfg, d)
+        if label == "day":
+            out.append((dawn_d, dusk_d, d))
+        else:
+            _, dusk_p = _sun(cfg, d - timedelta(days=1))
+            out.append((dusk_p, dawn_d, d))
+    return out
+
+
+def _fmt_hour(h: int) -> str:
+    return f"{h % 12 or 12}{'am' if h < 12 else 'pm'}"
+
+
+def _typical_window(hist, frac=0.7):
+    """Shortest CIRCULAR run of hours (handles the around-midnight case) whose detections
+    sum to >= `frac` of the total -> 'When does this species usually show?' e.g. '9pm-1am'."""
+    total = sum(hist)
+    if total <= 0:
+        return None
+    target = total * frac
+    best = None
+    for s in range(24):
+        csum = 0
+        for length in range(1, 25):
+            csum += hist[(s + length - 1) % 24]
+            if csum >= target:
+                if best is None or length < best[0]:
+                    best = (length, s, (s + length - 1) % 24)
+                break
+    if not best:
+        return None
+    if best[1] == best[2]:                      # a single dominant hour
+        return f"~{_fmt_hour(best[1])}"
+    return f"{_fmt_hour(best[1])}–{_fmt_hour(best[2])}"
+
+
+def _moon(d):
+    """Moon name/glyph/illumination for date `d`, or None if astral is unavailable."""
+    try:
+        from astral import moon
+        p = float(moon.phase(d))
+    except Exception:
+        return None
+    name, glyph = _MOON_PHASES[-1][1], _MOON_PHASES[-1][2]
+    for edge, nm, gl in _MOON_PHASES:
+        if p < edge:
+            name, glyph = nm, gl
+            break
+    illum = round(50.0 * (1.0 - math.cos(2.0 * math.pi * p / 28.0)))
+    return {"phase": round(p, 1), "name": name, "glyph": glyph, "illum_pct": illum}
+
+
+def _title_for(label, anchor, today) -> str:
+    delta = (today - anchor).days
+    if label == "night":
+        if delta <= 0:
+            return "Last Night"
+        if delta == 1:
+            return "The Night Before"
+        return "Night of " + anchor.strftime("%a, %b ") + str(anchor.day)
+    if delta <= 0:
+        return "Today"
+    if delta == 1:
+        return "Yesterday"
+    return anchor.strftime("%a, %b ") + str(anchor.day)
+
+
+def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_days=3) -> dict:
+    """Summarize the most-recently-completed period. `edition`: 'auto' (whichever ended most
+    recently -> night in the morning, day in the evening), or force 'day'/'night'.
+
+    Returns a JSON-able dict: edition, title, start/end, totals, a per-species roll (visits,
+    rep crop, first/last, novelty, streak, typical hours + 24-bucket histogram), headline
+    `novel` species, `quiet` regulars that didn't show, `plate` of the period, first/last
+    visitor, busiest hour, and `moon` (night editions). `empty:true` when nobody showed."""
+    now = now or _local_now()
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"empty": True, "edition": edition, "reason": "no database yet"}
+    raw = conn.execute(
+        "SELECT id, timestamp, source, detection_class, species, confidence, "
+        "species_confidence, crop_path FROM detections ORDER BY timestamp").fetchall()
+    conn.close()
+
+    rows = []
+    for r in raw:
+        dt = _parse(r["timestamp"])
+        if dt is None:
+            continue
+        rows.append({
+            "id": r["id"], "dt": dt, "timestamp": r["timestamp"], "source": r["source"],
+            "detection_class": r["detection_class"], "species": r["species"],
+            "confidence": r["confidence"] or 0.0, "species_confidence": r["species_confidence"],
+            "crop_path": r["crop_path"], "label": r["species"] or r["detection_class"],
+        })
+    # Drop false triggers / non-visitor human labels up front so every downstream tally
+    # (roll, plate, novelty, streaks) is about actual animals.
+    rows = [r for r in rows if (r["label"] or "").lower() not in _NON_CRITTER]
+
+    def in_window(s, e):
+        return [r for r in rows if s <= r["dt"] < e]
+
+    completed = _iter_completed(cfg, now)
+    chosen = next((c for c in completed if edition == "auto" or c[2] == edition), None)
+    if chosen is None:
+        return {"empty": True, "edition": edition, "reason": "no completed period yet"}
+
+    start, end, label, anchor = chosen
+    pr = in_window(start, end)
+    backed_off = False
+    # Nothing in the most recent period and the caller didn't force an edition? Fall back to
+    # the most recent period (either type) that has detections, so the page is never blank.
+    if not pr and edition == "auto":
+        for c in completed:
+            cand = in_window(c[0], c[1])
+            if cand:
+                start, end, label, anchor, pr = c[0], c[1], c[2], c[3], cand
+                backed_off = True
+                break
+
+    today = now.date()
+    out = {
+        "edition": label, "title": _title_for(label, anchor, today),
+        "start": start.isoformat(), "end": end.isoformat(), "backed_off": backed_off,
+        "moon": _moon(anchor - timedelta(days=1)) if label == "night" else None,
+    }
+    if not pr:
+        out.update({"empty": True, "visits": 0, "crops": 0, "species": [],
+                    "novel": [], "quiet": []})
+        return out
+
+    # --- visits over the period, attributed to every species they contain ---
+    visits = compute_visits(pr, cfg.visit_gap_minutes)
+    visits.sort(key=lambda v: v["start"])
+    per_sp_visits = Counter()
+    for v in visits:
+        for sp in v["classes"]:
+            per_sp_visits[sp] += 1
+
+    # --- all-time per-species history (for novelty + activity clock) ---
+    sp_all = defaultdict(list)
+    for r in rows:                 # rows are globally timestamp-sorted
+        sp_all[r["label"]].append(r)
+
+    def hours_hist(rs):
+        h = [0] * 24
+        for r in rs:
+            h[r["dt"].hour] += 1
+        return h
+
+    # --- presence across current + prior same-type windows (streak & quiet) ---
+    priors = _prior_windows(cfg, label, anchor)
+    window_species = [set(r["label"] for r in pr)]
+    window_species += [set(r["label"] for r in in_window(s, e)) for s, e, _d in priors]
+
+    def streak_of(sp):
+        n = 0
+        for ws in window_species:
+            if sp in ws:
+                n += 1
+            else:
+                break
+        return n
+
+    crops_by_sp = Counter(r["label"] for r in pr)
+    species_roll = []
+    for sp, crops in crops_by_sp.most_common():
+        srs = [r for r in pr if r["label"] == sp]
+        rep = max(srs, key=lambda r: (r["species_confidence"] or r["confidence"] or 0.0))
+        prev = [r for r in sp_all[sp] if r["dt"] < start]
+        prev_dt = prev[-1]["dt"] if prev else None
+        hist = hours_hist(sp_all[sp])
+        species_roll.append({
+            "species": sp, "visits": per_sp_visits.get(sp, 0), "crops": crops,
+            "rep_crop": _web(rep["crop_path"]),
+            "rep_conf": round(rep["species_confidence"] or rep["confidence"] or 0.0, 3),
+            "first": min(r["dt"] for r in srs).isoformat(),
+            "last": max(r["dt"] for r in srs).isoformat(),
+            "novelty": {"first_ever": prev_dt is None,
+                        "days_since": ((start.date() - prev_dt.date()).days if prev_dt else None)},
+            "streak": streak_of(sp), "typical": _typical_window(hist), "hours": hist,
+            "active_hours": sorted({r["dt"].hour for r in srs}),   # hours active THIS period
+        })
+
+    # --- headline novelty (first-ever, then rarest first) + quiet regulars ---
+    alltime = {sp: len(rs) for sp, rs in sp_all.items()}
+    novel_cands = [s for s in species_roll if s["species"] != "animal"
+                   and (s["novelty"]["first_ever"] or (s["novelty"]["days_since"] or 0) >= novelty_days)]
+    novel_cands.sort(key=lambda s: (not s["novelty"]["first_ever"], alltime.get(s["species"], 0)))
+    novel = [s["species"] for s in novel_cands[:6]]
+    present_now, prior_ws = window_species[0], window_species[1:]
+    quiet = []
+    if prior_ws:
+        seen_counts = Counter(sp for ws in prior_ws for sp in ws if sp != "animal")
+        for sp, c in seen_counts.items():
+            frac = c / len(prior_ws)
+            if frac >= regular_frac and sp not in present_now:
+                since = 1
+                for ws in prior_ws:
+                    if sp in ws:
+                        break
+                    since += 1
+                quiet.append({"species": sp, "frac": round(frac, 2), "periods_since": since})
+        quiet.sort(key=lambda q: -q["frac"])
+
+    # --- plate of the period, first/last visitor, busiest hour ---
+    plate = max(pr, key=lambda r: (r["species_confidence"] or r["confidence"] or 0.0))
+    busy = Counter(v["start"].hour for v in visits)
+    bh = busy.most_common(1)[0] if busy else None
+
+    out.update({
+        "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
+        "novel": novel, "quiet": quiet[:4],
+        "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
+                  "conf": round(plate["species_confidence"] or plate["confidence"] or 0.0, 3),
+                  "time": plate["dt"].isoformat()},
+        "first_visitor": {"species": pr[0]["label"], "time": pr[0]["dt"].isoformat()},
+        "last_visitor": {"species": pr[-1]["label"], "time": pr[-1]["dt"].isoformat()},
+        "busiest_hour": ({"hour": bh[0], "visits": bh[1]} if bh else None),
+    })
+    return out

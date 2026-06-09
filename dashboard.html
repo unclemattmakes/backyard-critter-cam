@@ -188,6 +188,75 @@
   .chip{background:var(--panel); border:1px solid var(--rule2); color:var(--dim); border-radius:3px; padding:5px 11px; cursor:pointer; font-family:var(--serif); font-variant:small-caps; font-size:14px; letter-spacing:.02em;}
   .chip:hover{border-color:var(--gilt); color:var(--ink);}
   .chip i{font-style:normal; font-family:var(--mono); font-size:10px; color:var(--gilt); margin-left:3px;}
+
+  /* ---- The Dispatch (period digest) ---- */
+  .dsp-head{display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin:4px 0 2px;}
+  .dsp-title{font-family:var(--serif); font-variant:small-caps; font-weight:500; font-size:clamp(24px,3.4vw,34px); letter-spacing:.02em; line-height:1.05;}
+  .dsp-sub{font-style:italic; color:var(--dim); margin-top:3px; font-size:14px;}
+  .dsp-toggle{display:flex; border:1px solid var(--rule2); border-radius:3px; overflow:hidden;}
+  .dsp-toggle button{background:none; border:0; border-left:1px solid var(--rule2); color:var(--dim); font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase; padding:7px 13px; cursor:pointer; transition:background .15s,color .15s;}
+  .dsp-toggle button:first-child{border-left:0;}
+  .dsp-toggle button:hover{color:var(--ink);}
+  .dsp-toggle button.on{background:var(--gilt); color:#16120a;}
+  .lede{margin:16px 0 6px; display:flex; flex-direction:column; gap:8px;}
+  .flag{font-family:var(--serif); font-style:italic; font-size:15px; color:var(--ink); border-left:2px solid var(--gilt); padding:1px 0 1px 12px;}
+  .flag.quiet{border-color:var(--rust); color:var(--dim);}
+  .flag.moon{border-color:var(--sage); color:var(--dim);}
+  .hero{display:grid; grid-template-columns:minmax(0,1.5fr) minmax(220px,1fr); overflow:hidden; margin:16px 0;}
+  @media(max-width:680px){.hero{grid-template-columns:1fr;}}
+  .hero-photo{background:#000 center/cover no-repeat; min-height:280px; border-right:1px solid var(--rule);}
+  @media(max-width:680px){.hero-photo{border-right:0; border-bottom:1px solid var(--rule);}}
+  .hero-info{padding:20px 24px; display:flex; flex-direction:column; justify-content:center;}
+  .hero-eyebrow{color:var(--gilt);}
+  .hero-name{font-variant:small-caps; font-size:30px; letter-spacing:.02em; line-height:1.08; margin-top:8px;}
+  .hero-latin{font-style:italic; color:var(--faint); margin-top:1px;}
+  .hero-meta{font-family:var(--mono); font-size:12px; color:var(--dim); margin-top:16px; line-height:1.7;}
+  .hero-meta .c{color:var(--sage);}
+  .roll{display:flex; flex-direction:column; border:1px solid var(--rule); border-radius:4px; overflow:hidden;}
+  .entry{display:grid; grid-template-columns:66px 1fr auto; gap:14px; align-items:center; padding:12px 14px; border-bottom:1px solid var(--rule); background:var(--panel); cursor:pointer; transition:background .15s;}
+  .entry:last-child{border-bottom:0;}
+  .entry[data-sp]:hover{background:var(--panel2);}
+  .entry-thumb{width:66px; height:56px; border-radius:3px; background:#000 center/cover no-repeat; border:1px solid var(--rule2);}
+  .entry-main{min-width:0;}
+  .entry-name{font-variant:small-caps; font-size:18px; letter-spacing:.02em; line-height:1.1; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
+  .entry-name .gx{font-variant:normal; font-size:16px;}
+  .entry-name .latin{font-style:italic; font-variant:normal; color:var(--faint); font-size:12px;}
+  .entry-when{font-family:var(--mono); font-size:11px; color:var(--faint); margin-top:4px;}
+  .entry-when .typ{color:var(--sage);}
+  .badges{display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;}
+  .badge{font-family:var(--mono); font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; padding:2px 6px; border-radius:2px; border:1px solid var(--rule2); color:var(--dim);}
+  .badge.new{background:var(--gilt); color:#16120a; border-color:var(--gilt);}
+  .badge.gap{border-color:var(--sage); color:var(--sage);}
+  .badge.streak{border-color:var(--rust); color:var(--rust);}
+  .entry-right{text-align:right; display:flex; flex-direction:column; align-items:flex-end; gap:7px;}
+  .entry-count{font-family:var(--mono); font-size:18px; color:var(--ink); white-space:nowrap;}
+  .entry-count small{color:var(--faint); font-size:11px;}
+  .clock{display:flex; align-items:flex-end; gap:1px; height:20px;}
+  .clock .hbar{width:3px; background:var(--rule2); border-radius:1px 1px 0 0;}
+  .clock .hbar.on{background:var(--gilt);}
+
+  /* ---- Calendar ---- */
+  .cal-head{display:flex; align-items:center; justify-content:center; gap:18px; margin:6px 0 16px;}
+  .cal-head .nav{background:none; border:1px solid var(--rule2); color:var(--dim); border-radius:3px; width:36px; height:32px; cursor:pointer; font-size:16px; line-height:1;}
+  .cal-head .nav:hover{border-color:var(--gilt); color:var(--ink);}
+  .cal-head .mo{font-family:var(--serif); font-variant:small-caps; font-size:23px; letter-spacing:.03em; min-width:240px; text-align:center;}
+  .cal-grid{display:grid; grid-template-columns:repeat(7,1fr); gap:6px;}
+  .cal-wd{font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); text-align:center; padding:0 0 4px;}
+  .cal-cell{min-height:94px; border:1px solid var(--rule); border-radius:4px; background:var(--panel); padding:6px 7px; position:relative; overflow:hidden;}
+  .cal-cell.out{opacity:.3;}
+  .cal-cell.has{cursor:pointer; transition:border-color .15s, transform .15s, box-shadow .15s;}
+  .cal-cell.has:hover{border-color:var(--gilt); transform:translateY(-2px); box-shadow:0 9px 22px -15px #000;}
+  .cal-cell.today{border-color:var(--gilt);}
+  .cal-d{font-family:var(--mono); font-size:12px; color:var(--dim);}
+  .cal-cell.today .cal-d{color:var(--gilt);}
+  .cal-v{position:absolute; top:6px; right:7px; font-family:var(--mono); font-size:10px; color:var(--faint);}
+  .cal-gl{display:flex; flex-wrap:wrap; gap:3px 6px; margin-top:9px; font-size:19px; line-height:1.05;}
+  .cal-gl .gl{display:inline-flex; align-items:baseline; filter:saturate(.82);}
+  .cal-gl .gl i{font-style:normal; font-family:var(--mono); font-size:9px; color:var(--faint); margin-left:1px;}
+  .mono-gl{font-family:var(--mono); font-size:11px; font-weight:600; letter-spacing:.03em; color:var(--sage); border:1px solid var(--rule2); border-radius:2px; padding:0 3px;}
+  .cal-legend{display:flex; flex-wrap:wrap; gap:10px 18px; margin:20px 2px 0; padding-top:14px; border-top:1px solid var(--rule); color:var(--dim);}
+  .cal-legend .li{display:inline-flex; align-items:center; gap:6px; font-variant:small-caps; letter-spacing:.02em; font-size:14px;}
+  .cal-legend .li b{font-weight:400; font-size:17px;}
 </style>
 </head>
 <body>
@@ -205,6 +274,8 @@
 
 <nav class="tabs">
   <button id="tab-live" class="on" onclick="show('live')">Live Observation</button>
+  <button id="tab-dispatch" onclick="show('dispatch')">The Dispatch</button>
+  <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
   <button id="tab-cat" onclick="show('cat')">Specimen Catalogue</button>
 </nav>
 
@@ -264,6 +335,16 @@
     </div>
     <div id="explore-body"></div>
   </section>
+
+  <!-- ============ THE DISPATCH (period digest) ============ -->
+  <section id="view-dispatch" class="view">
+    <div id="dispatch-body"><p class="empty">Loading the dispatch&hellip;</p></div>
+  </section>
+
+  <!-- ============ CALENDAR ============ -->
+  <section id="view-calendar" class="view">
+    <div id="calendar-body"><p class="empty">Loading the calendar&hellip;</p></div>
+  </section>
 </main>
 <div class="foot">Recorded by an unblinking eye at the sliding glass door. Counts are observations; one visit may leave many.<br>
 <a href="https://github.com/unclemattmakes/backyard-critter-cam" target="_blank" rel="noopener">Source</a> &middot; <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">AGPL-3.0</a></div>
@@ -297,11 +378,17 @@ const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
 function show(v){
   closeSettings();
   $('#view-live').classList.toggle('on',v==='live');
+  $('#view-dispatch').classList.toggle('on',v==='dispatch');
+  $('#view-calendar').classList.toggle('on',v==='calendar');
   $('#view-cat').classList.toggle('on',v==='cat');
   $('#view-explore').classList.toggle('on',v==='explore');
   $('#tab-live').classList.toggle('on',v==='live');
+  $('#tab-dispatch').classList.toggle('on',v==='dispatch');
+  $('#tab-calendar').classList.toggle('on',v==='calendar');
   $('#tab-cat').classList.toggle('on',v==='cat');
   if(v==='cat') loadCatalogue();
+  if(v==='dispatch') loadDispatch();
+  if(v==='calendar') loadCalendar();
 }
 
 /* ---------- camera controls ---------- */
@@ -604,6 +691,166 @@ async function renderDay(params,body){
   body.querySelectorAll('.chip[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
   obsState={day:date,species:null,start:null,end:null,offset:0};
   await loadMoreObs();
+}
+
+/* ---------- shared: species glyphs (calendar + dispatch) ---------- */
+// Non-visitor human-correction labels -- mirror of stats._NON_CRITTER. Hidden from glances.
+const NONCRITTER=new Set(['bricks','brick','blur','blurry','cat food','catfood','food','homeowner',
+  'door','porch','broom','chair','fence','wall','table','plant','pot','hose','shadow','reflection','leaf','leaves',
+  'rock','stick','sticks','ground','tree','bush','person','people','human','vehicle','car','unknown','unidentified',
+  'nothing','empty','none','background','n/a','na','']);
+const GLYPH_MAP={'raccoon':'🦝','domestic cat':'🐱','cat':'🐱','brown rat':'🐀','rat':'🐀',
+  'eastern cottontail':'🐰','american crow':'🐦‍⬛','animal':'🐾'};
+// {e:emoji} where a clear one exists, else {m:monogram} -- so any species the classifier emits
+// still renders. Opossum has no emoji, so it gets a small-caps monogram.
+function glyphInfo(sp){
+  const k=(sp||'').toLowerCase().replace(/’/g,"'");
+  if(GLYPH_MAP[k]) return {e:GLYPH_MAP[k]};
+  if(/squirrel|chipmunk/.test(k)) return {e:'🐿️'};
+  if(k.includes('opossum')) return {m:'Op'};
+  if(/sparrow|finch|wren|warbler|junco|towhee|thrush|jay|crow|raven|robin|starling|flicker|pigeon|dove|chickadee|hummingbird|waxwing|siskin|bushtit|nuthatch|woodpecker|blackbird|grosbeak|kinglet|tanager|swallow|\bbird\b/.test(k)) return {e:'🐦'};
+  if(/\brat\b|mouse|vole|mole|shrew/.test(k)) return {e:'🐀'};
+  if(/rabbit|cottontail|hare/.test(k)) return {e:'🐰'};
+  if(/coyote|fox|\bdog\b/.test(k)) return {e:'🐾'};
+  if(/deer|elk/.test(k)) return {e:'🦌'};
+  if(/skunk/.test(k)) return {e:'🦨'};
+  const m=k.split(/[\s-]+/).slice(0,2).map(w=>w[0]||'').join('').toUpperCase()||'?';
+  return {m};
+}
+const glyphHTML=g=>g.e?g.e:`<b class="mono-gl">${esc(g.m)}</b>`;
+const nameOf=sp=>sp==='animal'?'Unidentified':cap1(sp);
+const fmtHourJS=h=>`${(h%12)||12}${h<12?'am':'pm'}`;
+const fmtClock=iso=>{ const d=new Date(iso); return isNaN(d)?'':d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}); };
+
+/* ---------- The Dispatch (period digest) ---------- */
+let dispatchEdition='auto';
+function setDispatch(ed){ dispatchEdition=ed; loadDispatch(); }
+async function loadDispatch(){
+  const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the dispatch…</p>';
+  let d; try{ d=await fetch('/api/digest?edition='+dispatchEdition).then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
+  renderDispatch(d);
+}
+function dispatchHeader(d){
+  const ed=d.edition;
+  const masthead = ed==='night' ? 'The Morning Dispatch' : ed==='day' ? 'The Evening Dispatch' : 'The Dispatch';
+  const range = d.start ? `${fmtDateTime(d.start)} – ${fmtDateTime(d.end)}` : '';
+  return `<div class="dsp-head">
+    <div>
+      <div class="dsp-title">${esc(masthead)}<span style="color:var(--gilt)"> · </span>${esc(d.title||'')}</div>
+      <div class="dsp-sub">${esc(range)}${d.backed_off?' · last period with activity':''}</div>
+    </div>
+    <div class="dsp-toggle">
+      <button class="${ed==='night'?'on':''}" onclick="setDispatch('night')">☾ Night</button>
+      <button class="${ed==='day'?'on':''}" onclick="setDispatch('day')">☀ Day</button>
+    </div>
+  </div>`;
+}
+function renderDispatch(d){
+  const body=$('#dispatch-body');
+  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`; return; }
+  let html=dispatchHeader(d);
+  const flags=[];
+  (d.novel||[]).forEach(sp=>{ const s=(d.species||[]).find(x=>x.species===sp); const n=s&&s.novelty;
+    const lead = n&&n.first_ever ? 'First ever recorded' : (n&&n.days_since ? `First in ${n.days_since} days` : 'Notable');
+    flags.push(`<span class="flag new">❋ ${lead}: ${esc(nameOf(sp))}</span>`); });
+  (d.quiet||[]).forEach(q=>{ flags.push(`<span class="flag quiet">— No ${esc(nameOf(q.species))} this ${esc(d.edition)} (usually ${Math.round(q.frac*100)}% of ${esc(d.edition)}s)</span>`); });
+  if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
+  if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
+  if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`; return; }
+  if(d.plate){ const p=d.plate;
+    html+=`<div class="panel hero">
+      <div class="hero-photo" style="background-image:url('${p.crop_path?media(p.crop_path):''}')"></div>
+      <div class="hero-info">
+        <div class="hero-eyebrow lbl">Plate of the ${d.edition==='night'?'Night':'Day'}</div>
+        <div class="hero-name">${esc(nameOf(p.species))}</div>
+        <div class="hero-latin">${esc(latinOf(p.species))}</div>
+        <div class="hero-meta">${esc(fmtClock(p.time))}<br><span class="c">~${Math.round((p.conf||0)*100)}%</span> · sharpest frame</div>
+      </div></div>`;
+  }
+  const t=[['visits',(d.visits||0).toLocaleString()],['species',(d.species||[]).length],
+    ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
+  if(d.moon) t.push(['moon',d.moon.illum_pct+'%']);
+  html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
+  html+=`<h2 class="sec">The Roll <span class="n">${(d.species||[]).length} species</span></h2>`;
+  html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
+  body.innerHTML=html;
+  body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
+}
+function entryRow(s){
+  const n=s.novelty||{}, badges=[];
+  if(n.first_ever) badges.push('<span class="badge new">New</span>');
+  else if((n.days_since||0)>=3) badges.push(`<span class="badge gap">first in ${n.days_since}d</span>`);
+  if((s.streak||0)>=3) badges.push(`<span class="badge streak">${s.streak} in a row</span>`);
+  const active=new Set(s.active_hours||[]);
+  const hrs=s.hours||[], max=Math.max(1,...hrs);
+  const clock=hrs.map((c,h)=>{const ht=c?Math.max(2,Math.round(Math.sqrt(c/max)*18)):1;return `<span class="hbar${active.has(h)?' on':''}" style="height:${ht}px" title="${fmtHourJS(h)}: ${c}"></span>`;}).join('');
+  const g=glyphInfo(s.species), clickable=s.species!=='animal';
+  return `<div class="entry"${clickable?` data-sp="${esc(s.species)}"`:' style="cursor:default"'}>
+    <div class="entry-thumb" style="background-image:url('${s.rep_crop?media(s.rep_crop):''}')"></div>
+    <div class="entry-main">
+      <div class="entry-name"><span class="gx">${glyphHTML(g)}</span> ${esc(nameOf(s.species))} <span class="latin">${esc(latinOf(s.species))}</span></div>
+      <div class="entry-when">${fmtClock(s.first)}–${fmtClock(s.last)}${s.typical?` · <span class="typ">usually ${esc(s.typical)}</span>`:''}</div>
+      ${badges.length?`<div class="badges">${badges.join('')}</div>`:''}
+    </div>
+    <div class="entry-right">
+      <div class="entry-count">${s.visits}<small> visit${s.visits===1?'':'s'}</small></div>
+      <div class="clock" title="all-time activity by hour; gold = this period">${clock}</div>
+    </div>
+  </div>`;
+}
+
+/* ---------- Calendar ---------- */
+let calYear=null, calMonth=null, calByDay={};
+const ymdLocal=dt=>{const p=n=>String(n).padStart(2,'0');return dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate());};
+async function loadCalendar(){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }
+  catch(e){ $('#calendar-body').innerHTML='<p class="empty">Could not load the calendar.</p>'; return; }
+  calByDay={}; (s.by_day||[]).forEach(d=>{ calByDay[d.day]=d; });
+  if(calYear==null){
+    const days=Object.keys(calByDay).sort();
+    const base=days.length?new Date(days[days.length-1]+'T12:00:00'):new Date();
+    calYear=base.getFullYear(); calMonth=base.getMonth();
+  }
+  renderCalendar();
+}
+function calNav(delta){ calMonth+=delta; if(calMonth<0){calMonth=11;calYear--;} else if(calMonth>11){calMonth=0;calYear++;} renderCalendar(); }
+function glyphsForDay(entry){
+  if(!entry||!entry.classes) return '';
+  return Object.entries(entry.classes).filter(([sp])=>!NONCRITTER.has(sp.toLowerCase()))
+    .sort((a,b)=>b[1]-a[1]).slice(0,4)
+    .map(([sp,nn])=>{const g=glyphInfo(sp);return `<span class="gl" title="${esc(nameOf(sp))} · ${nn}">${glyphHTML(g)}${nn>1?`<i>${nn>99?'99+':nn}</i>`:''}</span>`;}).join('');
+}
+function renderCalendar(){
+  const body=$('#calendar-body');
+  const first=new Date(calYear,calMonth,1);
+  const start=new Date(calYear,calMonth,1); start.setDate(1-first.getDay());   // back to Sunday
+  const monthName=first.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  const todayStr=ymdLocal(new Date());
+  const wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(w=>`<div class="cal-wd">${w}</div>`).join('');
+  const monthSpecies={};
+  let cells='';
+  for(let i=0;i<42;i++){
+    const dt=new Date(start); dt.setDate(start.getDate()+i);
+    const ymd=ymdLocal(dt), inMonth=dt.getMonth()===calMonth, entry=calByDay[ymd];
+    if(inMonth&&entry&&entry.classes) Object.entries(entry.classes).forEach(([sp,nn])=>{ if(!NONCRITTER.has(sp.toLowerCase())) monthSpecies[sp]=(monthSpecies[sp]||0)+nn; });
+    cells+=`<div class="cal-cell${inMonth?'':' out'}${ymd===todayStr?' today':''}${entry&&inMonth?' has':''}"${entry&&inMonth?` data-day="${ymd}"`:''}>
+      <div class="cal-d">${dt.getDate()}</div>
+      ${entry&&inMonth?`<div class="cal-v" title="${entry.visits||0} visits">${entry.visits||0}</div>`:''}
+      <div class="cal-gl">${inMonth?glyphsForDay(entry):''}</div>
+    </div>`;
+  }
+  const legend=Object.entries(monthSpecies).sort((a,b)=>b[1]-a[1])
+    .map(([sp])=>{const g=glyphInfo(sp);return `<span class="li"><b>${glyphHTML(g)}</b> ${esc(nameOf(sp))}</span>`;}).join('');
+  body.innerHTML=`
+    <div class="cal-head">
+      <button class="nav" onclick="calNav(-1)" title="Previous month">‹</button>
+      <div class="mo">${esc(monthName)}</div>
+      <button class="nav" onclick="calNav(1)" title="Next month">›</button>
+    </div>
+    <div class="cal-grid">${wd}${cells}</div>
+    ${legend?`<div class="cal-legend">${legend}</div>`:'<p class="empty" style="padding:16px 2px">No visitors recorded this month.</p>'}`;
+  body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
 }
 
 /* ---------- settings popout ---------- */
