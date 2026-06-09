@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Backyard Observatory — Field Log</title>
+<style>
+  :root{
+    --bg:#15130d; --panel:#1c1910; --panel2:#221e14; --ink:#e9dec6; --dim:#a89b7e;
+    --faint:#6d6249; --rule:#37301f; --rule2:#4a4029;
+    --gilt:#c9a24b; --sage:#94a36b; --rust:#c05f3e; --ok:#86ab5d;
+    --serif:'Iowan Old Style','Palatino Linotype','Book Antiqua',Palatino,'Hoefler Text',Constantia,Georgia,'Times New Roman',serif;
+    --mono:'Cascadia Code','Cascadia Mono',Consolas,'SFMono-Regular',ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;}
+  body{
+    background:
+      radial-gradient(120% 80% at 50% -10%, #211c11 0%, var(--bg) 55%),
+      var(--bg);
+    color:var(--ink); font-family:var(--serif); font-size:16px; line-height:1.5;
+    -webkit-font-smoothing:antialiased; min-height:100vh;
+  }
+  body::before{ /* film grain */
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:900; opacity:.04;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .lbl{font-family:var(--mono); font-size:10.5px; letter-spacing:.22em; text-transform:uppercase; color:var(--faint);}
+  .mono{font-family:var(--mono);}
+  a{color:inherit;}
+
+  /* ---- Masthead ---- */
+  header.mast{ max-width:1280px; margin:0 auto; padding:26px 26px 0; text-align:center; }
+  .mast .rule{height:1px; background:var(--rule2);}
+  .mast .top{display:flex; justify-content:space-between; align-items:flex-end; padding:6px 2px; color:var(--dim);}
+  .mast h1{
+    font-family:var(--serif); font-weight:500; font-size:clamp(30px,5vw,52px); letter-spacing:.02em;
+    margin:14px 0 4px; font-variant:small-caps;
+  }
+  .mast h1 .amp{color:var(--gilt); font-style:italic;}
+  .mast .sub{font-style:italic; color:var(--dim); margin-bottom:14px;}
+  .live-chip{display:inline-flex; align-items:center; gap:7px; color:var(--ink);}
+  .live-dot{width:8px;height:8px;border-radius:50%;background:var(--rust); box-shadow:0 0 0 0 rgba(192,95,62,.6); animation:pulse 2s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(192,95,62,.55)}70%{box-shadow:0 0 0 7px rgba(192,95,62,0)}100%{box-shadow:0 0 0 0 rgba(192,95,62,0)}}
+
+  /* ---- Nav ---- */
+  nav.tabs{ max-width:1280px; margin:18px auto 0; padding:0 26px; display:flex; gap:28px; justify-content:center; }
+  nav.tabs button{
+    background:none; border:none; color:var(--dim); font-family:var(--serif); font-size:17px; font-variant:small-caps;
+    letter-spacing:.04em; padding:8px 2px 12px; cursor:pointer; position:relative; transition:color .2s;
+  }
+  nav.tabs button:hover{color:var(--ink);}
+  nav.tabs button.on{color:var(--ink);}
+  nav.tabs button.on::after{content:""; position:absolute; left:0; right:0; bottom:6px; height:2px; background:var(--gilt);}
+
+  main{max-width:1280px; margin:0 auto; padding:22px 26px 80px;}
+  .view{display:none; animation:fade .5s ease both;}
+  .view.on{display:block;}
+  @keyframes fade{from{opacity:0; transform:translateY(8px)}to{opacity:1; transform:none}}
+
+  .panel{background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--rule); border-radius:4px;}
+  h2.sec{font-family:var(--serif); font-variant:small-caps; letter-spacing:.05em; font-weight:500; font-size:21px; margin:34px 0 14px; color:var(--ink); display:flex; align-items:baseline; gap:12px;}
+  h2.sec::after{content:""; flex:1; height:1px; background:var(--rule); align-self:center;}
+  h2.sec .n{font-family:var(--mono); font-size:12px; color:var(--gilt); letter-spacing:.1em;}
+
+  /* ---- Live: stream plate + instrument panel ---- */
+  .obs{display:grid; grid-template-columns:minmax(0,1.7fr) minmax(290px,1fr); gap:20px;}
+  @media(max-width:920px){.obs{grid-template-columns:1fr;}}
+  .plate{padding:12px;}
+  .plate .frame{position:relative; background:#000; border:1px solid var(--rule2); overflow:hidden;}
+  .plate .frame::before,.plate .frame::after,.plate .frame i::before,.plate .frame i::after{
+    content:""; position:absolute; width:14px; height:14px; border:2px solid var(--gilt); z-index:3; opacity:.8;}
+  .plate .frame::before{top:7px;left:7px;border-right:0;border-bottom:0;}
+  .plate .frame::after{top:7px;right:7px;border-left:0;border-bottom:0;}
+  .plate .frame i::before{bottom:7px;left:7px;border-right:0;border-top:0;}
+  .plate .frame i::after{bottom:7px;right:7px;border-left:0;border-top:0;}
+  .plate img{display:block; width:100%; height:auto;}
+  .plate .cap{display:flex; justify-content:space-between; padding:10px 4px 2px; color:var(--dim);}
+
+  .panel.instr{padding:16px 16px 18px;}
+  .instr h3{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500; font-size:17px;}
+  .instr .hint{color:var(--faint); font-style:italic; font-size:13px; margin:0 0 14px;}
+  .ctrl{margin:13px 0;}
+  .ctrl .row{display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;}
+  .ctrl .row .name{color:var(--dim);}
+  .ctrl .row .val{font-family:var(--mono); font-size:12px; color:var(--gilt);}
+  .ctrl input[type=range]{ -webkit-appearance:none; appearance:none; width:100%; height:3px; background:var(--rule2); border-radius:3px; outline:none;}
+  .ctrl input[type=range]:disabled{opacity:.3;}
+  .ctrl.locked{opacity:.55;} .ctrl.locked .val{font-style:italic;}
+  .ctrl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none; width:15px;height:15px;border-radius:50%; background:var(--gilt); border:2px solid #100d07; cursor:pointer; box-shadow:0 1px 3px #000;}
+  .ctrl input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--gilt);border:2px solid #100d07;cursor:pointer;}
+  .auto{display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:var(--faint); font-family:var(--mono); font-size:10px; letter-spacing:.14em; text-transform:uppercase;}
+  .auto input{accent-color:var(--sage);}
+
+  /* ---- field tallies ---- */
+  .tallies{display:flex; flex-wrap:wrap; gap:0; border:1px solid var(--rule); border-radius:4px; overflow:hidden; margin-top:8px;}
+  .tally{flex:1 1 140px; padding:14px 16px; border-right:1px solid var(--rule); background:var(--panel);}
+  .tally:last-child{border-right:0;}
+  .tally .n{font-family:var(--mono); font-size:25px; color:var(--ink); line-height:1.1;}
+  .tally .n small{color:var(--gilt); font-size:14px;}
+  .tally .k{margin-top:3px;}
+
+  /* ---- specimen cards ---- */
+  .cards{display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:14px;}
+  .card{background:var(--panel); border:1px solid var(--rule); border-radius:4px; overflow:hidden; cursor:pointer; transition:transform .18s, border-color .18s, box-shadow .18s; animation:fade .5s both;}
+  .card:hover{transform:translateY(-3px); border-color:var(--rule2); box-shadow:0 10px 26px -14px #000;}
+  .card .thumb{aspect-ratio:4/3; background:#000 center/cover no-repeat; border-bottom:1px solid var(--rule); position:relative;}
+  .card .rank{position:absolute; top:7px; left:7px; font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--bg); background:var(--gilt); padding:1px 6px; border-radius:2px;}
+  .card .body{padding:10px 12px 12px;}
+  .card .common{font-variant:small-caps; font-size:17px; letter-spacing:.02em; line-height:1.15;}
+  .card .latin{font-style:italic; color:var(--faint); font-size:12px; margin-top:1px; min-height:15px;}
+  .card .meta{display:flex; justify-content:space-between; align-items:baseline; margin-top:9px; padding-top:8px; border-top:1px dotted var(--rule2);}
+  .card .count{font-family:var(--mono); font-size:18px; color:var(--ink);}
+  .card .count small{color:var(--faint); font-size:11px;}
+  .card .conf{font-family:var(--mono); font-size:11px; color:var(--sage);}
+
+  /* ---- species sheet (crop grid) ---- */
+  .sheet-head{display:flex; align-items:baseline; gap:16px; margin:6px 0 4px;}
+  .sheet-head .back{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--gilt); background:none; border:1px solid var(--rule2); border-radius:3px; padding:6px 10px; cursor:pointer;}
+  .sheet-head .back:hover{border-color:var(--gilt);}
+  .sheet-head h2{font-variant:small-caps; font-weight:500; font-size:28px; margin:0;}
+  .sheet-head .latin{font-style:italic; color:var(--faint);}
+  .crops{display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px;}
+  .crop{background:var(--panel); border:1px solid var(--rule); border-radius:4px; overflow:hidden; position:relative;}
+  .crop.v-1{border-color:#46522f;} .crop.v-0{border-color:#5a342a;}
+  .crop img{display:block; width:100%; height:120px; object-fit:cover; background:#000;}
+  .crop .ft{display:flex; align-items:center; gap:6px; padding:7px 8px; font-family:var(--mono); font-size:11px;}
+  .crop .ft .c{color:var(--sage);}
+  .crop .stamp{position:absolute; top:6px; right:6px; font-family:var(--mono); font-size:9px; letter-spacing:.12em; padding:2px 5px; border-radius:2px; text-transform:uppercase;}
+  .crop .stamp.v1{background:var(--ok); color:#10160a;} .crop .stamp.v0{background:var(--rust); color:#1a0d08;}
+  .crop .acts{margin-left:auto; display:flex; gap:5px;}
+  .crop button.b{background:none; border:1px solid var(--rule2); color:var(--dim); width:24px; height:22px; border-radius:3px; cursor:pointer; font-size:12px; line-height:1; padding:0;}
+  .crop button.b:hover{border-color:var(--gilt); color:var(--ink);}
+  .crop button.b.up:hover{border-color:var(--ok); color:var(--ok);}
+  .crop button.b.dn:hover{border-color:var(--rust); color:var(--rust);}
+  .crop select{display:none; width:100%; margin-top:0; background:var(--panel2); color:var(--ink); border:0; border-top:1px solid var(--rule); font-family:var(--mono); font-size:11px; padding:6px;}
+  .crop.editing select{display:block;}
+  .empty{color:var(--faint); font-style:italic; padding:30px 4px;}
+  .foot{max-width:1280px; margin:0 auto; padding:0 26px 40px; color:var(--faint); font-style:italic; text-align:center; font-size:13px;}
+
+  /* ---- live: settings button · latest visitor · common/rare duo ---- */
+  .cap-right{display:flex; align-items:center; gap:14px;}
+  .gear{display:inline-flex; align-items:center; gap:6px; background:none; border:1px solid var(--rule2);
+    color:var(--dim); font-family:var(--mono); font-size:10px; letter-spacing:.16em; text-transform:uppercase;
+    padding:5px 11px; border-radius:3px; cursor:pointer; transition:border-color .2s,color .2s;}
+  .gear:hover{border-color:var(--gilt); color:var(--ink);}
+  .span{display:block; text-align:center; margin:2px 0 10px;}
+
+  .latest{display:flex; flex-direction:column; overflow:hidden; cursor:pointer; transition:border-color .18s, box-shadow .18s;}
+  .latest:hover{border-color:var(--rule2); box-shadow:0 10px 26px -16px #000;}
+  .latest .latest-eyebrow{padding:14px 16px 0; color:var(--gilt);}
+  .latest-photo{flex:1 1 auto; min-height:210px; margin-top:10px; background:#000 center/cover no-repeat; border-top:1px solid var(--rule);}
+  .latest-info{padding:12px 16px 16px;}
+  .latest-name{font-variant:small-caps; font-size:24px; letter-spacing:.02em; line-height:1.12;}
+  .latest-latin{font-style:italic; color:var(--faint); font-size:13px; margin-top:1px; min-height:16px;}
+  .latest-when{font-family:var(--mono); font-size:12px; color:var(--dim); margin-top:9px; display:flex; gap:8px; align-items:center;}
+  .latest-when .conf{color:var(--sage);} .latest-when .dot{color:var(--faint);}
+
+  .duo{display:grid; grid-template-columns:1fr 1fr; gap:0 30px;}
+  @media(max-width:780px){.duo{grid-template-columns:1fr;}}
+  .cards.mini{grid-template-columns:repeat(3,minmax(0,1fr));}
+
+  /* ---- settings modal ---- */
+  .modal{position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px;}
+  .modal[hidden]{display:none;}
+  .modal-backdrop{position:absolute; inset:0; background:rgba(8,7,4,.66);}
+  .modal-card{position:relative; z-index:1; width:min(380px,94vw); max-height:88vh; overflow:auto; box-shadow:0 26px 64px -22px #000; animation:pop .24s ease both;}
+  @keyframes pop{from{opacity:0; transform:translateY(10px) scale(.985)} to{opacity:1; transform:none}}
+  .modal-x{position:absolute; top:11px; right:11px; width:28px; height:28px; line-height:1; font-size:12px; background:none; border:1px solid var(--rule2); color:var(--dim); border-radius:4px; cursor:pointer;}
+  .modal-x:hover{border-color:var(--gilt); color:var(--ink);}
+
+  /* ---- explorer (clickable field tallies -> drill-down screens) ---- */
+  .tally{cursor:pointer; transition:background .15s;}
+  .tally:hover{background:var(--panel2);}
+  .more{padding:18px 0 4px; text-align:center;}
+  .crop .obs-sp{margin-left:auto; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:62%; font-variant:small-caps; letter-spacing:.02em;}
+  .daygrid{display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px;}
+  .daycard{background:var(--panel); border:1px solid var(--rule); border-radius:4px; padding:14px 16px; cursor:pointer; transition:border-color .18s, transform .18s, box-shadow .18s;}
+  .daycard:hover{border-color:var(--rule2); transform:translateY(-2px); box-shadow:0 10px 26px -16px #000;}
+  .daycard-date{font-variant:small-caps; font-size:16px; letter-spacing:.02em;}
+  .daycard-stats{display:flex; gap:16px; margin-top:8px; font-family:var(--mono); font-size:11px; color:var(--faint);}
+  .daycard-stats b{color:var(--ink); font-size:13px;}
+  .day-summary{display:flex; flex-direction:column; gap:11px; margin-bottom:18px;}
+  .day-summary .back{align-self:flex-start;}
+  .chips{display:flex; flex-wrap:wrap; gap:7px;}
+  .chip{background:var(--panel); border:1px solid var(--rule2); color:var(--dim); border-radius:3px; padding:5px 11px; cursor:pointer; font-family:var(--serif); font-variant:small-caps; font-size:14px; letter-spacing:.02em;}
+  .chip:hover{border-color:var(--gilt); color:var(--ink);}
+  .chip i{font-style:normal; font-family:var(--mono); font-size:10px; color:var(--gilt); margin-left:3px;}
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="rule"></div>
+  <div class="top">
+    <span class="lbl" id="coords"></span>
+    <span class="lbl" id="period">—</span>
+  </div>
+  <h1>The Backyard <span class="amp">&amp;</span> Observatory</h1>
+  <div class="sub">A field log of the creatures who visit, <span class="live-chip"><span class="live-dot"></span>observation in progress</span></div>
+  <div class="rule"></div>
+</header>
+
+<nav class="tabs">
+  <button id="tab-live" class="on" onclick="show('live')">Live Observation</button>
+  <button id="tab-cat" onclick="show('cat')">Specimen Catalogue</button>
+</nav>
+
+<main>
+  <!-- ============ LIVE ============ -->
+  <section id="view-live" class="view on">
+    <div class="obs">
+      <div class="panel plate">
+        <div class="frame"><i></i><img src="/stream.mjpg" alt="live feed"></div>
+        <div class="cap">
+          <span class="lbl">Plate I · glass door cam</span>
+          <span class="cap-right">
+            <span class="lbl" id="cap-period">live</span>
+            <button class="gear" type="button" onclick="openSettings()" title="Camera settings">&#9881; Settings</button>
+          </span>
+        </div>
+      </div>
+      <aside class="panel latest" id="latest"><p class="empty" style="padding:20px">Awaiting the first visitor&hellip;</p></aside>
+    </div>
+
+    <div class="lbl span" id="span"></div>
+    <div class="tallies" id="tallies"></div>
+
+    <div class="duo">
+      <section>
+        <h2 class="sec">Most Common <span class="n">top 3</span></h2>
+        <div class="cards mini" id="most"></div>
+      </section>
+      <section>
+        <h2 class="sec">Rarely Seen <span class="n">top 3</span></h2>
+        <div class="cards mini" id="least"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ============ CATALOGUE ============ -->
+  <section id="view-cat" class="view">
+    <div id="cat-index">
+      <h2 class="sec">Specimen Catalogue <span class="n" id="cat-count"></span></h2>
+      <div class="cards" id="catalogue"></div>
+    </div>
+    <div id="cat-sheet" style="display:none">
+      <div class="sheet-head">
+        <button class="back" onclick="closeSheet()">← Catalogue</button>
+        <h2 id="sheet-name"></h2><span class="latin" id="sheet-latin"></span>
+      </div>
+      <p class="hint" style="color:var(--faint);font-style:italic">✓ confirm · ✗ wrong · ✎ correct the identification. Confirmed labels are protected from re-runs.</p>
+      <div class="crops" id="sheet-crops"></div>
+    </div>
+  </section>
+
+  <!-- ============ EXPLORE (drill-down from the field tallies) ============ -->
+  <section id="view-explore" class="view">
+    <div class="sheet-head">
+      <button class="back" onclick="exploreBack()">&larr; Back</button>
+      <h2 id="explore-title"></h2><span class="latin" id="explore-sub" style="font-style:normal"></span>
+    </div>
+    <div id="explore-body"></div>
+  </section>
+</main>
+<div class="foot">Recorded by an unblinking eye at the sliding glass door. Counts are observations; one visit may leave many.</div>
+
+<!-- Camera settings (popped out from the Live plate's Settings button) -->
+<div id="settings" class="modal" hidden>
+  <div class="modal-backdrop" onclick="closeSettings()"></div>
+  <div class="modal-card panel instr" role="dialog" aria-modal="true" aria-label="Camera settings">
+    <button class="modal-x" type="button" onclick="closeSettings()" aria-label="Close settings">&#10005;</button>
+    <h3>Instrument Panel</h3>
+    <p class="hint">Adjust the camera in real time. If the picture is soft, try toggling <em>Autofocus</em>. Controls your camera can&rsquo;t change are shown locked.</p>
+    <div id="controls"></div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cap1=s=>s.replace(/\b\w/g,c=>c.toUpperCase());
+const media=p=>'/media/'+encodeURI(p);
+// playful pseudo-taxonomic labels (flavour only)
+const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','eastern gray squirrel':'Sciurus carolinensis',
+  'dark-eyed junco':'Junco hyemalis','domestic cat':'Felis catus','virginia opossum':'Didelphis virginiana',
+  'spotted towhee':'Pipilo maculatus','brown rat':'Rattus norvegicus','steller’s jay':'Cyanocitta stelleri',
+  'black-capped chickadee':'Poecile atricapillus','house finch':'Haemorhous mexicanus','american robin':'Turdus migratorius',
+  'european starling':'Sturnus vulgaris','northern flicker':'Colaptes auratus','varied thrush':'Ixoreus naevius',
+  'band-tailed pigeon':'Patagioenas fasciata','eastern cottontail':'Sylvilagus floridanus','house sparrow':'Passer domesticus',
+  'townsend’s chipmunk':'Neotamias townsendii'};
+const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
+
+function show(v){
+  closeSettings();
+  $('#view-live').classList.toggle('on',v==='live');
+  $('#view-cat').classList.toggle('on',v==='cat');
+  $('#view-explore').classList.toggle('on',v==='explore');
+  $('#tab-live').classList.toggle('on',v==='live');
+  $('#tab-cat').classList.toggle('on',v==='cat');
+  if(v==='cat') loadCatalogue();
+}
+
+/* ---------- camera controls ---------- */
+const CONTROLS=[
+  {key:'exposure',label:'Exposure',min:-13,max:0,step:1,auto:'auto_exposure'},
+  {key:'gain',label:'Gain',min:0,max:255,step:1},
+  {key:'focus',label:'Focus',min:0,max:1023,step:5,auto:'autofocus'},
+  {key:'brightness',label:'Brightness',min:0,max:255,step:1},
+  {key:'contrast',label:'Contrast',min:0,max:255,step:1},
+  {key:'saturation',label:'Saturation',min:0,max:255,step:1},
+  {key:'sharpness',label:'Sharpness',min:0,max:255,step:1},
+  {key:'wb',label:'White balance',min:2000,max:8000,step:100,auto:'auto_wb'},
+];
+function buildControls(){
+  $('#controls').innerHTML=CONTROLS.map(c=>`
+    <div class="ctrl" data-k="${c.key}">
+      <div class="row">
+        <span class="name">${c.label}</span>
+        <span style="display:flex;gap:10px;align-items:center">
+          ${c.auto?`<label class="auto"><input type="checkbox" data-auto="${c.auto}"> auto</label>`:''}
+          <span class="val" data-val>—</span>
+        </span>
+      </div>
+      <input type="range" min="${c.min}" max="${c.max}" step="${c.step}" data-slider>
+    </div>`).join('');
+  $('#controls').querySelectorAll('.ctrl').forEach(el=>{
+    const key=el.dataset.k, sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]');
+    sl.addEventListener('input',()=>{ val.textContent=sl.value; touchedAt[key]=Date.now(); sendControl(key,parseFloat(sl.value)); });
+    const auto=el.querySelector('[data-auto]');
+    if(auto) auto.addEventListener('change',()=>{ sl.disabled=auto.checked; touchedAt[key]=Date.now(); sendAuto(auto.dataset.auto,auto.checked,sl); });
+  });
+}
+let postTimer={}, touchedAt={};   // touchedAt[key] = Date.now() of the user's last interaction with that control
+function postCamera(obj){ fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
+function sendControl(key,v){
+  let p;
+  if(key==='exposure')p={exposure:v};
+  else if(key==='gain')p={gain:v};
+  else if(key==='focus')p={AUTOFOCUS:0,FOCUS:v};
+  else if(key==='wb')p={AUTO_WB:0,WB_TEMPERATURE:v};
+  else p={[key.toUpperCase()]:v};
+  clearTimeout(postTimer[key]); postTimer[key]=setTimeout(()=>postCamera(p),60);
+}
+function sendAuto(autoKey,on,slider){
+  if(autoKey==='auto_exposure')postCamera({exposure:on?null:parseFloat(slider.value)});
+  else if(autoKey==='autofocus')postCamera(on?{AUTOFOCUS:1}:{AUTOFOCUS:0,FOCUS:parseFloat(slider.value)});
+  else if(autoKey==='auto_wb')postCamera(on?{AUTO_WB:1}:{AUTO_WB:0,WB_TEMPERATURE:parseFloat(slider.value)});
+}
+async function refreshCamera(){
+  let v; try{ v=await fetch('/api/camera').then(r=>r.json()); }catch(e){ return; }
+  if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
+  if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+  CONTROLS.forEach(c=>{
+    const el=$(`.ctrl[data-k="${c.key}"]`); if(!el)return;
+    const sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]'), au=el.querySelector('[data-auto]');
+    // Hardware lock: the driver rejects writes to this control (e.g. this webcam can't set
+    // manual FOCUS), so the slider stays locked no matter what -- see probe_writable_controls.
+    const locked = !!(v.writable && v.writable[c.key]===false);
+    el.classList.toggle('locked', locked);
+    el.title = locked ? `${c.label} can't be set on this camera (the driver rejects it).` : '';
+    if(au){
+      // Mirror the camera's auto/manual state only UNTIL the user takes control of this control;
+      // afterwards the checkbox is user-owned and the camera read-back never touches it again.
+      // (This webcam keeps reporting AUTOFOCUS=1.0 even after we set it to 0 -- the old code
+      // re-checked the box and disabled the Focus slider a few seconds after the user went manual.)
+      const a=v[c.auto];
+      if(!touchedAt[c.key] && a!=null && document.activeElement!==au){
+        au.checked = c.auto==='auto_exposure' ? !(Math.abs(a-0.25)<0.05) : (a>=0.5);
+      }
+    }
+    sl.disabled = locked || (au ? au.checked : false);   // hardware lock OR the local auto checkbox
+    if(locked){ val.textContent='locked'; return; }      // value read-back is meaningless when locked
+    // Don't fight the user: for ~10s after they last touched a control, leave its slider value
+    // alone -- the read-back can briefly lag the change we just POSTed and would yank it back.
+    if(Date.now()-(touchedAt[c.key]||0) < 10000) return;
+    let raw=v[c.key];
+    if(raw!=null && !document.activeElement.isEqualNode(sl)){ sl.value=raw; val.textContent=Math.round(raw); }
+  });
+}
+
+/* ---------- live stats + species ---------- */
+async function refreshLive(){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ return; }
+  if(s.period){ $('#period').textContent=s.period; }
+  if(s.span){ $('#span').textContent=`${s.span.start.slice(0,10)} → ${s.span.end.slice(0,10)}`; }
+  $('#cap-period').textContent=(window.__period||'live');
+  const days=(s.by_day||[]).length;
+  $('#tallies').innerHTML=[
+    ['observations',(s.total_crops||0).toLocaleString(),'obs'],
+    ['visits <small>est</small>',s.total_visits||0,'visits'],
+    ['species',(s.by_class||[]).length,'species'],
+    ['days afield',days,'days'],
+  ].map(([k,n,go])=>`<div class="tally" data-go="${go}"><div class="n">${n}</div><div class="k lbl">${k}</div></div>`).join('');
+  $('#tallies').querySelectorAll('.tally').forEach(el=>el.onclick=()=>goTally(el.dataset.go));
+
+  // Feature the most recent IDENTIFIED visitor; fall back to the newest detection if none are classified yet.
+  renderLatest((s.latest||[]).find(x=>x.species) || (s.latest||[])[0]);
+
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  const sp=(o.species||[]);
+  window.__species=sp;
+  const top=sp.slice(0,3), rare=sp.slice().reverse().filter(x=>!top.includes(x)).slice(0,3);
+  $('#most').innerHTML=top.map((x,i)=>card(x,i+1)).join('')||'<p class="empty">No specimens yet.</p>';
+  $('#least').innerHTML=rare.map(x=>card(x,null)).join('')||'<p class="empty">—</p>';
+  bindCards();
+}
+function timeAgo(iso){
+  if(!iso) return '';
+  const t=new Date(iso).getTime(); if(isNaN(t)) return '';
+  const s=Math.max(0,(Date.now()-t)/1000);
+  if(s<60) return 'just now';
+  if(s<3600){ const m=Math.floor(s/60); return `${m} min ago`; }
+  if(s<86400){ const h=Math.floor(s/3600); return `${h} hr${h>1?'s':''} ago`; }
+  const d=Math.floor(s/86400); return `${d} day${d>1?'s':''} ago`;
+}
+function renderLatest(d){
+  const el=$('#latest'); if(!el) return;
+  if(!d){ el.innerHTML='<p class="empty" style="padding:20px">No visitors logged yet.</p>'; el.onclick=null; return; }
+  const name=d.species||d.detection_class||'unknown', latin=d.species?latinOf(d.species):'';
+  const conf=(d.species_confidence!=null)?d.species_confidence:null;
+  el.innerHTML=`
+    <div class="latest-eyebrow lbl">Most Recent Visitor</div>
+    <div class="latest-photo" style="background-image:url('${d.crop_path?media(d.crop_path):''}')"></div>
+    <div class="latest-info">
+      <div class="latest-name">${esc(cap1(name))}</div>
+      <div class="latest-latin">${esc(latin)}</div>
+      <div class="latest-when"><span>${esc(timeAgo(d.timestamp))}</span>${conf!=null?`<span class="dot">·</span><span class="conf">~${Math.round(conf*100)}%</span>`:''}</div>
+    </div>`;
+  el.onclick = d.species ? ()=>{ show('cat'); openSheet(d.species); } : null;
+}
+function card(x,rank){
+  const latin=latinOf(x.species);
+  return `<div class="card" data-sp="${esc(x.species)}" style="animation-delay:${(rank||1)*40}ms">
+    <div class="thumb" style="background-image:url('${x.sample?media(x.sample):''}')">${rank?`<span class="rank">№${rank}</span>`:''}</div>
+    <div class="body">
+      <div class="common">${esc(cap1(x.species))}</div>
+      <div class="latin">${esc(latin)}</div>
+      <div class="meta"><span class="count">${x.count.toLocaleString()}<small> obs</small></span><span class="conf">~${Math.round((x.avg_conf||0)*100)}%</span></div>
+    </div></div>`;
+}
+function bindCards(){ document.querySelectorAll('.card[data-sp]').forEach(c=>c.onclick=()=>{ show('cat'); openSheet(c.dataset.sp); }); }
+
+/* ---------- catalogue + species sheet ---------- */
+async function loadCatalogue(){
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  const sp=o.species||[]; window.__species=sp;
+  $('#cat-count').textContent=`${sp.length} species · ${(o.total||0).toLocaleString()} observations`;
+  $('#catalogue').innerHTML=sp.map((x,i)=>card(x,i+1)).join('')||'<p class="empty">Catalogue is empty.</p>';
+  bindCards();
+}
+let LABELS=[];
+fetch('/api/labels').then(r=>r.json()).then(l=>LABELS=l).catch(()=>{});
+async function openSheet(name){
+  $('#cat-index').style.display='none'; $('#cat-sheet').style.display='block';
+  $('#sheet-name').textContent=cap1(name); $('#sheet-latin').textContent=latinOf(name);
+  $('#sheet-crops').innerHTML='<p class="empty">Loading plates…</p>';
+  let rows; try{ rows=await fetch('/api/species/'+encodeURIComponent(name)).then(r=>r.json()); }catch(e){ rows=[]; }
+  if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">No plates.</p>'; return; }
+  $('#sheet-crops').innerHTML=rows.map(r=>cropTile(r,name)).join('');
+}
+function cropTile(r,name){
+  const v=r.verified; const cls=v===1?'v-1':v===0?'v-0':'';
+  const stamp=v===1?'<span class="stamp v1">✓ confirmed</span>':v===0?'<span class="stamp v0">✗ wrong</span>':'';
+  const opts=['<option value="">— correct to —</option>'].concat(
+    LABELS.map(l=>`<option value="${esc(l)}"${l===name?' selected':''}>${esc(cap1(l))}</option>`)).join('');
+  return `<div class="crop ${cls}" data-id="${r.id}">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    ${stamp}
+    <div class="ft"><span class="c">${Math.round((r.confidence||0)*100)}%</span>
+      <span class="acts">
+        <button class="b up" title="confirm" onclick="act(${r.id},'verify',this)">✓</button>
+        <button class="b dn" title="wrong" onclick="act(${r.id},'reject',this)">✗</button>
+        <button class="b" title="correct" onclick="toggleEdit(this)">✎</button>
+      </span></div>
+    <select onchange="correct(${r.id},this.value)">${opts}</select>
+  </div>`;
+}
+function toggleEdit(btn){ btn.closest('.crop').classList.toggle('editing'); }
+async function act(id,action,btn){
+  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+  const crop=btn.closest('.crop');
+  crop.classList.remove('v-1','v-0'); crop.querySelectorAll('.stamp').forEach(s=>s.remove());
+  if(action==='verify'){ crop.classList.add('v-1'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v1">✓ confirmed</span>'); }
+  if(action==='reject'){ crop.classList.add('v-0'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v0">✗ wrong</span>'); crop.classList.add('editing'); }
+}
+async function correct(id,species){
+  if(!species)return;
+  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})});
+  const crop=document.querySelector(`.crop[data-id="${id}"]`);
+  crop.style.transition='opacity .4s'; crop.style.opacity='.25';
+}
+function closeSheet(){ $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
+
+/* ---------- explorer: drill into the field tallies ---------- */
+let exploreStack=[], visitsData=[], obsState=null;
+function goTally(t){
+  if(t==='species'){ show('cat'); return; }   // species => the existing Specimen Catalogue
+  exploreStack=[];
+  explore(t, {}, t==='obs'?'Observations':t==='visits'?'Visits':'Days Afield');
+}
+function explore(screen,params,title,sub){
+  exploreStack.push({screen,params:params||{},title:title||'',sub:sub||''});
+  renderExplore();
+}
+function exploreBack(){ exploreStack.pop(); exploreStack.length?renderExplore():show('live'); }
+function renderExplore(){
+  const cur=exploreStack[exploreStack.length-1]; if(!cur)return;
+  show('explore');
+  $('#explore-title').textContent=cur.title;
+  $('#explore-sub').textContent=cur.sub||'';
+  const body=$('#explore-body'); body.innerHTML='<p class="empty">Loading…</p>';
+  ({obs:renderObs,visits:renderVisits,days:renderDays,day:renderDay}[cur.screen]||(()=>{}))(cur.params,body);
+}
+const fmtDateTime=iso=>{ const d=new Date(iso); return isNaN(d)?iso:d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
+const fmtDay=ymd=>{ const d=new Date(ymd+'T12:00:00'); return isNaN(d)?ymd:d.toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric',year:'numeric'}); };
+
+async function renderObs(params,body){
+  obsState={day:params.day||null,species:params.species||null,start:params.start||null,end:params.end||null,offset:0};
+  body.innerHTML='<div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>';
+  await loadMoreObs();
+}
+async function loadMoreObs(){
+  const s=obsState; if(!s)return;
+  const qs=new URLSearchParams();
+  ['day','species','start','end'].forEach(k=>{ if(s[k]) qs.set(k,s[k]); });
+  qs.set('offset',s.offset); qs.set('limit',60);
+  let o; try{ o=await fetch('/api/crops?'+qs).then(r=>r.json()); }catch(e){ return; }
+  s.offset+=o.crops.length;
+  const grid=$('#obs-grid'); if(!grid)return;
+  grid.insertAdjacentHTML('beforeend', o.crops.map(obsTile).join(''));
+  if(!grid.children.length) grid.innerHTML='<p class="empty">No observations here.</p>';
+  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} total`;
+  if(!s.species) grid.querySelectorAll('.crop[data-sp]').forEach(el=>el.onclick=()=>explore('obs',{species:el.dataset.sp},cap1(el.dataset.sp)));
+  const more=$('#obs-more'); if(more) more.innerHTML = s.offset<o.total ? `<button class="back" onclick="loadMoreObs()">Load more &middot; ${(o.total-s.offset).toLocaleString()} left</button>` : '';
+}
+function obsTile(r){
+  const sp=r.species?cap1(r.species):'unidentified';
+  const conf=r.species_confidence!=null?r.species_confidence:r.confidence;
+  const v=r.verified;
+  return `<div class="crop ${v===1?'v-1':v===0?'v-0':''}"${r.species?` data-sp="${esc(r.species)}"`:''} title="${esc(fmtDateTime(r.timestamp))}">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    <div class="ft"><span class="c">${Math.round((conf||0)*100)}%</span><span class="obs-sp">${esc(sp)}</span></div>
+  </div>`;
+}
+
+async function renderVisits(params,body){
+  const qs=params.day?('?day='+encodeURIComponent(params.day)):'';
+  let o; try{ o=await fetch('/api/visits'+qs).then(r=>r.json()); }catch(e){ body.innerHTML='<p class="empty">Could not load visits.</p>'; return; }
+  visitsData=o.visits||[];
+  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
+  if(!visitsData.length){ body.innerHTML='<p class="empty">No visits.</p>'; return; }
+  body.innerHTML='<div class="cards">'+visitsData.map(visitCard).join('')+'</div>';
+  body.querySelectorAll('[data-vi]').forEach(el=>{ const v=visitsData[+el.dataset.vi];
+    el.onclick=()=>explore('obs',{start:v.start,end:v.end},`Visit · ${cap1(v.title||'animal')}`,fmtDateTime(v.start)); });
+}
+function visitCard(v,i){
+  return `<div class="card vcard" data-vi="${i}">
+    <div class="thumb" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')"></div>
+    <div class="body">
+      <div class="common">${esc(cap1(v.title||'animal'))}</div>
+      <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
+      <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
+    </div></div>`;
+}
+
+async function renderDays(params,body){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ body.innerHTML='<p class="empty">Could not load.</p>'; return; }
+  const days=(s.by_day||[]).slice().reverse();
+  $('#explore-sub').textContent=`${days.length} day${days.length===1?'':'s'}`;
+  if(!days.length){ body.innerHTML='<p class="empty">No days yet.</p>'; return; }
+  body.innerHTML='<div class="daygrid">'+days.map(dayCard).join('')+'</div>';
+  body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
+}
+function dayCard(d){
+  const nsp=Object.keys(d.classes||{}).length;
+  return `<div class="daycard" data-day="${esc(d.day)}">
+    <div class="daycard-date">${esc(fmtDay(d.day))}</div>
+    <div class="daycard-stats"><span><b>${(d.crops||0).toLocaleString()}</b> obs</span><span><b>${d.visits||0}</b> visits</span><span><b>${nsp}</b> species</span></div>
+  </div>`;
+}
+
+async function renderDay(params,body){
+  const date=params.date;
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ s={}; }
+  const d=(s.by_day||[]).find(x=>x.day===date)||{crops:0,visits:0,classes:{}};
+  $('#explore-sub').textContent=`${(d.crops||0).toLocaleString()} obs · ${d.visits||0} visits`;
+  const chips=Object.entries(d.classes||{}).map(([sp,n])=>`<button class="chip" data-sp="${esc(sp)}">${esc(cap1(sp))} <i>${n}</i></button>`).join('');
+  body.innerHTML=`
+    <div class="day-summary">
+      <button class="back" id="day-visits">${d.visits||0} visits this day &rarr;</button>
+      ${chips?`<div class="chips">${chips}</div>`:''}
+    </div>
+    <div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>`;
+  const dv=$('#day-visits'); if(dv) dv.onclick=()=>explore('visits',{day:date},`Visits · ${fmtDay(date)}`);
+  body.querySelectorAll('.chip[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
+  obsState={day:date,species:null,start:null,end:null,offset:0};
+  await loadMoreObs();
+}
+
+/* ---------- settings popout ---------- */
+function openSettings(){ const m=$('#settings'); if(m) m.hidden=false; }
+function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
+
+/* ---------- boot ---------- */
+buildControls();
+refreshLive(); refreshCamera();
+setInterval(refreshLive,6000);
+setInterval(refreshCamera,4000);
+</script>
+</body>
+</html>

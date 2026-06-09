@@ -1,0 +1,14 @@
+# Backyard Critter Cam -- runtime dependencies (built/tested on Python 3.14, Windows).
+#
+# torch + torchvision are installed SEPARATELY (see README "Setup" step 2) because they
+# must be the CUDA 12.8+ build (cu130 wheels) for this Blackwell GPU (RTX 50-series,
+# sm_120). A plain `pip install torch` pulls a CUDA 12.6 build whose kernels cannot run on
+# this GPU (torch.cuda.is_available() lies and the first real op dies). Install them with:
+#
+#   pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+#
+# Then install the rest from this file. (ultralytics pulls numpy/pillow/etc.; it will reuse
+# the cu130 torch already present rather than replacing it.)
+
+opencv-python>=4.10
+ultralytics>=8.3

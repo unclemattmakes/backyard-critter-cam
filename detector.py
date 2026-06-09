@@ -1,0 +1,185 @@
+"""
+Animal detector: MegaDetector v6 weights run directly on Ultralytics YOLO, pinned to CUDA.
+
+Why Ultralytics directly instead of the PytorchWildlife wrapper:
+  MegaDetector v6 *is* an Ultralytics YOLO model -- PytorchWildlife runs these exact weights
+  through Ultralytics internally. But importing PytorchWildlife eagerly pulls a heavy, fragile
+  chain (bioacoustics/soundfile, classification/timm, the legacy yolov5, and a gradio web UI)
+  that clashes with this project's "lean deps, no web servers" rule and is shaky on Python
+  3.14. So we load the identical official MDV6 weights (Microsoft's Zenodo release) directly.
+  Same model, same GPU inference, a fraction of the dependencies.
+
+The first run downloads the chosen weight into weights/ (stdlib urllib); later runs reuse it.
+"""
+from __future__ import annotations
+
+import shutil
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+import config
+
+
+class CudaUnavailableError(RuntimeError):
+    """Raised when the rig cannot actually run on the GPU. The message explains the fix."""
+
+
+@dataclass
+class Detection:
+    """One detected object in a frame."""
+    class_id: int                               # MegaDetector class id (0/1/2).
+    class_name: str                             # 'animal' | 'person' | 'vehicle'.
+    confidence: float                           # 0..1.
+    bbox: tuple[float, float, float, float]     # (x1, y1, x2, y2), absolute pixels.
+
+
+# Official MegaDetector v6 releases (Microsoft AI for Good Lab, Zenodo record 15398270).
+# version -> (download URL, local filename). This is the same table PytorchWildlife uses.
+MDV6_WEIGHTS: dict[str, tuple[str, str]] = {
+    "MDV6-yolov9-c":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1",       "MDV6-yolov9-c.pt"),
+    "MDV6-yolov9-e":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-e-1280.pt?download=1",  "MDV6-yolov9-e-1280.pt"),
+    "MDV6-yolov10-c": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-c.pt?download=1",      "MDV6-yolov10-c.pt"),
+    "MDV6-yolov10-e": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-e-1280.pt?download=1", "MDV6-yolov10-e-1280.pt"),
+    "MDV6-rtdetr-c":  ("https://zenodo.org/records/15398270/files/MDV6-rtdetr-c.pt?download=1",       "MDV6-rtdetr-c.pt"),
+}
+
+# MegaDetector's coarse classes. The weights carry model.names too; we prefer those at
+# runtime and fall back to this mapping only if they're missing.
+MD_CLASS_NAMES = {0: "animal", 1: "person", 2: "vehicle"}
+
+
+def verify_cuda() -> str:
+    """
+    Confirm PyTorch can actually *compute* on the GPU, not merely see it.
+    Returns the GPU name on success; raises CudaUnavailableError with a fix otherwise.
+    """
+    try:
+        import torch
+    except Exception as e:  # torch missing / broken install
+        raise CudaUnavailableError(f"PyTorch is not importable: {e}") from e
+
+    if not torch.cuda.is_available():
+        raise CudaUnavailableError(
+            "CUDA is not available to PyTorch. This rig requires an NVIDIA GPU and a CUDA "
+            "build of torch. Install one, e.g.:\n"
+            "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130"
+        )
+
+    # is_available() can be True while the wheel has no kernels for this GPU's compute
+    # capability (exactly what bit us on the RTX 5050 / Blackwell sm_120). Prove it runs.
+    try:
+        a = torch.randn(64, 64, device="cuda")
+        _ = (a @ a).sum().item()
+        torch.cuda.synchronize()
+    except Exception as e:
+        cap = name = None
+        try:
+            cap = torch.cuda.get_device_capability(0)
+            name = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+        raise CudaUnavailableError(
+            f"PyTorch sees the GPU ({name}, compute capability {cap}) but cannot run CUDA "
+            f"kernels on it. The installed torch was almost certainly built for a different "
+            f"GPU architecture. For Blackwell (RTX 50-series, sm_120) install a CUDA 12.8+ "
+            f"build:\n"
+            f"  pip install torch==2.12.0 torchvision==0.27.0 "
+            f"--index-url https://download.pytorch.org/whl/cu130\n"
+            f"Underlying error: {e}"
+        ) from e
+
+    return torch.cuda.get_device_name(0)
+
+
+def _ensure_weights(version: str, weights_dir: Path) -> Path:
+    """Return the local path to the weight file, downloading it once if missing."""
+    if version not in MDV6_WEIGHTS:
+        raise ValueError(
+            f"Unknown model_version '{version}'. Valid: {', '.join(MDV6_WEIGHTS)}"
+        )
+    url, fname = MDV6_WEIGHTS[version]
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    path = weights_dir / fname
+    if path.exists() and path.stat().st_size > 0:
+        return path
+
+    print(f"  downloading MegaDetector v6 weights '{version}' -> {path.name} (one time) ...")
+    tmp = path.with_suffix(path.suffix + ".part")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "backyard-cam/1.0"})
+        with urllib.request.urlopen(req) as resp, open(tmp, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        tmp.replace(path)
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"Failed to download weights from {url}: {e}") from e
+    return path
+
+
+class Detector:
+    """Loads MegaDetector v6 (Ultralytics YOLO) on the GPU and runs it on single frames."""
+
+    def __init__(
+        self,
+        model_version: str,
+        device: str = "cuda",
+        min_confidence: float = 0.25,
+        weights_dir: Path | None = None,
+    ):
+        self.gpu_name = verify_cuda()
+        self.device = device
+        self.min_confidence = float(min_confidence)
+
+        weights_path = _ensure_weights(model_version, weights_dir or (config.ROOT / "weights"))
+
+        # Imported here (not at module top) so a missing/broken torch surfaces via the clear
+        # verify_cuda() message above rather than an opaque import error.
+        from ultralytics import YOLO
+
+        self.model = YOLO(str(weights_path))
+        self.model.to(device)  # park the weights on the GPU so the first detect() is warm.
+
+        # Prefer the class names baked into the weights; fall back to the MD defaults.
+        names = getattr(self.model, "names", None)
+        if names:
+            self.class_names = {int(k): str(v) for k, v in dict(names).items()}
+        else:
+            self.class_names = dict(MD_CLASS_NAMES)
+
+    def detect(self, frame_bgr) -> list[Detection]:
+        """
+        Run the detector on a single OpenCV BGR frame and return detections at or above
+        min_confidence. Ultralytics expects BGR HWC numpy (OpenCV's native format), so the
+        frame is passed through directly. Boxes come back in absolute pixel coordinates of
+        the frame, matching the BGR frame used for drawing and cropping.
+        """
+        results = self.model.predict(
+            frame_bgr,
+            conf=self.min_confidence,
+            device=self.device,
+            verbose=False,
+        )
+        if not results:
+            return []
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        clss = boxes.cls.cpu().numpy()
+
+        out: list[Detection] = []
+        for i in range(len(xyxy)):
+            cid = int(clss[i])
+            x1, y1, x2, y2 = (float(v) for v in xyxy[i][:4])
+            out.append(
+                Detection(
+                    class_id=cid,
+                    class_name=self.class_names.get(cid, str(cid)),
+                    confidence=float(confs[i]),
+                    bbox=(x1, y1, x2, y2),
+                )
+            )
+        return out

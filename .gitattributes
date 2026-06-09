@@ -1,0 +1,20 @@
+# Consistent line endings across machines.
+# Default: treat files as text and check them out with LF. This silences the
+# Windows "LF will be replaced by CRLF" warnings (git stores text as LF anyway).
+* text=auto eol=lf
+
+# Windows batch files must keep CRLF, or cmd.exe can misbehave.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets -- never apply line-ending or text diff conversion.
+*.ico    binary
+*.pt     binary
+*.onnx   binary
+*.engine binary
+*.jpg    binary
+*.jpeg   binary
+*.png    binary
+*.db     binary
+*.sqlite binary
+*.sqlite3 binary
