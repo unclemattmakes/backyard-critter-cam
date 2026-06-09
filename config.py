@@ -62,8 +62,14 @@ class Config:
     latitude: float | None = None
     longitude: float | None = None
     camera_profiles: dict = field(default_factory=lambda: {
-        "day":   {"exposure": -8, "gain": None, "BACKLIGHT": 0},    # tuned 2026-06-08: stops the sunlit patio clipping (66% -> 0.3% blown)
-        "night": {"exposure": None, "gain": None, "BACKLIGHT": 0},   # still auto -- tune with tune.py at night once a light's in
+        # Auto-expose BOTH periods so the camera's own auto-exposure adapts continuously through
+        # the day -- the image tracks changing light (dawn / overcast / dusk) instead of being
+        # frozen. We tried a locked daytime exposure (-8) to kill peak-sun patio clipping, but it
+        # pinned the whole ~17 h daylight span at one value tuned for noon -- too dark exactly at
+        # the crepuscular hours when most critters show. If midday direct-sun clipping bothers you,
+        # bias auto darker (lower BRIGHTNESS, tuned with tune.py) rather than re-locking exposure.
+        "day":   {"exposure": None, "gain": None, "BACKLIGHT": 0},
+        "night": {"exposure": None, "gain": None, "BACKLIGHT": 0},   # tune with tune.py at night once a light's in
     })
 
     # ---- Motion gate (MOG2 background subtractor) -------------------------------
