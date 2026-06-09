@@ -12,3 +12,9 @@
 
 opencv-python>=4.10
 ultralytics>=8.3
+# Sun-driven day/night camera profiles (daynight.py). Without it the rig still runs, but
+# current_period() can't resolve dawn/dusk and the profiles disable (camera just auto-exposes).
+astral>=3.2
+# Species classifier (classify.py): BioCLIP 2 zero-shot. NOTE the PyPI distribution is named
+# `pybioclip` but it imports as `bioclip`. Reuses the separately-installed cu130 torch (header).
+pybioclip>=2.1
