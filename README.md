@@ -110,6 +110,17 @@ you run a detection.
 
 ## Running
 
+### Easiest way (no typing) — for the whole family
+
+Double-click **`start_critter_cam.bat`** (or **`start_critter_cam_lan.bat`** to also watch from
+a phone/tablet on the same Wi-Fi). A live **video window** opens and the **dashboard** opens in
+your browser; species names are added automatically — there's nothing else to start.
+
+**To stop:** click the live **video window** and press **`q`** — or just **close that window**.
+Everything (camera, dashboard, *and* species naming) shuts down together, in one step.
+
+### From the command line
+
 ```powershell
 # Find your webcam's index if 0 isn't it
 .\.venv\Scripts\python.exe backyard_cam.py --list-cameras
@@ -118,7 +129,8 @@ you run a detection.
 .\.venv\Scripts\python.exe backyard_cam.py
 ```
 
-Press **`q`** in the preview window to quit cleanly. The window is **resizable** — drag any edge.
+Press **`q`** in the preview window — or **close the window** — to quit cleanly; that also stops
+the in-process species naming. The window is **resizable** — drag any edge.
 
 Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + stats + gallery):
 
@@ -142,6 +154,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
 | `--no-preview` | Headless; quit with Ctrl+C. |
+| `--no-classify` | Detection only — don't name species live in this process. The rig names new crops by species in a background thread by default; this turns that off. You can still fill species later with `python classify.py`. |
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
 | `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
@@ -175,6 +188,10 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
   network add `--host 0.0.0.0` (and mind who's on your Wi-Fi).
 - Runs in the same process as capture; combine with `--no-preview` for a headless,
   browser-only rig, or keep the native window too.
+- **Species names appear on their own:** the rig names each new crop in a background thread, so
+  the recent-visitor card shows a species within a few seconds — no separate classifier process
+  to start or stop. (Disable with `--no-classify`; see `classify.py` for bulk re-naming after
+  you edit the label list.)
 
 ---
 

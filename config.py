@@ -141,6 +141,17 @@ class Config:
     web_port: int = 8000
     web_jpeg_quality: int = 80   # JPEG quality for the live stream (lighter than saved crops).
 
+    # ---- Live species naming (phase 2, folded into the live rig) -----------------
+    # The live rig names each new crop by species ITSELF, in a background thread, so a single
+    # process -- and a single window -- does both detection and naming. That's the whole reason
+    # you can shut the rig down with one 'q' (or by closing the video window): there's no second
+    # classifier console left running. Naming uses the CPU by default so it never competes with
+    # the live detector for the GPU. Set classify_live = False (or pass --no-classify) to run
+    # detection only; you can still fill species in later with `python classify.py`.
+    classify_live: bool = True
+    classify_device: str = "cpu"        # 'cpu' (default; no GPU contention) or 'cuda'.
+    classify_interval_s: float = 5.0    # Seconds between checks for new crops to name.
+
     # ---- Timezone convention ----------------------------------------------------
     # Timestamps are stored as LOCAL time WITH the UTC offset, ISO 8601, e.g.
     #     2026-06-07T19:25:59.123456-07:00

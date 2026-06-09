@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from collections import Counter
 
@@ -114,23 +115,43 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
     return tally, clf, device
 
 
+def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_size=64,
+               stop_event=None, session=None) -> Counter:
+    """Name freshly-saved crops by species as they land, until `stop_event` is set (or forever
+    if it's None). Builds the BioCLIP classifier once, then polls the DB every `interval`s.
+
+    This is the shared engine for live naming. It runs two ways:
+      * standalone   -- `classify.py --watch`, stopped with Ctrl-C; and
+      * folded in    -- backyard_cam.py runs it in a background thread, so ONE process / ONE
+                        window does detection AND naming, and a single 'q' stops both.
+    `session` (a Counter) accumulates the running tally -- pass one in to read it after a stop."""
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    session = session if session is not None else Counter()
+    clf, device = build_classifier(device)
+    print(f"[naming] BioCLIP 2 ready on {device}; naming new crops as they arrive "
+          f"(checking every {interval:.0f}s).")
+    while not stop_event.is_set():
+        rows = fetch_pending(conn, min_confidence, redo=False)
+        if rows:
+            print(f"[naming] {len(rows)} new crop(s) to name...")
+            tally, clf, device = classify_rows(conn, clf, device, rows, batch_size)
+            session.update(tally)
+        stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
+    return session
+
+
 def run_watch(conn, args) -> int:
-    """Poll forever for freshly-saved crops and classify them as they land, so the live
-    dashboard names the most-recent visitor instead of showing the coarse 'animal'."""
-    clf, device = build_classifier(args.device)
-    print(f"[watch] BioCLIP 2 ready on {device}; polling every {args.interval:.0f}s for new "
-          f"crops to classify (Ctrl-C to stop).")
+    """Standalone `--watch`: name new crops beside the live rig until Ctrl-C. The live rig now
+    names crops in-process (see watch_loop), so you only need this to run naming on a DIFFERENT
+    machine, or to push naming onto the GPU with `--device cuda`."""
     session = Counter()
+    stop_event = threading.Event()
     try:
-        while True:
-            rows = fetch_pending(conn, args.min_confidence, redo=False)
-            if rows:
-                print(f"[watch] {len(rows)} new crop(s) to classify...")
-                tally, clf, device = classify_rows(conn, clf, device, rows, args.batch_size)
-                session.update(tally)
-            time.sleep(args.interval)
+        watch_loop(conn, device=args.device, interval=args.interval,
+                   min_confidence=args.min_confidence, batch_size=args.batch_size,
+                   stop_event=stop_event, session=session)
     except KeyboardInterrupt:
-        print("\n[watch] stopped. Session tally:")
+        print("\n[naming] stopped. Session tally:")
         for sp, n in session.most_common():
             print(f"  {sp:26} {n}")
     finally:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import cv2
 
+import classify
 import config
 import daynight
 import db
@@ -422,6 +424,31 @@ def run(cfg: config.Config) -> None:
     # the dashboard locks the rest. Only when serving -- it briefly nudges supported controls.
     writable = probe_writable_controls(cap) if control_bridge is not None else {}
 
+    # Species naming, folded into THIS process: a background thread names new crops by species
+    # as they land (CPU by default, so it never fights the live detector for the GPU). Running
+    # it here -- instead of a separate `classify.py --watch` console -- is what makes shutdown
+    # simple: one 'q' (or closing the video window) stops naming too, with no orphaned process.
+    # It loads BioCLIP in the background, so the camera and preview come up immediately.
+    classify_stop = threading.Event()
+    classify_thread = None
+    if cfg.classify_live:
+        def _name_crops():
+            try:
+                cconn = db.connect(cfg.db_path)   # the thread needs its OWN sqlite connection
+            except Exception as e:
+                print(f"  [naming] couldn't open the database; species naming is off: {e}")
+                return
+            try:
+                classify.watch_loop(cconn, device=cfg.classify_device,
+                                    interval=cfg.classify_interval_s, stop_event=classify_stop)
+            except Exception as e:   # never let a naming hiccup take down the live rig
+                print(f"  [naming] stopped on an error (detection keeps running): {e}")
+            finally:
+                cconn.close()
+        classify_thread = threading.Thread(target=_name_crops, name="naming", daemon=True)
+        classify_thread.start()
+        print("  species naming: ON -- new crops get named automatically in this window.\n")
+
     gate = MotionGate(cfg)
     last_detect_t = 0.0          # monotonic time of last detector run (for rate limiting)
     last_dets: list[Detection] = []
@@ -542,9 +569,15 @@ def run(cfg: config.Config) -> None:
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         print("\n'q' pressed -- shutting down.")
                         break
+                    # Closing the video window (its X button) shuts the rig down too, so a teen
+                    # can just close the window instead of remembering the 'q' key.
+                    if cv2.getWindowProperty(cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        print("\nVideo window closed -- shutting down.")
+                        break
     except KeyboardInterrupt:
         print("\nInterrupted -- shutting down.")
     finally:
+        classify_stop.set()          # tell the naming thread to finish its poll and exit
         if server is not None:
             web.shutdown(server)
         try:
@@ -552,6 +585,8 @@ def run(cfg: config.Config) -> None:
         except Exception:
             pass
         cv2.destroyAllWindows()
+        if classify_thread is not None:
+            classify_thread.join(timeout=3.0)   # daemon, so we never hang if it's mid-classify
         conn.close()
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.")
 
@@ -586,6 +621,10 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="Also save the full frame for each detection event (default off).")
     p.add_argument("--no-preview", action="store_true",
                    help="Run headless (no window). Quit with Ctrl+C.")
+    p.add_argument("--no-classify", dest="classify_live", action="store_false",
+                   default=c.classify_live,
+                   help="Detection only -- don't name species live in this process. "
+                        "(You can still fill species in later with `python classify.py`.)")
     p.add_argument("--list-cameras", action="store_true",
                    help="Probe camera indices and exit.")
     p.add_argument("--stats", action="store_true",
@@ -620,6 +659,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         serve=args.serve,
         web_host=args.host,
         web_port=args.port,
+        classify_live=args.classify_live,
     )
     return cfg, args
 
