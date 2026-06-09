@@ -57,9 +57,14 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
 
 ## Requirements
 
-- **Windows** (uses the DirectShow capture backend for fast camera init).
-- **NVIDIA GPU + CUDA.** Inference is GPU-only by design; the app refuses to run on CPU and
-  prints an actionable error if the GPU can't execute.
+- **Windows or Linux** (macOS too). Windows uses the fast DirectShow capture backend; off
+  Windows the rig automatically falls back to OpenCV's native backend (V4L2 on Linux), so no
+  config change is needed.
+- **NVIDIA GPU + CUDA recommended, but not required.** By default (`--device cuda`) inference
+  runs on the GPU and the app fails loud if the GPU can't execute. Pass **`--device cpu`** to
+  run without a GPU — slower per frame, but the motion gate only wakes the detector on real
+  motion, so a backyard rig stays usable on a laptop CPU — or **`--device auto`** to use the
+  GPU when present and fall back to CPU otherwise.
 - **Python 3.14** (what this project was built and tested against).
 
 > **Blackwell / RTX 50-series note (important).** This machine's RTX 5050 is compute
@@ -90,6 +95,17 @@ C:\Python314\python.exe -m venv .venv
 The MegaDetector v6 weights (~tens of MB) download automatically from Zenodo the first time
 you run a detection.
 
+> **Running without an NVIDIA GPU (CPU / Linux box).** Skip the cu130 step above and install a
+> CPU-only torch instead:
+>
+> ```
+> pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+> ```
+>
+> then `pip install -r requirements.txt` as usual, and run with **`--device cpu`**. If the box
+> *does* have a (non-Blackwell) NVIDIA GPU, install the matching CUDA torch build and use
+> **`--device auto`** instead. The camera backend switches to V4L2 automatically on Linux.
+
 ---
 
 ## Running
@@ -119,6 +135,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--camera-index N` | Which webcam (default 0). |
 | `--width W --height H` | Requested capture resolution. |
 | `--model-version V` | `MDV6-yolov10-c` (default, fast) · `MDV6-yolov9-c` · `MDV6-rtdetr-c` · `MDV6-yolov10-e` / `MDV6-yolov9-e` (heavier, more accurate). |
+| `--device D` | `cuda` (default, needs an NVIDIA GPU) · `cpu` (no GPU, slower) · `auto` (GPU if usable, else CPU). |
 | `--min-confidence F` | Minimum detector confidence to draw/save (default 0.25). |
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
 | `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |

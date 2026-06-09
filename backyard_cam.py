@@ -120,10 +120,18 @@ def probe_writable_controls(cap) -> dict:
     return out
 
 
+def capture_backend(cfg: config.Config) -> int:
+    """Pick the OpenCV capture backend. DirectShow is a Windows-only API, so we only use it on
+    Windows (and only when enabled); on Linux/macOS we pass CAP_ANY and let OpenCV choose the
+    native backend (V4L2 / AVFoundation). This is what lets the same code run on the Linux box."""
+    if cfg.use_dshow_backend and sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
 def open_camera(cfg: config.Config) -> cv2.VideoCapture:
     """Open the webcam with the configured backend/resolution and warm it up."""
-    backend = cv2.CAP_DSHOW if cfg.use_dshow_backend else cv2.CAP_ANY
-    cap = cv2.VideoCapture(cfg.camera_index, backend)
+    cap = cv2.VideoCapture(cfg.camera_index, capture_backend(cfg))
     if cfg.frame_width:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
     if cfg.frame_height:
@@ -167,12 +175,14 @@ def reopen_camera(cap: cv2.VideoCapture, cfg: config.Config) -> cv2.VideoCapture
     return None
 
 
-def list_cameras(max_index: int = 8) -> None:
-    """Probe indices 0..max_index-1 with DirectShow and report which ones open."""
-    print("Probing camera indices via DirectShow (this can take a few seconds)...")
+def list_cameras(cfg: config.Config, max_index: int = 8) -> None:
+    """Probe indices 0..max_index-1 with the platform's backend and report which ones open."""
+    backend = capture_backend(cfg)
+    backend_name = "DirectShow" if backend == cv2.CAP_DSHOW else "the default backend"
+    print(f"Probing camera indices via {backend_name} (this can take a few seconds)...")
     found = False
     for i in range(max_index):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(i, backend)
         if cap.isOpened():
             ok, _ = cap.read()
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -352,13 +362,16 @@ def run(cfg: config.Config) -> None:
 
     conn = db.connect(cfg.db_path)
 
-    # Build the detector first: this performs the real CUDA check and downloads the model
-    # weights on first run. If the GPU can't run it, we fail here with a clear message
-    # (before touching the camera).
+    # Build the detector first: this resolves the device (a real GPU compute-check for
+    # 'cuda'/'auto') and downloads the model weights on first run. With device='cuda' and no
+    # usable GPU we fail here with a clear message (before touching the camera).
     print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
     print("  (first run downloads the model weights from Zenodo -- one time only)")
     detector = Detector(cfg.model_version, cfg.device, cfg.min_confidence)
-    print(f"  detector ready on GPU: {detector.gpu_name}")
+    if detector.device == "cuda":
+        print(f"  detector ready on GPU: {detector.device_name}")
+    else:
+        print("  detector ready on CPU -- slower per frame, but the motion gate keeps it usable.")
 
     cap = open_camera(cfg)
     if cap is None or not cap.isOpened():
@@ -558,6 +571,9 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     p.add_argument("--gain", type=float, default=c.gain, help="Lock manual gain. Omit for auto.")
     p.add_argument("--model-version", default=c.model_version,
                    help="MDV6-yolov10-c | MDV6-yolov9-c | MDV6-rtdetr-c | MDV6-yolov10-e | MDV6-yolov9-e")
+    p.add_argument("--device", default=c.device, choices=["cuda", "cpu", "auto"],
+                   help="Inference device: cuda (default, requires an NVIDIA GPU) | cpu (no GPU "
+                        "needed, slower) | auto (GPU if it genuinely runs, else CPU).")
     p.add_argument("--min-confidence", type=float, default=c.min_confidence)
     p.add_argument("--motion-min-area", type=int, default=c.motion_min_area,
                    help="Largest motion blob (px) needed to wake the detector.")
@@ -591,6 +607,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         exposure=args.exposure,
         gain=args.gain,
         model_version=args.model_version,
+        device=args.device,
         min_confidence=args.min_confidence,
         motion_min_area=args.motion_min_area,
         detector_min_interval_s=args.detector_interval,
@@ -610,7 +627,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
 def main() -> int:
     cfg, args = parse_args()
     if args.list_cameras:
-        list_cameras()
+        list_cameras(cfg)
         return 0
     if args.stats:
         print_stats(cfg)
