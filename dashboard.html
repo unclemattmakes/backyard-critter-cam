@@ -463,7 +463,8 @@ function cropTile(r,name){
   const v=r.verified; const cls=v===1?'v-1':v===0?'v-0':'';
   const stamp=v===1?'<span class="stamp v1">✓ confirmed</span>':v===0?'<span class="stamp v0">✗ wrong</span>':'';
   const opts=['<option value="">— correct to —</option>'].concat(
-    LABELS.map(l=>`<option value="${esc(l)}"${l===name?' selected':''}>${esc(cap1(l))}</option>`)).join('');
+    LABELS.map(l=>`<option value="${esc(l)}"${l===name?' selected':''}>${esc(cap1(l))}</option>`),
+    ['<option value="__other__">+ other (type a label)…</option>']).join('');
   return `<div class="crop ${cls}" data-id="${r.id}">
     <img loading="lazy" src="${media(r.crop_path)}" alt="">
     ${stamp}
@@ -485,6 +486,7 @@ async function act(id,action,btn){
   if(action==='reject'){ crop.classList.add('v-0'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v0">✗ wrong</span>'); crop.classList.add('editing'); }
 }
 async function correct(id,species){
+  if(species==='__other__'){ species=(prompt('New label for this crop (e.g. cat food):')||'').trim(); }
   if(!species)return;
   await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})});
   const crop=document.querySelector(`.crop[data-id="${id}"]`);
