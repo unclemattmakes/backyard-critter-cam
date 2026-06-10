@@ -45,6 +45,7 @@ skipped; one bad file never aborts the batch.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import time
 from dataclasses import replace
@@ -55,6 +56,7 @@ import cv2
 
 import config
 import db
+import visits
 from config import CONFIG
 # Reuse the live rig's exact crop + path logic so trail-cam crops are byte-for-byte the same
 # convention as glass-door crops (same padded/clamped box, same filename, same crops_dir/<date>/
@@ -229,6 +231,18 @@ def move_to_processed(path: Path, processed_dir: Path) -> None:
         print(f"  [warn] imported but could not move {path.name} to {processed_dir}: {e}")
 
 
+def refresh_visits(conn, cfg: config.Config) -> None:
+    """Re-collapse detections into visit events after an import lands, so the dashboard's
+    Behaviour tab includes the trail-cam visits without a manual `python visits.py`. Best-effort
+    and subsecond at this scale; an error never fails an import that already succeeded."""
+    try:
+        conn.row_factory = sqlite3.Row
+        visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
+        print("  visit ledger refreshed.")
+    except Exception as e:
+        print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
+
+
 def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
                   source: str, recursive: bool, processed_dir: Path | None,
                   skip: set[str]) -> tuple[int, int, int]:
@@ -284,6 +298,8 @@ def watch_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
             if imported:
                 print(f"  [watch] +{imported} file(s), +{saved} crop(s) "
                       f"(session: {total_imported} files / {total_saved} crops).")
+                if saved:
+                    refresh_visits(conn, cfg)
             time.sleep(interval)
     except KeyboardInterrupt:
         print(f"\n[watch] stopped. Imported {total_imported} file(s), "
@@ -379,6 +395,8 @@ def main() -> int:
             extra = f" (skipped {skipped} already-imported)" if skipped else ""
             print(f"\nDone. Imported {imported} file(s); saved {saved} crop(s) to "
                   f"{cfg.db_path}{extra}.")
+            if saved:
+                refresh_visits(conn, cfg)
             rc = 0
     finally:
         conn.close()

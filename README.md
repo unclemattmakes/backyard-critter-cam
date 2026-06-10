@@ -251,6 +251,12 @@ second shot at individual ID (a limp reads the same from any angle, where a sing
 - A rolling **pre-roll buffer** means each clip opens on the animal *arriving* (the seconds
   before the detector first fired); recording ends a few seconds after the last detection, or at
   a safety cap so a camped-out raccoon can't make a giant file.
+- **`clipmotion.py`** turns each clip into a **motion fingerprint** — the detector tracks the
+  animal through sampled frames, and the trajectory yields duration, path length, straightness
+  (beeline = 1, milling about ≈ 0), avg/peak speed, moving fraction (vs head-down eating), and
+  an approach/retreat cue. The raw track is stored as JSON (`clip_tracks` table) so richer gait
+  work (stride rhythm, limp detection) can re-derive later without re-running the detector.
+  Batch + resumable: `python clipmotion.py` after clips accumulate; `--show` to read them back.
 - One `.mp4` per visit under `clips/<date>/`, plus a row in the **`clips`** table (time span,
   fps, size, detection count) for later behaviour queries. Crops are still saved alongside.
 - All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes) live in
@@ -285,7 +291,13 @@ The second axis. Once crops are classified, a chain of small tools turns raw det
   raccoons are nocturnal"). Catches both genuinely unusual visits and mis-classifications; gets
   sharper per-individual as you hand-label with `reid.py --name`.
 
-Re-run `visits.py` after new capture (or after `classify.py` / `reid.py` adds labels).
+The dashboard surfaces all of this: a **Behaviour** tab (profiles, off-pattern flags,
+co-occurrence) and an **Individuals** tab where you *name the cast* — each look-alike group
+shows its best crops with a name box; naming two groups the same name merges them, and the
+per-individual axes sharpen as the cast grows.
+
+The visit ledger refreshes itself on rig shutdown and after trail-cam imports; `visits.py` is
+only needed manually after offline label edits.
 
 ---
 

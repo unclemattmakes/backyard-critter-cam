@@ -157,6 +157,41 @@ def species_overview(cfg) -> dict | None:
     return {"species": species, "total": sum(s["count"] for s in species)}
 
 
+def individuals_overview(cfg, thumbs: int = 6) -> dict:
+    """Phase-3 labelling: every individual_id group (placeholder clusters like 'raccoon_c01' and
+    hand-named individuals like 'Notch') with crop count, time span, dominant species, and a strip
+    of its most-readable crops. Powers the dashboard's Individuals tab, where naming a group --
+    or naming two groups the same -- is the cheap human step that turns clusters into a cast."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"groups": [], "total_crops": 0}
+    rows = conn.execute(
+        "SELECT individual_id iid, COUNT(*) n, MIN(timestamp) first_seen, MAX(timestamp) last_seen "
+        "FROM detections WHERE individual_id IS NOT NULL GROUP BY individual_id"
+    ).fetchall()
+    groups = []
+    for r in rows:
+        sp = conn.execute(
+            "SELECT species, COUNT(*) c FROM detections WHERE individual_id = ? AND species IS "
+            "NOT NULL GROUP BY species ORDER BY c DESC LIMIT 1", (r["iid"],)).fetchone()
+        crops = conn.execute(
+            "SELECT crop_path FROM detections WHERE individual_id = ? "
+            "ORDER BY confidence DESC LIMIT ?", (r["iid"], thumbs)).fetchall()
+        # Placeholder = reid.py --write-clusters output ('<species>_cNN'); named = anything else.
+        is_placeholder = "_c" in r["iid"] and r["iid"].rsplit("_c", 1)[-1].isdigit()
+        groups.append({
+            "id": r["iid"], "n_crops": r["n"], "placeholder": is_placeholder,
+            "species": sp["species"] if sp else None,
+            "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+            "crops": [c["crop_path"].replace("\\", "/") for c in crops if c["crop_path"]],
+        })
+    conn.close()
+    # Named individuals first (the cast), then placeholders by size (biggest worth naming first).
+    groups.sort(key=lambda g: (g["placeholder"], -g["n_crops"]))
+    return {"groups": groups, "total_crops": sum(g["n_crops"] for g in groups),
+            "named": sum(1 for g in groups if not g["placeholder"])}
+
+
 def species_crops(cfg, species: str, limit: int = 160) -> list:
     """Recent crops for one species (newest first) for the by-species browser."""
     conn = db.connect_readonly(cfg.db_path)

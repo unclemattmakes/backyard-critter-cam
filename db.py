@@ -130,6 +130,31 @@ CREATE TABLE IF NOT EXISTS clips (
 );
 CREATE INDEX IF NOT EXISTS idx_clips_started ON clips(started_at);
 CREATE INDEX IF NOT EXISTS idx_clips_source  ON clips(source);
+
+-- Phase 4 ANALYSIS: one motion track per clip (clipmotion.py). The clip's frames are sampled,
+-- the detector finds the animal in each, and the box-centre trajectory becomes a MOTION
+-- FINGERPRINT: how fast, how straight, how hesitant, approaching or retreating. Motion is the
+-- behaviour signal stills can't carry -- and a confound-robust second shot at individual ID (a
+-- limp reads the same from any angle). `track` keeps the raw normalized trajectory as JSON so
+-- richer gait features can be re-derived later WITHOUT re-running the detector over the video.
+CREATE TABLE IF NOT EXISTS clip_tracks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id         INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    model           TEXT    NOT NULL,   -- detector used to build the track.
+    created_at      TEXT    NOT NULL,
+    n_samples       INTEGER,            -- frames sampled from the clip.
+    n_hits          INTEGER,            -- samples where an animal/person box was found.
+    track           TEXT,               -- JSON [[t_s, cx, cy, w, h, conf], ...], coords normalized 0..1.
+    duration_s      REAL,               -- span of the track (first hit .. last hit).
+    path_len        REAL,               -- total distance travelled (normalized units).
+    net_disp        REAL,               -- straight-line start->end distance.
+    straightness    REAL,               -- net_disp / path_len: 1 = beeline, ~0 = milling about.
+    avg_speed       REAL,               -- mean speed while moving (normalized units / s).
+    peak_speed      REAL,
+    moving_frac     REAL,               -- fraction of samples in motion (vs stationary, e.g. eating).
+    area_trend      REAL                -- end/start box-area ratio: >1 approached the camera, <1 left.
+);
+CREATE INDEX IF NOT EXISTS idx_clip_tracks_clip ON clip_tracks(clip_id);
 """
 
 
@@ -218,6 +243,34 @@ def insert_clip(conn: sqlite3.Connection, *, source: str, clip_path: str, starte
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def insert_clip_track(conn: sqlite3.Connection, *, clip_id: int, model: str, n_samples: int,
+                      n_hits: int, track_json: str, features: dict) -> int:
+    """Store one clip's motion track + derived features (clipmotion.py). Replaces any existing
+    track for the same (clip, model) so --redo is idempotent."""
+    conn.execute("DELETE FROM clip_tracks WHERE clip_id = ? AND model = ?", (int(clip_id), model))
+    cur = conn.execute(
+        """INSERT INTO clip_tracks (clip_id, model, created_at, n_samples, n_hits, track,
+                                    duration_s, path_len, net_disp, straightness, avg_speed,
+                                    peak_speed, moving_frac, area_trend)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (int(clip_id), model, now_local_iso(), int(n_samples), int(n_hits), track_json,
+         features.get("duration_s"), features.get("path_len"), features.get("net_disp"),
+         features.get("straightness"), features.get("avg_speed"), features.get("peak_speed"),
+         features.get("moving_frac"), features.get("area_trend")),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def clips_needing_tracks(conn: sqlite3.Connection, model: str):
+    """Clips that don't yet have a motion track for `model` (resumable batch processing)."""
+    return conn.execute(
+        """SELECT c.id, c.clip_path, c.fps FROM clips c
+           WHERE NOT EXISTS (SELECT 1 FROM clip_tracks t WHERE t.clip_id = c.id AND t.model = ?)
+           ORDER BY c.id""", (model,)
+    ).fetchall()
 
 
 def clear_visits(conn: sqlite3.Connection) -> None:
@@ -377,3 +430,13 @@ def set_individual_bulk(conn: sqlite3.Connection, detection_ids: Sequence[int],
                      [(individual_id, int(i)) for i in detection_ids])
     conn.commit()
     return len(detection_ids)
+
+
+def rename_individual(conn: sqlite3.Connection, old: str, new: Optional[str]) -> int:
+    """Rename every crop labelled `old` to `new` (the dashboard's naming action). Naming two
+    groups the same `new` MERGES them -- that's a feature: several look-alike clusters often turn
+    out to be one animal. `new=None` clears the label back to unassigned. Returns rows changed."""
+    cur = conn.execute("UPDATE detections SET individual_id = ? WHERE individual_id = ?",
+                       (new, old))
+    conn.commit()
+    return cur.rowcount

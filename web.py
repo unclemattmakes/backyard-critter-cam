@@ -160,6 +160,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(stats.period_digest(cfg, edition=(q.get("edition") or ["auto"])[0]))
                 elif path == "/api/behavior":
                     self._json(behavior.overview(cfg))
+                elif path == "/api/individuals":
+                    self._json(stats.individuals_overview(cfg))
                 elif path == "/snapshot.jpg":
                     frame, _ = frame_buffer.get()
                     if frame is None:
@@ -192,6 +194,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 if path == "/api/camera":
                     control_bridge.request(_clean_settings(data))
                     self._json({"ok": True})
+                elif path == "/api/individual":
+                    self._individual_action(data)
                 elif path.startswith("/api/detection/"):
                     self._detection_action(int(path.rsplit("/", 1)[-1]), data)
                 else:
@@ -203,6 +207,29 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json({"error": str(e)}, code=500)
                 except Exception:
                     pass
+
+        def _individual_action(self, data):
+            """Name / merge / clear an individual group: {"from": "raccoon_c01", "to": "Notch"}.
+            to="" or null clears the label. Naming two groups the same name merges them. The visit
+            ledger is refreshed afterwards so per-individual behaviour follows the rename."""
+            old = (data.get("from") or "").strip()
+            new = (data.get("to") or "").strip() or None
+            if not old:
+                self._json({"error": "missing 'from'"}, code=400)
+                return
+            import sqlite3 as _sq
+            import visits as _visits
+            conn = db.connect(cfg.db_path)
+            try:
+                n = db.rename_individual(conn, old, new)
+                try:
+                    conn.row_factory = _sq.Row
+                    _visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
+                except Exception:
+                    pass   # visit refresh is best-effort; the rename itself already committed
+                self._json({"ok": True, "renamed": n, "to": new})
+            finally:
+                conn.close()
 
         def _detection_action(self, det_id, data):
             action = data.get("action")

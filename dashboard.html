@@ -277,6 +277,7 @@
   <button id="tab-live" class="on" onclick="show('live')">Live Observation</button>
   <button id="tab-dispatch" onclick="show('dispatch')">The Dispatch</button>
   <button id="tab-behavior" onclick="show('behavior')">Behaviour</button>
+  <button id="tab-indiv" onclick="show('indiv')">Individuals</button>
   <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
   <button id="tab-cat" onclick="show('cat')">Specimen Catalogue</button>
 </nav>
@@ -348,6 +349,11 @@
     <div id="behavior-body"><p class="empty">Reading the field notes&hellip;</p></div>
   </section>
 
+  <!-- ============ INDIVIDUALS (phase 3: name the cast) ============ -->
+  <section id="view-indiv" class="view">
+    <div id="indiv-body"><p class="empty">Gathering the suspects&hellip;</p></div>
+  </section>
+
   <!-- ============ CALENDAR ============ -->
   <section id="view-calendar" class="view">
     <div id="calendar-body"><p class="empty">Loading the calendar&hellip;</p></div>
@@ -387,17 +393,20 @@ function show(v){
   $('#view-live').classList.toggle('on',v==='live');
   $('#view-dispatch').classList.toggle('on',v==='dispatch');
   $('#view-behavior').classList.toggle('on',v==='behavior');
+  $('#view-indiv').classList.toggle('on',v==='indiv');
   $('#view-calendar').classList.toggle('on',v==='calendar');
   $('#view-cat').classList.toggle('on',v==='cat');
   $('#view-explore').classList.toggle('on',v==='explore');
   $('#tab-live').classList.toggle('on',v==='live');
   $('#tab-dispatch').classList.toggle('on',v==='dispatch');
   $('#tab-behavior').classList.toggle('on',v==='behavior');
+  $('#tab-indiv').classList.toggle('on',v==='indiv');
   $('#tab-calendar').classList.toggle('on',v==='calendar');
   $('#tab-cat').classList.toggle('on',v==='cat');
   if(v==='cat') loadCatalogue();
   if(v==='dispatch') loadDispatch();
   if(v==='behavior') loadBehavior();
+  if(v==='indiv') loadIndividuals();
   if(v==='calendar') loadCalendar();
 }
 
@@ -861,6 +870,65 @@ function renderBehavior(d){
       `<span class="flag">${esc(nameOf(c.a))} + ${esc(nameOf(c.b))} · ${c.n}</span>`).join('')+`</div>`;
   }
   body.innerHTML=html;
+}
+
+/* ---------- individuals (phase 3: hand-label the clusters into a cast) ---------- */
+async function loadIndividuals(){
+  const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
+  let d; try{ d=await fetch('/api/individuals').then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
+  renderIndividuals(d);
+}
+function indivRow(g){
+  const span=(g.first_seen&&g.last_seen)?`${g.first_seen.slice(5,10)} → ${g.last_seen.slice(5,10)}`:'';
+  const thumbs=(g.crops||[]).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+  const act = g.placeholder
+    ? `<input id="nm-${esc(g.id)}" placeholder="name… (e.g. Notch)" style="width:130px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">
+       <button class="gear" onclick="nameIndiv('${esc(g.id)}')">Name</button>`
+    : `<button class="gear" onclick="nameIndiv('${esc(g.id)}')" title="rename">Rename</button>
+       <button class="gear" onclick="clearIndiv('${esc(g.id)}')" title="unassign these crops">Clear</button>
+       <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
+      <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${act}</div>
+  </div>`;
+}
+function renderIndividuals(d){
+  const body=$('#indiv-body');
+  const groups=d.groups||[];
+  if(!groups.length){ body.innerHTML='<p class="empty">No individuals yet — run <code>python reid.py --write-clusters</code> to propose look-alike groups, then name them here.</p>'; return; }
+  const named=groups.filter(g=>!g.placeholder), prop=groups.filter(g=>g.placeholder);
+  let html=`<p class="lbl" style="opacity:.75;margin:4px 0 14px">Each group is a set of crops that LOOK alike (appearance clustering — proposals, not certainties).
+    Naming a group adds it to the cast; giving two groups the same name merges them. Through-glass appearance is weak — when unsure, leave it unnamed.</p>`;
+  if(named.length){
+    html+=`<h2 class="sec">The Cast <span class="n">${named.length} named</span></h2>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px">${named.map(indivRow).join('')}</div>`;
+  }
+  html+=`<h2 class="sec">Unnamed Look-Alike Groups <span class="n">${prop.length} proposed</span></h2>`;
+  html+=`<div style="display:flex;flex-direction:column;gap:8px">${prop.slice(0,30).map(indivRow).join('')}</div>`;
+  if(prop.length>30) html+=`<p class="empty">…and ${prop.length-30} smaller groups (name the big ones first).</p>`;
+  body.innerHTML=html;
+}
+async function nameIndiv(from){
+  const inp=document.getElementById('nm-'+from);
+  const to=(inp&&inp.value||'').trim();
+  if(!to){ if(inp) inp.focus(); return; }
+  await postIndiv(from,to);
+}
+async function clearIndiv(from){
+  if(!confirm(`Unassign all crops labelled "${from}"?`)) return;
+  await postIndiv(from,null);
+}
+async function postIndiv(from,to){
+  try{
+    const r=await fetch('/api/individual',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({from,to})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
 }
 
 async function loadCalendar(){

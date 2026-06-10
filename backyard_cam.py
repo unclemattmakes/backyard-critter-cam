@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ import config
 import daynight
 import db
 import stats
+import visits
 import web
 from config import CONFIG
 from detector import CudaUnavailableError, Detection, Detector
@@ -662,6 +664,15 @@ def run(cfg: config.Config) -> None:
         except Exception:
             pass
         cv2.destroyAllWindows()
+        # Keep the visit ledger fresh: collapse this session's detections into visit events so
+        # the dashboard's Behaviour tab is current without a manual `python visits.py` run.
+        # A full rebuild is subsecond at this scale; never let it block a clean shutdown.
+        try:
+            conn.row_factory = sqlite3.Row
+            visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
+            print("  visit ledger refreshed.")
+        except Exception as e:
+            print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
         conn.close()
         clips_note = f"  Recorded {recorder.clips_saved} clip(s)." if recorder is not None else ""
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.{clips_note}")
