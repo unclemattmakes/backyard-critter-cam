@@ -416,7 +416,8 @@ def run(cfg: config.Config) -> None:
     # usable GPU we fail here with a clear message (before touching the camera).
     print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
     print("  (first run downloads the model weights from Zenodo -- one time only)")
-    detector = Detector(cfg.model_version, cfg.device, cfg.min_confidence)
+    detector = Detector(cfg.model_version, cfg.device, cfg.min_confidence,
+                        classes=cfg.detect_classes)
     if detector.device == "cuda":
         print(f"  detector ready on GPU: {detector.device_name}")
     else:

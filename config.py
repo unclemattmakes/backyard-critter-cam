@@ -104,9 +104,17 @@ class Config:
     # A detection must score at least this to come back from the detector (passed as
     # MegaDetector's det_conf_thres) -- so weaker boxes are never drawn or saved.
     min_confidence: float = 0.25
-    # MegaDetector's coarse classes: 0=animal, 1=person, 2=vehicle. We DRAW every class in
-    # the preview (wave a hand and watch it work), but only SAVE the classes listed here.
-    # Default = animals only, so you sitting next to the camera don't fill crops/ with selfies.
+    # Which detector classes to REPORT at all. MegaDetector's coarse classes are 0=animal,
+    # 1=person, 2=vehicle. A glass-door cam keeps catching cars on the street as "vehicle",
+    # which only clutters the live preview (the saved data is filtered separately by
+    # save_classes). Listing a subset here tells Ultralytics to ignore the rest entirely --
+    # they're never returned, drawn, or saved, at no extra cost (one YOLO pass scores every
+    # class regardless). Keep "person" so the "wave a hand and watch it work" liveness check
+    # still draws a box at the door. None = report every class (the old draw-everything behaviour).
+    detect_classes: tuple[str, ...] | None = ("animal", "person")
+    # Of the classes the detector reports, only these are SAVED (cropped + written to the DB).
+    # Default = animals only, so a person at the glass door is boxed in the live view but never
+    # fills crops/ with selfies. (Anything not in detect_classes never reaches here to begin with.)
     save_classes: tuple[str, ...] = ("animal",)
     # Don't run the detector more often than this while motion is continuous. Caps GPU load
     # and stops a lingering crow from writing a near-duplicate row on every single frame.

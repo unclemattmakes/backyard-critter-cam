@@ -157,6 +157,7 @@ class Detector:
         device: str = "cuda",
         min_confidence: float = 0.25,
         weights_dir: Path | None = None,
+        classes: tuple[str, ...] | None = None,
     ):
         # Resolve 'cuda' / 'cpu' / 'auto' to a concrete device. 'cuda' still fails loud if the
         # GPU can't compute; 'cpu' and 'auto' make the rig runnable without an NVIDIA GPU.
@@ -179,6 +180,21 @@ class Detector:
         else:
             self.class_names = dict(MD_CLASS_NAMES)
 
+        # Optionally restrict which classes the detector REPORTS at all (cfg.detect_classes).
+        # We resolve the requested names against the model's own class map and hand the ids to
+        # Ultralytics, so the rest are never returned (never drawn, considered, or saved).
+        # Unknown names are warned about and skipped; if that would leave nothing, fall back to
+        # reporting every class rather than going silently blind. None/empty = report all.
+        self.class_ids: list[int] | None = None
+        if classes:
+            name_to_id = {v: k for k, v in self.class_names.items()}
+            ids = [name_to_id[n] for n in classes if n in name_to_id]
+            unknown = [n for n in classes if n not in name_to_id]
+            if unknown:
+                print(f"  [detector] ignoring unknown detect_classes name(s): "
+                      f"{', '.join(unknown)} (known: {', '.join(self.class_names.values())})")
+            self.class_ids = ids or None
+
     def detect(self, frame_bgr) -> list[Detection]:
         """
         Run the detector on a single OpenCV BGR frame and return detections at or above
@@ -189,6 +205,7 @@ class Detector:
         results = self.model.predict(
             frame_bgr,
             conf=self.min_confidence,
+            classes=self.class_ids,   # None = all classes; a list restricts to those class ids
             device=self.device,
             verbose=False,
         )
