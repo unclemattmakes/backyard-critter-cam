@@ -130,7 +130,7 @@ Everything (camera, dashboard, *and* species naming) shuts down together, in one
 ```
 
 Press **`q`** in the preview window — or **close the window** — to quit cleanly; that also stops
-the in-process species naming. The window is **resizable** — drag any edge.
+the species-naming helper. The window is **resizable** — drag any edge.
 
 Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + stats + gallery):
 
@@ -154,7 +154,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
 | `--no-preview` | Headless; quit with Ctrl+C. |
-| `--no-classify` | Detection only — don't name species live in this process. The rig names new crops by species in a background thread by default; this turns that off. You can still fill species later with `python classify.py`. |
+| `--no-classify` | Detection only — don't start the live species-naming helper. The rig launches it (and stops it) automatically by default; this turns that off. You can still fill species later with `python classify.py`. |
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
 | `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
@@ -188,10 +188,12 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
   network add `--host 0.0.0.0` (and mind who's on your Wi-Fi).
 - Runs in the same process as capture; combine with `--no-preview` for a headless,
   browser-only rig, or keep the native window too.
-- **Species names appear on their own:** the rig names each new crop in a background thread, so
-  the recent-visitor card shows a species within a few seconds — no separate classifier process
-  to start or stop. (Disable with `--no-classify`; see `classify.py` for bulk re-naming after
-  you edit the label list.)
+- **Species names appear on their own:** the rig starts a small naming **helper** (`classify.py
+  --watch`) as a child process and stops it with the app, so the recent-visitor card fills in a
+  species by itself — nothing extra to launch or close. The helper takes a minute to warm up its
+  model at startup; the header shows **"Identifier: warming up… / on"** so you can tell it's
+  working. (Disable with `--no-classify`; see `classify.py` for bulk re-naming after you edit the
+  label list.)
 
 ---
 

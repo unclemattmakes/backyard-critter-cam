@@ -266,6 +266,7 @@
   <div class="top">
     <span class="lbl" id="coords"></span>
     <span class="lbl" id="period">—</span>
+    <span class="lbl" id="naming"></span>
   </div>
   <h1>The Backyard <span class="amp">&amp;</span> Observatory</h1>
   <div class="sub">A field log of the creatures who visit, <span class="live-chip"><span class="live-dot"></span>observation in progress</span></div>
@@ -860,9 +861,25 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); }
 
 /* ---------- boot ---------- */
 buildControls();
-refreshLive(); refreshCamera();
+async function refreshNaming(){
+  let n; try{ n=await fetch('/api/naming').then(r=>r.json()); }catch(e){ return; }
+  const el=document.getElementById('naming'); if(!el) return;
+  const map={ loading:['#d9a23b','Identifier: warming up…'],
+              ready:['#5b8c5a','Identifier: on'],
+              stopped:['#b4503f','Identifier: stopped'] };
+  const m=map[n.state];
+  if(!m){ el.style.display='none'; return; }
+  el.style.display='';
+  el.innerHTML='<span style="color:'+m[0]+'">●</span> '+m[1];
+  el.title = n.state==='loading'
+      ? 'The species identifier is loading its model (about a minute). New visitors get named once it is ready.'
+      : n.state==='stopped' ? 'The species identifier is not running right now.'
+      : 'New visitors are being named automatically.';
+}
+refreshLive(); refreshCamera(); refreshNaming();
 setInterval(refreshLive,6000);
 setInterval(refreshCamera,4000);
+setInterval(refreshNaming,4000);
 </script>
 </body>
 </html>

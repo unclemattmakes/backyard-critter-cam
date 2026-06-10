@@ -19,6 +19,10 @@ from pathlib import Path
 # whole rig (code + db + crops) is relocatable as one directory.
 ROOT = Path(__file__).resolve().parent
 
+# Where the live species-naming helper (classify.py --watch) writes its status, so the dashboard
+# can show "warming up" vs "naming" vs "stopped". A hidden file in the project root.
+NAMING_STATUS_FILE = ROOT / ".naming_status.json"
+
 
 @dataclass
 class Config:

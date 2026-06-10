@@ -20,6 +20,7 @@ no retraining. Re-runnable and resumable: by default only rows with species IS N
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -115,6 +116,18 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
     return tally, clf, device
 
 
+def _write_naming_status(state: str, **extra) -> None:
+    """Write a tiny status file the web dashboard reads, so it can show whether live naming is
+    'loading' (model warming up), 'ready' (naming new crops), or 'stopped'. Atomic, best-effort."""
+    try:
+        data = {"state": state, "ts": time.time(), "pid": os.getpid(), **extra}
+        tmp = config.NAMING_STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, config.NAMING_STATUS_FILE)
+    except Exception:
+        pass
+
+
 def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_size=64,
                stop_event=None, session=None) -> Counter:
     """Name freshly-saved crops by species as they land, until `stop_event` is set (or forever
@@ -127,16 +140,20 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
     `session` (a Counter) accumulates the running tally -- pass one in to read it after a stop."""
     stop_event = stop_event if stop_event is not None else threading.Event()
     session = session if session is not None else Counter()
+    _write_naming_status("loading", device=device)   # dashboard shows "warming up" until ready
     clf, device = build_classifier(device)
     print(f"[naming] BioCLIP 2 ready on {device}; naming new crops as they arrive "
           f"(checking every {interval:.0f}s).")
+    _write_naming_status("ready", device=device, named=sum(session.values()))
     while not stop_event.is_set():
         rows = fetch_pending(conn, min_confidence, redo=False)
         if rows:
             print(f"[naming] {len(rows)} new crop(s) to name...")
             tally, clf, device = classify_rows(conn, clf, device, rows, batch_size)
             session.update(tally)
+        _write_naming_status("ready", device=device, named=sum(session.values()))  # heartbeat
         stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
+    _write_naming_status("stopped", device=device, named=sum(session.values()))
     return session
 
 
@@ -175,6 +192,9 @@ def main() -> int:
                         "(load the model once, poll the DB). For running beside the live rig.")
     p.add_argument("--interval", type=float, default=5.0,
                    help="Seconds between polls in --watch mode (default 5).")
+    p.add_argument("--tag", default=None,
+                   help="Internal marker the live rig puts on this helper's command line so it "
+                        "can find and cleanly stop it (and any subprocess) on shutdown.")
     args = p.parse_args()
 
     if args.device is None:

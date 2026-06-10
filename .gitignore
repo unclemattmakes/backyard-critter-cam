@@ -33,6 +33,10 @@ weights/
 # ===== Local private config (real coordinates / machine-specific overrides) =====
 config_local.py
 
+# ===== Runtime status (live-naming helper heartbeat; regenerated each run) =====
+.naming_status.json
+.naming_status.tmp
+
 # ===== Local tooling / editor / OS =====
 # .claude/ holds a machine-specific launch.json (absolute venv path)
 .claude/

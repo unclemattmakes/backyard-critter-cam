@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -142,6 +143,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(_candidate_labels(cfg))
                 elif path == "/api/camera":
                     self._json(control_bridge.snapshot())
+                elif path == "/api/naming":
+                    self._json(_naming_status())
                 elif path == "/api/crops":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.crops_page(
@@ -246,6 +249,22 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
     server.daemon_threads = True
     server.stop_event = stop_event
     return server
+
+
+def _naming_status() -> dict:
+    """Read the live-naming helper's status file (written by classify.py --watch) so the
+    dashboard can show warming-up vs naming vs stopped. A stale heartbeat is treated as stopped."""
+    p = config.NAMING_STATUS_FILE
+    try:
+        if not p.exists():
+            return {"state": "off"}
+        data = json.loads(p.read_text())
+        data["age"] = round(time.time() - float(data.get("ts", 0)), 1)
+        if data.get("state") in ("loading", "ready") and data["age"] > 30:
+            data["state"] = "stopped"      # heartbeat went stale -> the helper died
+        return data
+    except Exception:
+        return {"state": "off"}
 
 
 def _candidate_labels(cfg) -> list:

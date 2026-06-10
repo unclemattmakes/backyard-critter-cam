@@ -14,8 +14,9 @@ Run `python backyard_cam.py --list-cameras` to find your webcam's index.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
-import threading
 import time
 from dataclasses import replace
 from datetime import datetime
@@ -23,7 +24,6 @@ from pathlib import Path
 
 import cv2
 
-import classify
 import config
 import daynight
 import db
@@ -356,6 +356,53 @@ def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
         cv2.circle(frame, (frame.shape[1] - 20, 20), 8, (0, 0, 255), -1)
 
 
+# ---- Naming subprocess ------------------------------------------------------------
+def _naming_pids(tag: str) -> list:
+    """PIDs of python processes whose command line carries our unique --tag (the live-naming
+    helper and any interpreter the venv launcher re-spawned for it). Windows-only, best-effort."""
+    ps = ("Get-CimInstance Win32_Process | "
+          f"Where-Object {{ $_.Name -like 'python*' -and $_.CommandLine -like '*{tag}*' }} | "
+          "Select-Object -ExpandProperty ProcessId")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=15)
+        return [p.strip() for p in out.stdout.splitlines() if p.strip()]
+    except Exception:
+        return []
+
+
+def _stop_naming(proc, tag: str | None = None) -> None:
+    """Stop the species-naming helper and EVERY process it spawned, on shutdown. On Windows the
+    venv's python.exe is a launcher whose real interpreter can run OUTSIDE the launcher's process
+    tree, so killing the tree alone can leave it orphaned. So we also match the helper by the
+    unique --tag we put on its command line and sweep those, repeating until none remain. Silent
+    and best-effort: naming is optional and may already have exited."""
+    if proc is None:
+        return
+    if sys.platform != "win32":
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+    for _ in range(4):
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        pids = _naming_pids(tag) if tag else []
+        if not pids:
+            break
+        subprocess.run(["taskkill", "/F"] + [a for p in pids for a in ("/PID", p)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.4)
+
+
 # ---- Main loop ---------------------------------------------------------------------
 def run(cfg: config.Config) -> None:
     cfg.crops_dir.mkdir(parents=True, exist_ok=True)
@@ -424,30 +471,29 @@ def run(cfg: config.Config) -> None:
     # the dashboard locks the rest. Only when serving -- it briefly nudges supported controls.
     writable = probe_writable_controls(cap) if control_bridge is not None else {}
 
-    # Species naming, folded into THIS process: a background thread names new crops by species
-    # as they land (CPU by default, so it never fights the live detector for the GPU). Running
-    # it here -- instead of a separate `classify.py --watch` console -- is what makes shutdown
-    # simple: one 'q' (or closing the video window) stops naming too, with no orphaned process.
-    # It loads BioCLIP in the background, so the camera and preview come up immediately.
-    classify_stop = threading.Event()
-    classify_thread = None
+    # Species naming runs as a managed CHILD PROCESS (classify.py --watch), not a thread: the
+    # BioCLIP model can only be BUILT on a process's main thread -- constructing it in a
+    # background thread deadlocks -- so naming gets its own process. That also loads the model
+    # in parallel, so the camera and preview still come up instantly. The child shares THIS
+    # console (its logs print here; no extra window), and we kill it on shutdown, so there's
+    # still one launch and one stop with nothing left running.
+    classify_proc = None
+    classify_tag = f"backyard-naming-{os.getpid()}"   # unique marker for a clean, total shutdown
     if cfg.classify_live:
-        def _name_crops():
-            try:
-                cconn = db.connect(cfg.db_path)   # the thread needs its OWN sqlite connection
-            except Exception as e:
-                print(f"  [naming] couldn't open the database; species naming is off: {e}")
-                return
-            try:
-                classify.watch_loop(cconn, device=cfg.classify_device,
-                                    interval=cfg.classify_interval_s, stop_event=classify_stop)
-            except Exception as e:   # never let a naming hiccup take down the live rig
-                print(f"  [naming] stopped on an error (detection keeps running): {e}")
-            finally:
-                cconn.close()
-        classify_thread = threading.Thread(target=_name_crops, name="naming", daemon=True)
-        classify_thread.start()
-        print("  species naming: ON -- new crops get named automatically in this window.\n")
+        try:
+            classify_proc = subprocess.Popen(
+                [sys.executable, str(config.ROOT / "classify.py"), "--watch",
+                 "--device", str(cfg.classify_device),
+                 "--interval", str(cfg.classify_interval_s),
+                 "--tag", classify_tag],
+                cwd=str(config.ROOT),
+            )
+            print("  species naming: ON -- a helper is warming up the model (~1-2 min), then it\n"
+                  "  names new crops automatically. The dashboard shows when it's ready.\n")
+        except Exception as e:
+            print(f"  [naming] couldn't start the species-naming helper "
+                  f"(detection still works): {e}\n")
+            classify_proc = None
 
     gate = MotionGate(cfg)
     last_detect_t = 0.0          # monotonic time of last detector run (for rate limiting)
@@ -577,7 +623,7 @@ def run(cfg: config.Config) -> None:
     except KeyboardInterrupt:
         print("\nInterrupted -- shutting down.")
     finally:
-        classify_stop.set()          # tell the naming thread to finish its poll and exit
+        _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
         if server is not None:
             web.shutdown(server)
         try:
@@ -585,8 +631,6 @@ def run(cfg: config.Config) -> None:
         except Exception:
             pass
         cv2.destroyAllWindows()
-        if classify_thread is not None:
-            classify_thread.join(timeout=3.0)   # daemon, so we never hang if it's mid-classify
         conn.close()
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.")
 
