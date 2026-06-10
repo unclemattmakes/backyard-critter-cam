@@ -23,3 +23,7 @@ pybioclip>=2.1
 # Both reuse the cu130 torch / numpy / pillow already present (timm is also a pybioclip dep).
 timm>=1.0
 scipy>=1.13
+
+# --- Development only (not needed to run the rig) ---
+# Test suite: `python -m pytest tests/ -q`. Pure-logic tests, no GPU/camera/model needed.
+pytest>=8.0

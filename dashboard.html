@@ -276,6 +276,7 @@
 <nav class="tabs">
   <button id="tab-live" class="on" onclick="show('live')">Live Observation</button>
   <button id="tab-dispatch" onclick="show('dispatch')">The Dispatch</button>
+  <button id="tab-behavior" onclick="show('behavior')">Behaviour</button>
   <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
   <button id="tab-cat" onclick="show('cat')">Specimen Catalogue</button>
 </nav>
@@ -342,6 +343,11 @@
     <div id="dispatch-body"><p class="empty">Loading the dispatch&hellip;</p></div>
   </section>
 
+  <!-- ============ BEHAVIOUR ============ -->
+  <section id="view-behavior" class="view">
+    <div id="behavior-body"><p class="empty">Reading the field notes&hellip;</p></div>
+  </section>
+
   <!-- ============ CALENDAR ============ -->
   <section id="view-calendar" class="view">
     <div id="calendar-body"><p class="empty">Loading the calendar&hellip;</p></div>
@@ -380,15 +386,18 @@ function show(v){
   closeSettings();
   $('#view-live').classList.toggle('on',v==='live');
   $('#view-dispatch').classList.toggle('on',v==='dispatch');
+  $('#view-behavior').classList.toggle('on',v==='behavior');
   $('#view-calendar').classList.toggle('on',v==='calendar');
   $('#view-cat').classList.toggle('on',v==='cat');
   $('#view-explore').classList.toggle('on',v==='explore');
   $('#tab-live').classList.toggle('on',v==='live');
   $('#tab-dispatch').classList.toggle('on',v==='dispatch');
+  $('#tab-behavior').classList.toggle('on',v==='behavior');
   $('#tab-calendar').classList.toggle('on',v==='calendar');
   $('#tab-cat').classList.toggle('on',v==='cat');
   if(v==='cat') loadCatalogue();
   if(v==='dispatch') loadDispatch();
+  if(v==='behavior') loadBehavior();
   if(v==='calendar') loadCalendar();
 }
 
@@ -804,6 +813,56 @@ function entryRow(s){
 /* ---------- Calendar ---------- */
 let calYear=null, calMonth=null, calByDay={};
 const ymdLocal=dt=>{const p=n=>String(n).padStart(2,'0');return dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate());};
+/* ---------- behaviour (phase 4: visits, profiles, the two-axis read-out) ---------- */
+async function loadBehavior(){
+  const body=$('#behavior-body'); body.innerHTML='<p class="empty">Reading the field notes…</p>';
+  let d; try{ d=await fetch('/api/behavior').then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load behaviour.</p>'; return; }
+  renderBehavior(d);
+}
+function behaviorClock(hours, win){
+  const max=Math.max(1,...hours);
+  const inWin=h=> win ? (win.start_hour<=win.end_hour ? (h>=win.start_hour&&h<=win.end_hour)
+                                                       : (h>=win.start_hour||h<=win.end_hour)) : false;
+  return hours.map((c,h)=>{ const ht=c?Math.max(2,Math.round(Math.sqrt(c/max)*18)):1;
+    return `<span title="${fmtHourJS(h)}: ${c} visit(s)" style="display:inline-block;width:4px;height:${ht}px;`
+      +`background:${inWin(h)?'var(--gilt,#c8a45a)':'rgba(255,255,255,.22)'}"></span>`; }).join('');
+}
+function renderBehavior(d){
+  const body=$('#behavior-body');
+  if(!d || d.need_rebuild){ body.innerHTML='<p class="empty">No visits yet — run <code>python visits.py</code> to build them.</p>'; return; }
+  if(!d.visits){ body.innerHTML='<p class="empty">No visits recorded yet.</p>'; return; }
+  const flags=(d.flags||[]).filter(f=>f.verdict==='DISAGREES');
+  let html=`<div class="tallies">
+    <div class="tally" style="cursor:default"><div class="n">${d.visits.toLocaleString()}</div><div class="k lbl">visits</div></div>
+    <div class="tally" style="cursor:default"><div class="n">${d.species.length}</div><div class="k lbl">species</div></div>
+    <div class="tally" style="cursor:default"><div class="n">${flags.length}</div><div class="k lbl">off-pattern</div></div></div>`;
+  if(flags.length){
+    html+=`<h2 class="sec">Off-Pattern <span class="n">appearance vs behaviour</span></h2>`;
+    html+=`<div class="lede">`+flags.map(f=>
+      `<span class="flag quiet">⚑ ${esc(nameOf(f.species))} at ${esc((f.started_at||'').slice(11,16))} — ${esc((f.notes&&f.notes[0])||'unusual')}</span>`
+    ).join('')+`</div>`;
+  }
+  html+=`<h2 class="sec">Field Notes <span class="n">${d.species.length} species</span></h2>`;
+  html+=`<div style="display:flex;flex-direction:column;gap:8px">`+d.species.map(s=>{
+    const hours=Array.from({length:24},(_,h)=>s.arrival_hours[h]||s.arrival_hours[String(h)]||0);
+    const win=s.typical_window;
+    const wtxt=win?`${String(win.start_hour).padStart(2,'0')}–${String(win.end_hour).padStart(2,'0')}h`:'—';
+    const dwell=s.dwell_median_s>=60?Math.round(s.dwell_median_s/60)+'m':Math.round(s.dwell_median_s)+'s';
+    return `<div class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px">
+      <div><div style="font-weight:600">${esc(nameOf(s.species))}</div>
+        <div class="lbl" style="opacity:.72">${s.n_visits} visits · ${s.visits_per_day}/day · dwell ~${dwell} · usually ${wtxt}</div></div>
+      <div style="display:flex;align-items:flex-end;gap:1px;height:20px" title="arrivals by hour (0–23h); highlighted = typical window">${behaviorClock(hours,win)}</div>
+    </div>`;
+  }).join('')+`</div>`;
+  if((d.co_occurrence||[]).length){
+    html+=`<h2 class="sec">Seen Together <span class="n">who shares a visit</span></h2>`;
+    html+=`<div class="lede">`+d.co_occurrence.map(c=>
+      `<span class="flag">${esc(nameOf(c.a))} + ${esc(nameOf(c.b))} · ${c.n}</span>`).join('')+`</div>`;
+  }
+  body.innerHTML=html;
+}
+
 async function loadCalendar(){
   let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }
   catch(e){ $('#calendar-body').innerHTML='<p class="empty">Could not load the calendar.</p>'; return; }

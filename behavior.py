@@ -161,6 +161,62 @@ def _sparkline(hour_counts: dict) -> str:
     return out
 
 
+def overview(cfg, recent: int = 40) -> dict:
+    """JSON-able behaviour summary for the dashboard (/api/behavior): per-species profiles, the
+    co-occurrence table, and recent visits scored by species-fit (the two-axis disagreements).
+    Read-only and WAL-safe. Returns {"need_rebuild": True} if the visits table is empty."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"visits": 0, "species": [], "co_occurrence": [], "flags": []}
+    try:
+        if conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0] == 0:
+            return {"visits": 0, "species": [], "co_occurrence": [], "flags": [],
+                    "need_rebuild": True}
+        species = []
+        for sp in _critter_species(conn):
+            p = species_profile(conn, sp)
+            if not p:
+                continue
+            species.append({
+                "species": sp, "n_visits": p["n_visits"], "visits_per_day": p["visits_per_day"],
+                "dwell_median_s": p["dwell_median_s"], "peak_hour": p["peak_hour"],
+                "typical_window": p["typical_window"], "arrival_hours": p["arrival_hours"],
+                "crops_per_visit": p["crops_per_visit"],
+            })
+        species.sort(key=lambda s: -s["n_visits"])
+        co = [{"a": a, "b": b, "n": n} for (a, b), n in co_occurrence(conn).most_common(12)]
+
+        import twoaxis  # lazy: twoaxis imports behavior; this avoids a circular import at load
+        flags = []
+        rows = conn.execute("SELECT * FROM visits ORDER BY started_at DESC LIMIT ?",
+                            [recent]).fetchall()
+        for v in rows:
+            sp = (v["species"] or "").lower()
+            if sp in _NON_CRITTER:
+                continue
+            prof = species_profile(conn, v["species"]) if v["species"] else None
+            verdict, notes = twoaxis.species_fit(v, prof)
+            a, b = _parse(v["started_at"]), _parse(v["ended_at"])
+            flags.append({
+                "visit_id": v["id"], "species": v["species"],
+                "started_at": v["started_at"],
+                "dwell_s": int((b - a).total_seconds()) if a and b else 0,
+                "rep_crop": _rep_crop(conn, v["representative_detection_id"]),
+                "verdict": verdict, "notes": notes,
+            })
+        total = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+        return {"visits": total, "species": species, "co_occurrence": co, "flags": flags}
+    finally:
+        conn.close()
+
+
+def _rep_crop(conn, detection_id):
+    if detection_id is None:
+        return None
+    r = conn.execute("SELECT crop_path FROM detections WHERE id = ?", [detection_id]).fetchone()
+    return r["crop_path"].replace("\\", "/") if r and r["crop_path"] else None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: behaviour profiles from visits.")
     p.add_argument("--species", help="Profile one species (e.g. raccoon).")

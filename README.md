@@ -392,7 +392,10 @@ Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
   --match` (appearance score), and `twoaxis.py` — the **two-axis readout** that flags "looks like
   X but isn't acting like X." Plus `--record-clips` banks the video for gait/motion analysis.
   Sharpens per-individual as you hand-label. Still to come: motion/gait features off the clips.
-- **Later — trail-cam batch importer:** `source='trail_cam_sd'`, same pipeline downstream.
+- **Later — trail-cam batch importer:** ✅ `import_trailcam.py` — dump the SD card into a folder,
+  `python import_trailcam.py <folder>` runs the same detector over it and writes crops with
+  `source='trail_cam_sd'`. EXIF timestamps, idempotent re-runs, `--watch` a drop folder. Same
+  pipeline downstream (species ID, re-ID, behaviour all key off the `source` column).
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —
 augment the critter-knower, don't replace them. And: boring and robust over clever; most of
