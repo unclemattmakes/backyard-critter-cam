@@ -179,7 +179,12 @@ class Config:
     # 0 < scale <= 1: downscale recorded frames. 1.0 = full resolution. Lower (e.g. 0.5) cuts BOTH
     # the in-RAM pre-roll buffer (~Nx720p frames) and the file size; bump down if memory is tight.
     clip_scale: float = 1.0
-    clip_codec: str = "mp4v"            # OpenCV fourcc; 'mp4v' -> .mp4, works on Windows w/o extra dlls
+    # Clip video codec. 'h264' records straight to browser-playable H.264 by piping frames to
+    # ffmpeg (libx264): ~half the size of mp4v, plays in any <video>, and cv2 still reads it for
+    # clipmotion. Falls back to OpenCV's 'mp4v' writer automatically if ffmpeg isn't on PATH. Set
+    # to an OpenCV fourcc ('mp4v', 'XVID', ...) to force the cv2 writer instead -- but note mp4v is
+    # NOT browser-playable, so the dashboard has to transcode those on the fly (see web.py).
+    clip_codec: str = "h264"
 
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
     # The live rig names each new crop by species ITSELF, in a background thread, so a single

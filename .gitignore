@@ -20,6 +20,8 @@ tuning/
 reid/
 # behaviour clips (phase-4 video capture; large/binary, --record-clips)
 clips/
+# browser-playable H.264 transcodes of clips (regenerated on demand by the web dashboard)
+clips_web/
 
 # ===== Model weights (auto-download from Zenodo on first run) =====
 weights/

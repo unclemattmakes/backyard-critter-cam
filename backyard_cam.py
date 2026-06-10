@@ -29,6 +29,7 @@ import clips
 import config
 import daynight
 import db
+import quality
 import stats
 import visits
 import web
@@ -300,7 +301,9 @@ def _rel(path: Path) -> str:
 
 
 def save_crop(frame_bgr, det: Detection, cfg: config.Config, day: str, stamp: str, idx: int):
-    """Crop the (padded, clamped) detection box and write it as a JPEG. Returns the Path."""
+    """Crop the (padded, clamped) detection box and write it as a JPEG. Returns (Path, quality) --
+    the shot-quality score (quality.score_crop) computed from the crop we already have in hand, so
+    the dashboard can later lead with the sharpest frame -- or None if the box is degenerate."""
     h, w = frame_bgr.shape[:2]
     x1, y1, x2, y2 = det.bbox
     pad_x = (x2 - x1) * cfg.crop_padding
@@ -318,7 +321,7 @@ def save_crop(frame_bgr, det: Detection, cfg: config.Config, day: str, stamp: st
     day_dir.mkdir(parents=True, exist_ok=True)
     path = day_dir / f"{stamp}_{idx}_{det.class_name}_{det.confidence:.2f}.jpg"
     cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
-    return path
+    return path, quality.score_crop(crop)
 
 
 def save_frame(frame_bgr, cfg: config.Config, day: str, stamp: str):
@@ -608,9 +611,10 @@ def run(cfg: config.Config) -> None:
                         frame_path = _rel(fp) if fp else None
 
                     for i, det in enumerate(saved_dets):
-                        crop = save_crop(frame, det, cfg, day, stamp, i)
-                        if crop is None:
+                        saved = save_crop(frame, det, cfg, day, stamp, i)
+                        if saved is None:
                             continue
+                        crop_path, crop_q = saved
                         db.insert_detection(
                             conn,
                             timestamp=iso,
@@ -620,12 +624,13 @@ def run(cfg: config.Config) -> None:
                             bbox=det.bbox,
                             frame_w=w,
                             frame_h=h,
-                            crop_path=_rel(crop),
+                            crop_path=_rel(crop_path),
                             frame_path=frame_path,
+                            crop_quality=crop_q,
                             # species / individual_id stay NULL in V1.
                         )
                         total_saved += 1
-                        print(f"  [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop)}")
+                        print(f"  [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
 
             # --- Live preview + optional web stream ---
             if cfg.show_preview or server is not None:

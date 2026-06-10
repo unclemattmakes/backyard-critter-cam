@@ -13,6 +13,8 @@ restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/s
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -104,8 +106,129 @@ def _is_within(target: Path, parent: Path) -> bool:
         return False
 
 
+# Media types served from /media (crops, frames, and now behaviour clips). Video needs a correct
+# Content-Type AND HTTP Range support, or a browser <video> won't stream or seek.
+_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+}
+_RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
+
+
+def _parse_range(header: str, size: int):
+    """Parse a single-range 'bytes=START-END' header against a `size`-byte file. Returns
+    (start, end, open_ended) inclusive, or None for an unsatisfiable/garbled range. Handles an
+    open-ended 'bytes=START-' (the common video probe) and a suffix 'bytes=-N' (last N bytes)."""
+    try:
+        spec = header.split("=", 1)[1].split(",", 1)[0].strip()
+        lo, _, hi = spec.partition("-")
+        open_ended = lo != "" and hi == ""
+        if lo == "":                       # suffix range: the last N bytes
+            n = int(hi)
+            if n <= 0:
+                return None
+            start, end = max(0, size - n), size - 1
+        else:
+            start = int(lo)
+            end = int(hi) if hi else size - 1
+        end = min(end, size - 1)
+        if start < 0 or start > end or start >= size:
+            return None
+        return start, end, open_ended
+    except (ValueError, IndexError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Web-playable clips. The rig records clips with OpenCV's 'mp4v' fourcc (MPEG-4 Part 2) because
+# that's the codec cv2 can reliably WRITE on Windows -- but browsers only DECODE H.264 in an .mp4,
+# so an mp4v clip fails to play in a <video> (MEDIA_ERR_SRC_NOT_SUPPORTED). We therefore transcode
+# each clip to H.264 ONCE, on first view, into a `clips_web/` cache (faststart = instant streaming),
+# and serve that. Originals are left untouched for clipmotion/re-ID (cv2 reads mp4v fine). Needs
+# ffmpeg on PATH; without it we serve the original and the browser simply can't play it.
+# ---------------------------------------------------------------------------
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_transcode_guard = threading.Lock()
+_transcode_locks: dict = {}
+_codec_cache: dict = {}        # clip path -> video codec_name, so each clip is probed at most once
+
+
+def _is_h264(path: Path) -> bool:
+    """True if `path`'s video stream is already H.264 (browser-playable) -- new clips are recorded
+    this way, so they're served as-is and never re-transcoded. Probed once per path, then cached.
+    Without ffprobe we assume NOT h264 (so a legacy mp4v clip still gets transcoded)."""
+    if _FFPROBE is None:
+        return False
+    key = str(path)
+    if key not in _codec_cache:
+        try:
+            r = subprocess.run(
+                [_FFPROBE, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=15)
+            _codec_cache[key] = (r.stdout or "").strip()
+        except Exception:
+            _codec_cache[key] = ""
+    return _codec_cache[key] == "h264"
+
+
+def _lock_for(key: str) -> threading.Lock:
+    """One lock per output path, so concurrent range requests for the same clip transcode once."""
+    with _transcode_guard:
+        lk = _transcode_locks.get(key)
+        if lk is None:
+            lk = _transcode_locks[key] = threading.Lock()
+        return lk
+
+
+def _web_clip(src: Path, clips_root: Path, cache_root: Path):
+    """H.264 version of clip `src`, transcoded once into `cache_root` mirroring its path under
+    `clips_root`. Returns the cached Path, or None if it can't be made (no ffmpeg / transcode
+    failed) -- the caller then serves the original. Re-transcodes if the source is newer."""
+    if _FFMPEG is None:
+        return None
+    if _is_h264(src):
+        return src                         # already browser-playable (new clips) -> serve as-is
+    try:
+        rel = src.relative_to(clips_root)
+    except ValueError:
+        rel = Path(src.name)
+    out = cache_root / rel
+
+    def _fresh() -> bool:
+        try:
+            return out.stat().st_size > 0 and out.stat().st_mtime >= src.stat().st_mtime
+        except OSError:
+            return False
+
+    if _fresh():
+        return out
+    with _lock_for(str(out)):
+        if _fresh():                       # another thread may have just built it
+            return out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp.mp4")
+        try:
+            subprocess.run(
+                [_FFMPEG, "-y", "-loglevel", "error", "-i", str(src),
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(tmp)],
+                check=True, timeout=180,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            tmp.replace(out)               # atomic publish; partial reads never see a half file
+            return out
+        except Exception:                  # noqa: BLE001 -- bad ffmpeg/codec -> fall back to original
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return None
+
+
 def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBridge):
-    allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir)]
+    allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir)]
     stop_event = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
@@ -270,10 +393,38 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             if not any(_is_within(target, d) for d in allowed_dirs) or not target.is_file():
                 self._send(404, "text/plain", b"not found")
                 return
-            ext = target.suffix.lower()
-            ctype = ("image/jpeg" if ext in (".jpg", ".jpeg")
-                     else "image/png" if ext == ".png" else "application/octet-stream")
-            self._send(200, ctype, target.read_bytes(), {"Cache-Control": "max-age=86400"})
+            ctype = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            # Clips are recorded as mp4v (browser-undecodable); serve a cached H.264 transcode.
+            serve = target
+            if target.suffix.lower() == ".mp4":
+                clips_root = cfg.clips_dir.resolve()
+                if _is_within(target, clips_root):
+                    web_ver = _web_clip(target, clips_root, clips_root.parent / "clips_web")
+                    if web_ver is not None:
+                        serve = web_ver
+            size = serve.stat().st_size
+            rng = self.headers.get("Range")
+            if not rng:
+                # Whole file. Advertise Accept-Ranges so a <video> knows it can seek next time.
+                self._send(200, ctype, serve.read_bytes(),
+                           {"Cache-Control": "max-age=86400", "Accept-Ranges": "bytes"})
+                return
+            parsed = _parse_range(rng, size)
+            if parsed is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            start, end, open_ended = parsed
+            if open_ended:                          # serve a bounded chunk; the player asks for more
+                end = min(end, start + _RANGE_CHUNK - 1)
+            with open(serve, "rb") as f:
+                f.seek(start)
+                body = f.read(end - start + 1)
+            self._send(206, ctype, body, {
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Accept-Ranges": "bytes", "Cache-Control": "max-age=86400",
+            })
 
     server = ThreadingHTTPServer((cfg.web_host, cfg.web_port), Handler)
     server.daemon_threads = True
