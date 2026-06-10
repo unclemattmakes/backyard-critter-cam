@@ -152,6 +152,8 @@ All defaults live in `config.py`; these override them per-run:
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
 | `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
+| `--record-clips` | Record a short video clip around each visit (phase-4 behaviour capture; default off). |
+| `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
 | `--no-preview` | Headless; quit with Ctrl+C. |
 | `--no-classify` | Detection only — don't start the live species-naming helper. The rig launches it (and stops it) automatically by default; this turns that off. You can still fill species later with `python classify.py`. |
@@ -197,13 +199,75 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
 
 ---
 
+## Individual re-identification (phase 3)
+
+Two batch tools turn the accumulated crops into an **appearance** signal — *who does this
+look like?* — kept deliberately separate from behaviour (phase 4), per the plan. Run them
+after a species (raccoons first) has banked a few hundred readable crops.
+
+```powershell
+# 1. Embed: one MegaDescriptor appearance vector per readable raccoon crop -> detection_embeddings
+.\.venv\Scripts\python.exe embed.py --species raccoon          # GPU, resumable
+
+# 2. Re-ID: cluster the vectors into candidate individuals + write contact-sheet montages
+.\.venv\Scripts\python.exe reid.py --species raccoon           # -> reid/raccoon/cluster_*.jpg
+
+# Look at the montages, then name a cluster that's clearly one animal:
+.\.venv\Scripts\python.exe reid.py --name cluster_03 Notch     # sets individual_id on its crops
+
+# "Who else looks like this crop?" — the second-opinion lookup (cross-session, burst-filtered):
+.\.venv\Scripts\python.exe reid.py --neighbors 2765
+```
+
+- **Model:** [MegaDescriptor-L-384](https://huggingface.co/BVRA/MegaDescriptor-L-384) (the
+  wildlife re-ID foundation model), loaded via `timm`. Vectors are L2-normalized, so cosine
+  similarity is a dot product. The schema keys vectors by `model`, so a second embedder can be
+  added later without a migration.
+- **What works well:** near-duplicate / same-visit grouping is excellent (a lingering
+  raccoon's burst scores 0.97+), so clustering reliably collapses a visit, and the
+  neighbour lookup is a useful "second opinion."
+- **What it is *not*:** a push-button "name every raccoon" oracle. On whole-body crops with
+  an identical patio background, the embedding keys partly on **pose + background**, so
+  cross-session *same-individual* similarity (~0.5) overlaps with *different-individual*
+  similarity — there's no clean threshold that maps clusters straight to individuals. That's
+  by design: appearance is **one axis**, surfaced to *augment* your eye, not replace it (see
+  [PLAN.md](PLAN.md)). Hand-labelling the obvious clusters + the neighbour lookup is the
+  intended workflow; behaviour (phase 4) is the other axis.
+
+---
+
+## Behaviour clips (phase 4 capture)
+
+Stills capture *who* and *when*; a short **video clip** captures *how* — gait, approach speed,
+dwell, vigilance, who-defers-to-whom. That's the substance of behaviour, and a confound-robust
+second shot at individual ID (a limp reads the same from any angle, where a single still — pose
++ soft glass — does not). Opt-in, off by default:
+
+```powershell
+.\.venv\Scripts\python.exe backyard_cam.py --record-clips            # record a clip around each visit
+.\.venv\Scripts\python.exe backyard_cam.py --record-clips --clip-classes animal person   # also record yourself (test)
+```
+
+- A rolling **pre-roll buffer** means each clip opens on the animal *arriving* (the seconds
+  before the detector first fired); recording ends a few seconds after the last detection, or at
+  a safety cap so a camped-out raccoon can't make a giant file.
+- One `.mp4` per visit under `clips/<date>/`, plus a row in the **`clips`** table (time span,
+  fps, size, detection count) for later behaviour queries. Crops are still saved alongside.
+- All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes) live in
+  `config.py`; `clip_scale < 1.0` trims the in-RAM buffer and file size if memory is tight.
+- Make it permanent (incl. the family launchers) by setting `record_clips = True` in `config.py`.
+
+---
+
 ## Output
 
 ```
 backyard/
-  backyard.db          SQLite database (one row per detection)
+  backyard.db          SQLite database (one row per detection; clips in the clips table)
   crops/2026-06-07/    cropped detection JPEGs, foldered by date
   frames/2026-06-07/   full frames (only if --save-full-frame)
+  clips/2026-06-07/    behaviour video clips (only if --record-clips)
+  reid/raccoon/        re-ID contact-sheet montages (regenerated by reid.py)
 ```
 
 Crop filenames look like `2026-06-07T19-25-59-123_0_animal_0.94.jpg`
@@ -228,11 +292,16 @@ read off a window-side clock, but globally unambiguous and sortable.
 | `frame_w`, `frame_h` | Frame size, so a box stays interpretable / re-normalizable. |
 | `crop_path` | Path to the saved crop (relative to project root). Always set. |
 | `frame_path` | Full-frame path, or NULL. |
-| `species` | **NULL in V1.** Phase 2 (species classification) fills it. |
-| `individual_id` | **NULL in V1.** Phase 3 (re-identification) fills it. |
+| `species` | Phase 2 (species classification, `classify.py`) fills it. |
+| `individual_id` | Phase 3 (re-identification): set when you hand-label a cluster with `reid.py`. NULL until then. |
 
-A second table, **`detection_embeddings`** (keyed to `detections.id`), is created but never
-written to in V1 — it's the stub for phase-3 re-ID vectors.
+A second table, **`detection_embeddings`** (keyed to `detections.id`), holds the phase-3
+appearance vectors: `embed.py` writes one L2-normalized MegaDescriptor embedding per readable
+crop, keyed by `model`, and `reid.py` reads them back to cluster crops into individuals.
+
+A third table, **`clips`**, holds one row per recorded behaviour clip (`--record-clips`):
+`clip_path`, `started_at`/`ended_at`, `fps`, size, and detection count. A clip spans a time
+window on one `source`, so the detections captured during it join by timestamp — no FK needed.
 
 Example queries:
 
@@ -279,11 +348,14 @@ Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
 - **Phase 1 — Live capture skeleton:** ✅ this code.
 - **Phase 2 — Species ID:** classify the accumulated crops to fill `detections.species` (let
   a few days of crops pile up first; pick the current best wildlife classifier at build time).
-- **Phase 3 — Individual re-ID:** embed → cluster → hand-label ("Notch", "Gimpy"), per
-  species, **raccoons first** (mask / tail-rings / ear notches carry signal; crows barely do).
-- **Phase 4 — Behaviour + the disagreement alert:** per-individual arrival windows,
-  co-occurrence, dwell time. The payoff is a **two-axis readout** — appearance match score
-  *next to* behaviour fit — that flags "looks like X but isn't acting like X."
+- **Phase 3 — Individual re-ID:** ⚙️ tooling built (`embed.py` → `reid.py`): embed → cluster →
+  hand-label ("Notch", "Gimpy"), per species, **raccoons first**. Same-visit grouping is
+  strong; confident *cross-session* individual ID from appearance alone is not (background +
+  pose dominate) — so it's a labelling assistant + second opinion, paired with phase-4 behaviour.
+- **Phase 4 — Behaviour + the disagreement alert:** ⚙️ capture started (`--record-clips` banks
+  short videos per visit; see above). Next: per-individual arrival windows, co-occurrence, dwell
+  time, and gait. The payoff is a **two-axis readout** — appearance match score *next to*
+  behaviour fit — that flags "looks like X but isn't acting like X."
 - **Later — trail-cam batch importer:** `source='trail_cam_sd'`, same pipeline downstream.
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —

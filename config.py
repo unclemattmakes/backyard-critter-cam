@@ -153,6 +153,30 @@ class Config:
     web_port: int = 8000
     web_jpeg_quality: int = 80   # JPEG quality for the live stream (lighter than saved crops).
 
+    # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
+    # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
+    # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust
+    # second shot at individual ID: a limp reads the same from any angle). OPT-IN: off by default
+    # so the family one-click rig's disk behaviour doesn't change until you ask for it. The
+    # recorder keeps a rolling pre-roll buffer so a clip includes the animal ARRIVING, then writes
+    # until clip_post_roll_s after the last detection (or the clip_max_s safety cap). Stills are
+    # still saved alongside -- clips are additive, and the crops still feed species ID.
+    record_clips: bool = False          # turn on with this or --record-clips
+    clips_dir: Path = ROOT / "clips"
+    # Which detector classes START/extend a clip. None = same as save_classes (animals), so a
+    # person at the glass is boxed live but never recorded. Decoupled from save_classes on
+    # purpose: set ("animal", "person") to also capture human approaches WITHOUT saving person
+    # crops -- which is exactly how you test the recorder yourself (walk by, no DB selfie).
+    clip_classes: tuple[str, ...] | None = None
+    clip_pre_roll_s: float = 3.0        # seconds of buffered pre-detection footage to prepend
+    clip_post_roll_s: float = 3.0       # keep recording this long after the last detection
+    clip_max_s: float = 60.0            # hard cap: a camped-out raccoon can't make a giant file
+    clip_fps: float | None = None       # None = measure the live capture rate; or force a value
+    # 0 < scale <= 1: downscale recorded frames. 1.0 = full resolution. Lower (e.g. 0.5) cuts BOTH
+    # the in-RAM pre-roll buffer (~Nx720p frames) and the file size; bump down if memory is tight.
+    clip_scale: float = 1.0
+    clip_codec: str = "mp4v"            # OpenCV fourcc; 'mp4v' -> .mp4, works on Windows w/o extra dlls
+
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
     # The live rig names each new crop by species ITSELF, in a background thread, so a single
     # process -- and a single window -- does both detection and naming. That's the whole reason

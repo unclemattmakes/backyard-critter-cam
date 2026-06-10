@@ -24,6 +24,7 @@ from pathlib import Path
 
 import cv2
 
+import clips
 import config
 import daynight
 import db
@@ -341,7 +342,8 @@ def draw_detections(frame, detections: list[Detection]) -> None:
 
 
 def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
-             saved: int, source: str, model: str, period: str | None = None) -> None:
+             saved: int, source: str, model: str, period: str | None = None,
+             recording: bool = False) -> None:
     lines = [
         f"{source}  |  {model}" + (f"  |  {period}" if period else ""),
         f"FPS {fps:4.1f}   motion {int(motion_area):>6} px   saved {saved}",
@@ -352,8 +354,11 @@ def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
         cv2.putText(frame, text, (10, y), FONT, 0.55, (0, 0, 0), 3, cv2.LINE_AA)      # shadow
         cv2.putText(frame, text, (10, y), FONT, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         y += 24
-    if motion:  # red "recording motion" dot, top-right
+    if motion:  # red "motion" dot, top-right
         cv2.circle(frame, (frame.shape[1] - 20, 20), 8, (0, 0, 255), -1)
+    if recording:  # "REC" tag under the motion dot while a behaviour clip is being written
+        cv2.putText(frame, "REC", (frame.shape[1] - 52, 48), FONT, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, "REC", (frame.shape[1] - 52, 48), FONT, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
 
 
 # ---- Naming subprocess ------------------------------------------------------------
@@ -408,6 +413,8 @@ def run(cfg: config.Config) -> None:
     cfg.crops_dir.mkdir(parents=True, exist_ok=True)
     if cfg.save_full_frame:
         cfg.frames_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.record_clips:
+        cfg.clips_dir.mkdir(parents=True, exist_ok=True)
 
     conn = db.connect(cfg.db_path)
 
@@ -496,6 +503,15 @@ def run(cfg: config.Config) -> None:
                   f"(detection still works): {e}\n")
             classify_proc = None
 
+    # Optional behaviour-clip recorder (phase 4 capture): records a short video around each
+    # visit. Off unless cfg.record_clips / --record-clips. Lives in this (capture) thread.
+    recorder = clips.ClipRecorder(cfg, conn) if cfg.record_clips else None
+    clip_trigger = cfg.clip_classes or cfg.save_classes   # which classes start a clip
+    if recorder is not None:
+        print(f"  behaviour clips: ON -- recording short videos to {_rel(cfg.clips_dir)}/ "
+              f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, "
+              f"cap {cfg.clip_max_s:g}s; triggers on {', '.join(clip_trigger)}).\n")
+
     gate = MotionGate(cfg)
     last_detect_t = 0.0          # monotonic time of last detector run (for rate limiting)
     last_dets: list[Detection] = []
@@ -557,6 +573,10 @@ def run(cfg: config.Config) -> None:
             motion_area = gate.update(frame)
             motion = (frame_count > MOTION_WARMUP_FRAMES) and (motion_area > cfg.motion_min_area)
 
+            # --- Behaviour clip: buffer pre-roll every frame; write + auto-stop while recording ---
+            if recorder is not None:
+                recorder.note_frame(frame, now, loop_fps=fps)
+
             # --- Detector (only on motion, rate-limited) ---
             if motion and (now - last_detect_t) >= cfg.detector_min_interval_s:
                 last_detect_t = now
@@ -568,6 +588,13 @@ def run(cfg: config.Config) -> None:
 
                 if dets:
                     last_dets, last_dets_t = dets, now
+                    saved_dets = [d for d in dets if d.class_name in cfg.save_classes]
+                    # Clips trigger on clip_trigger (default = save_classes), independent of what
+                    # gets cropped -- so a person can record a test clip without a DB selfie.
+                    if recorder is not None:
+                        clip_dets = [d for d in dets if d.class_name in clip_trigger]
+                        if clip_dets:
+                            recorder.note_detection(now, clip_dets)
                     dt = datetime.now().astimezone()
                     iso = dt.isoformat()
                     day = dt.strftime("%Y-%m-%d")
@@ -578,7 +605,7 @@ def run(cfg: config.Config) -> None:
                         fp = save_frame(frame, cfg, day, stamp)
                         frame_path = _rel(fp) if fp else None
 
-                    for i, det in enumerate(d for d in dets if d.class_name in cfg.save_classes):
+                    for i, det in enumerate(saved_dets):
                         crop = save_crop(frame, det, cfg, day, stamp, i)
                         if crop is None:
                             continue
@@ -605,7 +632,8 @@ def run(cfg: config.Config) -> None:
                 draw_detections(disp, show)
                 draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion,
                          saved=total_saved, source=cfg.source, model=cfg.model_version,
-                         period=active_period)
+                         period=active_period,
+                         recording=recorder is not None and recorder.recording)
                 if server is not None:
                     ok_enc, buf = cv2.imencode(".jpg", disp,
                                                [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
@@ -624,6 +652,8 @@ def run(cfg: config.Config) -> None:
     except KeyboardInterrupt:
         print("\nInterrupted -- shutting down.")
     finally:
+        if recorder is not None:
+            recorder.finalize()                     # flush any clip that was mid-record (writes its DB row)
         _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
         if server is not None:
             web.shutdown(server)
@@ -633,7 +663,8 @@ def run(cfg: config.Config) -> None:
             pass
         cv2.destroyAllWindows()
         conn.close()
-        print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.")
+        clips_note = f"  Recorded {recorder.clips_saved} clip(s)." if recorder is not None else ""
+        print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.{clips_note}")
 
 
 # ---- CLI ---------------------------------------------------------------------------
@@ -664,6 +695,15 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     p.add_argument("--frames-dir", default=str(c.frames_dir))
     p.add_argument("--save-full-frame", action="store_true", default=c.save_full_frame,
                    help="Also save the full frame for each detection event (default off).")
+    p.add_argument("--record-clips", action="store_true", default=c.record_clips,
+                   help="Record a short video clip around each visit (phase-4 behaviour capture; "
+                        "default off). Crops are still saved alongside.")
+    p.add_argument("--clips-dir", default=str(c.clips_dir),
+                   help="Where behaviour clips are written (with --record-clips).")
+    p.add_argument("--clip-classes", nargs="+", default=None,
+                   metavar="CLASS", choices=["animal", "person", "vehicle"],
+                   help="Detector classes that trigger a clip (default: same as saved = animal). "
+                        "e.g. --clip-classes animal person to also record yourself as a test.")
     p.add_argument("--no-preview", action="store_true",
                    help="Run headless (no window). Quit with Ctrl+C.")
     p.add_argument("--no-classify", dest="classify_live", action="store_false",
@@ -699,6 +739,9 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         crops_dir=Path(args.crops_dir),
         frames_dir=Path(args.frames_dir),
         save_full_frame=args.save_full_frame,
+        record_clips=args.record_clips,
+        clips_dir=Path(args.clips_dir),
+        clip_classes=tuple(args.clip_classes) if args.clip_classes else c.clip_classes,
         show_preview=not args.no_preview,
         visit_gap_minutes=args.visit_gap_min,
         serve=args.serve,

@@ -99,6 +99,28 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_detection ON detection_embeddings(dete
 --   );
 -- plus a detections.visit_id FK assigned by a collapsing pass. (Counting crows also needs
 -- co-occurrence -- who arrived together -- see PLAN.md phase 4.)
+
+-- Phase 4 CAPTURE: one short VIDEO clip recorded around a visit (clips.py / --record-clips).
+-- Stills say WHO/WHEN; a clip says HOW (gait, approach, dwell, co-occurrence) -- the substance
+-- of behaviour, and a confound-robust second shot at individual ID via motion. A clip spans
+-- [started_at, ended_at] on one `source`, so the detections written during that window join to
+-- it by time -- no FK needed yet. This is a real, populated table (unlike the visits sketch
+-- above), but it stays lean: behaviour ANALYSIS reads the clips later, off the live path.
+CREATE TABLE IF NOT EXISTS clips (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT    NOT NULL,   -- which rig recorded it (matches detections.source).
+    clip_path       TEXT    NOT NULL,   -- path to the saved .mp4 (relative to project root).
+    started_at      TEXT    NOT NULL,   -- local ISO 8601 w/ offset, like detections.timestamp.
+    ended_at        TEXT,               -- set when the clip is finalized (NULL if cut off mid-write).
+    fps             REAL,               -- playback rate written into the file (measured live rate).
+    width           INTEGER,
+    height          INTEGER,
+    frame_count     INTEGER,            -- frames written (pre-roll + live + post-roll).
+    detection_count INTEGER,            -- detector hits during the clip (rough "how busy").
+    max_confidence  REAL                -- best detector score in the clip (a usability proxy).
+);
+CREATE INDEX IF NOT EXISTS idx_clips_started ON clips(started_at);
+CREATE INDEX IF NOT EXISTS idx_clips_source  ON clips(source);
 """
 
 
@@ -167,6 +189,28 @@ def insert_detection(
     return int(cur.lastrowid)
 
 
+def insert_clip(conn: sqlite3.Connection, *, source: str, clip_path: str, started_at: str,
+                ended_at: Optional[str], fps: Optional[float], width: Optional[int],
+                height: Optional[int], frame_count: int, detection_count: int,
+                max_confidence: Optional[float]) -> int:
+    """Phase 4: record one behaviour clip's metadata; returns its new id."""
+    cur = conn.execute(
+        """
+        INSERT INTO clips (source, clip_path, started_at, ended_at, fps, width, height,
+                           frame_count, detection_count, max_confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (source, clip_path, started_at, ended_at,
+         None if fps is None else float(fps),
+         None if width is None else int(width),
+         None if height is None else int(height),
+         int(frame_count), int(detection_count),
+         None if max_confidence is None else float(max_confidence)),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the original schema (keeps existing DBs current)."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(detections)")}
@@ -203,3 +247,90 @@ def correct_species(conn: sqlite3.Connection, detection_id: int, species: str) -
         (species, int(detection_id)),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 -- re-identification: appearance embeddings + individual labels.
+#
+# embed.py writes one L2-normalized appearance vector per readable crop into
+# detection_embeddings (keyed by `model`, so a second embedder can be added later without a
+# migration). reid.py reads them back as a matrix to cluster crops into individuals; once a
+# cluster is named, individual_id is written onto the member detections. Counting stays in
+# crops here -- VISIT collapsing (PLAN.md phase 4) needs individual_id first, which is exactly
+# what this produces.
+# ---------------------------------------------------------------------------
+
+def insert_embedding(conn: sqlite3.Connection, detection_id: int, model: str, dim: int,
+                     embedding: bytes, created_at: Optional[str] = None) -> None:
+    """Store one appearance vector for a detection. `embedding` is raw float32 bytes (already
+    L2-normalized, so a dot product between two vectors is their cosine similarity). Replaces
+    any existing vector for the same (detection, model) so a --redo run is idempotent."""
+    conn.execute(
+        "DELETE FROM detection_embeddings WHERE detection_id = ? AND model = ?",
+        (int(detection_id), model),
+    )
+    conn.execute(
+        "INSERT INTO detection_embeddings (detection_id, model, dim, embedding, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (int(detection_id), model, int(dim), embedding, created_at or now_local_iso()),
+    )
+
+
+def embedded_ids(conn: sqlite3.Connection, model: str) -> set[int]:
+    """Detection ids that already have a vector for `model` -- lets embed.py skip them (resumable)."""
+    return {r[0] for r in conn.execute(
+        "SELECT detection_id FROM detection_embeddings WHERE model = ?", (model,))}
+
+
+def fetch_for_embedding(conn: sqlite3.Connection, model: str, *, species: Optional[str],
+                        min_confidence: float, redo: bool, limit: int = 0):
+    """Animal crops that should get an appearance vector: above the usability gate, optionally
+    restricted to one species. Unless --redo, rows already embedded for `model` are skipped."""
+    where = "detection_class = 'animal' AND confidence >= ?"
+    params: list = [min_confidence]
+    if species:
+        where += " AND species = ?"
+        params.append(species)
+    rows = conn.execute(
+        f"SELECT id, crop_path FROM detections WHERE {where} ORDER BY id", params
+    ).fetchall()
+    if not redo:
+        done = embedded_ids(conn, model)
+        rows = [r for r in rows if r[0] not in done]
+    return rows[:limit] if limit else rows
+
+
+def load_embeddings(conn: sqlite3.Connection, model: str, *, species: Optional[str] = None,
+                    min_confidence: float = 0.0):
+    """Read back every stored vector for `model` (optionally one species / confidence gate),
+    joined to the detection metadata reid.py needs. Returns a list of sqlite3.Row with
+    columns: id, crop_path, confidence, species, individual_id, timestamp, embedding (bytes)."""
+    where = "e.model = ? AND d.detection_class = 'animal' AND d.confidence >= ?"
+    params: list = [model, min_confidence]
+    if species:
+        where += " AND d.species = ?"
+        params.append(species)
+    return conn.execute(
+        f"""SELECT d.id, d.crop_path, d.confidence, d.species, d.individual_id, d.timestamp,
+                   e.embedding
+            FROM detection_embeddings e JOIN detections d ON d.id = e.detection_id
+            WHERE {where} ORDER BY d.id""",
+        params,
+    ).fetchall()
+
+
+def set_individual(conn: sqlite3.Connection, detection_id: int,
+                   individual_id: Optional[str]) -> None:
+    """Phase 3: assign (or clear, with None) the individual a crop belongs to."""
+    conn.execute("UPDATE detections SET individual_id = ? WHERE id = ?",
+                 (individual_id, int(detection_id)))
+    conn.commit()
+
+
+def set_individual_bulk(conn: sqlite3.Connection, detection_ids: Sequence[int],
+                        individual_id: Optional[str]) -> int:
+    """Assign one individual to many crops at once (naming a whole cluster). Returns the count."""
+    conn.executemany("UPDATE detections SET individual_id = ? WHERE id = ?",
+                     [(individual_id, int(i)) for i in detection_ids])
+    conn.commit()
+    return len(detection_ids)

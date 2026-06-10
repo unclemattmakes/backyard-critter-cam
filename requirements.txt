@@ -18,3 +18,8 @@ astral>=3.2
 # Species classifier (classify.py): BioCLIP 2 zero-shot. NOTE the PyPI distribution is named
 # `pybioclip` but it imports as `bioclip`. Reuses the separately-installed cu130 torch (header).
 pybioclip>=2.1
+# Phase 3 re-identification. embed.py loads MegaDescriptor (the wildlife re-ID foundation model)
+# through timm; reid.py clusters the resulting vectors with scipy's hierarchical clustering.
+# Both reuse the cu130 torch / numpy / pillow already present (timm is also a pybioclip dep).
+timm>=1.0
+scipy>=1.13

@@ -16,6 +16,10 @@ env/
 crops/
 frames/
 tuning/
+# reid.py contact-sheet montages (regenerated from the embeddings on demand)
+reid/
+# behaviour clips (phase-4 video capture; large/binary, --record-clips)
+clips/
 
 # ===== Model weights (auto-download from Zenodo on first run) =====
 weights/
