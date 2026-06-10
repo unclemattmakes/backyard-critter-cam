@@ -540,6 +540,33 @@ function renderLatest(d){
       <div class="latest-when"><span>${esc(timeAgo(d.timestamp))}</span>${conf!=null?`<span class="dot">·</span><span class="conf">~${Math.round(conf*100)}%</span>`:''}</div>
     </div>`;
   el.onclick = d.species ? ()=>{ show('cat'); openSheet(d.species); } : null;
+  flagLatest(d, el);   // async: appends an "off-pattern hour" chip only when behaviour disagrees
+}
+/* Live two-axis awareness (species level): if the most recent visitor arrived OUTSIDE its
+   species' typical window, say so right on the card. Quiet when everything fits — the
+   disagreement is the information (PLAN.md). Windows come from /api/behavior, cached 5 min. */
+let __bwinCache=null, __bwinAt=0;
+async function behaviorWindows(){
+  if(__bwinCache && Date.now()-__bwinAt<300000) return __bwinCache;
+  try{
+    const d=await fetch('/api/behavior').then(r=>r.json());
+    const m={}; (d.species||[]).forEach(s=>{ if(s.typical_window && s.n_visits>=3) m[s.species]=s.typical_window; });
+    __bwinCache=m; __bwinAt=Date.now(); return m;
+  }catch(e){ return __bwinCache||{}; }
+}
+function hourInWin(h,w){ return w.start_hour<=w.end_hour ? (h>=w.start_hour&&h<=w.end_hour) : (h>=w.start_hour||h<=w.end_hour); }
+async function flagLatest(d,el){
+  try{
+    if(!d||!d.species||!d.timestamp) return;
+    const wins=await behaviorWindows(); const w=wins[d.species]; if(!w) return;
+    const h=new Date(d.timestamp).getHours();
+    if(isNaN(h)||hourInWin(h,w)) return;
+    const info=el.querySelector('.latest-info'); if(!info||info.querySelector('.offpat')) return;
+    const f=document.createElement('div'); f.className='offpat';
+    f.style.cssText='margin-top:8px;font-size:12px;color:#d9a441;border:1px solid rgba(217,164,65,.4);border-radius:4px;padding:4px 8px;display:inline-block';
+    f.textContent=`⚑ off-pattern hour — ${nameOf(d.species)} usually ${String(w.start_hour).padStart(2,'0')}–${String(w.end_hour).padStart(2,'0')}h`;
+    info.appendChild(f);
+  }catch(e){ /* a missing chip is never worth breaking the live card */ }
 }
 function card(x,rank){
   const latin=latinOf(x.species);
