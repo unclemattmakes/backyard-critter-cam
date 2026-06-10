@@ -28,6 +28,9 @@ if that's too much.
 """
 from __future__ import annotations
 
+import argparse
+import shutil
+import subprocess
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +43,59 @@ import db
 # Upper bound assumed for sizing the pre-roll ring (frames = pre_roll_s * this). The real fps is
 # measured for playback; this only bounds the buffer so memory can't grow without limit.
 _RING_FPS_CAP = 30
+
+# H.264 (libx264) encode settings for the ffmpeg-pipe writer -- matched to web.py's transcode so
+# clips recorded here look identical to transcoded ones. 'veryfast' is far quicker than the live
+# capture rate (no backpressure at 720p/~10-15 fps); '-bf 0' keeps the written frame count exact.
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_X264_PRESET = "veryfast"
+_X264_CRF = "23"
+_H264_ALIASES = {"h264", "libx264", "avc1", "x264"}
+
+
+class _FfmpegWriter:
+    """A cv2.VideoWriter-compatible sink that pipes raw BGR frames to ffmpeg -> H.264 .mp4.
+
+    Why: OpenCV can only reliably WRITE 'mp4v' (MPEG-4 Part 2) on this rig, which browsers can't
+    decode; libx264 plays in any <video>, is ~half the size, and cv2 still READS it for clipmotion.
+    Same three-method surface as cv2.VideoWriter (isOpened / write / release) so the recorder
+    doesn't care which one it's using. '+faststart' moves the moov atom to the front on close so
+    the dashboard can stream the clip immediately."""
+
+    def __init__(self, path: Path, fps: float, size: tuple[int, int]):
+        w, h = size
+        self.proc = subprocess.Popen(
+            [_FFMPEG, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{max(1.0, fps):.6f}",
+             "-i", "-", "-an", "-c:v", "libx264", "-preset", _X264_PRESET, "-crf", _X264_CRF,
+             "-bf", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._ok = self.proc.stdin is not None
+
+    def isOpened(self) -> bool:
+        return self._ok and self.proc.poll() is None
+
+    def write(self, frame) -> None:
+        try:
+            self.proc.stdin.write(frame.tobytes())     # frame is a C-contiguous BGR uint8 ndarray
+        except (BrokenPipeError, OSError, ValueError):
+            self._ok = False                            # ffmpeg died -> recorder drops the clip
+
+    def release(self) -> None:
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=30)                  # let ffmpeg flush + write the moov atom
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
 
 def _rel(path: Path) -> str:
@@ -76,6 +132,12 @@ def prune_clips(cfg: config.Config, conn) -> int:
             continue                           # in use / already gone -- try the next one
         total -= sz
         removed += 1
+        # Drop the browser transcode (clips_web mirror) too, so the web cache never outlives its
+        # clip -- it stays inside the same rolling budget and is regenerated on demand if needed.
+        try:
+            (cfg.clips_dir.parent / "clips_web" / p.relative_to(cfg.clips_dir)).unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
         try:
             conn.execute("DELETE FROM clips WHERE clip_path = ?", (_rel(p),))
             conn.commit()
@@ -85,6 +147,72 @@ def prune_clips(cfg: config.Config, conn) -> int:
         print(f"[clips] pruned {removed} oldest clip(s) to stay under "
               f"{cfg.clips_max_gb:g} GB (rolling window).")
     return removed
+
+
+def _video_codec(path: Path) -> str:
+    """Video stream codec_name via ffprobe ('' if unknown / ffprobe missing)."""
+    if _FFPROBE is None:
+        return ""
+    try:
+        r = subprocess.run(
+            [_FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def convert_legacy_to_h264(clips_dir: Path, *, verbose: bool = True) -> dict:
+    """One-time migration: re-encode every non-H.264 clip under `clips_dir` to H.264 IN PLACE, so it
+    plays in a browser without the dashboard's on-demand transcode. Clips recorded before clip_codec
+    defaulted to 'h264' are mp4v; so are any recorded during an ffmpeg-less stretch (the cv2 fallback)
+    -- this fixes both. Idempotent (already-H.264 clips are skipped) and atomic (encode to a temp
+    file, then swap), so an interrupted run never corrupts a clip. Frame count / fps / dimensions are
+    preserved, so the clips DB rows -- keyed on the unchanged clip_path -- stay valid (no DB write).
+    Needs ffmpeg + ffprobe on PATH. Returns {converted, skipped, failed, saved_bytes}."""
+    res = {"converted": 0, "skipped": 0, "failed": 0, "saved_bytes": 0}
+    if _FFMPEG is None or _FFPROBE is None:
+        print("[clips] ffmpeg/ffprobe not on PATH -- cannot convert clips to H.264.")
+        return res
+    if not clips_dir.exists():
+        print(f"[clips] no clips directory at {clips_dir}.")
+        return res
+    for p in sorted(clips_dir.rglob("*.mp4")):
+        if p.name.endswith(".tmp.mp4"):
+            continue                            # a leftover temp from an interrupted run -- ignore
+        if _video_codec(p) == "h264":
+            res["skipped"] += 1
+            continue
+        tmp = p.with_suffix(".h264.tmp.mp4")
+        before = p.stat().st_size
+        try:
+            subprocess.run(
+                [_FFMPEG, "-y", "-loglevel", "error", "-i", str(p), "-an", "-c:v", "libx264",
+                 "-preset", _X264_PRESET, "-crf", _X264_CRF, "-pix_fmt", "yuv420p",
+                 "-movflags", "+faststart", str(tmp)],
+                check=True, timeout=600, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                raise RuntimeError("ffmpeg produced an empty file")
+            after = tmp.stat().st_size
+            tmp.replace(p)                      # atomic in-place swap; clip_path is unchanged
+            res["converted"] += 1
+            res["saved_bytes"] += max(0, before - after)
+            if verbose:
+                print(f"  converted {p.name}  ({before / 1e6:.1f} -> {after / 1e6:.1f} MB)")
+        except Exception as e:  # noqa: BLE001 -- original is untouched (we swap only on success)
+            res["failed"] += 1
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print(f"  [clips] failed to convert {p.name}: {e}")
+    if verbose:
+        print(f"[clips] H.264 conversion: {res['converted']} converted, "
+              f"{res['skipped']} already H.264"
+              + (f", {res['failed']} failed" if res["failed"] else "")
+              + f"  (freed {res['saved_bytes'] / 1e6:.0f} MB).")
+    return res
 
 
 class ClipRecorder:
@@ -103,6 +231,14 @@ class ClipRecorder:
         self.post_roll = max(0.0, cfg.clip_post_roll_s)
         self.max_s = max(1.0, cfg.clip_max_s)
         self.codec = cfg.clip_codec
+        # 'h264' -> pipe to ffmpeg (browser-playable). If ffmpeg is missing we fall back to the
+        # OpenCV mp4v writer so recording still works (the dashboard transcodes those on demand).
+        want_h264 = str(cfg.clip_codec).lower() in _H264_ALIASES
+        self.use_ffmpeg = want_h264 and _FFMPEG is not None
+        self.cv2_codec = "mp4v" if want_h264 else str(cfg.clip_codec)
+        if want_h264 and _FFMPEG is None:
+            print("[clips] ffmpeg not found on PATH -- recording mp4v instead of H.264 "
+                  "(clips still record; the dashboard will transcode them for playback).")
         ring_len = max(1, int(self.pre_roll * _RING_FPS_CAP) + 5)
         self.ring: deque = deque(maxlen=ring_len)
 
@@ -198,13 +334,26 @@ class ClipRecorder:
         for _t, f in list(self.ring):
             self._write(f)
 
+    def _open_writer(self, w: int, h: int):
+        """Open the clip sink: an ffmpeg/H.264 pipe when configured + available, else cv2's mp4v
+        writer. Returns the writer, or None if it couldn't be opened (caller disables recording)."""
+        if self.use_ffmpeg:
+            try:
+                wr = _FfmpegWriter(self.clip_path, self.fps, (w, h))
+                if wr.isOpened():
+                    return wr
+            except Exception as e:  # noqa: BLE001 -- fall back to cv2 rather than lose the clip
+                print(f"[clips] ffmpeg writer failed ({e}); falling back to OpenCV mp4v.")
+            self.use_ffmpeg = False                 # don't retry ffmpeg for the rest of the run
+        return cv2.VideoWriter(str(self.clip_path), cv2.VideoWriter_fourcc(*self.cv2_codec),
+                               self.fps, (w, h))
+
     def _write(self, frame) -> None:
         if self.writer is None:
             h, w = frame.shape[:2]
             self.size = (w, h)
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            writer = cv2.VideoWriter(str(self.clip_path), fourcc, self.fps, (w, h))
-            if not writer.isOpened():
+            writer = self._open_writer(w, h)
+            if writer is None or not writer.isOpened():
                 print(f"[clips] could not open a video writer ('{self.codec}' codec) -- "
                       f"disabling clip recording for this run.")
                 self.disabled = True
@@ -227,7 +376,11 @@ class ClipRecorder:
                 pass
         self.writer = None
 
-        if self.frame_count > 0 and self.clip_path is not None:
+        # A finalized clip must have frames AND a non-empty file on disk -- if ffmpeg died mid-write
+        # the pipe writer leaves a 0-byte/missing file, which we drop rather than log a dead row.
+        wrote_file = (self.clip_path is not None and self.clip_path.exists()
+                      and self.clip_path.stat().st_size > 0)
+        if self.frame_count > 0 and wrote_file:
             rel = _rel(self.clip_path)
             ended = datetime.now().astimezone().isoformat()
             w, h = self.size if self.size else (None, None)
@@ -250,3 +403,23 @@ class ClipRecorder:
                     self.clip_path.unlink()
             except Exception:
                 pass
+
+
+def main() -> int:
+    """Clip maintenance CLI. Currently: migrate legacy mp4v clips to browser-playable H.264."""
+    p = argparse.ArgumentParser(description="Behaviour-clip maintenance utilities.")
+    p.add_argument("--to-h264", action="store_true",
+                   help="Re-encode legacy mp4v clips in --clips-dir to H.264 in place "
+                        "(browser-playable; idempotent; preserves the clips DB rows).")
+    p.add_argument("--clips-dir", default=str(config.CONFIG.clips_dir),
+                   help="Clips directory to operate on (default: config.clips_dir).")
+    args = p.parse_args()
+    if args.to_h264:
+        convert_legacy_to_h264(Path(args.clips_dir))
+        return 0
+    p.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

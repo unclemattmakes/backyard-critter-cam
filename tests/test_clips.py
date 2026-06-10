@@ -17,6 +17,8 @@ decodable .mp4 (reopened with cv2.VideoCapture, frames counted). cv2 + numpy are
 from __future__ import annotations
 
 import dataclasses
+import shutil
+import subprocess
 
 import cv2
 import numpy as np
@@ -229,6 +231,81 @@ def test_finalize_is_safe_when_not_recording(clip_cfg, clip_conn):
     rec.finalize()             # never recorded
     rec.finalize()             # again
     assert _count_clip_rows(clip_conn) == 0
+
+
+# --- H.264 recording (browser-playable, via the ffmpeg pipe) ----------------------------
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_records_browser_playable_h264(clip_cfg, clip_conn):
+    """With clip_codec='h264' the recorder pipes frames to ffmpeg and writes a real H.264 .mp4 --
+    browser-playable, exact frame count, and still cv2-decodable for clipmotion."""
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    assert rec.use_ffmpeg is True
+    rec.note_detection(now=0.0, detections=[FakeDetection(0.9)])
+    n_live = 8
+    for i in range(n_live):
+        rec.note_detection(now=i * 0.1, detections=[FakeDetection(0.6)])  # keep alive
+        rec.note_frame(_frame(), now=i * 0.1, loop_fps=15.0)
+    clip_path = rec.clip_path
+    rec.finalize()
+
+    assert _count_clip_rows(clip_conn) == 1
+    assert clip_path.exists() and clip_path.stat().st_size > 0
+    codec = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=codec_name", "-of", "default=nw=1:nk=1", str(clip_path)],
+        capture_output=True, text=True).stdout.strip()
+    assert codec == "h264"                     # NOT mp4v -> plays in a browser <video>
+    assert _decode_frame_count(clip_path) == n_live   # cv2 still reads it (clipmotion path)
+
+
+def test_h264_falls_back_to_mp4v_without_ffmpeg(clip_cfg, clip_conn, monkeypatch):
+    """If ffmpeg isn't available, clip_codec='h264' degrades to the cv2 mp4v writer rather than
+    failing to record -- the dashboard transcodes those for playback."""
+    monkeypatch.setattr(clips, "_FFMPEG", None)
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    assert rec.use_ffmpeg is False and rec.cv2_codec == "mp4v"
+    rec.note_detection(now=0.0, detections=[FakeDetection(0.9)])
+    for i in range(5):
+        rec.note_detection(now=i * 0.1, detections=[FakeDetection(0.6)])
+        rec.note_frame(_frame(), now=i * 0.1, loop_fps=15.0)
+    rec.finalize()
+    assert _count_clip_rows(clip_conn) == 1
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg/ffprobe not on PATH")
+def test_convert_legacy_mp4v_to_h264_in_place(clip_cfg, clip_conn):
+    """convert_legacy_to_h264 re-encodes an mp4v clip to H.264 in place (same path), preserves the
+    frame count, and is idempotent (a second pass skips the now-H.264 file)."""
+    cfg = dataclasses.replace(clip_cfg, clip_codec="mp4v")
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    assert rec.use_ffmpeg is False                         # records mp4v to start
+    rec.note_detection(now=0.0, detections=[FakeDetection(0.9)])
+    for i in range(6):
+        rec.note_detection(now=i * 0.1, detections=[FakeDetection(0.6)])
+        rec.note_frame(_frame(), now=i * 0.1, loop_fps=15.0)
+    clip_path = rec.clip_path
+    rec.finalize()
+
+    def codec(p):
+        return subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name", "-of", "default=nw=1:nk=1", str(p)],
+            capture_output=True, text=True).stdout.strip()
+
+    assert codec(clip_path) != "h264"
+    n_before = _decode_frame_count(clip_path)
+
+    res = clips.convert_legacy_to_h264(cfg.clips_dir, verbose=False)
+    assert res["converted"] == 1 and res["skipped"] == 0
+    assert clip_path.exists() and codec(clip_path) == "h264"   # converted in place, same path
+    assert _decode_frame_count(clip_path) == n_before          # frame count preserved
+
+    res2 = clips.convert_legacy_to_h264(cfg.clips_dir, verbose=False)
+    assert res2["converted"] == 0 and res2["skipped"] == 1     # idempotent
 
 
 def test_detection_count_and_max_conf_tracked(clip_cfg, clip_conn):

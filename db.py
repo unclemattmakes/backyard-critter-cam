@@ -62,7 +62,12 @@ CREATE TABLE IF NOT EXISTS detections (
     species_verified    INTEGER,        -- Human review via dashboard: NULL = unreviewed, 1 = confirmed, 0 = wrong.
     species_source      TEXT,           -- 'bioclip' (auto) or 'human' (corrected in the dashboard).
     individual_id       TEXT,           -- NULLABLE. Phase 3 (re-identification) fills this. NULL until phase 3.
-    visit_id            INTEGER         -- Phase 4: which visit (visits.id) this crop belongs to; stamped by visits.py.
+    visit_id            INTEGER,        -- Phase 4: which visit (visits.id) this crop belongs to; stamped by visits.py.
+
+    -- "How good a shot is this?" Image-derived (sharpness x night-eyeshine boost; see quality.py),
+    -- so the dashboard can lead a visit with its CUTEST/sharpest frame, not just the most confident
+    -- one. NULL until scored (live at capture time, or backfilled by `python quality.py`).
+    crop_quality        REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_timestamp  ON detections(timestamp);
@@ -202,6 +207,7 @@ def insert_detection(
     frame_path: Optional[str] = None,
     species: Optional[str] = None,       # Left NULL in V1.
     individual_id: Optional[str] = None,  # Left NULL in V1.
+    crop_quality: Optional[float] = None,  # Image-derived shot quality (quality.py); NULL if unscored.
 ) -> int:
     """Insert one detection row; returns its new id."""
     x1, y1, x2, y2 = bbox
@@ -210,13 +216,14 @@ def insert_detection(
         INSERT INTO detections (
             timestamp, source, detection_class, confidence,
             bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h,
-            crop_path, frame_path, species, individual_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            crop_path, frame_path, species, individual_id, crop_quality
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             timestamp, source, detection_class, float(confidence),
             float(x1), float(y1), float(x2), float(y2), int(frame_w), int(frame_h),
             crop_path, frame_path, species, individual_id,
+            None if crop_quality is None else float(crop_quality),
         ),
     )
     conn.commit()
@@ -316,6 +323,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE detections ADD COLUMN species_source TEXT")
     if "visit_id" not in cols:
         conn.execute("ALTER TABLE detections ADD COLUMN visit_id INTEGER")
+    if "crop_quality" not in cols:
+        conn.execute("ALTER TABLE detections ADD COLUMN crop_quality REAL")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
@@ -343,6 +352,15 @@ def correct_species(conn: sqlite3.Connection, detection_id: int, species: str) -
         (species, int(detection_id)),
     )
     conn.commit()
+
+
+def set_crop_quality_bulk(conn: sqlite3.Connection, pairs: Sequence[tuple]) -> int:
+    """Store image-derived crop_quality for many detections at once -- `pairs` = [(det_id, q), ...].
+    Used by quality.py to backfill crops captured before scoring existed. Returns rows updated."""
+    conn.executemany("UPDATE detections SET crop_quality = ? WHERE id = ?",
+                     [(float(q), int(i)) for i, q in pairs])
+    conn.commit()
+    return len(pairs)
 
 
 # ---------------------------------------------------------------------------

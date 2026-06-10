@@ -257,6 +257,54 @@
   .cal-legend{display:flex; flex-wrap:wrap; gap:10px 18px; margin:20px 2px 0; padding-top:14px; border-top:1px solid var(--rule); color:var(--dim);}
   .cal-legend .li{display:inline-flex; align-items:center; gap:6px; font-variant:small-caps; letter-spacing:.02em; font-size:14px;}
   .cal-legend .li b{font-weight:400; font-size:17px;}
+
+  /* ---- clips: play affordance · lightbox player · highlight reel ---- */
+  .playable{position:relative;}
+  .play-badge{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; cursor:pointer; z-index:2;}
+  .play-badge::before{content:"\25B6"; font-family:var(--mono); font-size:15px; color:var(--ink); padding-left:3px;
+    width:42px; height:42px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    background:rgba(16,13,7,.5); border:1.5px solid rgba(233,222,198,.85); box-shadow:0 4px 16px -4px #000;
+    transition:transform .16s, background .16s, color .16s, border-color .16s;}
+  .play-badge:hover::before{transform:scale(1.09); background:rgba(201,162,75,.92); color:#16120a; border-color:var(--gilt);}
+  .play-badge.sm::before{width:28px; height:28px; font-size:11px; padding-left:2px;}
+  .clip-count{position:absolute; bottom:6px; right:6px; z-index:2; font-family:var(--mono); font-size:9px; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--ink); background:rgba(16,13,7,.68); border:1px solid var(--rule2); padding:2px 6px; border-radius:2px;}
+
+  /* lightbox player (single clip or a reel playlist) */
+  .clipbox-card{position:relative; z-index:1; width:min(960px,96vw); max-height:92vh; overflow:auto;
+    background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--rule2); border-radius:5px;
+    box-shadow:0 26px 70px -22px #000; padding:14px 16px 14px; animation:pop .24s ease both;}
+  .clipbox-eyebrow{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:9px; color:var(--gilt);}
+  .clipbox-stage{position:relative; background:#000; border:1px solid var(--rule2); display:flex;}
+  .clipbox-stage video{display:block; width:100%; max-height:62vh; background:#000;}
+  .reel-nav{position:absolute; top:50%; transform:translateY(-50%); z-index:2; width:40px; height:58px; padding:0;
+    background:rgba(16,13,7,.5); border:1px solid var(--rule2); color:var(--ink); font-size:22px; line-height:1; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; transition:background .15s, color .15s;}
+  .reel-nav:hover{background:rgba(201,162,75,.9); color:#16120a;}
+  .reel-nav.prev{left:0; border-left:0;} .reel-nav.next{right:0; border-right:0;}
+  .reel-nav:disabled{opacity:.22; cursor:default; background:rgba(16,13,7,.5); color:var(--ink);}
+  .clipbox-cap{display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; padding:11px 2px 2px; color:var(--dim);}
+  .clipbox-cap .nm{font-variant:small-caps; font-size:20px; letter-spacing:.02em; color:var(--ink); line-height:1;}
+  .clipbox-cap .c{color:var(--sage);}
+  .filmstrip{display:flex; gap:8px; overflow-x:auto; padding:11px 2px 4px;}
+  .filmstrip .fs{flex:0 0 auto; width:118px; cursor:pointer; border:1px solid var(--rule); border-radius:3px; overflow:hidden; background:var(--panel); transition:border-color .15s, transform .15s;}
+  .filmstrip .fs:hover{border-color:var(--rule2); transform:translateY(-2px);}
+  .filmstrip .fs.on{border-color:var(--gilt);}
+  .filmstrip .fs .ft{aspect-ratio:16/10; background:#000 center/cover no-repeat; position:relative;}
+  .filmstrip .fs .dur{position:absolute; bottom:4px; right:4px; font-family:var(--mono); font-size:9px; color:var(--ink); background:rgba(16,13,7,.72); padding:1px 4px; border-radius:2px;}
+  .filmstrip .fs .lab{font-family:var(--mono); font-size:9.5px; letter-spacing:.03em; color:var(--dim); padding:4px 7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+
+  /* dispatch highlight-reel hero */
+  .reelhero{position:relative; overflow:hidden; cursor:pointer; min-height:300px; margin:6px 0 10px;
+    background:#000 center/cover no-repeat; border:1px solid var(--rule);}
+  .reelhero .big-play{position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:74px; height:74px; border-radius:50%;
+    background:rgba(16,13,7,.48); border:2px solid rgba(233,222,198,.9); display:flex; align-items:center; justify-content:center;
+    font-size:26px; color:var(--ink); padding-left:5px; transition:transform .18s, background .18s, color .18s, border-color .18s;}
+  .reelhero:hover .big-play{transform:translate(-50%,-50%) scale(1.08); background:rgba(201,162,75,.92); color:#16120a; border-color:var(--gilt);}
+  .reelhero .scrim{position:absolute; inset:0; background:linear-gradient(180deg,rgba(10,8,4,0) 45%,rgba(10,8,4,.8)); display:flex; flex-direction:column; justify-content:flex-end; padding:18px 22px;}
+  .reelhero .rh-eyebrow{color:var(--gilt);}
+  .reelhero .rh-title{font-variant:small-caps; font-size:24px; letter-spacing:.02em; margin-top:3px;}
+  .reelhero .rh-meta{font-family:var(--mono); font-size:12px; color:var(--dim); margin-top:4px;}
 </style>
 </head>
 <body>
@@ -373,6 +421,22 @@
   </div>
 </div>
 
+<!-- Clip player (lightbox) — plays a single clip, or a whole reel as an auto-advancing playlist -->
+<div id="clipbox" class="modal" hidden>
+  <div class="modal-backdrop" onclick="closeClipbox()"></div>
+  <div class="clipbox-card" role="dialog" aria-modal="true" aria-label="Clip player">
+    <div class="clipbox-eyebrow"><span class="lbl" id="clip-title">Clip</span>
+      <button class="modal-x" type="button" onclick="closeClipbox()" aria-label="Close" style="position:static">&#10005;</button></div>
+    <div class="clipbox-stage">
+      <button class="reel-nav prev" id="clip-prev" type="button" onclick="reelStep(-1)" aria-label="Previous clip">&lsaquo;</button>
+      <video id="clip-video" controls autoplay playsinline preload="metadata"></video>
+      <button class="reel-nav next" id="clip-next" type="button" onclick="reelStep(1)" aria-label="Next clip">&rsaquo;</button>
+    </div>
+    <div class="clipbox-cap" id="clip-cap"></div>
+    <div class="filmstrip" id="clip-strip"></div>
+  </div>
+</div>
+
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -387,6 +451,58 @@ const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','
   'band-tailed pigeon':'Patagioenas fasciata','eastern cottontail':'Sylvilagus floridanus','house sparrow':'Passer domesticus',
   'townsend’s chipmunk':'Neotamias townsendii'};
 const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
+const fmtDur=s=>{ s=Math.round(s||0); return s>=60?`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`:`${s}s`; };
+
+/* ---------- clip player (lightbox; plays one clip or a whole reel as a playlist) ----------
+   Everywhere a thumbnail has clip(s) behind it, clicking plays them here. A reel auto-advances
+   (the <video> 'ended' event steps to the next), with a filmstrip + ‹ › + arrow keys to scrub. */
+let __clips=[], __ci=0, __reelMode=false;
+function playClips(clips,i,title){
+  clips=(clips||[]).filter(c=>c&&c.clip_path);
+  if(!clips.length) return;
+  __clips=clips; __ci=Math.max(0,Math.min(i||0,clips.length-1)); __reelMode=clips.length>1;
+  const box=$('#clipbox'); if(!box) return;
+  $('#clip-title').textContent=title||(__reelMode?`Reel · ${clips.length} clips`:'Clip');
+  box.hidden=false;
+  const strip=$('#clip-strip'); strip.style.display=__reelMode?'flex':'none';
+  strip.innerHTML=__reelMode?__clips.map((c,k)=>`
+    <div class="fs" data-i="${k}" onclick="reelGo(${k})">
+      <div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
+      <div class="lab">${esc(fmtClock(c.start)||'')}${c.species?' · '+esc(nameOf(c.species)):''}</div>
+    </div>`).join(''):'';
+  const v=$('#clip-video');
+  v.onended=()=>{ if(__reelMode && __ci<__clips.length-1) reelStep(1); };
+  document.addEventListener('keydown',clipKeys);
+  showClip();
+}
+function showClip(){
+  const c=__clips[__ci]; if(!c) return;
+  const v=$('#clip-video');
+  // Poster = the clip's best frame, shown while the H.264 transcode streams in on first view
+  // (a cold clip can take a few seconds; cached instantly after).
+  if(c.thumb) v.poster=media(c.thumb); else v.removeAttribute('poster');
+  v.src=media(c.clip_path);
+  const pr=v.play(); if(pr&&pr.catch) pr.catch(()=>{});
+  $('#clip-cap').innerHTML=`${c.species?`<span class="nm">${esc(nameOf(c.species))}</span>`:''}
+    ${c.start?`<span class="mono" style="font-size:12px">${esc(fmtClock(c.start))}</span>`:''}
+    ${c.seconds?`<span class="mono" style="font-size:12px">· ${fmtDur(c.seconds)}</span>`:''}
+    ${c.dets?`<span class="mono" style="font-size:12px">· ${c.dets} detection${c.dets===1?'':'s'}</span>`:''}
+    ${c.conf!=null?`<span class="c mono" style="font-size:12px">· ~${Math.round(c.conf*100)}%</span>`:''}
+    ${__reelMode?`<span class="mono" style="font-size:12px;margin-left:auto;color:var(--faint)">${__ci+1} / ${__clips.length}</span>`:''}`;
+  const prev=$('#clip-prev'), next=$('#clip-next');
+  prev.style.display=next.style.display=__reelMode?'flex':'none';
+  prev.disabled=__ci<=0; next.disabled=__ci>=__clips.length-1;
+  $('#clip-strip').querySelectorAll('.fs').forEach(el=>{
+    const on=+el.dataset.i===__ci; el.classList.toggle('on',on); if(on) el.scrollIntoView({inline:'center',block:'nearest'}); });
+}
+function reelStep(d){ const n=__ci+d; if(n<0||n>=__clips.length) return; __ci=n; showClip(); }
+function reelGo(i){ if(i>=0&&i<__clips.length){ __ci=i; showClip(); } }
+function closeClipbox(){ const m=$('#clipbox'); if(!m) return; m.hidden=true;
+  const v=$('#clip-video'); v.pause(); v.onended=null; v.removeAttribute('src'); v.load();
+  document.removeEventListener('keydown',clipKeys); }
+function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='ArrowRight') reelStep(1); else if(e.key==='ArrowLeft') reelStep(-1); }
+/* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
+const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
 
 function show(v){
   closeSettings();
@@ -533,13 +649,17 @@ function renderLatest(d){
   const conf=(d.species_confidence!=null)?d.species_confidence:null;
   el.innerHTML=`
     <div class="latest-eyebrow lbl">Most Recent Visitor</div>
-    <div class="latest-photo" style="background-image:url('${d.crop_path?media(d.crop_path):''}')"></div>
+    <div class="latest-photo playable" style="background-image:url('${d.crop_path?media(d.crop_path):''}')">${d.clip?playBadge(1):''}</div>
     <div class="latest-info">
       <div class="latest-name">${esc(cap1(name))}</div>
       <div class="latest-latin">${esc(latin)}</div>
-      <div class="latest-when"><span>${esc(timeAgo(d.timestamp))}</span>${conf!=null?`<span class="dot">·</span><span class="conf">~${Math.round(conf*100)}%</span>`:''}</div>
+      <div class="latest-when"><span>${esc(timeAgo(d.timestamp))}</span>${conf!=null?`<span class="dot">·</span><span class="conf">~${Math.round(conf*100)}%</span>`:''}${d.clip?`<span class="dot">·</span><span>${fmtDur(d.clip.seconds)} clip</span>`:''}</div>
     </div>`;
   el.onclick = d.species ? ()=>{ show('cat'); openSheet(d.species); } : null;
+  // The ▶ on the photo plays the clip that was rolling for this visitor; the rest of the card
+  // still opens the species sheet. (No clip => no badge, card behaves as before.)
+  const pb=el.querySelector('[data-play]');
+  if(pb) pb.onclick=(e)=>{ e.stopPropagation(); playClips([d.clip],0,cap1(name)); };
   flagLatest(d, el);   // async: appends an "off-pattern hour" chip only when behaviour disagrees
 }
 /* Live two-axis awareness (species level): if the most recent visitor arrived OUTSIDE its
@@ -692,12 +812,17 @@ async function renderVisits(params,body){
   $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
   if(!visitsData.length){ body.innerHTML='<p class="empty">No visits.</p>'; return; }
   body.innerHTML='<div class="cards">'+visitsData.map(visitCard).join('')+'</div>';
+  // A visit with clips plays its video on click (what you asked for); one without falls back to
+  // its crop grid (the old behaviour, for visits before clip recording was on).
   body.querySelectorAll('[data-vi]').forEach(el=>{ const v=visitsData[+el.dataset.vi];
-    el.onclick=()=>explore('obs',{start:v.start,end:v.end},`Visit · ${cap1(v.title||'animal')}`,fmtDateTime(v.start)); });
+    el.onclick=(v.clips&&v.clips.length)
+      ? ()=>playClips(v.clips,0,`${cap1(v.title||'animal')} · ${fmtDateTime(v.start)}`)
+      : ()=>explore('obs',{start:v.start,end:v.end},`Visit · ${cap1(v.title||'animal')}`,fmtDateTime(v.start)); });
 }
 function visitCard(v,i){
+  const nclips=(v.clips||[]).length;
   return `<div class="card vcard" data-vi="${i}">
-    <div class="thumb" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')"></div>
+    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
     <div class="body">
       <div class="common">${esc(cap1(v.title||'animal'))}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
@@ -804,9 +929,27 @@ function renderDispatch(d){
   if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
   if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
   if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`; return; }
+  // Highlight reel — the night's clips, played back-to-back. Poster is the sharpest still
+  // (the plate); the filmstrip lets you jump straight to any moment.
+  window.__reel=d.reel||[];
+  if(window.__reel.length){
+    const total=window.__reel.reduce((a,c)=>a+(c.seconds||0),0);
+    const poster=(d.plate&&d.plate.crop_path)||window.__reel[0].thumb;
+    html+=`<h2 class="sec">Highlight Reel <span class="n">${window.__reel.length} clip${window.__reel.length>1?'s':''} · ${fmtDur(total)}</span></h2>`;
+    html+=`<div class="panel reelhero" id="reelhero" style="background-image:url('${poster?media(poster):''}')">
+      <div class="big-play">&#9654;</div>
+      <div class="scrim">
+        <div class="rh-eyebrow lbl">Watch the ${d.edition==='night'?'night':'day'}</div>
+        <div class="rh-title">The visitors, in sequence</div>
+        <div class="rh-meta">${window.__reel.length} clips · ${fmtDur(total)} of footage · press play</div>
+      </div></div>`;
+    html+=`<div class="filmstrip" id="dsp-strip">`+window.__reel.map((c,i)=>`
+      <div class="fs" data-i="${i}"><div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
+        <div class="lab">${esc(fmtClock(c.start))} · ${esc(nameOf(c.species||'·'))}</div></div>`).join('')+`</div>`;
+  }
   if(d.plate){ const p=d.plate;
     html+=`<div class="panel hero">
-      <div class="hero-photo" style="background-image:url('${p.crop_path?media(p.crop_path):''}')"></div>
+      <div class="hero-photo playable" style="background-image:url('${p.crop_path?media(p.crop_path):''}')">${p.clip?playBadge(1):''}</div>
       <div class="hero-info">
         <div class="hero-eyebrow lbl">Plate of the ${d.edition==='night'?'Night':'Day'}</div>
         <div class="hero-name">${esc(nameOf(p.species))}</div>
@@ -818,12 +961,19 @@ function renderDispatch(d){
     ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
   if(d.moon) t.push(['moon',d.moon.illum_pct+'%']);
   html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
+  window.__rollClips=(d.species||[]).map(s=> s.clip?{...s.clip, species:s.species}:null);
   html+=`<h2 class="sec">The Roll <span class="n">${(d.species||[]).length} species</span></h2>`;
   html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
   body.innerHTML=html;
   body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
+  // Reel: the hero plays the whole thing; each filmstrip cell jumps straight to that clip.
+  const rh=$('#reelhero'); if(rh) rh.onclick=()=>playClips(window.__reel,0,'Highlight Reel — '+(d.title||''));
+  const ds=$('#dsp-strip'); if(ds) ds.querySelectorAll('.fs').forEach(el=>el.onclick=()=>playClips(window.__reel,+el.dataset.i,'Highlight Reel — '+(d.title||'')));
+  // ▶ on the plate (when a clip caught the sharpest frame) and on each roll row.
+  const pp=body.querySelector('.hero-photo .play-badge'); if(pp&&d.plate&&d.plate.clip) pp.onclick=(e)=>{ e.stopPropagation(); playClips([d.plate.clip],0,nameOf(d.plate.species)); };
+  body.querySelectorAll('.entry .play-badge[data-ci]').forEach(el=>el.onclick=(e)=>{ e.stopPropagation(); const c=(window.__rollClips||[])[+el.dataset.ci]; if(c) playClips([c],0,nameOf(c.species||'')); });
 }
-function entryRow(s){
+function entryRow(s,i){
   const n=s.novelty||{}, badges=[];
   if(n.first_ever) badges.push('<span class="badge new">New</span>');
   else if((n.days_since||0)>=3) badges.push(`<span class="badge gap">first in ${n.days_since}d</span>`);
@@ -833,7 +983,7 @@ function entryRow(s){
   const clock=hrs.map((c,h)=>{const ht=c?Math.max(2,Math.round(Math.sqrt(c/max)*18)):1;return `<span class="hbar${active.has(h)?' on':''}" style="height:${ht}px" title="${fmtHourJS(h)}: ${c}"></span>`;}).join('');
   const g=glyphInfo(s.species), clickable=s.species!=='animal';
   return `<div class="entry"${clickable?` data-sp="${esc(s.species)}"`:' style="cursor:default"'}>
-    <div class="entry-thumb" style="background-image:url('${s.rep_crop?media(s.rep_crop):''}')"></div>
+    <div class="entry-thumb${s.clip?' playable':''}" style="background-image:url('${s.rep_crop?media(s.rep_crop):''}')">${s.clip?`<span class="play-badge sm" data-ci="${i}"></span>`:''}</div>
     <div class="entry-main">
       <div class="entry-name"><span class="gx">${glyphHTML(g)}</span> ${esc(nameOf(s.species))} <span class="latin">${esc(latinOf(s.species))}</span></div>
       <div class="entry-when">${fmtClock(s.first)}–${fmtClock(s.last)}${s.typical?` · <span class="typ">usually ${esc(s.typical)}</span>`:''}</div>

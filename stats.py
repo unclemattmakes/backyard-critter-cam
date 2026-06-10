@@ -17,6 +17,7 @@ import db
 
 LATEST_LIMIT = 24          # how many recent crops to surface (gallery)
 RECENT_VISITS_LIMIT = 20   # how many recent visit events to surface
+REEL_LIMIT = 24            # max clips in a dispatch "highlight reel" (busiest kept, then time-ordered)
 
 
 def _parse(ts: str):
@@ -26,8 +27,15 @@ def _parse(ts: str):
         return None
 
 
-def compute_visits(rows, gap_minutes: float):
-    """Collapse time-ordered detection rows into visit events, per source."""
+def compute_visits(rows, gap_minutes: float, rep_key=None):
+    """Collapse time-ordered detection rows into visit events, per source.
+
+    `rep_key(row) -> float` scores each crop for the visit's REPRESENTATIVE (thumbnail) pick; the
+    highest-scoring crop wins. Defaults to detector confidence (the most readable crop). visits_page
+    passes a portrait-aware score (confidence x how much of the frame the animal fills) so a visit's
+    thumbnail leans toward a close, usable shot -- the nearest thing to "a photo of its face"
+    without a face detector -- rather than whichever frame merely scored highest."""
+    rep_key = rep_key or (lambda r: r["confidence"] or 0.0)
     gap = timedelta(minutes=gap_minutes)
     by_source = defaultdict(list)
     for r in rows:
@@ -43,18 +51,110 @@ def compute_visits(rows, gap_minutes: float):
             if cur is None or (dt - cur["end"]) > gap:
                 if cur is not None:
                     visits.append(cur)
-                cur = {"source": source, "start": dt, "end": dt, "count": 0,
-                       "max_conf": 0.0, "classes": Counter(), "rep_crop": None}
+                cur = {"source": source, "start": dt, "end": dt, "count": 0, "max_conf": 0.0,
+                       "rep_score": None, "classes": Counter(), "rep_crop": None}
             conf = r["confidence"] or 0.0
+            score = rep_key(r)
             cur["end"] = dt
             cur["count"] += 1
-            if cur["rep_crop"] is None or conf > cur["max_conf"]:   # keep the most readable crop
+            if cur["rep_score"] is None or score > cur["rep_score"]:   # keep the best thumbnail crop
                 cur["rep_crop"] = r["crop_path"]
+                cur["rep_score"] = score
             cur["max_conf"] = max(cur["max_conf"], conf)
             cur["classes"][r["species"] or r["detection_class"]] += 1
         if cur is not None:
             visits.append(cur)
     return visits
+
+
+def _shot_score(r) -> float:
+    """Rank a crop as a THUMBNAIL -- "the best/cutest shot of this visit". Leads with the stored
+    image quality (sharpness x night eyeshine; quality.py), lifted by how much of the frame the
+    animal fills and how centered it is (both cheap from the bbox already in the row). Falls back
+    to confidence x size for crops captured before quality scoring existed (crop_quality NULL).
+    Works on a sqlite3.Row or a plain dict, so visits_page and the digest can share it. cv2-free."""
+    try:
+        fw, fh = (r["frame_w"] or 0), (r["frame_h"] or 0)
+        size = ((r["bbox_x2"] - r["bbox_x1"]) * (r["bbox_y2"] - r["bbox_y1"]) / float(fw * fh)
+                if fw and fh else 0.0)
+        cx = (r["bbox_x1"] + r["bbox_x2"]) / 2.0 / (fw or 1)
+        cy = (r["bbox_y1"] + r["bbox_y2"]) / 2.0 / (fh or 1)
+        center = 1.0 - min(1.0, abs(cx - 0.5) + abs(cy - 0.5))   # 1 = dead-center, ->0 at the edges
+    except Exception:
+        size, center = 0.0, 0.5
+    try:
+        q = r["crop_quality"]
+    except (KeyError, IndexError):
+        q = None
+    if q is not None:
+        return float(q) * (0.6 + min(size, 0.4)) * (0.7 + 0.3 * center)
+    conf = (r["species_confidence"] or r["confidence"] or 0.0)    # transitional pre-scoring fallback
+    return conf * (1.0 + min(size, 0.25))
+
+
+# ---------------------------------------------------------------------------
+# Behaviour CLIPS <-> visits / periods / crops. A clip (clips table) spans [started_at, ended_at]
+# on one source; every detection written during that window falls inside it -- no FK, matched by
+# time (verified against the live DB). So a VISIT, a digest PERIOD, or a single crop can each be
+# linked to the video that was rolling at that moment, which is what lets a thumbnail play its clip.
+# Pure time math -- no cv2/torch, like the rest of stats.py.
+# ---------------------------------------------------------------------------
+
+def load_clips(conn) -> list:
+    """Every clip, parsed once for in-memory time-overlap matching. Each entry carries the parsed
+    span (sdt/edt) plus the URL-friendly fields the dashboard needs. [] if there are no clips."""
+    try:
+        rows = conn.execute(
+            "SELECT source, clip_path, started_at, ended_at, fps, width, height, "
+            "frame_count, detection_count, max_confidence FROM clips ORDER BY started_at"
+        ).fetchall()
+    except Exception:
+        return []          # an old DB without the clips table -> just no clips to link
+    out = []
+    for r in rows:
+        sdt = _parse(r["started_at"])
+        if sdt is None:
+            continue
+        edt = _parse(r["ended_at"]) if r["ended_at"] else sdt
+        if r["fps"] and r["frame_count"]:
+            seconds = round(r["frame_count"] / r["fps"], 1)   # true playback length
+        else:
+            seconds = round((edt - sdt).total_seconds(), 1) if edt else None
+        out.append({
+            "source": r["source"], "sdt": sdt, "edt": edt or sdt,
+            "clip_path": _web(r["clip_path"]), "start": r["started_at"], "seconds": seconds,
+            "dets": r["detection_count"] or 0,
+            "conf": round(r["max_confidence"], 3) if r["max_confidence"] is not None else None,
+        })
+    return out
+
+
+def _clip_out(c) -> dict | None:
+    """JSON-able view of a clip (drops the parsed datetimes used only for matching)."""
+    if not c:
+        return None
+    return {"clip_path": c["clip_path"], "start": c["start"], "seconds": c["seconds"],
+            "dets": c["dets"], "conf": c["conf"]}
+
+
+def clips_overlapping(clips, source, start, end) -> list:
+    """Clips on `source` whose [sdt,edt] overlaps the window [start,end] (datetimes), busiest
+    first (most detections, then longest) -- the order to offer a visit's clips for playback."""
+    if start is None or end is None:
+        return []
+    hits = [c for c in clips if c["source"] == source and c["sdt"] <= end and c["edt"] >= start]
+    hits.sort(key=lambda c: (c["dets"], c["seconds"] or 0), reverse=True)
+    return hits
+
+
+def clip_at(clips, source, dt):
+    """The clip whose window contains instant `dt` on `source` (busiest wins ties), or None --
+    links one specific crop/detection to the video that was rolling then."""
+    if dt is None:
+        return None
+    cover = [c for c in clips if c["source"] == source and c["sdt"] <= dt <= c["edt"]]
+    cover.sort(key=lambda c: c["dets"], reverse=True)
+    return cover[0] if cover else None
 
 
 def compute_stats(cfg) -> dict | None:
@@ -71,6 +171,7 @@ def compute_stats(cfg) -> dict | None:
         "species_confidence, crop_path "
         "FROM detections ORDER BY timestamp"
     ).fetchall()
+    clips = load_clips(conn)
     conn.close()
 
     gap = cfg.visit_gap_minutes
@@ -102,6 +203,8 @@ def compute_stats(cfg) -> dict | None:
         "species_confidence": (round(r["species_confidence"], 3)
                                if r["species_confidence"] is not None else None),
         "crop_path": web(r["crop_path"]),
+        # The clip rolling when this crop was caught (so the live card can play it), or None.
+        "clip": _clip_out(clip_at(clips, r["source"], _parse(r["timestamp"]))),
     } for r in list(reversed(rows))[:LATEST_LIMIT]]
 
     recent_visits = [{
@@ -112,6 +215,7 @@ def compute_stats(cfg) -> dict | None:
         "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
         "max_conf": round(v["max_conf"], 3),
         "classes": dict(v["classes"].most_common()),
+        "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
     } for v in sorted(visits, key=lambda v: v["start"], reverse=True)[:RECENT_VISITS_LIMIT]]
 
     return {
@@ -241,10 +345,13 @@ def visits_page(cfg, day=None, limit=300) -> dict:
         return {"visits": [], "total": 0}
     clause, args = ("WHERE timestamp LIKE ?", [str(day) + "%"]) if day else ("", [])
     rows = conn.execute(
-        f"SELECT id, source, timestamp, detection_class, species, confidence, crop_path "
+        f"SELECT id, source, timestamp, detection_class, species, confidence, species_confidence, "
+        f"crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
         f"FROM detections {clause} ORDER BY timestamp", args).fetchall()
+    clips = load_clips(conn)
     conn.close()
-    visits = compute_visits(rows, cfg.visit_gap_minutes)
+
+    visits = compute_visits(rows, cfg.visit_gap_minutes, rep_key=_shot_score)
     visits.sort(key=lambda v: v["start"], reverse=True)
     out = []
     for v in visits[:limit]:
@@ -255,6 +362,9 @@ def visits_page(cfg, day=None, limit=300) -> dict:
             "max_conf": round(v["max_conf"], 3), "title": title,
             "classes": dict(v["classes"].most_common()),
             "rep_crop": ((v.get("rep_crop") or "").replace("\\", "/") or None),
+            # The clips that rolled during this visit (busiest first) -> click the card, watch the
+            # video. Empty for visits before clip recording was on (e.g. daytime pre-06-09).
+            "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
         })
     return {"visits": out, "total": len(visits)}
 
@@ -437,8 +547,10 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
     if conn is None:
         return {"empty": True, "edition": edition, "reason": "no database yet"}
     raw = conn.execute(
-        "SELECT id, timestamp, source, detection_class, species, confidence, "
-        "species_confidence, crop_path FROM detections ORDER BY timestamp").fetchall()
+        "SELECT id, timestamp, source, detection_class, species, confidence, species_confidence, "
+        "crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
+        "FROM detections ORDER BY timestamp").fetchall()
+    clips = load_clips(conn)
     conn.close()
 
     rows = []
@@ -451,6 +563,9 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
             "detection_class": r["detection_class"], "species": r["species"],
             "confidence": r["confidence"] or 0.0, "species_confidence": r["species_confidence"],
             "crop_path": r["crop_path"], "label": r["species"] or r["detection_class"],
+            "crop_quality": r["crop_quality"],
+            "bbox_x1": r["bbox_x1"], "bbox_y1": r["bbox_y1"], "bbox_x2": r["bbox_x2"],
+            "bbox_y2": r["bbox_y2"], "frame_w": r["frame_w"], "frame_h": r["frame_h"],
         })
     # Drop false triggers / non-visitor human labels up front so every downstream tally
     # (roll, plate, novelty, streaks) is about actual animals.
@@ -525,7 +640,7 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
     species_roll = []
     for sp, crops in crops_by_sp.most_common():
         srs = [r for r in pr if r["label"] == sp]
-        rep = max(srs, key=lambda r: (r["species_confidence"] or r["confidence"] or 0.0))
+        rep = max(srs, key=_shot_score)        # lead the roll row with this species' cutest frame
         prev = [r for r in sp_all[sp] if r["dt"] < start]
         prev_dt = prev[-1]["dt"] if prev else None
         hist = hours_hist(sp_all[sp])
@@ -539,6 +654,8 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
                         "days_since": ((start.date() - prev_dt.date()).days if prev_dt else None)},
             "streak": streak_of(sp), "typical": _typical_window(hist), "hours": hist,
             "active_hours": sorted({r["dt"].hour for r in srs}),   # hours active THIS period
+            # The clip behind this species' best frame this period (so the roll row plays it).
+            "clip": _clip_out(clip_at(clips, rep["source"], rep["dt"])),
         })
 
     # --- headline novelty (first-ever, then rarest first) + quiet regulars ---
@@ -562,17 +679,43 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
                 quiet.append({"species": sp, "frac": round(frac, 2), "periods_since": since})
         quiet.sort(key=lambda q: -q["frac"])
 
-    # --- plate of the period, first/last visitor, busiest hour ---
-    plate = max(pr, key=lambda r: (r["species_confidence"] or r["confidence"] or 0.0))
+    # --- plate of the period (the single best/cutest shot), first/last visitor, busiest hour ---
+    plate = max(pr, key=_shot_score)
     busy = Counter(v["start"].hour for v in visits)
     bh = busy.most_common(1)[0] if busy else None
 
+    # --- highlight reel: each in-window clip fronted by its CUTEST frame (best _shot_score, not
+    # just the most-confident). Drop clips whose best shot is weak relative to the night -- the
+    # all-blurry / tiny / distant ones -- keep the cutest REEL_LIMIT, then replay in time order so
+    # the reel relives the night. Only clips that actually caught a real visitor are considered. ---
+    cand = []
+    for c in clips:
+        if c["edt"] < start or c["sdt"] > end:
+            continue
+        inside = [r for r in pr if c["sdt"] <= r["dt"] <= c["edt"]]
+        if not inside:
+            continue
+        best = max(inside, key=_shot_score)
+        cand.append({**_clip_out(c), "thumb": _web(best["crop_path"]),
+                     "species": Counter(r["label"] for r in inside).most_common(1)[0][0],
+                     "_score": _shot_score(best)})
+    reel = []
+    if cand:
+        median = sorted(x["_score"] for x in cand)[len(cand) // 2]
+        floor = 0.45 * median                          # drop shots well below the night's typical
+        kept = [x for x in cand if x["_score"] >= floor] or cand
+        kept.sort(key=lambda x: x["_score"], reverse=True)              # cutest first ...
+        reel = sorted(kept[:REEL_LIMIT], key=lambda x: x["start"])      # ... then replay in order
+        for x in reel:
+            x.pop("_score", None)
+
     out.update({
         "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
-        "novel": novel, "quiet": quiet[:4],
+        "novel": novel, "quiet": quiet[:4], "reel": reel,
         "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
                   "conf": round(plate["species_confidence"] or plate["confidence"] or 0.0, 3),
-                  "time": plate["dt"].isoformat()},
+                  "time": plate["dt"].isoformat(),
+                  "clip": _clip_out(clip_at(clips, plate["source"], plate["dt"]))},
         "first_visitor": {"species": pr[0]["label"], "time": pr[0]["dt"].isoformat()},
         "last_visitor": {"species": pr[-1]["label"], "time": pr[-1]["dt"].isoformat()},
         "busiest_hour": ({"hour": bh[0], "visits": bh[1]} if bh else None),
