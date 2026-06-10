@@ -100,6 +100,35 @@ class EmbeddingStore:
         except (ValueError, TypeError):
             return None
 
+    def centroids(self):
+        """Per-individual mean embedding (re-normalized), over crops that have an individual_id.
+        Returns {individual_id: (centroid_vec, n_crops)}. The appearance 'template' for each."""
+        groups = {}
+        for idx, ind in enumerate(self.individual_ids):
+            if ind:
+                groups.setdefault(ind, []).append(idx)
+        out = {}
+        for ind, idxs in groups.items():
+            c = self.X[idxs].mean(axis=0)
+            n = np.linalg.norm(c)
+            out[ind] = (c / n if n else c, len(idxs))
+        return out
+
+    def match(self, detection_id, top=5):
+        """Rank labelled individuals by appearance similarity to one crop: cosine of the crop's
+        vector to each individual's centroid. Returns [(individual_id, cosine, n_crops), ...] best
+        first. This is the 'closest appearance match: X 78%, Y 41%' read-out."""
+        i = self._index.get(detection_id)
+        if i is None:
+            raise KeyError(f"detection {detection_id} has no '{self.model}' embedding.")
+        cents = self.centroids()
+        if not cents:
+            raise ValueError("no labelled individuals yet -- run reid.py --write-clusters or --name first.")
+        q = self.X[i]
+        ranked = sorted(((ind, float(q @ c), n) for ind, (c, n) in cents.items()),
+                        key=lambda r: -r[1])
+        return ranked[:top]
+
     def cluster(self, threshold, method):
         """Agglomerative clustering on cosine distance. Returns labels[] (1-based cluster id per
         crop, as scipy.fcluster gives) aligned to self.ids."""
@@ -220,6 +249,21 @@ def do_neighbors(conn, store, args):
     return 0
 
 
+def do_match(conn, store, args):
+    """Appearance match for one crop against the labelled individuals (the re-ID query)."""
+    mid = args.match
+    try:
+        ranked = store.match(mid, top=args.k)
+    except (KeyError, ValueError) as e:
+        print(e)
+        return 1
+    print(f"Closest appearance match for detection #{mid}:")
+    for ind, sim, n in ranked:
+        bar = "#" * int(round(sim * 30))
+        print(f"  {ind:16} {sim:5.2f}  {bar:<30}  ({n} crops)")
+    return 0
+
+
 def do_name(conn, store, args):
     """Rename a montage cluster ('cluster_03') to a real individual ('Notch'). Re-derives the
     same clustering used for the montages so the cluster numbers line up."""
@@ -266,6 +310,9 @@ def main() -> int:
                    help="Max crops drawn per cluster contact sheet (default 25).")
     p.add_argument("--neighbors", type=int, default=None, metavar="DETECTION_ID",
                    help="Instead of clustering, montage the crops most similar to this detection.")
+    p.add_argument("--match", type=int, default=None, metavar="DETECTION_ID",
+                   help="Rank labelled individuals by appearance similarity to this crop "
+                        "(the 'closest appearance match: X 78%%' read-out).")
     p.add_argument("--k", type=int, default=25, help="How many neighbors for --neighbors (default 25).")
     p.add_argument("--min-gap-minutes", type=float, default=30.0,
                    help="For --neighbors, exclude crops within this many minutes of the query so "
@@ -284,6 +331,8 @@ def main() -> int:
     try:
         if args.name is not None:
             return do_name(conn, store, args)
+        if args.match is not None:
+            return do_match(conn, store, args)
         if args.neighbors is not None:
             return do_neighbors(conn, store, args)
         return do_cluster(conn, store, args)

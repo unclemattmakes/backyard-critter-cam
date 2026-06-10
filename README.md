@@ -259,6 +259,36 @@ second shot at individual ID (a limp reads the same from any angle, where a sing
 
 ---
 
+## Behaviour analysis (phase 4)
+
+The second axis. Once crops are classified, a chain of small tools turns raw detections into
+*behaviour* — and pairs it with the appearance axis for the payoff read-out:
+
+```powershell
+.\.venv\Scripts\python.exe visits.py --stats        # collapse detections -> visit events (count visits, not crops)
+.\.venv\Scripts\python.exe behavior.py              # per-species arrival windows, dwell, co-occurrence
+.\.venv\Scripts\python.exe reid.py --match 457      # "closest appearance match: raccoon_c02 0.74, ..."
+.\.venv\Scripts\python.exe twoaxis.py               # appearance NEXT TO behaviour; flag the disagreements
+```
+
+- **`visits.py`** — collapses consecutive same-source detections (< gap minutes apart) into one
+  **visit** (`visits` table + a `visit_id` on each detection). One lingering raccoon = ~200
+  crops but **one** visit; everything downstream counts visits, not crops.
+- **`behavior.py`** — per-species (and per-individual) profiles: arrival-hour window (computed on
+  the 24-h circle so a midnight-spanning crepuscular animal gets one sensible window), dwell
+  time, visits/day, and **co-occurrence** (which species share a visit — crows run in family
+  groups, so who-arrives-with-whom is real signal).
+- **`reid.py --match`** — ranks the labelled individuals a crop looks most like (cosine to each
+  individual's appearance centroid). The appearance axis as a number.
+- **`twoaxis.py`** — the payoff. For each visit it puts the **appearance** match *next to* the
+  **behaviour** fit and flags when they **disagree** ("labelled raccoon, but arrived at 11am —
+  raccoons are nocturnal"). Catches both genuinely unusual visits and mis-classifications; gets
+  sharper per-individual as you hand-label with `reid.py --name`.
+
+Re-run `visits.py` after new capture (or after `classify.py` / `reid.py` adds labels).
+
+---
+
 ## Output
 
 ```
@@ -294,6 +324,7 @@ read off a window-side clock, but globally unambiguous and sortable.
 | `frame_path` | Full-frame path, or NULL. |
 | `species` | Phase 2 (species classification, `classify.py`) fills it. |
 | `individual_id` | Phase 3 (re-identification): set when you hand-label a cluster with `reid.py`. NULL until then. |
+| `visit_id` | Phase 4: which `visits` row this crop belongs to (stamped by `visits.py`). |
 
 A second table, **`detection_embeddings`** (keyed to `detections.id`), holds the phase-3
 appearance vectors: `embed.py` writes one L2-normalized MegaDescriptor embedding per readable
@@ -302,6 +333,10 @@ crop, keyed by `model`, and `reid.py` reads them back to cluster crops into indi
 A third table, **`clips`**, holds one row per recorded behaviour clip (`--record-clips`):
 `clip_path`, `started_at`/`ended_at`, `fps`, size, and detection count. A clip spans a time
 window on one `source`, so the detections captured during it join by timestamp — no FK needed.
+
+A fourth table, **`visits`** (phase 4, built by `visits.py`), holds one row per collapsed visit
+event — `source`, dominant `species`/`individual_id`, `started_at`/`ended_at` (→ dwell),
+`detection_count`, and a `representative_detection_id`. Detections point back via `visit_id`.
 
 Example queries:
 
@@ -352,10 +387,11 @@ Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
   hand-label ("Notch", "Gimpy"), per species, **raccoons first**. Same-visit grouping is
   strong; confident *cross-session* individual ID from appearance alone is not (background +
   pose dominate) — so it's a labelling assistant + second opinion, paired with phase-4 behaviour.
-- **Phase 4 — Behaviour + the disagreement alert:** ⚙️ capture started (`--record-clips` banks
-  short videos per visit; see above). Next: per-individual arrival windows, co-occurrence, dwell
-  time, and gait. The payoff is a **two-axis readout** — appearance match score *next to*
-  behaviour fit — that flags "looks like X but isn't acting like X."
+- **Phase 4 — Behaviour + the disagreement alert:** ⚙️ built (see *Behaviour analysis* above):
+  `visits.py` (visit events), `behavior.py` (arrival windows, dwell, co-occurrence), `reid.py
+  --match` (appearance score), and `twoaxis.py` — the **two-axis readout** that flags "looks like
+  X but isn't acting like X." Plus `--record-clips` banks the video for gait/motion analysis.
+  Sharpens per-individual as you hand-label. Still to come: motion/gait features off the clips.
 - **Later — trail-cam batch importer:** `source='trail_cam_sd'`, same pipeline downstream.
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —

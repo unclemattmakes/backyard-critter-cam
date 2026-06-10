@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS detections (
     species_confidence  REAL,           -- Phase 2 classifier score 0..1 for `species` (NULL until classified).
     species_verified    INTEGER,        -- Human review via dashboard: NULL = unreviewed, 1 = confirmed, 0 = wrong.
     species_source      TEXT,           -- 'bioclip' (auto) or 'human' (corrected in the dashboard).
-    individual_id       TEXT            -- NULLABLE. Phase 3 (re-identification) fills this. NULL until phase 3.
+    individual_id       TEXT,           -- NULLABLE. Phase 3 (re-identification) fills this. NULL until phase 3.
+    visit_id            INTEGER         -- Phase 4: which visit (visits.id) this crop belongs to; stamped by visits.py.
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_timestamp  ON detections(timestamp);
@@ -84,21 +85,29 @@ CREATE TABLE IF NOT EXISTS detection_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_detection ON detection_embeddings(detection_id);
 
--- FUTURE (phase 4 prep): VISIT-EVENT COLLAPSING -- not implemented in V1, captured here so
--- the plan lives at the schema. One animal lingering fires many detections (the first dusk
--- session logged ~45 crops of a single raccoon). Raw crop counts over-count "visits" ~10x,
--- so any frequency / behaviour statistic must count VISITS, not crops. A visit = consecutive
--- detections of the SAME individual on the SAME source separated by < N minutes -- which
--- needs individual_id (phase 3) to be precise, so it lands in phase 4. Planned shape:
---   CREATE TABLE visits (
---     id            INTEGER PRIMARY KEY AUTOINCREMENT,
---     source        TEXT,  species TEXT,  individual_id TEXT,  -- individual_id NULL until re-ID
---     started_at    TEXT,  ended_at TEXT,
---     detection_count INTEGER,  max_confidence REAL,
---     representative_detection_id INTEGER REFERENCES detections(id)   -- the most readable crop
---   );
--- plus a detections.visit_id FK assigned by a collapsing pass. (Counting crows also needs
--- co-occurrence -- who arrived together -- see PLAN.md phase 4.)
+-- Phase 4: VISIT-EVENT COLLAPSING. One animal lingering fires many detections (the first dusk
+-- session logged ~45 crops of a single raccoon), so raw crop counts over-count "visits" ~10x and
+-- every frequency / behaviour statistic must count VISITS, not crops. A visit = consecutive
+-- detections on the SAME source separated by < N minutes (visits.py builds this table and stamps
+-- detections.visit_id). It can't yet split two animals present at once -- that needs reliable
+-- individual_id -- so `individual_id` here is the visit's DOMINANT label when available, else NULL.
+-- (Counting crows also needs co-occurrence -- who arrived together -- which behaviour.py reads
+-- off these rows; see PLAN.md phase 4.)
+CREATE TABLE IF NOT EXISTS visits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT    NOT NULL,   -- which rig (matches detections.source).
+    species         TEXT,               -- dominant species across the visit's crops (NULL if none classified).
+    individual_id   TEXT,               -- dominant individual_id (NULL until phase-3 labels exist).
+    started_at      TEXT    NOT NULL,   -- first detection's timestamp (local ISO 8601 w/ offset).
+    ended_at        TEXT    NOT NULL,   -- last detection's timestamp; dwell = ended-started.
+    detection_count INTEGER NOT NULL,   -- crops in the visit (a rough "how long / how active").
+    max_confidence  REAL,               -- best detector score in the visit.
+    representative_detection_id INTEGER REFERENCES detections(id)   -- the most readable crop.
+);
+CREATE INDEX IF NOT EXISTS idx_visits_started ON visits(started_at);
+CREATE INDEX IF NOT EXISTS idx_visits_source  ON visits(source);
+CREATE INDEX IF NOT EXISTS idx_visits_species ON visits(species);
+CREATE INDEX IF NOT EXISTS idx_visits_individual ON visits(individual_id);
 
 -- Phase 4 CAPTURE: one short VIDEO clip recorded around a visit (clips.py / --record-clips).
 -- Stills say WHO/WHEN; a clip says HOW (gait, approach, dwell, co-occurrence) -- the substance
@@ -211,6 +220,38 @@ def insert_clip(conn: sqlite3.Connection, *, source: str, clip_path: str, starte
     return int(cur.lastrowid)
 
 
+def clear_visits(conn: sqlite3.Connection) -> None:
+    """Drop all visit rows and un-stamp every detection -- visits.py does a full rebuild (the
+    detection set is small and a from-scratch pass is simpler/safer than incremental upkeep)."""
+    conn.execute("DELETE FROM visits")
+    conn.execute("UPDATE detections SET visit_id = NULL WHERE visit_id IS NOT NULL")
+    conn.commit()
+
+
+def insert_visit(conn: sqlite3.Connection, *, source: str, species: Optional[str],
+                 individual_id: Optional[str], started_at: str, ended_at: str,
+                 detection_count: int, max_confidence: Optional[float],
+                 representative_detection_id: Optional[int]) -> int:
+    """Phase 4: write one collapsed visit event; returns its new id."""
+    cur = conn.execute(
+        """
+        INSERT INTO visits (source, species, individual_id, started_at, ended_at,
+                            detection_count, max_confidence, representative_detection_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (source, species, individual_id, started_at, ended_at, int(detection_count),
+         None if max_confidence is None else float(max_confidence),
+         None if representative_detection_id is None else int(representative_detection_id)),
+    )
+    return int(cur.lastrowid)
+
+
+def assign_visit(conn: sqlite3.Connection, detection_ids: Sequence[int], visit_id: int) -> None:
+    """Stamp a visit's id onto its member detections (detections.visit_id)."""
+    conn.executemany("UPDATE detections SET visit_id = ? WHERE id = ?",
+                     [(int(visit_id), int(i)) for i in detection_ids])
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the original schema (keeps existing DBs current)."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(detections)")}
@@ -220,6 +261,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE detections ADD COLUMN species_verified INTEGER")
     if "species_source" not in cols:
         conn.execute("ALTER TABLE detections ADD COLUMN species_source TEXT")
+    if "visit_id" not in cols:
+        conn.execute("ALTER TABLE detections ADD COLUMN visit_id INTEGER")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
