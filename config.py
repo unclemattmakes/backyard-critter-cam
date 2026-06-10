@@ -156,12 +156,16 @@ class Config:
     # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
     # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
     # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust
-    # second shot at individual ID: a limp reads the same from any angle). OPT-IN: off by default
-    # so the family one-click rig's disk behaviour doesn't change until you ask for it. The
-    # recorder keeps a rolling pre-roll buffer so a clip includes the animal ARRIVING, then writes
-    # until clip_post_roll_s after the last detection (or the clip_max_s safety cap). Stills are
+    # second shot at individual ID: a limp reads the same from any angle). The recorder keeps a
+    # rolling pre-roll buffer so a clip includes the animal ARRIVING, then writes until
+    # clip_post_roll_s after the last detection (or the clip_max_s safety cap). Stills are
     # still saved alongside -- clips are additive, and the crops still feed species ID.
-    record_clips: bool = False          # turn on with this or --record-clips
+    # ON by default (2026-06-09) so the rig banks motion data for clipmotion.py / gait work by
+    # itself; safe to leave on because clips_max_gb prunes the OLDEST clips to a disk budget
+    # (measured ~0.44 MB/s of active footage -> a busy night ~0.8 GB; 10 GB = a rolling ~2
+    # weeks). Turn off per-run with --no-record-clips, or permanently here.
+    record_clips: bool = True
+    clips_max_gb: float = 10.0          # disk budget for clips/; oldest pruned past this (0 = no cap)
     clips_dir: Path = ROOT / "clips"
     # Which detector classes START/extend a clip. None = same as save_classes (animals), so a
     # person at the glass is boxed live but never recorded. Decoupled from save_classes on

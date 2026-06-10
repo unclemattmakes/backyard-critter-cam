@@ -706,9 +706,10 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     p.add_argument("--frames-dir", default=str(c.frames_dir))
     p.add_argument("--save-full-frame", action="store_true", default=c.save_full_frame,
                    help="Also save the full frame for each detection event (default off).")
-    p.add_argument("--record-clips", action="store_true", default=c.record_clips,
+    p.add_argument("--record-clips", action=argparse.BooleanOptionalAction, default=c.record_clips,
                    help="Record a short video clip around each visit (phase-4 behaviour capture; "
-                        "default off). Crops are still saved alongside.")
+                        "ON by default, disk-capped to clips_max_gb). --no-record-clips turns it "
+                        "off for a run. Crops are still saved alongside.")
     p.add_argument("--clips-dir", default=str(c.clips_dir),
                    help="Where behaviour clips are written (with --record-clips).")
     p.add_argument("--clip-classes", nargs="+", default=None,

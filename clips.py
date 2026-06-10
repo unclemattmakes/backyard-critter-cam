@@ -50,6 +50,43 @@ def _rel(path: Path) -> str:
         return str(path)
 
 
+def prune_clips(cfg: config.Config, conn) -> int:
+    """Keep clips/ under cfg.clips_max_gb by deleting the OLDEST clips (file + DB row; any
+    clip_tracks rows cascade). This is what makes always-on recording safe on a family rig --
+    the folder is a rolling window, never an unbounded grower. Returns clips removed.
+    Best-effort: a locked/missing file is skipped, never fatal. 0/None budget = no cap."""
+    budget = (cfg.clips_max_gb or 0) * (1024 ** 3)
+    if budget <= 0 or not cfg.clips_dir.exists():
+        return 0
+    try:
+        files = [(p.stat().st_mtime, p.stat().st_size, p)
+                 for p in cfg.clips_dir.rglob("*.mp4")]
+    except OSError:
+        return 0
+    total = sum(sz for _, sz, _ in files)
+    if total <= budget:
+        return 0
+    removed = 0
+    for _mt, sz, p in sorted(files):           # oldest first
+        if total <= budget:
+            break
+        try:
+            p.unlink()
+        except OSError:
+            continue                           # in use / already gone -- try the next one
+        total -= sz
+        removed += 1
+        try:
+            conn.execute("DELETE FROM clips WHERE clip_path = ?", (_rel(p),))
+            conn.commit()
+        except Exception:
+            pass                               # orphan row is harmless; next prune retries
+    if removed:
+        print(f"[clips] pruned {removed} oldest clip(s) to stay under "
+              f"{cfg.clips_max_gb:g} GB (rolling window).")
+    return removed
+
+
 class ClipRecorder:
     """Records a short clip around each visit. Drive it from the capture loop:
         recorder.note_frame(frame, now)              # every frame (buffers pre-roll, writes clip)
@@ -83,6 +120,7 @@ class ClipRecorder:
         self.max_conf = 0.0
         self.clips_saved = 0
         self._loop_fps = None          # the capture loop's sustained fps (best clip-rate estimate)
+        prune_clips(cfg, conn)         # enforce the disk budget left over from previous runs
 
     # -- frame ingestion -----------------------------------------------------------
     def _prep(self, frame):
@@ -204,6 +242,7 @@ class ClipRecorder:
             self.clips_saved += 1
             print(f"[clips] saved {rel}  ({self.frame_count} frames, {dur:.1f}s, "
                   f"{self.detection_count} det)")
+            prune_clips(self.cfg, self.conn)   # keep the rolling window inside the disk budget
         elif self.clip_path is not None:
             # Opened but nothing got written -- drop the empty file.
             try:

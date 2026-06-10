@@ -152,7 +152,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
 | `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
-| `--record-clips` | Record a short video clip around each visit (phase-4 behaviour capture; default off). |
+| `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` with oldest-first pruning). |
 | `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
 | `--no-preview` | Headless; quit with Ctrl+C. |
@@ -241,11 +241,14 @@ after a species (raccoons first) has banked a few hundred readable crops.
 Stills capture *who* and *when*; a short **video clip** captures *how* — gait, approach speed,
 dwell, vigilance, who-defers-to-whom. That's the substance of behaviour, and a confound-robust
 second shot at individual ID (a limp reads the same from any angle, where a single still — pose
-+ soft glass — does not). Opt-in, off by default:
++ soft glass — does not). **On by default**, and safe to leave on: the clips folder is a
+**rolling window** — past the `clips_max_gb` disk budget (default 10 GB ≈ two busy weeks) the
+oldest clips are pruned automatically, file and DB row both.
 
 ```powershell
-.\.venv\Scripts\python.exe backyard_cam.py --record-clips            # record a clip around each visit
-.\.venv\Scripts\python.exe backyard_cam.py --record-clips --clip-classes animal person   # also record yourself (test)
+.\.venv\Scripts\python.exe backyard_cam.py                           # clips record by default
+.\.venv\Scripts\python.exe backyard_cam.py --no-record-clips         # ...this run, stills only
+.\.venv\Scripts\python.exe backyard_cam.py --clip-classes animal person   # also record yourself (test)
 ```
 
 - A rolling **pre-roll buffer** means each clip opens on the animal *arriving* (the seconds
@@ -259,9 +262,9 @@ second shot at individual ID (a limp reads the same from any angle, where a sing
   Batch + resumable: `python clipmotion.py` after clips accumulate; `--show` to read them back.
 - One `.mp4` per visit under `clips/<date>/`, plus a row in the **`clips`** table (time span,
   fps, size, detection count) for later behaviour queries. Crops are still saved alongside.
-- All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes) live in
-  `config.py`; `clip_scale < 1.0` trims the in-RAM buffer and file size if memory is tight.
-- Make it permanent (incl. the family launchers) by setting `record_clips = True` in `config.py`.
+- All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes, disk budget)
+  live in `config.py`; `clip_scale < 1.0` trims the in-RAM buffer and file size if memory is
+  tight; `record_clips = False` turns recording off permanently (incl. the family launchers).
 
 ---
 
