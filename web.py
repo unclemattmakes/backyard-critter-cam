@@ -285,6 +285,16 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(behavior.overview(cfg))
                 elif path == "/api/individuals":
                     self._json(stats.individuals_overview(cfg))
+                elif path == "/api/reid/queue":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(_reid_queue(cfg, species=(q.get("species") or ["raccoon"])[0],
+                                           limit=min(int((q.get("limit") or [30])[0]), 100)))
+                elif path == "/api/reid/poses":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
+                elif path == "/api/reid/clips":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(_reid_clips(cfg, (q.get("individual") or [""])[0]))
                 elif path == "/snapshot.jpg":
                     frame, _ = frame_buffer.get()
                     if frame is None:
@@ -319,6 +329,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json({"ok": True})
                 elif path == "/api/individual":
                     self._individual_action(data)
+                elif path == "/api/reid/confirm":
+                    self._reid_confirm(data)
                 elif path.startswith("/api/detection/"):
                     self._detection_action(int(path.rsplit("/", 1)[-1]), data)
                 else:
@@ -330,6 +342,26 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json({"error": str(e)}, code=500)
                 except Exception:
                     pass
+
+        def _reid_confirm(self, data):
+            """Confirm (or clear) WHO one visit was: {"visit_id": 1014, "name": "Stan"}.
+            name=""/null clears. Stamps the visit's species-matching crops (individual_source=
+            'human') and mirrors the name onto the visits row. Deliberately does NOT rebuild the
+            visits table -- a rebuild renumbers visit ids and would invalidate every other card
+            in the open review queue; labels live on detections, so the next rebuild inherits
+            them anyway."""
+            try:
+                vid = int(data.get("visit_id"))
+            except (TypeError, ValueError):
+                self._json({"error": "missing/bad 'visit_id'"}, code=400)
+                return
+            name = (data.get("name") or "").strip() or None
+            conn = db.connect(cfg.db_path)
+            try:
+                n = db.label_visit(conn, vid, name)
+                self._json({"ok": True, "visit_id": vid, "name": name, "stamped": n})
+            finally:
+                conn.close()
 
         def _individual_action(self, data):
             """Name / merge / clear an individual group: {"from": "raccoon_c01", "to": "Notch"}.
@@ -446,6 +478,142 @@ def _naming_status() -> dict:
         return data
     except Exception:
         return {"state": "off"}
+
+
+def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
+    """The Individuals tab's review queue: recent visits of `species` with a WHO suggestion each
+    (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
+    nothing is confirmed yet -- the cold-start visit-groups to name first. Read-only; the heavy
+    lifting (prototype matching over the embedding matrix) lives in individuals.VisitMatcher and
+    is rebuilt per call, which is fine for a tab that loads on demand."""
+    import individuals
+
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"species": species, "queue": [], "cast": [], "bootstrap": []}
+    try:
+        matcher = individuals.VisitMatcher(conn, species, cfg)
+
+        def _rep_crop(det_id):
+            if det_id is None:
+                return None
+            r = conn.execute("SELECT crop_path FROM detections WHERE id = ?", (det_id,)).fetchone()
+            return r["crop_path"].replace("\\", "/") if r and r["crop_path"] else None
+
+        def _dwell(a, b):
+            try:
+                from datetime import datetime as _dt
+                return int((_dt.fromisoformat(b) - _dt.fromisoformat(a)).total_seconds())
+            except (ValueError, TypeError):
+                return 0
+
+        queue = []
+        rows = conn.execute(
+            """SELECT id, started_at, ended_at, detection_count, representative_detection_id
+               FROM visits WHERE species = ? ORDER BY started_at DESC LIMIT ?""",
+            (species, limit)).fetchall()
+        for v in rows:
+            s = matcher.suggest(v["id"])
+            queue.append({
+                "visit_id": v["id"], "started_at": v["started_at"],
+                "dwell_s": _dwell(v["started_at"], v["ended_at"]),
+                "n_crops": v["detection_count"],
+                "rep_crop": _rep_crop(v["representative_detection_id"]),
+                "confirmed_as": s["confirmed_as"], "candidates": s["candidates"],
+                "novel": s["novel"], "multi": s["multi"],
+                "co_present_frames": s["co_present_frames"],
+                "co_present_clips": s["co_present_clips"],
+                "n_embedded": s["n_embedded"], "note": s["note"],
+            })
+
+        # The confirmed cast, with how much template material backs each name.
+        cast: dict = {}
+        for vid, name in matcher.confirmed.items():
+            c = cast.setdefault(name, {"name": name, "n_visits": 0, "last_seen": None})
+            c["n_visits"] += 1
+            started = matcher.visit_started.get(vid)
+            if started and (c["last_seen"] is None or started > c["last_seen"]):
+                c["last_seen"] = started
+
+        def _group_crops(visit_ids):
+            if not visit_ids:
+                return []
+            reps = conn.execute(
+                f"""SELECT representative_detection_id FROM visits
+                    WHERE id IN ({','.join('?' * len(visit_ids))})""", visit_ids).fetchall()
+            return [c for c in (_rep_crop(r["representative_detection_id"]) for r in reps) if c]
+
+        has_templates = bool(matcher.templates())
+
+        # Cold start only: until something is confirmed, naming visit-GROUPS beats naming visits.
+        bootstrap = []
+        if not has_templates:
+            for g in matcher.bootstrap_groups():
+                bootstrap.append({**g, "crops": _group_crops(g["visits"])})
+
+        # Once there's a cast, RE-FIT: sort the unconfirmed remainder into "looks like <name>"
+        # buckets (for bulk-confirm) + candidate-new-individual groups, and flag any confirmed
+        # individual that has no clean solo template yet.
+        refit = None
+        if has_templates:
+            r = matcher.refit()
+            started = matcher.visit_started
+            fits = {name: {"visits": [{**x, "rep_crop": _rep_crop(conn.execute(
+                        "SELECT representative_detection_id FROM visits WHERE id=?",
+                        (x["visit_id"],)).fetchone()[0])} for x in lst]}
+                    for name, lst in r["fits"].items()}
+            refit = {
+                "fits": fits,
+                "novel_groups": [{**g, "crops": _group_crops(g["visits"])}
+                                 for g in r["novel_groups"]],
+                "untemplated": r["untemplated"], "n_fit": r["n_fit"], "n_novel": r["n_novel"]}
+
+        # Heads-up when suggestions are running blind: high-conf crops still missing vectors.
+        backlog = conn.execute(
+            """SELECT COUNT(*) FROM detections d
+               WHERE d.species = ? AND d.confidence >= ? AND NOT EXISTS
+                 (SELECT 1 FROM detection_embeddings e
+                  WHERE e.detection_id = d.id AND e.model = ?)""",
+            (species, cfg.reid_suggest_min_conf, individuals.EMBED_MODEL)).fetchone()[0]
+
+        return {"species": species, "queue": queue,
+                "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
+                "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
+                "novel_threshold": cfg.reid_novel_threshold}
+    finally:
+        conn.close()
+
+
+def _reid_poses(cfg, individual: str, top: int = 12) -> dict:
+    """Characteristic poses of one confirmed individual: clusters of its crops by appearance
+    embedding (identity fixed -> the embedding varies by pose/viewpoint). Returns the biggest
+    `top` pose-groups, each with representative crop paths."""
+    import individuals
+    if not individual:
+        return {"individual": "", "poses": []}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"individual": individual, "poses": []}
+    try:
+        groups = individuals.pose_groups(conn, individual, cfg=cfg)
+        return {"individual": individual, "n_groups": len(groups), "poses": groups[:top]}
+    finally:
+        conn.close()
+
+
+def _reid_clips(cfg, individual: str) -> dict:
+    """Behaviour clips attributable to one confirmed individual (via the visits they overlap)."""
+    import individuals
+    if not individual:
+        return {"individual": "", "clips": []}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"individual": individual, "clips": []}
+    try:
+        clips = individuals.clips_for_individual(conn, individual)
+        return {"individual": individual, "n_clips": len(clips), "clips": clips}
+    finally:
+        conn.close()
 
 
 def _candidate_labels(cfg) -> list:
