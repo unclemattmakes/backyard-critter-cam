@@ -305,6 +305,17 @@
   .reelhero .rh-eyebrow{color:var(--gilt);}
   .reelhero .rh-title{font-variant:small-caps; font-size:24px; letter-spacing:.02em; margin-top:3px;}
   .reelhero .rh-meta{font-family:var(--mono); font-size:12px; color:var(--dim); margin-top:4px;}
+  /* Any served crop/frame is click-to-enlarge (see the #lightbox handler). */
+  img[src*="/media/"]{cursor:zoom-in;}
+  #lightbox{position:fixed; inset:0; z-index:100; display:none; align-items:center; justify-content:center;
+    background:rgba(8,6,3,.86); backdrop-filter:blur(3px); cursor:zoom-out;}
+  #lightbox.open{display:flex;}
+  #lightbox img{max-width:92vw; max-height:86vh; border:1px solid var(--rule2); border-radius:6px;
+    box-shadow:0 18px 60px rgba(0,0,0,.6); background:#0c0a06; image-rendering:auto;}
+  #lightbox .lb-cap{position:fixed; bottom:22px; left:50%; transform:translateX(-50%); font-family:var(--mono);
+    font-size:13px; color:var(--ink); background:rgba(16,13,7,.7); border:1px solid var(--rule);
+    padding:6px 12px; border-radius:5px; max-width:90vw; text-align:center;}
+  #lightbox .lb-hint{position:fixed; top:18px; right:22px; font-family:var(--mono); font-size:12px; color:var(--dim);}
 </style>
 </head>
 <body>
@@ -821,13 +832,34 @@ async function renderVisits(params,body){
 }
 function visitCard(v,i){
   const nclips=(v.clips||[]).length;
+  const sp=(v.title&&v.title!=='animal')?v.title:'';
+  // The label footer stops click-propagation so using it never triggers the card's play/drill.
+  const footer=`<div class="vlabel" onclick="event.stopPropagation()" style="margin-top:8px;display:flex;flex-direction:column;gap:5px">
+      <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
+        <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+        ${speciesSelect('vsp-'+i,sp)}
+        <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
+      <div style="display:flex;gap:5px;align-items:center">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
+      <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
+    </div>`;
   return `<div class="card vcard" data-vi="${i}">
     <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
     <div class="body">
       <div class="common">${esc(cap1(v.title||'animal'))}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
       <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
+      ${footer}
     </div></div>`;
+}
+function _visitTarget(i){ const v=visitsData[i]||{}; return {source:v.source,start:v.start,end:v.end}; }
+function visitSaved(i,msg){ const s=document.getElementById('vst-'+i); if(s){ s.textContent=msg; s.style.color='var(--ok)'; } }
+function explorerName(i){
+  const inp=document.getElementById('vn-'+i); const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  postVisitLabel(_visitTarget(i),{name},()=>visitSaved(i,'✓ named '+name));
+}
+function explorerSpecies(i){
+  visitSpeciesCorrect(_visitTarget(i),'vsp-'+i,r=>visitSaved(i,'✓ '+nameOf(r.species_set||r.dominant_species||'')));
 }
 
 async function renderDays(params,body){
@@ -1049,12 +1081,207 @@ function renderBehavior(d){
   body.innerHTML=html;
 }
 
-/* ---------- individuals (phase 3: hand-label the clusters into a cast) ---------- */
+/* ---------- individuals (phase 3: suggest-confirm loop + hand-label the clusters) ---------- */
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
-  let d; try{ d=await fetch('/api/individuals').then(r=>r.json()); }
-  catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
-  renderIndividuals(d);
+  let d=null,q=null;
+  try{
+    [q,d]=await Promise.all([
+      fetch('/api/reid/queue').then(r=>r.json()).catch(()=>null),
+      fetch('/api/individuals').then(r=>r.json())]);
+  }catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
+  renderIndividuals(d,q);
+}
+
+/* The review queue: every recent visit gets a "who is this?" suggestion; you confirm or
+   correct. Each confirmation becomes a new appearance template, so suggestions sharpen as the
+   cast grows. Before anything is confirmed, name the bootstrap visit-GROUPS instead. */
+let REID_BOOT=[];
+function reidWhen(ts){ return ts? ts.slice(5,16).replace('T',' ') : '?'; }
+function reidInput(id,ph){ return `<input id="${id}" placeholder="${ph}" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit" onkeydown="if(event.key==='Enter')this.nextElementSibling.click()">`; }
+function reidCard(v){
+  const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
+  const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
+  const multiEv=[v.co_present_frames? `${v.co_present_frames} still frame(s)`:'', v.co_present_clips? `${v.co_present_clips} clip(s)`:''].filter(Boolean).join(' + ');
+  const multi=v.multi? `<span class="flag" style="background:rgba(255,170,60,.16);border-color:rgba(255,170,60,.4)" title="${multiEv||'two animals'} show two raccoons at once — co-arrival is behaviour signal; the appearance suggestion is a blend">2+ raccoons</span>` : '';
+  let sugg='', act='';
+  if(v.confirmed_as){
+    sugg=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(v.confirmed_as)} ✓</span>`;
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},null,true)" title="unconfirm this visit">Clear</button>`;
+  }else if((v.candidates||[]).length){
+    const top=v.candidates[0];
+    const rest=v.candidates.slice(1).map(c=>`${esc(c.name)} ${Math.round(c.similarity*100)}%`).join(' · ');
+    sugg=`<span class="flag" title="nearest confirmed visit: #${top.via_visit} (${reidWhen(top.via_started)})">looks like <b>${esc(top.name)}</b> ${Math.round(top.similarity*100)}%</span>`
+        +(v.novel? `<span class="flag" style="background:rgba(255,120,90,.14);border-color:rgba(255,120,90,.4)" title="best match is below the novelty threshold">possibly someone new</span>`:'')
+        +(rest? `<span class="lbl" style="opacity:.6">${rest}</span>`:'');
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},'${esc(top.name)}')" title="yes, it's ${esc(top.name)}">✓ ${esc(top.name)}</button>
+         ${reidInput('rq-'+v.visit_id,'or who…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
+  }else{
+    sugg=`<span class="lbl" style="opacity:.65">${esc(v.note||'no suggestion yet')}</span>`;
+    act=`${reidInput('rq-'+v.visit_id,'who is this…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
+  }
+  const sp=v.species||'raccoon', spId='rqsp-'+v.visit_id;
+  const spRow=`<div style="display:flex;gap:6px;align-items:center;margin-top:8px;border-top:1px solid var(--rule);padding-top:8px;flex-wrap:wrap">
+    <span class="lbl" style="opacity:.72">species: <b>${esc(nameOf(sp))}</b></span>
+    <button class="gear" onclick="postVisitLabel({visit_id:${v.visit_id}},{verify:true},loadIndividuals)" title="confirm this species for the whole visit">✓</button>
+    ${speciesSelect(spId,sp)}
+    <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
+  return `<div class="panel" style="padding:10px 14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      ${thumb}
+      <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
+        <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${multi}</div>
+      <div style="display:flex;gap:6px;align-items:center">${act}</div>
+    </div>
+    ${spRow}
+  </div>`;
+}
+function reidBootCard(g,i){
+  const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;
+  const nmulti=(g.multi||[]).filter(Boolean).length;
+  const thumbs=(g.crops||[]).slice(0,6).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">look-alike group ${i+1}</div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti? ` · ${nmulti}× 2+ animals`:''}</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${reidInput('rg-'+i,'name… (e.g. Stan)')}<button class="gear" onclick="reidNameGroup(${i})">Name all</button></div>
+  </div>`;
+}
+/* Re-fit: once a cast exists, sort the unconfirmed remainder into "looks like <name>" buckets
+   (bulk-confirm) and candidate-new-individual groups, and flag anyone named only on a pair visit. */
+let REID_REFIT=null;
+function reidFitCard(name,bucket){
+  const vs=bucket.visits||[];
+  const thumbs=vs.slice(0,8).map(x=>x.rep_crop?
+    `<img src="/media/${encodeURI(x.rep_crop)}" loading="lazy" title="visit #${x.visit_id} · ${Math.round(x.similarity*100)}%" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`:'').join('');
+  const lo=Math.round(vs[vs.length-1].similarity*100), hi=Math.round(vs[0].similarity*100);
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:150px"><div style="font-weight:600">looks like ${esc(name)}</div>
+      <div class="lbl" style="opacity:.72">${vs.length} unconfirmed visit(s) · ${lo}–${hi}% match</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="gear" onclick="reidConfirmFit('${esc(name)}')" title="confirm all ${vs.length} visits as ${esc(name)}">✓ All ${vs.length} as ${esc(name)}</button></div>
+  </div>`;
+}
+function reidNovelCard(g,i){
+  const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;
+  const nmulti=(g.multi||[]).filter(Boolean).length;
+  const thumbs=(g.crops||[]).slice(0,8).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('');
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">possible new individual ${i+1}</div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti?` · ${nmulti}× 2+ animals`:''}</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${reidInput('rn-'+i,'name…')}<button class="gear" onclick="reidNameNovel(${i})">Name all</button></div>
+  </div>`;
+}
+function reidRefitHTML(refit){
+  if(!refit) return '';
+  const fitNames=Object.keys(refit.fits||{});
+  if(!fitNames.length && !(refit.novel_groups||[]).length && !(refit.untemplated||[]).length) return '';
+  let html=`<h2 class="sec">Fit to the Cast <span class="n">sort the rest by who they resemble — confirm in bulk</span></h2>`;
+  if((refit.untemplated||[]).length){
+    html+=`<p class="lbl" style="margin:2px 0 10px;color:var(--rust)">⚠ ${refit.untemplated.map(esc).join(', ')} ${refit.untemplated.length>1?'were':'was'} confirmed only on a <b>multi-animal visit</b>, so the appearance template is a blend of two raccoons and can't be matched. Confirm a <b>solo</b> visit for ${refit.untemplated.length>1?'each':'them'} (find one in the queue below without a “2+ raccoons” badge) to make ${refit.untemplated.length>1?'them':'it'} findable.</p>`;
+  }
+  if(fitNames.length){
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">${
+      fitNames.sort((a,b)=>refit.fits[b].visits.length-refit.fits[a].visits.length)
+        .map(n=>reidFitCard(n,refit.fits[n])).join('')}</div>`;
+  }
+  if((refit.novel_groups||[]).length){
+    html+=`<p class="lbl" style="opacity:.75;margin:8px 0 6px">Looks like nobody on file yet — ${refit.n_novel} visit(s) clustered into candidate new individuals:</p>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${refit.novel_groups.map(reidNovelCard).join('')}</div>`;
+  }
+  return html;
+}
+function reidQueueHTML(q){
+  if(!q||(!q.queue.length&&!q.bootstrap.length&&!q.refit)) return '';
+  let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
+  if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops have no appearance vector yet — suggestions may run thin until you run <code>python embed.py --min-confidence 0.5</code>.</p>`;
+  if(q.bootstrap.length){
+    html+=`<p class="lbl" style="opacity:.75;margin:4px 0 10px">Nothing confirmed yet, so here are the corpus' look-alike <b>visit groups</b> (each is probably one animal — your eye decides; skip the 2+-animal ones first pass). Naming a group confirms every visit in it.</p>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${q.bootstrap.map(reidBootCard).join('')}</div>`;
+  }
+  html+=reidRefitHTML(q.refit);
+  if(q.queue.length){
+    const cast=(q.cast||[]).map(c=>`<span class="flag">${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}</span>`).join(' ');
+    if(cast) html+=`<h2 class="sec">Visit-by-Visit <span class="n">${q.queue.length} recent</span></h2><div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`;
+  }
+  return html;
+}
+/* Shared per-visit labelling (species confirm/correct + individual name), used by BOTH the
+   "Who is this?" queue (targets a visit_id) and the Explorer Visits list (targets a
+   source+start+end span). One backend: POST /api/visit/label. */
+function speciesSelect(id, current){
+  const opts=['<option value="">— correct species… —</option>']
+    .concat(LABELS.map(l=>`<option value="${esc(l)}"${l===current?' selected':''}>${esc(cap1(l))}</option>`),
+            ['<option value="__other__">+ other…</option>']).join('');
+  return `<select id="${id}" style="padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit;font:inherit;max-width:150px">${opts}</select>`;
+}
+async function postVisitLabel(target, body, after){
+  try{
+    const r=await fetch('/api/visit/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(Object.assign({}, target, body))}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    if(after) after(r);
+  }catch(e){ alert('Could not save: '+e); }
+}
+function visitSpeciesCorrect(target, selectId, after){
+  const sel=document.getElementById(selectId); if(!sel) return;
+  let sp=sel.value;
+  if(sp==='__other__'){ sp=(prompt('New species label (e.g. striped skunk):')||'').trim(); }
+  if(!sp) return;
+  postVisitLabel(target, {species:sp}, after);
+}
+async function reidConfirmMany(visitIds,name){
+  try{
+    for(const vid of visitIds)
+      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({visit_id:vid,name})});
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+async function reidConfirmFit(name){
+  const b=REID_REFIT&&REID_REFIT.fits&&REID_REFIT.fits[name]; if(!b) return;
+  const ids=b.visits.map(x=>x.visit_id);
+  if(!confirm(`Confirm all ${ids.length} visits as ${name}?`)) return;
+  reidConfirmMany(ids,name);
+}
+async function reidNameNovel(i){
+  const inp=document.getElementById('rn-'+i);
+  const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=REID_REFIT&&REID_REFIT.novel_groups&&REID_REFIT.novel_groups[i]; if(!g) return;
+  reidConfirmMany(g.visits,name);
+}
+async function reidConfirm(vid,name,clear){
+  if(clear&&!confirm('Unconfirm this visit?')) return;
+  if(!clear&&!name){
+    const inp=document.getElementById('rq-'+vid);
+    name=(inp&&inp.value||'').trim();
+    if(!name){ if(inp) inp.focus(); return; }
+  }
+  try{
+    const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({visit_id:vid,name:clear?null:name})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+async function reidNameGroup(i){
+  const inp=document.getElementById('rg-'+i);
+  const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=REID_BOOT[i]; if(!g) return;
+  try{
+    for(const vid of g.visits)
+      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({visit_id:vid,name})});
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
 }
 function indivRow(g){
   const span=(g.first_seen&&g.last_seen)?`${g.first_seen.slice(5,10)} → ${g.last_seen.slice(5,10)}`:'';
@@ -1063,28 +1290,68 @@ function indivRow(g){
   const act = g.placeholder
     ? `<input id="nm-${esc(g.id)}" placeholder="name… (e.g. Notch)" style="width:130px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">
        <button class="gear" onclick="nameIndiv('${esc(g.id)}')">Name</button>`
-    : `<button class="gear" onclick="nameIndiv('${esc(g.id)}')" title="rename">Rename</button>
+    : `<button class="gear" onclick="togglePoses('${esc(g.id)}')" title="cluster this individual's crops into characteristic poses">Poses</button>
+       <button class="gear" onclick="toggleClips('${esc(g.id)}')" title="watch this individual's behaviour clips">Clips</button>
+       <button class="gear" onclick="nameIndiv('${esc(g.id)}')" title="rename">Rename</button>
        <button class="gear" onclick="clearIndiv('${esc(g.id)}')" title="unassign these crops">Clear</button>
-       <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
-  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
-    <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
-      <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div></div>
-    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
-    <div style="display:flex;gap:6px;align-items:center">${act}</div>
+       <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:90px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
+  return `<div class="panel" style="padding:10px 14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
+        <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div></div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+      <div style="display:flex;gap:6px;align-items:center">${act}</div>
+    </div>
+    ${g.placeholder?'':`<div id="poses-${esc(g.id)}" style="display:none;margin-top:10px;border-top:1px solid var(--rule);padding-top:10px"></div>
+    <div id="clips-${esc(g.id)}" style="display:none;margin-top:10px;border-top:1px solid var(--rule);padding-top:10px"></div>`}
   </div>`;
 }
-function renderIndividuals(d){
+async function toggleClips(name){
+  const box=document.getElementById('clips-'+name); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; box.innerHTML='<p class="lbl" style="opacity:.7">Gathering '+esc(name)+"'s clips…</p>";
+  let d; try{ d=await fetch('/api/reid/clips?individual='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not load clips.</p>'; return; }
+  const clips=d.clips||[];
+  if(!clips.length){ box.innerHTML='<p class="lbl" style="opacity:.7">No clips overlap '+esc(name)+"'s visits (clips only exist from 2026-06-09 on).</p>"; return; }
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:8px">${esc(name)}'s footage — ${d.n_clips} clip(s), newest first. ⚠ marks clips during a 2+-raccoon visit (shows ${esc(name)} with another).</div>`
+    +`<div style="display:flex;flex-wrap:wrap;gap:12px">`+clips.map(c=>
+      `<div style="flex:0 0 auto;width:240px"><video src="/media/${encodeURI(c.clip_path)}" controls preload="metadata" style="width:240px;border-radius:5px;background:#000"></video>`
+      +`<div class="lbl" style="opacity:.6;font-family:var(--mono);font-size:11px;margin-top:2px">${reidWhen(c.started_at)}${c.duration_s?` · ${Math.round(c.duration_s)}s`:''}${c.multi?' · ⚠ 2+':''}</div></div>`).join('')
+    +`</div>`;
+}
+async function togglePoses(name){
+  const box=document.getElementById('poses-'+name); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; box.innerHTML='<p class="lbl" style="opacity:.7">Clustering '+esc(name)+"'s poses…</p>";
+  let d; try{ d=await fetch('/api/reid/poses?individual='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not load poses.</p>'; return; }
+  const poses=d.poses||[];
+  if(!poses.length){ box.innerHTML='<p class="lbl" style="opacity:.7">Not enough embedded crops to cluster poses yet.</p>'; return; }
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:8px">${esc(name)}'s characteristic poses — ${d.n_groups} group(s) of crops that share a body posture/viewpoint (the biggest ${poses.length} shown):</div>`
+    +`<div style="display:flex;flex-wrap:wrap;gap:14px">`+poses.map((p,i)=>
+      `<div style="flex:0 0 auto"><div class="lbl" style="opacity:.6;font-family:var(--mono);font-size:11px;margin-bottom:3px">pose ${i+1} · ${p.n} crops</div>`
+      +`<div style="display:flex;gap:3px;flex-wrap:wrap;max-width:300px">`+(p.rep_crops||[]).map(c=>
+        `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:60px;height:60px;object-fit:cover;border-radius:4px">`).join('')+`</div></div>`).join('')
+    +`</div>`;
+}
+function renderIndividuals(d,q){
   const body=$('#indiv-body');
-  const groups=d.groups||[];
-  if(!groups.length){ body.innerHTML='<p class="empty">No individuals yet — run <code>python reid.py --write-clusters</code> to propose look-alike groups, then name them here.</p>'; return; }
+  REID_BOOT=(q&&q.bootstrap)||[];
+  REID_REFIT=(q&&q.refit)||null;
+  const queueHTML=reidQueueHTML(q);
+  const groups=(d&&d.groups)||[];
+  if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals yet — let visits accumulate, run <code>python embed.py</code>, then name the look-alike groups that appear here.</p>'; return; }
+  if(!groups.length){ body.innerHTML=queueHTML; return; }
   const named=groups.filter(g=>!g.placeholder), prop=groups.filter(g=>g.placeholder);
-  let html=`<p class="lbl" style="opacity:.75;margin:4px 0 14px">Each group is a set of crops that LOOK alike (appearance clustering — proposals, not certainties).
-    Naming a group adds it to the cast; giving two groups the same name merges them. Through-glass appearance is weak — when unsure, leave it unnamed.</p>`;
+  let html=queueHTML;
   if(named.length){
     html+=`<h2 class="sec">The Cast <span class="n">${named.length} named</span></h2>`;
     html+=`<div style="display:flex;flex-direction:column;gap:8px">${named.map(indivRow).join('')}</div>`;
   }
-  html+=`<h2 class="sec">Unnamed Look-Alike Groups <span class="n">${prop.length} proposed</span></h2>`;
+  html+=`<h2 class="sec">Crop-Level Look-Alike Clusters <span class="n">${prop.length} proposed — the visit queue above is the sharper tool</span></h2>`;
+  html+=`<p class="lbl" style="opacity:.75;margin:4px 0 14px">Each group is a set of crops that LOOK alike (appearance clustering — proposals, not certainties).
+    Naming a group adds it to the cast; giving two groups the same name merges them. Through-glass appearance is weak — when unsure, leave it unnamed.</p>`;
   html+=`<div style="display:flex;flex-direction:column;gap:8px">${prop.slice(0,30).map(indivRow).join('')}</div>`;
   if(prop.length>30) html+=`<p class="empty">…and ${prop.length-30} smaller groups (name the big ones first).</p>`;
   body.innerHTML=html;
@@ -1184,6 +1451,56 @@ refreshLive(); refreshCamera(); refreshNaming();
 setInterval(refreshLive,6000);
 setInterval(refreshCamera,4000);
 setInterval(refreshNaming,4000);
+/* ---------- lightbox: click any crop/frame to enlarge ---------- */
+/* Delegated so it covers every served image across all tabs (review queue, cast, species
+   browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.
+   The thumbnails are full-res crops sized down by CSS, so the same src shown at natural size
+   IS the enlargement; no separate big-image endpoint needed. */
+(function(){
+  const lb=document.createElement('div');
+  lb.id='lightbox';
+  lb.innerHTML='<div class="lb-hint">← → or click image to browse · Esc to close</div>'
+              +'<img alt="enlarged crop"><div class="lb-cap"></div>';
+  document.body.appendChild(lb);   // this script runs at end of <body>, so body exists
+  const img=lb.querySelector('img'), cap=lb.querySelector('.lb-cap');
+  let gallery=[], idx=-1;
+  function captionFor(el){
+    // Nearest visit/individual label if there is one, else the filename; + position in the set.
+    const card=el.closest('.panel'); let label='';
+    if(card){ const h=card.querySelector('div[style*="font-weight:600"]'); if(h) label=h.textContent.trim(); }
+    const file=decodeURI((el.getAttribute('src')||'').split('/').pop());
+    const base=label? label+' — '+file : file;
+    return gallery.length>1? `${base}   ·   ${idx+1} / ${gallery.length}` : base;
+  }
+  function showIdx(i){
+    if(!gallery.length) return;
+    idx=(i+gallery.length)%gallery.length;        // wrap both directions
+    img.src=gallery[idx].src; cap.textContent=captionFor(gallery[idx]);
+  }
+  function openFrom(el){
+    // The gallery is every crop/frame currently on the page, in document order, so ← → walk the
+    // strip you clicked from (a visit's crops, the cast, the explorer) without per-view wiring.
+    gallery=[...document.querySelectorAll('img[src*="/media/"]')].filter(x=>!lb.contains(x));
+    const at=gallery.indexOf(el);
+    gallery=gallery.length?gallery:[el];
+    showIdx(at<0?0:at); lb.classList.add('open');
+  }
+  function close(){ lb.classList.remove('open'); img.removeAttribute('src'); gallery=[]; idx=-1; }
+  lb.addEventListener('click',e=>{ e.target===img? showIdx(idx+1) : close(); });  // image=next, backdrop=close
+  document.addEventListener('keydown',e=>{
+    if(!lb.classList.contains('open')) return;
+    if(e.key==='Escape') close();
+    else if(e.key==='ArrowRight'){ e.preventDefault(); showIdx(idx+1); }
+    else if(e.key==='ArrowLeft'){ e.preventDefault(); showIdx(idx-1); }
+  });
+  document.addEventListener('click',e=>{
+    const t=e.target;
+    if(t&&t.tagName==='IMG'&&!lb.contains(t)&&/\/media\//.test(t.getAttribute('src')||'')){
+      e.preventDefault();
+      openFrom(t);
+    }
+  });
+})();
 </script>
 </body>
 </html>

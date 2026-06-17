@@ -136,19 +136,23 @@ CREATE TABLE IF NOT EXISTS clips (
 CREATE INDEX IF NOT EXISTS idx_clips_started ON clips(started_at);
 CREATE INDEX IF NOT EXISTS idx_clips_source  ON clips(source);
 
--- Phase 4 ANALYSIS: one motion track per clip (clipmotion.py). The clip's frames are sampled,
--- the detector finds the animal in each, and the box-centre trajectory becomes a MOTION
--- FINGERPRINT: how fast, how straight, how hesitant, approaching or retreating. Motion is the
--- behaviour signal stills can't carry -- and a confound-robust second shot at individual ID (a
--- limp reads the same from any angle). `track` keeps the raw normalized trajectory as JSON so
--- richer gait features can be re-derived later WITHOUT re-running the detector over the video.
+-- Phase 4 ANALYSIS: motion tracks per clip (clipmotion.py). The clip's frames are sampled,
+-- the detector finds the animals in each, and per-frame boxes are associated into one row PER
+-- ANIMAL (track_idx 0..N -- a pair visit yields two tracklets). Each box-centre trajectory
+-- becomes a MOTION FINGERPRINT: how fast, how straight, how hesitant, approaching or
+-- retreating -- plus a GAIT estimate (stride cadence from the body-bob periodicity while
+-- walking). Motion is the behaviour signal stills can't carry -- and a confound-robust second
+-- shot at individual ID (a limp reads the same from any angle). `track` keeps the raw
+-- normalized trajectory as JSON so richer gait features can be re-derived later WITHOUT
+-- re-running the detector over the video.
 CREATE TABLE IF NOT EXISTS clip_tracks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     clip_id         INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
     model           TEXT    NOT NULL,   -- detector used to build the track.
+    track_idx       INTEGER NOT NULL DEFAULT 0,  -- which animal within the clip (0-based).
     created_at      TEXT    NOT NULL,
     n_samples       INTEGER,            -- frames sampled from the clip.
-    n_hits          INTEGER,            -- samples where an animal/person box was found.
+    n_hits          INTEGER,            -- samples in THIS tracklet (its length in boxes).
     track           TEXT,               -- JSON [[t_s, cx, cy, w, h, conf], ...], coords normalized 0..1.
     duration_s      REAL,               -- span of the track (first hit .. last hit).
     path_len        REAL,               -- total distance travelled (normalized units).
@@ -157,9 +161,31 @@ CREATE TABLE IF NOT EXISTS clip_tracks (
     avg_speed       REAL,               -- mean speed while moving (normalized units / s).
     peak_speed      REAL,
     moving_frac     REAL,               -- fraction of samples in motion (vs stationary, e.g. eating).
-    area_trend      REAL                -- end/start box-area ratio: >1 approached the camera, <1 left.
+    area_trend      REAL,               -- end/start box-area ratio: >1 approached the camera, <1 left.
+    stride_hz       REAL,               -- gait cadence (body-bob frequency while walking); NULL = none found.
+    stride_strength REAL,               -- autocorrelation peak 0..1 backing stride_hz; NULL with it.
+    walk_s          REAL                -- seconds of continuous walking the gait estimate is based on.
 );
 CREATE INDEX IF NOT EXISTS idx_clip_tracks_clip ON clip_tracks(clip_id);
+
+-- Phase 4 (part 3): one APPEARANCE prototype per clip tracklet (clipembed.py). A tracklet is a
+-- single animal tracked through a clip, so embedding its sharpest frames gives a clean per-ANIMAL
+-- appearance vector EVEN inside a multi-animal visit -- which the still pipeline can only treat as
+-- a blended whole. Same 1536-d MegaDescriptor space as detection_embeddings, so clip and still
+-- vectors are directly comparable (a tracklet can be matched to a confirmed individual, two
+-- tracklets in one clip can be tested as a different-individual pair, and a pair visit's tracklets
+-- can be clustered to un-blend the two animals). Keyed by (track, model); cascades when a track is
+-- recomputed.
+CREATE TABLE IF NOT EXISTS clip_track_embeddings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id    INTEGER NOT NULL REFERENCES clip_tracks(id) ON DELETE CASCADE,
+    model       TEXT    NOT NULL,   -- embedder tag, e.g. 'megadescriptor-l-384'.
+    dim         INTEGER NOT NULL,
+    embedding   BLOB    NOT NULL,   -- float32, L2-normalized (mean of the sampled frames).
+    n_frames    INTEGER,            -- how many frames were pooled into this prototype.
+    created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clip_track_emb ON clip_track_embeddings(track_id, model);
 """
 
 
@@ -252,23 +278,32 @@ def insert_clip(conn: sqlite3.Connection, *, source: str, clip_path: str, starte
     return int(cur.lastrowid)
 
 
-def insert_clip_track(conn: sqlite3.Connection, *, clip_id: int, model: str, n_samples: int,
-                      n_hits: int, track_json: str, features: dict) -> int:
-    """Store one clip's motion track + derived features (clipmotion.py). Replaces any existing
-    track for the same (clip, model) so --redo is idempotent."""
+def insert_clip_tracks(conn: sqlite3.Connection, *, clip_id: int, model: str, n_samples: int,
+                       tracklets: Sequence[dict]) -> int:
+    """Store ALL of one clip's motion tracklets (one row per animal, track_idx 0..N) + their
+    derived features (clipmotion.py). Each tracklet dict: {"track_json", "n_hits", "features"}.
+    Replaces every existing row for the same (clip, model) so --redo is idempotent. A clip with
+    NO animal found still gets one empty marker row (n_hits=0) so the resumable batch doesn't
+    re-process it forever. Returns rows inserted."""
     conn.execute("DELETE FROM clip_tracks WHERE clip_id = ? AND model = ?", (int(clip_id), model))
-    cur = conn.execute(
-        """INSERT INTO clip_tracks (clip_id, model, created_at, n_samples, n_hits, track,
-                                    duration_s, path_len, net_disp, straightness, avg_speed,
-                                    peak_speed, moving_frac, area_trend)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (int(clip_id), model, now_local_iso(), int(n_samples), int(n_hits), track_json,
-         features.get("duration_s"), features.get("path_len"), features.get("net_disp"),
-         features.get("straightness"), features.get("avg_speed"), features.get("peak_speed"),
-         features.get("moving_frac"), features.get("area_trend")),
-    )
+    if not tracklets:
+        tracklets = [{"track_json": "[]", "n_hits": 0, "features": {}}]
+    for idx, t in enumerate(tracklets):
+        f = t.get("features") or {}
+        conn.execute(
+            """INSERT INTO clip_tracks (clip_id, model, track_idx, created_at, n_samples, n_hits,
+                                        track, duration_s, path_len, net_disp, straightness,
+                                        avg_speed, peak_speed, moving_frac, area_trend,
+                                        stride_hz, stride_strength, walk_s)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (int(clip_id), model, idx, now_local_iso(), int(n_samples), int(t["n_hits"]),
+             t["track_json"], f.get("duration_s"), f.get("path_len"), f.get("net_disp"),
+             f.get("straightness"), f.get("avg_speed"), f.get("peak_speed"),
+             f.get("moving_frac"), f.get("area_trend"),
+             f.get("stride_hz"), f.get("stride_strength"), f.get("walk_s")),
+        )
     conn.commit()
-    return int(cur.lastrowid)
+    return len(tracklets)
 
 
 def clips_needing_tracks(conn: sqlite3.Connection, model: str):
@@ -278,6 +313,48 @@ def clips_needing_tracks(conn: sqlite3.Connection, model: str):
            WHERE NOT EXISTS (SELECT 1 FROM clip_tracks t WHERE t.clip_id = c.id AND t.model = ?)
            ORDER BY c.id""", (model,)
     ).fetchall()
+
+
+def insert_clip_track_embedding(conn: sqlite3.Connection, *, track_id: int, model: str, dim: int,
+                                embedding: bytes, n_frames: int) -> None:
+    """Store one tracklet's appearance prototype (clipembed.py). Raw float32 bytes, already
+    L2-normalized so a dot product is cosine similarity. Idempotent per (track, model)."""
+    conn.execute("DELETE FROM clip_track_embeddings WHERE track_id = ? AND model = ?",
+                 (int(track_id), model))
+    conn.execute(
+        "INSERT INTO clip_track_embeddings (track_id, model, dim, embedding, n_frames, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (int(track_id), model, int(dim), embedding, int(n_frames), now_local_iso()))
+    conn.commit()
+
+
+def clip_tracks_needing_embedding(conn: sqlite3.Connection, model: str, min_hits: int):
+    """Sustained tracklets (>= min_hits boxes) that have a stored track but no appearance vector
+    for `model` yet -- the resumable work-list for clipembed.py. Joins the clip path + fps so the
+    embedder can re-open the video and seek to the tracklet's frames."""
+    return conn.execute(
+        """SELECT t.id AS track_id, t.clip_id, t.track_idx, t.track, t.n_hits,
+                  c.clip_path, c.fps
+           FROM clip_tracks t JOIN clips c ON c.id = t.clip_id
+           WHERE t.n_hits >= ? AND t.track IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM clip_track_embeddings e
+                             WHERE e.track_id = t.id AND e.model = ?)
+           ORDER BY t.clip_id, t.track_idx""",
+        (int(min_hits), model)).fetchall()
+
+
+def load_clip_track_embeddings(conn: sqlite3.Connection, model: str, *, species=None):
+    """Read back tracklet appearance prototypes joined to clip + (time-overlapping) context, for
+    matching/analysis. Returns rows with: track_id, clip_id, track_idx, n_hits, embedding,
+    clip_started_at, clip_source. (Visit/individual attribution is done by the caller via time
+    overlap, as visits renumber on rebuild.)"""
+    return conn.execute(
+        """SELECT e.track_id, t.clip_id, t.track_idx, t.n_hits, e.embedding,
+                  c.started_at AS clip_started_at, c.ended_at AS clip_ended_at, c.source AS clip_source
+           FROM clip_track_embeddings e
+           JOIN clip_tracks t ON t.id = e.track_id
+           JOIN clips c ON c.id = t.clip_id
+           WHERE e.model = ? ORDER BY c.started_at, t.track_idx""", (model,)).fetchall()
 
 
 def clear_visits(conn: sqlite3.Connection) -> None:
@@ -325,6 +402,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE detections ADD COLUMN visit_id INTEGER")
     if "crop_quality" not in cols:
         conn.execute("ALTER TABLE detections ADD COLUMN crop_quality REAL")
+    if "individual_source" not in cols:
+        # Who assigned individual_id: 'cluster' (reid.py look-alike proposal) vs 'human'
+        # (confirmed in the dashboard / --name). The suggestion engine builds its appearance
+        # templates ONLY from human-confirmed labels; placeholder clusters never feed back.
+        conn.execute("ALTER TABLE detections ADD COLUMN individual_source TEXT")
+        # Every label written before this column existed was a reid.py placeholder cluster.
+        conn.execute("UPDATE detections SET individual_source = 'cluster' "
+                     "WHERE individual_id IS NOT NULL")
+    # clip_tracks grew multi-animal + gait columns (2026-06-11, phase 4 part 2).
+    ct_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_tracks)")}
+    if "track_idx" not in ct_cols:
+        conn.execute("ALTER TABLE clip_tracks ADD COLUMN track_idx INTEGER NOT NULL DEFAULT 0")
+    for col in ("stride_hz", "stride_strength", "walk_s"):
+        if col not in ct_cols:
+            conn.execute(f"ALTER TABLE clip_tracks ADD COLUMN {col} REAL")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
@@ -434,18 +526,21 @@ def load_embeddings(conn: sqlite3.Connection, model: str, *, species: Optional[s
 
 
 def set_individual(conn: sqlite3.Connection, detection_id: int,
-                   individual_id: Optional[str]) -> None:
+                   individual_id: Optional[str], source: Optional[str] = "human") -> None:
     """Phase 3: assign (or clear, with None) the individual a crop belongs to."""
-    conn.execute("UPDATE detections SET individual_id = ? WHERE id = ?",
-                 (individual_id, int(detection_id)))
+    conn.execute("UPDATE detections SET individual_id = ?, individual_source = ? WHERE id = ?",
+                 (individual_id, None if individual_id is None else source, int(detection_id)))
     conn.commit()
 
 
 def set_individual_bulk(conn: sqlite3.Connection, detection_ids: Sequence[int],
-                        individual_id: Optional[str]) -> int:
-    """Assign one individual to many crops at once (naming a whole cluster). Returns the count."""
-    conn.executemany("UPDATE detections SET individual_id = ? WHERE id = ?",
-                     [(individual_id, int(i)) for i in detection_ids])
+                        individual_id: Optional[str], source: Optional[str] = "human") -> int:
+    """Assign one individual to many crops at once (naming a whole cluster). Returns the count.
+    `source` records who decided: 'human' (a confirmation -- feeds the suggestion templates) or
+    'cluster' (a reid.py look-alike proposal -- never feeds back into suggestions)."""
+    src = None if individual_id is None else source
+    conn.executemany("UPDATE detections SET individual_id = ?, individual_source = ? WHERE id = ?",
+                     [(individual_id, src, int(i)) for i in detection_ids])
     conn.commit()
     return len(detection_ids)
 
@@ -453,8 +548,118 @@ def set_individual_bulk(conn: sqlite3.Connection, detection_ids: Sequence[int],
 def rename_individual(conn: sqlite3.Connection, old: str, new: Optional[str]) -> int:
     """Rename every crop labelled `old` to `new` (the dashboard's naming action). Naming two
     groups the same `new` MERGES them -- that's a feature: several look-alike clusters often turn
-    out to be one animal. `new=None` clears the label back to unassigned. Returns rows changed."""
-    cur = conn.execute("UPDATE detections SET individual_id = ? WHERE individual_id = ?",
-                       (new, old))
+    out to be one animal. `new=None` clears the label back to unassigned. Returns rows changed.
+    A rename is a human act: the renamed crops become source='human' (a cleared label loses its
+    source too)."""
+    cur = conn.execute(
+        "UPDATE detections SET individual_id = ?, individual_source = ? WHERE individual_id = ?",
+        (new, None if new is None else "human", old))
     conn.commit()
     return cur.rowcount
+
+
+def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional[str],
+                source: str = "human") -> int:
+    """Confirm WHO a visit was: stamp `individual_id` onto the visit's detections that match the
+    visit's dominant species (a stray mid-visit crow crop keeps its own identity), and mirror it
+    onto the visits row. The visit is the labelling unit -- one solo animal per visit, so one
+    confirmation labels every crop AND makes the visit a template for future suggestions.
+    `individual_id=None` clears. Returns crops stamped."""
+    v = conn.execute("SELECT species FROM visits WHERE id = ?", (int(visit_id),)).fetchone()
+    if v is None:
+        return 0
+    sp = v[0]
+    where = "visit_id = ?" + ("" if sp is None else " AND species = ?")
+    params = [int(visit_id)] + ([] if sp is None else [sp])
+    cur = conn.execute(
+        f"UPDATE detections SET individual_id = ?, individual_source = ? WHERE {where}",
+        [individual_id, None if individual_id is None else source] + params)
+    conn.execute("UPDATE visits SET individual_id = ? WHERE id = ?",
+                 (individual_id, int(visit_id)))
+    conn.commit()
+    return cur.rowcount
+
+
+_UNSET = object()   # sentinel: "argument not provided" (distinct from None = "clear the label")
+
+
+def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = None,
+                      source: Optional[str] = None, start: Optional[str] = None,
+                      end: Optional[str] = None, name=_UNSET, species: Optional[str] = None,
+                      verify: bool = False) -> dict:
+    """Confirm/correct a whole visit's SPECIES and/or assign its INDIVIDUAL, in one shot. The
+    visit is identified EITHER by `visit_id` (the Individuals queue, which has it) OR by a
+    (`source`, `start`, `end`) time span (the Explorer computes visits on the fly and has no
+    visits.id) -- both resolve to the same set of detections, so the two review surfaces share
+    this one backend.
+
+      species='raccoon'  -> correct every crop in the set to that species (confidence 1,
+                            verified, source='human').
+      verify=True        -> (no species) just confirm the existing species on every crop.
+      name='Stan'        -> set individual_id on the crops matching the visit's DOMINANT species
+                            (a stray crow crop in a raccoon visit keeps its own identity);
+                            name=None clears; omit `name` to leave identity untouched.
+
+    Species is applied first, so naming after a correction scopes to the corrected species. Any
+    `visits` rows the detections belong to are synced (species/individual_id) so the queue and the
+    Explorer agree. Returns a small summary dict. Operates via WHERE clauses (not id lists) so a
+    1000-crop visit never hits SQLite's bound-variable limit."""
+    if visit_id is not None:
+        where, params = "visit_id = ?", [int(visit_id)]
+    elif source and start and end:
+        where, params = "source = ? AND timestamp >= ? AND timestamp <= ?", [source, start, end]
+    else:
+        return {"detections": 0, "error": "need visit_id or source+start+end"}
+
+    n = conn.execute(f"SELECT COUNT(*) FROM detections WHERE {where}", params).fetchone()[0]
+    if not n:
+        return {"detections": 0}
+
+    if species:
+        conn.execute(
+            f"UPDATE detections SET species = ?, species_confidence = 1.0, species_verified = 1, "
+            f"species_source = 'human' WHERE {where}", [species] + params)
+    elif verify:
+        conn.execute(f"UPDATE detections SET species_verified = 1 WHERE {where}", params)
+
+    dominant = None
+    if name is not _UNSET:
+        row = conn.execute(
+            f"SELECT species FROM detections WHERE {where} AND species IS NOT NULL "
+            f"GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1", params).fetchone()
+        dominant = row[0] if row else None
+        src = None if name is None else "human"
+        if dominant is None:
+            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ? "
+                         f"WHERE {where}", [name, src] + params)
+        else:
+            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ? "
+                         f"WHERE {where} AND species = ?", [name, src] + params + [dominant])
+
+    # Sync the visits-table rows these detections belong to (subquery, no big IN list).
+    vsub = f"id IN (SELECT DISTINCT visit_id FROM detections WHERE {where} AND visit_id IS NOT NULL)"
+    if species:
+        conn.execute(f"UPDATE visits SET species = ? WHERE {vsub}", [species] + params)
+    if name is not _UNSET:
+        conn.execute(f"UPDATE visits SET individual_id = ? WHERE {vsub}", [name] + params)
+    conn.commit()
+    return {"detections": int(n), "dominant_species": dominant,
+            "species_set": species or None, "named": None if name is _UNSET else name}
+
+
+def confirmed_visit_labels(conn: sqlite3.Connection, species: Optional[str] = None) -> dict:
+    """{visit_id: individual_id} for every visit with human-confirmed crops (the suggestion
+    templates). Read from DETECTIONS, not visits -- visits.py rebuilds from scratch, but the
+    stamped crops persist, so labels survive a rebuild. Dominant name per visit."""
+    where = "individual_source = 'human' AND individual_id IS NOT NULL AND visit_id IS NOT NULL"
+    params: list = []
+    if species:
+        where += " AND species = ?"
+        params.append(species)
+    rows = conn.execute(
+        f"""SELECT visit_id, individual_id, COUNT(*) n FROM detections WHERE {where}
+            GROUP BY visit_id, individual_id ORDER BY visit_id, n DESC""", params).fetchall()
+    out: dict = {}
+    for r in rows:                       # first row per visit = dominant (ordered by n DESC)
+        out.setdefault(r[0], r[1])
+    return out

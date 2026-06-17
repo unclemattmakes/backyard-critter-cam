@@ -357,7 +357,7 @@ def visits_page(cfg, day=None, limit=300) -> dict:
     for v in visits[:limit]:
         title = v["classes"].most_common(1)[0][0] if v["classes"] else "animal"
         out.append({
-            "start": v["start"].isoformat(), "end": v["end"].isoformat(),
+            "start": v["start"].isoformat(), "end": v["end"].isoformat(), "source": v["source"],
             "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
             "max_conf": round(v["max_conf"], 3), "title": title,
             "classes": dict(v["classes"].most_common()),

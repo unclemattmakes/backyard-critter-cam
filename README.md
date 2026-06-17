@@ -234,6 +234,48 @@ after a species (raccoons first) has banked a few hundred readable crops.
   [PLAN.md](PLAN.md)). Hand-labelling the obvious clusters + the neighbour lookup is the
   intended workflow; behaviour (phase 4) is the other axis.
 
+### The suggest-confirm loop (`individuals.py`)
+
+Single crops can't be matched across sessions — but **whole visits can**. Averaging a visit's
+best crops into one *prototype* washes out the pose/burst noise: on real data, the same
+raccoon's visits on different nights match at **0.83–0.93** while two *different* raccoons
+photographed **in the same frame** (same light, same glass — the perfect controlled test,
+courtesy of a two-raccoon visit) score only ~0.36–0.42. `individuals.py` builds on that:
+every unconfirmed raccoon visit gets a suggestion — the nearest *human-confirmed* visit's
+name ("looks like Stan 0.84"), or a *"possibly someone new"* flag — and each confirmation
+becomes a new template, so **suggestions sharpen as you confirm**. No training; just
+accumulating verified prototypes. Visits with two raccoons present at once get a "2+ raccoons"
+badge — detected from simultaneous separated boxes in the stills *and* from clips holding two
+sustained motion tracks (`clipmotion.py`), which catch pairs the sparse stills miss (co-arrival
+is behaviour signal; their blended prototype never teaches).
+
+The **dashboard's Individuals tab** is the intended surface: a "Who is this?" review queue
+with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
+anything is confirmed. Once you've named a few, it adds:
+
+- **Fit to the Cast** — re-fits the unconfirmed remainder against your confirmed individuals:
+  "12 more visits look like Stan" with a one-click **bulk confirm**, plus the leftovers that
+  *look like nobody on file* clustered into **candidate new individuals**. It also flags anyone
+  confirmed **only on a multi-animal visit** (their template is a blend of two raccoons and
+  can't be matched) so you know to confirm a *solo* visit for them.
+- **Poses** — per individual, clusters that animal's crops by appearance embedding. With identity
+  held fixed, the embedding varies by *posture/viewpoint*, so the clusters are the animal's
+  characteristic poses (the same pose-binding that defeats cross-individual ID, used in reverse).
+- **Clips** — per individual, the behaviour clips that overlap its visits, so you can watch each
+  named raccoon move (clips during a 2+-raccoon visit are flagged).
+
+Crops are **click-to-enlarge** everywhere, with ← / → to step through the strip you clicked.
+
+The same calls work from the CLI:
+
+```powershell
+.\.venv\Scripts\python.exe embed.py --min-confidence 0.5       # keep vectors fresh first
+.\.venv\Scripts\python.exe individuals.py --bootstrap          # cold start: nameable visit-groups
+.\.venv\Scripts\python.exe individuals.py --queue              # recent visits + suggestions
+.\.venv\Scripts\python.exe individuals.py --refit              # fit the rest to the named cast
+.\.venv\Scripts\python.exe individuals.py --confirm 1014 Stan  # confirm one visit
+```
+
 ---
 
 ## Behaviour clips (phase 4 capture)
@@ -254,12 +296,16 @@ oldest clips are pruned automatically, file and DB row both.
 - A rolling **pre-roll buffer** means each clip opens on the animal *arriving* (the seconds
   before the detector first fired); recording ends a few seconds after the last detection, or at
   a safety cap so a camped-out raccoon can't make a giant file.
-- **`clipmotion.py`** turns each clip into a **motion fingerprint** — the detector tracks the
-  animal through sampled frames, and the trajectory yields duration, path length, straightness
-  (beeline = 1, milling about ≈ 0), avg/peak speed, moving fraction (vs head-down eating), and
-  an approach/retreat cue. The raw track is stored as JSON (`clip_tracks` table) so richer gait
-  work (stride rhythm, limp detection) can re-derive later without re-running the detector.
-  Batch + resumable: `python clipmotion.py` after clips accumulate; `--show` to read them back.
+- **`clipmotion.py`** turns each clip into **motion fingerprints, one per animal** — the
+  detector runs over every frame, double-boxes are suppressed (NMS), and boxes are associated
+  into per-animal *tracklets* (a pair visit = two tracks). Each trajectory yields duration, path
+  length, straightness (beeline = 1, milling about ≈ 0), avg/peak speed, moving fraction (vs
+  head-down eating), an approach/retreat cue — plus a **gait estimate**: stride cadence (Hz)
+  from the body-bob periodicity while walking, with the autocorrelation strength saying how much
+  to trust it. The raw track is stored as JSON (`clip_tracks` table) so richer gait work (limp
+  asymmetry) can re-derive later without re-running the detector. Batch + resumable:
+  `python clipmotion.py` after clips accumulate; `--show` reads tracks back; `--report` groups
+  motion features by individual/visit and prints the pair-clip same-conditions comparisons.
 - One `.mp4` per visit under `clips/<date>/`, plus a row in the **`clips`** table (time span,
   fps, size, detection count) for later behaviour queries. Crops are still saved alongside.
 - All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes, disk budget)

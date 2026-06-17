@@ -186,6 +186,31 @@ class Config:
     # NOT browser-playable, so the dashboard has to transcode those on the fly (see web.py).
     clip_codec: str = "h264"
 
+    # ---- Individual suggestions (phase 3, the confirm-or-correct loop) -----------
+    # The suggestion engine (individuals.py) compares a visit's appearance PROTOTYPE (mean of its
+    # best crops' embeddings) against every HUMAN-CONFIRMED visit, nearest-visit-first. Validated
+    # on real data 2026-06-11: single crops can't match across sessions (~0.5 ceiling, see
+    # reid.py), but visit prototypes recover it (same-animal cross-night matches at 0.83-0.93 vs
+    # ~0.3-0.45 between different night-blocks), and two different raccoons IN THE SAME FRAME
+    # score only ~0.36-0.42 -- so a high prototype match is meaningful. Every confirmation adds a
+    # template, so suggestions sharpen as the cast gets named ("gets better over time").
+    reid_proto_top_k: int = 40          # best crops (by crop_quality) averaged into a prototype
+    reid_proto_min_crops: int = 3       # fewer embedded crops than this = too thin to suggest on
+    reid_suggest_min_conf: float = 0.5  # embedding gate: crops below this confidence don't vote
+    # Best-match similarity below this = "possibly someone new" (novelty flag). Between the
+    # different-raccoon ceiling (~0.45) and the same-raccoon cross-night floor (~0.7).
+    reid_novel_threshold: float = 0.55
+    # >= this many frames with two separated raccoon boxes = a multi-animal visit: it gets a
+    # "2+ raccoons" badge and its (blended) prototype never becomes a suggestion template.
+    reid_co_presence_min: int = 3
+    # CLIP-based co-presence (clipmotion.py tracklets) is a SECOND, more sensitive multi-animal
+    # signal: the full-frame-rate clips catch the second raccoon walking apart in moments the
+    # sparse live detections miss (validated 2026-06-11: clips flagged 6 pair visits the
+    # detection badge missed, all in the pair's time window). A visit counts as multi if THIS
+    # many of its clips each hold >= 2 sustained tracklets. 2 (not 1) so a lone fragmentation
+    # artifact can't wrongly exclude a good solo template; clip-only flags need corroboration.
+    reid_clip_co_presence_min_clips: int = 2
+
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
     # The live rig names each new crop by species ITSELF, in a background thread, so a single
     # process -- and a single window -- does both detection and naming. That's the whole reason

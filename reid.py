@@ -223,7 +223,8 @@ def do_cluster(conn, store, args):
         n_written = 0
         for rank, (cid, _) in enumerate(big, 1):
             members = [store.ids[i] for i in range(len(store)) if labels[i] == cid]
-            n_written += db.set_individual_bulk(conn, members, f"{species_slug}_c{rank:02d}")
+            n_written += db.set_individual_bulk(conn, members, f"{species_slug}_c{rank:02d}",
+                                                source="cluster")
         print(f"\nStamped placeholder individual_id='{species_slug}_cNN' on {n_written} crop(s) "
               f"across {len(big)} clusters (--write-clusters). These group look-alikes; "
               f"rename real individuals with --name.")
@@ -283,7 +284,7 @@ def do_name(conn, store, args):
         return 1
     cid = big[rank - 1][0]
     members = [store.ids[i] for i in range(len(store)) if labels[i] == cid]
-    n = db.set_individual_bulk(conn, members, name)
+    n = db.set_individual_bulk(conn, members, name, source="human")
     print(f"Set individual_id='{name}' on {n} crop(s) (was {cluster_tag}). "
           f"Re-run clustering or check the dashboard to confirm.")
     return 0
