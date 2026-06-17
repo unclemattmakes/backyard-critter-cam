@@ -410,6 +410,57 @@ def test_refit_flags_individual_confirmed_only_on_pair_visit(conn, cfg):
     assert "Stan" not in r["untemplated"]    # Stan has a clean solo template
 
 
+def _clip_tracklets_in_visit(conn, vid, vecs, *, start_min, end_min):
+    """A clip inside visit `vid`'s window with one sustained, embedded tracklet per vector."""
+    cid = db.insert_clip(conn, source=db.SOURCE_GLASS_DOOR_CAM, clip_path=f"clips/{start_min}.mp4",
+                         started_at=_ts(start_min), ended_at=_ts(end_min), fps=10.0, width=1280,
+                         height=720, frame_count=300, detection_count=12, max_confidence=0.9)
+    db.insert_clip_tracks(conn, clip_id=cid, model="MDV6", n_samples=300,
+                          tracklets=[{"track_json": "[]", "n_hits": 40, "features": {}} for _ in vecs])
+    tids = [r["id"] for r in conn.execute(
+        "SELECT id FROM clip_tracks WHERE clip_id=? ORDER BY track_idx", (cid,))]
+    for tid, vec in zip(tids, vecs):
+        v = np.asarray(vec, dtype=np.float32)
+        db.insert_clip_track_embedding(conn, track_id=tid, model=individuals.EMBED_MODEL,
+                                       dim=len(vec), embedding=(v / np.linalg.norm(v)).tobytes(),
+                                       n_frames=8, rep_crop=f"clip_crops/track_{tid}.jpg")
+    return cid, tids
+
+
+def test_unblend_visit_separates_two_animals(conn, cfg):
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
+    _clip_tracklets_in_visit(conn, vid, [[1, 0, 0], [1, .05, 0], [.98, .1, 0], [0, 1, 0], [0, .97, .1]],
+                             start_min=1, end_min=2)
+    r = individuals.unblend_visit(conn, vid, distance=0.45)
+    assert r["n_tracklets"] == 5
+    assert sorted((g["n"] for g in r["groups"]), reverse=True) == [3, 2]
+    big = r["groups"][0]
+    assert len(big["track_ids"]) == 3 and len(big["rep_crops"]) == 3 and big["label"] is None
+    # Naming the cluster lands on the tracklets and reads back as the group's label.
+    db.set_clip_track_individual(conn, big["track_ids"], "Notch")
+    r2 = individuals.unblend_visit(conn, vid, distance=0.45)
+    assert [g["label"] for g in r2["groups"] if g["n"] == 3][0] == "Notch"
+
+
+def test_unblend_visit_handles_no_tracklets(conn, cfg):
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
+    r = individuals.unblend_visit(conn, vid)
+    assert r["groups"] == [] and "tracklet" in (r["note"] or "")
+
+
+def test_set_clip_track_individual_round_trip(conn, cfg):
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
+    _, tids = _clip_tracklets_in_visit(conn, vid, [[1, 0, 0], [0, 1, 0]], start_min=1, end_min=2)
+    assert db.set_clip_track_individual(conn, tids, "Elliot") == 2
+    rows = conn.execute(f"SELECT individual_id, individual_source FROM clip_tracks "
+                        f"WHERE id IN ({','.join('?' * len(tids))})", tids).fetchall()
+    assert all(r["individual_id"] == "Elliot" and r["individual_source"] == "human" for r in rows)
+    db.set_clip_track_individual(conn, tids, None)
+    rows = conn.execute(f"SELECT individual_id, individual_source FROM clip_tracks "
+                        f"WHERE id IN ({','.join('?' * len(tids))})", tids).fetchall()
+    assert all(r["individual_id"] is None and r["individual_source"] is None for r in rows)
+
+
 def test_bootstrap_groups_split_two_animals(conn, cfg):
     a1 = _three_crop_visit(conn, [1, 0, 0], start_min=0)
     a2 = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)

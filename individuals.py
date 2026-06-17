@@ -159,6 +159,58 @@ def _iso_overlap(a0, a1, b0, b1) -> bool:
         return False
 
 
+def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, cfg=None) -> dict:
+    """Separate a multi-animal visit into its individuals using the CLIP TRACKLETS (which track
+    each animal independently). Clusters the visit's tracklet appearance prototypes and returns
+    the groups biggest-first -- in a true pair visit the two dominant clusters are the two animals
+    (validated: the peak Notch+Elliot visit split 36/29). Each group carries representative
+    frame-crops (clipembed rep_crop) so the eye can tell which is which, and any individual label
+    already on its tracklets. The caller labels each cluster (db.set_clip_track_individual), which
+    is how the pair member who is never solo finally gets a clean appearance template.
+
+    Tracklets are matched to the visit by clip<->visit time overlap on the same source. Returns
+    {visit_id, n_tracklets, groups:[{track_ids, n, cohesion, rep_crops, label}], note}."""
+    cfg = cfg or config.CONFIG
+    v = conn.execute("SELECT source, started_at, ended_at FROM visits WHERE id = ?",
+                     (int(visit_id),)).fetchone()
+    if v is None:
+        return {"visit_id": visit_id, "groups": [], "n_tracklets": 0, "note": "no such visit"}
+    src, vs, ve = v["source"], v["started_at"], v["ended_at"]
+    rows = [r for r in db.load_clip_track_embeddings(conn, EMBED_MODEL)
+            if r["clip_source"] == src and _iso_overlap(
+                r["clip_started_at"], r["clip_ended_at"] or r["clip_started_at"], vs, ve)]
+    out = {"visit_id": visit_id, "n_tracklets": len(rows), "groups": [], "note": None}
+    if len(rows) < 2:
+        out["note"] = ("no embedded tracklets for this visit yet -- run clipmotion.py then "
+                       "clipembed.py" if not rows else "only one tracklet -- nothing to separate")
+        return out
+    X = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+    S = X @ X.T
+    D = np.clip(1.0 - S, 0.0, None)
+    np.fill_diagonal(D, 0.0)
+    labels = fcluster(linkage(squareform(D, checks=False), method="average"),
+                      t=distance, criterion="distance")
+    groups = defaultdict(list)
+    for i, l in enumerate(labels):
+        groups[l].append(i)
+    for idxs in groups.values():
+        sub = X[idxs]
+        sims = sub @ sub.T
+        coh = float((sims.sum() - len(idxs)) / max(len(idxs) * (len(idxs) - 1), 1)) if len(idxs) > 1 else 1.0
+        idxs.sort(key=lambda i: -rows[i]["n_hits"])           # sturdiest tracklets first
+        labelled = {rows[i]["individual_id"] for i in idxs if rows[i]["individual_id"]}
+        out["groups"].append({
+            "track_ids": [rows[i]["track_id"] for i in idxs],
+            "n": len(idxs), "cohesion": round(coh, 2),
+            "rep_crops": [rows[i]["rep_crop"] for i in idxs if rows[i]["rep_crop"]][:8],
+            "label": sorted(labelled)[0] if len(labelled) == 1 else None,
+        })
+    out["groups"].sort(key=lambda g: -g["n"])
+    return out
+
+
 def clips_for_individual(conn, individual_id: str, species: str = "raccoon", limit: int = 24) -> list:
     """Behaviour clips attributable to one confirmed individual: clips that overlap (in time, same
     source) a visit labelled `individual_id`. Newest first. Each clip carries `multi=True` when its

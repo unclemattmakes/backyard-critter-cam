@@ -263,6 +263,12 @@ anything is confirmed. Once you've named a few, it adds:
   characteristic poses (the same pose-binding that defeats cross-individual ID, used in reverse).
 - **Clips** — per individual, the behaviour clips that overlap its visits, so you can watch each
   named raccoon move (clips during a 2+-raccoon visit are flagged).
+- **Un-blend** — on a 2+-raccoon visit, separate the animals using the **clips**. A clip tracks
+  each animal independently, so `clipembed.py` embeds each motion tracklet's frames into the same
+  vector space as the stills; clustering a pair visit's tracklets splits the two animals (the peak
+  Notch+Elliot visit splits 36/29), each shown with frame-crop thumbnails to name. This is how the
+  pair member who is **never solo** finally gets a clean appearance template — the labels land on
+  the tracklets (clip-space, separate from the still-space `detections.individual_id`).
 
 Crops are **click-to-enlarge** everywhere, with ← / → to step through the strip you clicked.
 
