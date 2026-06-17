@@ -331,6 +331,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._individual_action(data)
                 elif path == "/api/reid/confirm":
                     self._reid_confirm(data)
+                elif path == "/api/visit/label":
+                    self._visit_label(data)
                 elif path.startswith("/api/detection/"):
                     self._detection_action(int(path.rsplit("/", 1)[-1]), data)
                 else:
@@ -342,6 +344,38 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json({"error": str(e)}, code=500)
                 except Exception:
                     pass
+
+        def _visit_label(self, data):
+            """Confirm/correct a visit's SPECIES and/or name its INDIVIDUAL in one call -- the
+            shared backend for the Individuals queue (sends visit_id) and the Explorer Visits
+            list (sends source+start+end). Body: {visit_id | source,start,end} plus any of
+            {name (str|null), species (str), verify (bool)}. Deliberately does NOT rebuild visits
+            (a rebuild renumbers ids and would invalidate an open queue; labels live on the
+            detections and survive the next rebuild)."""
+            kw = {}
+            if data.get("visit_id") is not None:
+                try:
+                    kw["visit_id"] = int(data["visit_id"])
+                except (TypeError, ValueError):
+                    self._json({"error": "bad visit_id"}, code=400)
+                    return
+            elif data.get("source") and data.get("start") and data.get("end"):
+                kw.update(source=str(data["source"]), start=str(data["start"]),
+                          end=str(data["end"]))
+            else:
+                self._json({"error": "need visit_id or source+start+end"}, code=400)
+                return
+            if "name" in data:                      # present (incl. null) = act on identity
+                kw["name"] = (str(data["name"]).strip() or None) if data["name"] is not None else None
+            if data.get("species"):
+                kw["species"] = str(data["species"]).strip()
+            if data.get("verify"):
+                kw["verify"] = True
+            conn = db.connect(cfg.db_path)
+            try:
+                self._json({"ok": True, **db.apply_visit_label(conn, **kw)})
+            finally:
+                conn.close()
 
         def _reid_confirm(self, data):
             """Confirm (or clear) WHO one visit was: {"visit_id": 1014, "name": "Stan"}.
@@ -523,7 +557,7 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "novel": s["novel"], "multi": s["multi"],
                 "co_present_frames": s["co_present_frames"],
                 "co_present_clips": s["co_present_clips"],
-                "n_embedded": s["n_embedded"], "note": s["note"],
+                "n_embedded": s["n_embedded"], "note": s["note"], "species": species,
             })
 
         # The confirmed cast, with how much template material backs each name.

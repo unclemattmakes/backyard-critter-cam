@@ -134,6 +134,58 @@ def test_label_visit_stamps_species_matching_crops_only(conn):
     assert r["individual_id"] is None and r["individual_source"] is None
 
 
+def test_apply_visit_label_species_and_name_together(conn):
+    d1, d2 = _det(conn, minutes=0), _det(conn, minutes=0.5)
+    vid = _visit(conn, [d1, d2])
+    r = db.apply_visit_label(conn, visit_id=vid, name="Stan", species="raccoon")
+    assert r["detections"] == 2
+    rows = {x["id"]: x for x in conn.execute(
+        "SELECT id, species, species_verified, species_source, individual_id, individual_source "
+        "FROM detections")}
+    for d in (d1, d2):
+        assert rows[d]["species"] == "raccoon" and rows[d]["species_verified"] == 1
+        assert rows[d]["species_source"] == "human"
+        assert rows[d]["individual_id"] == "Stan" and rows[d]["individual_source"] == "human"
+    v = conn.execute("SELECT species, individual_id FROM visits WHERE id=?", (vid,)).fetchone()
+    assert v["species"] == "raccoon" and v["individual_id"] == "Stan"
+
+
+def test_apply_visit_label_verify_only_keeps_species(conn):
+    d = _det(conn, minutes=0, species="raccoon")
+    vid = _visit(conn, [d])
+    db.apply_visit_label(conn, visit_id=vid, verify=True)
+    row = conn.execute("SELECT species, species_verified FROM detections WHERE id=?", (d,)).fetchone()
+    assert row["species"] == "raccoon" and row["species_verified"] == 1
+
+
+def test_apply_visit_label_name_scopes_to_dominant_species(conn):
+    r1, r2 = _det(conn, minutes=0), _det(conn, minutes=0.4)
+    crow = _det(conn, minutes=0.6, species="American crow")
+    vid = _visit(conn, [r1, r2, crow])
+    db.apply_visit_label(conn, visit_id=vid, name="Stan")        # name only, no species change
+    ind = {x["id"]: x["individual_id"] for x in conn.execute("SELECT id, individual_id FROM detections")}
+    assert ind[r1] == "Stan" and ind[r2] == "Stan" and ind[crow] is None
+
+
+def test_apply_visit_label_by_time_range(conn):
+    d1, d2 = _det(conn, minutes=1), _det(conn, minutes=2)
+    outside = _det(conn, minutes=100)
+    r = db.apply_visit_label(conn, source=db.SOURCE_GLASS_DOOR_CAM, start=_ts(0), end=_ts(10),
+                             name="Notch", species="raccoon")
+    assert r["detections"] == 2
+    ind = {x["id"]: x["individual_id"] for x in conn.execute("SELECT id, individual_id FROM detections")}
+    assert ind[d1] == "Notch" and ind[d2] == "Notch" and ind[outside] is None
+
+
+def test_apply_visit_label_clear_name(conn):
+    d = _det(conn, minutes=0)
+    vid = _visit(conn, [d])
+    db.apply_visit_label(conn, visit_id=vid, name="Stan")
+    db.apply_visit_label(conn, visit_id=vid, name=None)
+    row = conn.execute("SELECT individual_id, individual_source FROM detections WHERE id=?", (d,)).fetchone()
+    assert row["individual_id"] is None and row["individual_source"] is None
+
+
 def test_confirmed_visit_labels_reads_only_human_labels(conn):
     d1, d2 = _det(conn, minutes=0), _det(conn, minutes=10)
     v1 = _visit(conn, [d1], start_min=0)

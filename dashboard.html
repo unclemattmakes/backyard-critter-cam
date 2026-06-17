@@ -832,13 +832,34 @@ async function renderVisits(params,body){
 }
 function visitCard(v,i){
   const nclips=(v.clips||[]).length;
+  const sp=(v.title&&v.title!=='animal')?v.title:'';
+  // The label footer stops click-propagation so using it never triggers the card's play/drill.
+  const footer=`<div class="vlabel" onclick="event.stopPropagation()" style="margin-top:8px;display:flex;flex-direction:column;gap:5px">
+      <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
+        <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+        ${speciesSelect('vsp-'+i,sp)}
+        <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
+      <div style="display:flex;gap:5px;align-items:center">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
+      <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
+    </div>`;
   return `<div class="card vcard" data-vi="${i}">
     <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
     <div class="body">
       <div class="common">${esc(cap1(v.title||'animal'))}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
       <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
+      ${footer}
     </div></div>`;
+}
+function _visitTarget(i){ const v=visitsData[i]||{}; return {source:v.source,start:v.start,end:v.end}; }
+function visitSaved(i,msg){ const s=document.getElementById('vst-'+i); if(s){ s.textContent=msg; s.style.color='var(--ok)'; } }
+function explorerName(i){
+  const inp=document.getElementById('vn-'+i); const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  postVisitLabel(_visitTarget(i),{name},()=>visitSaved(i,'✓ named '+name));
+}
+function explorerSpecies(i){
+  visitSpeciesCorrect(_visitTarget(i),'vsp-'+i,r=>visitSaved(i,'✓ '+nameOf(r.species_set||r.dominant_species||'')));
 }
 
 async function renderDays(params,body){
@@ -1099,12 +1120,21 @@ function reidCard(v){
     sugg=`<span class="lbl" style="opacity:.65">${esc(v.note||'no suggestion yet')}</span>`;
     act=`${reidInput('rq-'+v.visit_id,'who is this…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
   }
-  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
-    ${thumb}
-    <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
-      <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${multi}</div>
-    <div style="display:flex;gap:6px;align-items:center">${act}</div>
+  const sp=v.species||'raccoon', spId='rqsp-'+v.visit_id;
+  const spRow=`<div style="display:flex;gap:6px;align-items:center;margin-top:8px;border-top:1px solid var(--rule);padding-top:8px;flex-wrap:wrap">
+    <span class="lbl" style="opacity:.72">species: <b>${esc(nameOf(sp))}</b></span>
+    <button class="gear" onclick="postVisitLabel({visit_id:${v.visit_id}},{verify:true},loadIndividuals)" title="confirm this species for the whole visit">✓</button>
+    ${speciesSelect(spId,sp)}
+    <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
+  return `<div class="panel" style="padding:10px 14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      ${thumb}
+      <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
+        <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${multi}</div>
+      <div style="display:flex;gap:6px;align-items:center">${act}</div>
+    </div>
+    ${spRow}
   </div>`;
 }
 function reidBootCard(g,i){
@@ -1181,6 +1211,30 @@ function reidQueueHTML(q){
     html+=`<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`;
   }
   return html;
+}
+/* Shared per-visit labelling (species confirm/correct + individual name), used by BOTH the
+   "Who is this?" queue (targets a visit_id) and the Explorer Visits list (targets a
+   source+start+end span). One backend: POST /api/visit/label. */
+function speciesSelect(id, current){
+  const opts=['<option value="">— correct species… —</option>']
+    .concat(LABELS.map(l=>`<option value="${esc(l)}"${l===current?' selected':''}>${esc(cap1(l))}</option>`),
+            ['<option value="__other__">+ other…</option>']).join('');
+  return `<select id="${id}" style="padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit;font:inherit;max-width:150px">${opts}</select>`;
+}
+async function postVisitLabel(target, body, after){
+  try{
+    const r=await fetch('/api/visit/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(Object.assign({}, target, body))}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    if(after) after(r);
+  }catch(e){ alert('Could not save: '+e); }
+}
+function visitSpeciesCorrect(target, selectId, after){
+  const sel=document.getElementById(selectId); if(!sel) return;
+  let sp=sel.value;
+  if(sp==='__other__'){ sp=(prompt('New species label (e.g. striped skunk):')||'').trim(); }
+  if(!sp) return;
+  postVisitLabel(target, {species:sp}, after);
 }
 async function reidConfirmMany(visitIds,name){
   try{
