@@ -1,8 +1,12 @@
 # Backyard Critter Cam — Project Plan
 
-> Canonical project plan (authored by Matt, 2026-06-07). The code in this repo is **Phase 1**.
-> This document is the single source of truth for where the system is going; module/README
-> comments defer to it.
+> Canonical project plan (authored by Matt, 2026-06-07). This document is the single source of
+> truth for the system's *design and philosophy*; module/README comments defer to it.
+>
+> **Status (updated 2026-06-18): all four phases are now built.** See the per-phase ✅ markers
+> below, and the [README](README.md) for how to run each. The plan's *principles* (two separate
+> axes; boring-and-robust over clever) are unchanged — what follows is the original reasoning,
+> annotated where reality has since filled it in.
 
 *A live + batch wildlife detection and individual-identification system for the backyard.
 Crows, raccoons, opossums. Built on the NVIDIA laptop, logging to SQLite, augmenting an
@@ -125,11 +129,12 @@ the full system now; populate only what each phase can.
 - `species` — TEXT, nullable. NULL in v1; phase 2 fills it.
 - `individual_id` — TEXT, nullable. NULL until phase 3; re-ID fills it.
 
-**Future stores (stub/comment now, don't implement early):**
-- embeddings for re-ID — either an `embedding` BLOB column or a separate table keyed to
-  `detection.id`.
-- a `visits` concept (see "Visit-event collapsing" below).
-- per-individual behavior profiles (phase 4).
+**Future stores (planned then, ✅ now built):**
+- embeddings for re-ID — ✅ a separate `detection_embeddings` table keyed to `detections.id`
+  (plus `clip_track_embeddings` for per-tracklet appearance vectors).
+- a `visits` concept (see "Visit-event collapsing" below) — ✅ the `visits` table.
+- per-individual behavior profiles (phase 4) — ✅ derived on demand by `behavior.py`, with
+  `clip_tracks` storing the motion/gait fingerprints clips are turned into.
 
 ---
 
@@ -143,28 +148,47 @@ overlay is the point: you watch it work. Species and individual ID deliberately 
 *Status: working end-to-end. First crops captured a raccoon at dusk, correctly boxed, with
 confidence in the filename. Mirror problem never materialized.*
 
-### Phase 2 — Species ID on the crops
+### Phase 2 — Species ID on the crops ✅ DONE
+
+*Built with **BioCLIP 2** (zero-shot, `classify.py`), run live beside the rig. Learning: an
+organism-only classifier can't reject non-animals, so a general-CLIP "is this an animal?" gate
+(`clipfilter.py`) runs first to absorb MegaDetector's food / empty-frame false-fires.*
+
 Run a classifier on the animal crops to fill the `species` column. Let crops accumulate for
 a few days first so there's a corpus to work with. **Tooling moves fast here — verify the
 current best backyard/wildlife species classifier options at build time rather than
 assuming.** Filter on confidence before classifying (high-confidence crops are the readable
 ones — the filename confidence is effectively a crop-*usability* score).
 
-### Phase 3 — Individual re-identification
+### Phase 3 — Individual re-identification ✅ DONE (raccoons)
+
+*Validated finding: single crops don't match across sessions (~0.5 ceiling — background + pose
+dominate), but **visit prototypes do** (same raccoon 0.83–0.93 across nights), so the system is a
+suggest-confirm loop (`individuals.py`), not an oracle. Pair visits are un-blended from the clips
+so a never-solo animal still gets a clean appearance template.*
+
 Crop → feature embedding → cluster embeddings → hand-label clusters once ("Notch," "Gimpy,"
 "three-legged"). Turn this on **per species**, starting with raccoons (best case), then
 opossums. For crows, expect appearance to underperform — lean on phase 4 instead. There's a
 small ecosystem of wildlife-specific re-ID tooling; **check what's current when you get
 here.** Store embeddings per the stubbed schema. Filter by confidence before clustering.
 
-### Phase 4 — Behavior profiles + the disagreement alert
+### Phase 4 — Behavior profiles + the disagreement alert ✅ DONE
+
+*Built: `visits.py`, `behavior.py`, and `twoaxis.py` (the two-axis readout), plus clip capture
+and `clipmotion.py` motion/gait fingerprints. Sharpens per-individual as the cast is named.*
+
 The differentiator nobody builds. Accumulate a per-individual profile: typical arrival
 window, co-occurrence partners, boldness at the food, dwell time. Then the payoff —
 implement the **two-axis readout**: appearance match score *next to* behavior fit, and fire
 the *"this looks like X but isn't behaving like X"* alert when they disagree. This is your
 original instinct, given a memory.
 
-### Later — Trail-cam batch importer
+### Later — Trail-cam batch importer ✅ DONE
+
+*Built: `import_trailcam.py` — watch-folder SD-card ingest writing crops with
+`source = 'trail_cam_sd'`; same pipeline downstream.*
+
 Watch-folder script that ingests SD-card dumps with `source = 'trail_cam_sd'`. Same pipeline
 downstream. Handles IR grayscale frames (structure-based features for night mammals).
 
@@ -210,7 +234,7 @@ frames without crashing. Boring and robust.
 
 ## One-line summary
 
-Two cameras, one SQLite brain, four phases. Capture first (done), then name the species,
-then name the individuals (raccoons first), then learn their behavior — and surface
-appearance and behavior *separately* so the system can tell you when a familiar-looking
-visitor isn't acting like themselves.
+Two cameras, one SQLite brain, four phases — **all now built**: capture, name the species,
+name the individuals (raccoons first), then learn their behavior — and surface appearance and
+behavior *separately* so the system can tell you when a familiar-looking visitor isn't acting
+like themselves.

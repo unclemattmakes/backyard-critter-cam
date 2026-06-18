@@ -8,8 +8,14 @@ critter it sees — crows, raccoons, opossums.
 This glass-door cam is the **primary rig for all three species, day and night** (the
 "glass = mirror after dark" worry didn't pan out — lit animals at the pane read clearly; a
 raccoon already turned up at dusk). A second source — a wider-yard weatherproof trail cam,
-imported in batches off its SD card — plugs into the same pipeline later. **V1 (this code)
-is the live capture skeleton.** The full four-phase vision lives in [PLAN.md](PLAN.md).
+imported in batches off its SD card — plugs into the same pipeline later.
+
+What began as a live-capture skeleton is now the **full four-phase system** the plan called
+for. It captures, **names the species** on every crop (BioCLIP 2), **re-identifies individual
+animals** across nights — down to telling apart two raccoons that only ever show up together —
+and reads their **behaviour** off short video clips, all surfaced in a local web
+**dashboard** you can leave open in a browser tab. The design philosophy and the rest of the
+roadmap live in [PLAN.md](PLAN.md).
 
 ---
 
@@ -17,10 +23,14 @@ is the live capture skeleton.** The full four-phase vision lives in [PLAN.md](PL
 
 ```
 USB webcam (OpenCV / DirectShow)
-   -> MOG2 motion gate        cheap background subtraction; skips still frames
-   -> MegaDetector v6 (CUDA)  runs only on frames with real motion, rate-limited
-   -> per detection:          draw box  +  save crop (+ optional full frame)  +  SQLite row
-   -> live preview window      boxes + confidence; press 'q' to quit
+   -> MOG2 motion gate          cheap background subtraction; skips still frames
+   -> MegaDetector v6 (CUDA)    runs only on frames with real motion, rate-limited
+   -> per detection:            draw box + save crop + score shot-quality + SQLite row,
+                                and record a short video clip around the visit
+   -> species namer (helper)    label each new crop (BioCLIP 2), behind a general-CLIP
+                                "is this even an animal?" gate that drops food/empty frames
+   -> live preview + dashboard  boxes & confidence in a window ('q' to quit) and/or a
+                                local web page (--serve): live feed, stats, gallery, and more
 ```
 
 The motion gate means the GPU detector runs a tiny fraction of the time (only when
@@ -31,11 +41,19 @@ something actually moves), so the rig is light enough to sit running next to you
   [Ultralytics](https://docs.ultralytics.com/) YOLO models, so we run them **directly via
   Ultralytics** on the GPU rather than through the heavier PytorchWildlife wrapper (see
   [Notes on the detector](#notes-on-the-detector)). It classifies coarse `animal` /
-  `person` / `vehicle` and rejects empty frames. Fine-grained **species** and **individual
-  ID** are deliberately *not* done in V1 (future phases).
-- **Saved by default:** animals only. People and vehicles are still *drawn* in the preview
+  `person` / `vehicle` and rejects empty frames; **fine-grained species and individual ID are
+  separate phases** layered on top (see [Species ID](#species-identification-phase-2) and
+  [re-ID](#individual-re-identification-phase-3) below).
+- **Detector class filter:** the street outside throws off a lot of `vehicle` boxes, so
+  `detect_classes` in `config.py` tells the detector to report only `animal` + `person`. One
+  YOLO pass scores every class regardless, so dropping the rest costs nothing and just
+  declutters the live view.
+- **Saved by default:** animals only. A person at the glass is still *drawn* in the preview
   (wave at the camera to confirm it's working) but not written to disk, so you sitting next
   to the camera don't fill `crops/` with selfies. Change `save_classes` in `config.py`.
+- **Shot quality:** every saved crop is scored for sharpness — with a bump for night
+  eyeshine, i.e. an animal looking toward the glass — by `quality.py`, so the dashboard can
+  lead a visit with its *cutest, sharpest* frame rather than merely the highest-confidence one.
 
 ---
 
@@ -182,20 +200,78 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
 ### Web dashboard (`--serve`)
 
 `python backyard_cam.py --serve` runs the same capture loop **and** a local web page (open
-`http://127.0.0.1:8000`) with the **live annotated feed** (MJPEG), the live **stats**, and a
-**gallery** of recent crops — a one-stop shop you can leave open in a browser tab.
+`http://127.0.0.1:8000`) — a field journal for the yard you can leave open in a browser tab. It
+has grown from a single live feed into **six tabs**:
+
+- **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
+  how-long-ago, confidence, a ▶ badge to play its clip, and a live *off-pattern* flag if it
+  arrived at an odd hour for its species), running tallies, and most-/least-common species.
+- **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day): a back-to-back
+  highlight reel of clips, the "plate of the night" hero shot, novelty & quiet flags ("first
+  raccoon in 9 days"), moon phase, and a full species roll with per-hour activity clocks.
+- **Behaviour** — per-species field notes (visits/day, median dwell, typical arrival window,
+  hourly chart), **off-pattern** alerts, and **seen-together** co-occurrence pairs.
+- **Individuals** — the "name the cast" workspace (see
+  [phase 3](#individual-re-identification-phase-3)): a *Who is this?* review queue with
+  one-click confirm / correct / clear, bulk **Fit to the Cast**, per-individual **Poses** and
+  **Clips**, and **Un-blend** for multi-animal visits.
+- **Calendar** — a month grid; each day shows its visit count and top-species emoji, click
+  through to a day's crops and visits.
+- **Specimen Catalogue** — every species as a card; open one to confirm (✓) / reject (✗) /
+  correct (✎, free-text allowed) each crop. Crops are **click-to-enlarge** everywhere, with
+  ← / → to step through the strip.
+
+There's also an **Instrument Panel** (the ⚙ modal): live camera controls — exposure, gain,
+focus, white balance — read from and pushed to the *running* camera, so you can dial in the
+glass-door shot without restarting (a live companion to `tune.py`).
 
 - Built on Python's stdlib `http.server` — **no web framework, no new dependencies**.
 - **Localhost only** by default (it shows your camera). To watch from a phone on the same
   network add `--host 0.0.0.0` (and mind who's on your Wi-Fi).
 - Runs in the same process as capture; combine with `--no-preview` for a headless,
   browser-only rig, or keep the native window too.
-- **Species names appear on their own:** the rig starts a small naming **helper** (`classify.py
+- **Species names appear on their own:** the rig starts the naming **helper** (`classify.py
   --watch`) as a child process and stops it with the app, so the recent-visitor card fills in a
   species by itself — nothing extra to launch or close. The helper takes a minute to warm up its
-  model at startup; the header shows **"Identifier: warming up… / on"** so you can tell it's
-  working. (Disable with `--no-classify`; see `classify.py` for bulk re-naming after you edit the
-  label list.)
+  model; the header shows **"Identifier: warming up… / on"** so you can tell it's working.
+- **Clips just play.** Clips recorded in legacy `mp4v` aren't browser-playable, so the server
+  transcodes them to H.264 **on demand** into a `clips_web/` cache (with range-request seeking);
+  H.264 clips are served as-is and the originals are never touched, so `clipmotion.py` still
+  reads them.
+
+---
+
+## Species identification (phase 2)
+
+Every saved crop gets a **species** name, not just the coarse `animal` label — zero-shot, via
+**[BioCLIP 2](https://pypi.org/project/pybioclip/)** (`classify.py`). Because it's zero-shot,
+**editing the candidate-species list is free**: the list in `classify.py` (`SPECIES_LABELS`, a
+Pacific-Northwest backyard starter set) is just text — tweak it for your yard and re-run, no
+retraining. It's resumable and re-runnable; by default only crops without a species are named.
+
+```powershell
+.\.venv\Scripts\python.exe classify.py              # name every unlabeled crop (GPU)
+.\.venv\Scripts\python.exe classify.py --redo       # re-name everything (after editing labels)
+.\.venv\Scripts\python.exe classify.py --watch      # name new crops live, beside the rig (CPU)
+```
+
+- **Live by default.** The rig runs `classify.py --watch` itself as a background helper, so the
+  dashboard's "Most Recent Visitor" card fills in a species within seconds. It names on the
+  **CPU** by default so it never fights the live detector for the GPU. (Disable with
+  `--no-classify`; you can still backfill later with `python classify.py`.)
+- **The non-animal gate (`clipfilter.py`).** MegaDetector's coarse `animal` class sometimes
+  false-fires on a plate of food, a pet bowl, or bare deck — and BioCLIP, being an
+  *organism-only* model, can't reject those: it forces every crop onto the nearest real species
+  (in this DB they piled up as "brown rat"). So a **general CLIP** runs *first* and answers the
+  one question BioCLIP can't — *"is this even an animal?"* — labelling non-animal crops
+  `not an animal` and skipping BioCLIP entirely. It's zero-shot too (edit the prompt lists in
+  `clipfilter.py`); tune the cut with `python clipfilter.py --sample`, which prints a threshold
+  sweep over your own crops and writes nothing.
+- **You have the final say.** In the dashboard's **Specimen Catalogue** you confirm (✓), reject
+  (✗), or correct (✎, with a free-text option) any label. Human verdicts are *sticky* — never
+  overwritten by a re-run — and they feed the per-individual behaviour profiles. Non-critter
+  corrections ("cat food", "blur", …) live on a denylist so they vanish from the stats and the
+  digest, exactly like `not an animal`.
 
 ---
 
@@ -395,8 +471,13 @@ read off a window-side clock, but globally unambiguous and sortable.
 | `frame_w`, `frame_h` | Frame size, so a box stays interpretable / re-normalizable. |
 | `crop_path` | Path to the saved crop (relative to project root). Always set. |
 | `frame_path` | Full-frame path, or NULL. |
-| `species` | Phase 2 (species classification, `classify.py`) fills it. |
-| `individual_id` | Phase 3 (re-identification): set when you hand-label a cluster with `reid.py`. NULL until then. |
+| `crop_quality` | Phase 2: image shot-quality (sharpness × night eyeshine; `quality.py`) — picks the "cutest" thumbnail. |
+| `species` | Phase 2 (`classify.py`, BioCLIP 2) fills it; `not an animal` for crops the prefilter rejects. |
+| `species_confidence` | Phase 2 classifier score 0–1 for `species`. |
+| `species_verified` | Human review in the dashboard: NULL = unreviewed, 1 = confirmed, 0 = wrong. |
+| `species_source` | `bioclip` / `clip-filter` (auto) or `human` (corrected in the dashboard). |
+| `individual_id` | Phase 3 (re-ID): set when you confirm a visit or hand-label a cluster. NULL until then. |
+| `individual_source` | How `individual_id` was set (e.g. `human`, `refit`). |
 | `visit_id` | Phase 4: which `visits` row this crop belongs to (stamped by `visits.py`). |
 
 A second table, **`detection_embeddings`** (keyed to `detections.id`), holds the phase-3
@@ -410,6 +491,15 @@ window on one `source`, so the detections captured during it join by timestamp �
 A fourth table, **`visits`** (phase 4, built by `visits.py`), holds one row per collapsed visit
 event — `source`, dominant `species`/`individual_id`, `started_at`/`ended_at` (→ dwell),
 `detection_count`, and a `representative_detection_id`. Detections point back via `visit_id`.
+
+Two further tables back the clip-based behaviour and un-blend work. **`clip_tracks`** (built by
+`clipmotion.py`) holds one **motion fingerprint per animal per clip** — duration, path length,
+straightness, average/peak speed, moving fraction, an approach/retreat cue, and a gait estimate
+(stride cadence + how much to trust it) — plus the raw trajectory as JSON, so richer gait
+features can be re-derived later without re-running the detector. **`clip_track_embeddings`**
+(`clipembed.py`) holds one MegaDescriptor appearance vector per tracklet, in the *same* vector
+space as `detection_embeddings` — that shared space is what lets a pair visit be split into its
+two animals and a never-solo individual finally get a clean template.
 
 Example queries:
 
@@ -430,8 +520,11 @@ GROUP BY hour ORDER BY hour;
 ## Configuration
 
 `config.py` is the single source of truth for every knob: camera index/resolution, motion
-sensitivity, model version, confidence threshold, which classes get saved, output paths,
-and the `--save-full-frame` default. The CLI flags above just override these per run.
+sensitivity, model version, confidence threshold, which detector classes are reported
+(`detect_classes`) and which get saved (`save_classes`), output paths, the behaviour-clip
+settings (pre/post-roll, disk budget, codec), the species and non-animal-prefilter settings,
+and the re-ID thresholds. The CLI flags above just override the common ones per run; the live
+camera controls are also adjustable from the dashboard's **Instrument Panel** without a restart.
 
 ### Camera tuning & day/night profiles
 
@@ -449,22 +542,37 @@ The camera's best settings differ with the light, so two pieces handle it:
 
 ---
 
+## Tests
+
+A pure-logic test suite covers the data-shaping code — visit collapsing, behaviour profiles,
+the two-axis readout, the non-animal gate's scoring, clip motion + embeddings, shot-quality, and
+the DB layer — with **no GPU, camera, or model download needed**:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+```
+
+---
+
 ## Roadmap
 
 Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
 
-- **Phase 1 — Live capture skeleton:** ✅ this code.
-- **Phase 2 — Species ID:** classify the accumulated crops to fill `detections.species` (let
-  a few days of crops pile up first; pick the current best wildlife classifier at build time).
-- **Phase 3 — Individual re-ID:** ⚙️ tooling built (`embed.py` → `reid.py`): embed → cluster →
-  hand-label ("Notch", "Gimpy"), per species, **raccoons first**. Same-visit grouping is
-  strong; confident *cross-session* individual ID from appearance alone is not (background +
-  pose dominate) — so it's a labelling assistant + second opinion, paired with phase-4 behaviour.
-- **Phase 4 — Behaviour + the disagreement alert:** ⚙️ built (see *Behaviour analysis* above):
+- **Phase 1 — Live capture skeleton:** ✅ MOG2 gate → MegaDetector → crop + clip + SQLite row,
+  with a live preview window and the web dashboard.
+- **Phase 2 — Species ID:** ✅ `classify.py` names every crop zero-shot with **BioCLIP 2**, live
+  beside the rig, behind a general-CLIP non-animal gate (`clipfilter.py`); confirm/correct in the
+  dashboard.
+- **Phase 3 — Individual re-ID:** ✅ built. `embed.py` → `reid.py` for appearance clustering, then
+  the **suggest-confirm loop** (`individuals.py`): single crops can't be matched across sessions,
+  but **visit prototypes can** (same raccoon 0.83–0.93 across nights), so every visit gets a
+  "looks like Stan" suggestion that sharpens as you confirm. Pair visits are **un-blended** from
+  the clips, and once labelled those clip-space templates find the animal again.
+- **Phase 4 — Behaviour + the disagreement alert:** ✅ built (see *Behaviour analysis* above):
   `visits.py` (visit events), `behavior.py` (arrival windows, dwell, co-occurrence), `reid.py
   --match` (appearance score), and `twoaxis.py` — the **two-axis readout** that flags "looks like
-  X but isn't acting like X." Plus `--record-clips` banks the video for gait/motion analysis.
-  Sharpens per-individual as you hand-label. Still to come: motion/gait features off the clips.
+  X but isn't acting like X." Clips record by default and `clipmotion.py` turns them into
+  motion/gait fingerprints. Sharpens per-individual as you hand-label.
 - **Later — trail-cam batch importer:** ✅ `import_trailcam.py` — dump the SD card into a folder,
   `python import_trailcam.py <folder>` runs the same detector over it and writes crops with
   `source='trail_cam_sd'`. EXIF timestamps, idempotent re-runs, `--watch` a drop folder. Same
