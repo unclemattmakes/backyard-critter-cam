@@ -213,6 +213,14 @@ class Config:
     # many of its clips each hold >= 2 sustained tracklets. 2 (not 1) so a lone fragmentation
     # artifact can't wrongly exclude a good solo template; clip-only flags need corroboration.
     reid_clip_co_presence_min_clips: int = 2
+    # CLIP-SPACE appearance match: once a pair member is un-blended (its clip tracklets labelled),
+    # those tracklets form a CLIP-space template that finds it in new visits -- the only way a
+    # never-solo animal (Elliot) becomes recognizable. Clip vectors sit in a different, lower
+    # similarity regime than the still prototypes, so they need their OWN threshold (measured
+    # 2026-06-16: same-individual clip<->clip 0.52 / cross-space still<->clip-centroid 0.65, vs
+    # ~0.10-0.18 for different individuals -- both separate cleanly at 0.40). Distinct from the
+    # still-still novelty cut (reid_novel_threshold 0.55).
+    reid_clip_match_threshold: float = 0.40
 
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
     # The live rig names each new crop by species ITSELF, in a background thread, so a single

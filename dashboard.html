@@ -1120,6 +1120,14 @@ function reidCard(v){
     sugg=`<span class="lbl" style="opacity:.65">${esc(v.note||'no suggestion yet')}</span>`;
     act=`${reidInput('rq-'+v.visit_id,'who is this…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
   }
+  // Clip-space match: a SEPARATE signal from the un-blended tracklets — the only way a never-solo
+  // pair member (Elliot) gets named in a new visit. Shown distinctly; offers a confirm when it's
+  // the only suggestion on offer.
+  const clipTop=(v.clip_candidates||[])[0];
+  const clipSugg=clipTop?`<span class="flag" style="background:rgba(120,160,220,.16);border-color:rgba(120,160,220,.45)" title="clip-space appearance match (from un-blended individuals) — a separate signal from the still match">clip-match <b>${esc(clipTop.name)}</b> ${Math.round(clipTop.similarity*100)}%</span>`:'';
+  if(clipTop && !v.confirmed_as && !(v.candidates||[]).length){
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},'${esc(clipTop.name)}')" title="confirm from the clip-space match">✓ ${esc(clipTop.name)}</button> `+act;
+  }
   const sp=v.species||'raccoon', spId='rqsp-'+v.visit_id;
   const spRow=`<div style="display:flex;gap:6px;align-items:center;margin-top:8px;border-top:1px solid var(--rule);padding-top:8px;flex-wrap:wrap">
     <span class="lbl" style="opacity:.72">species: <b>${esc(nameOf(sp))}</b></span>
@@ -1133,7 +1141,7 @@ function reidCard(v){
       ${thumb}
       <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
         <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${multi}</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
     ${spRow}
@@ -1155,7 +1163,11 @@ async function renderUnblend(vid){
   catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
   REID_UNBLEND[vid]=d.groups||[];
   if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
-  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). The two biggest are usually the pair — name each clean single animal (their clip-space template makes them findable later).</div>`
+  const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
+  const hint=anySugg
+    ? `The two biggest groups are usually the pair. ✓ a clip-match to confirm, or correct it — each label sharpens the next visit.`
+    : `The two biggest groups are usually the pair — name each clean single animal. Once you've named both pair members once, future pair visits will <b>auto-suggest</b> them from the clips.`;
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
     +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
 }
 function reidUnblendGroup(vid,g,i){
@@ -1164,11 +1176,20 @@ function reidUnblendGroup(vid,g,i){
     || '<span class="lbl" style="opacity:.5">no thumbnails yet (clipembed --redo still running?)</span>';
   const lab=g.label?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(g.label)} ✓</span>`:'';
   const iid='ubn-'+vid+'-'+i;
+  const top=(g.suggestion||[])[0];
+  const sugg=(!g.label&&top)?`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},'${esc(top.name)}')" title="clip-space match — confirm this group is ${esc(top.name)}">✓ ${esc(top.name)} ${Math.round(top.similarity*100)}%</button>`:'';
   return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
     <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
-    <div style="display:flex;gap:6px;align-items:center">${lab}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
+    <div style="display:flex;gap:6px;align-items:center">${lab}${sugg}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
   </div>`;
+}
+function reidUnblendConfirm(vid,i,name){
+  const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json()).then(r=>{
+      if(r.error){ alert(r.error); return; } renderUnblend(vid);
+    }).catch(e=>alert('Could not save: '+e));
 }
 async function reidUnblendLabel(vid,i){
   const inp=document.getElementById('ubn-'+vid+'-'+i); const name=(inp&&inp.value||'').trim();

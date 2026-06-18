@@ -575,6 +575,7 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "n_crops": v["detection_count"],
                 "rep_crop": _rep_crop(v["representative_detection_id"]),
                 "confirmed_as": s["confirmed_as"], "candidates": s["candidates"],
+                "clip_candidates": s["clip_candidates"],
                 "novel": s["novel"], "multi": s["multi"],
                 "co_present_frames": s["co_present_frames"],
                 "co_present_clips": s["co_present_clips"],
@@ -650,7 +651,12 @@ def _reid_unblend(cfg, visit_id: str) -> dict:
     if conn is None:
         return {"visit_id": vid, "groups": []}
     try:
-        return individuals.unblend_visit(conn, vid, cfg=cfg)
+        # Cluster suggestions use EXPLICIT un-blend labels only (clean per-animal templates that
+        # separate the bonded pair -- validated 5/7), NOT the solo-visit-attributed blob (which is
+        # coarse and, for a never-solo animal, impossible). So pass an empty solo map: the
+        # suggestions stay quiet until the first cluster is labelled, then they sharpen.
+        templates = individuals.clip_templates(conn, {}, cfg=cfg)
+        return individuals.unblend_visit(conn, vid, templates=templates, cfg=cfg)
     finally:
         conn.close()
 
