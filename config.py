@@ -233,6 +233,29 @@ class Config:
     classify_device: str = "cpu"        # 'cpu' (default; no GPU contention) or 'cuda'.
     classify_interval_s: float = 5.0    # Seconds between checks for new crops to name.
 
+    # ---- Non-animal prefilter (general CLIP, runs BEFORE BioCLIP) ----------------
+    # BioCLIP is organism-only: it can't say "that's not an animal", so MegaDetector's coarse
+    # 'animal' false-fires (a plate of food, a pet bowl, bare ground at the glass door) get forced
+    # onto the nearest real species -- historically they piled up as "brown rat" (none real). This
+    # gate runs a GENERAL CLIP (open_clip, already installed for BioCLIP) on each crop FIRST and
+    # asks the one question BioCLIP can't: "is this even an animal?" Crops it judges non-animal are
+    # labelled clipfilter.NONANIMAL_LABEL (in stats._NON_CRITTER, so the digest/dashboard hide
+    # them) and skip BioCLIP entirely. Zero-shot -- prompt lists live in clipfilter.py, edit freely.
+    nonanimal_filter: bool = True
+    # open_clip checkpoint. ViT-B-32 is the smallest sane choice, so it adds little memory next to
+    # BioCLIP on the CPU naming helper (~0.6 GB). Heavier (ViT-L-14) is sharper but much larger.
+    nonanimal_model: str = "ViT-B-32"
+    nonanimal_pretrained: str = "laion2b_s34b_b79k"
+    # Reject (label non-animal) only when CLIP puts at least this much probability mass on the
+    # non-animal prototype vs the animal one. Deliberately > 0.5 so the gate is conservative -- it
+    # should fire only when quite sure, never shave off a genuine (if odd-looking) critter. Tune
+    # with `python clipfilter.py --sample` (prints a threshold sweep over the real crops).
+    # Validated 2026-06-17 on this DB: 0.50 wrongly hid 5% of human-VERIFIED animals; 0.55+ kept
+    # verified animals AND the dog at 0% while still catching ~56% of the food false-fires, so 0.60
+    # sits with margin above that cliff. The residual ~2% low-confidence (det 0.25-0.45) collateral
+    # is flat across 0.55-0.65 (and some of it is non-animal junk anyway).
+    nonanimal_threshold: float = 0.60
+
     # ---- Timezone convention ----------------------------------------------------
     # Timestamps are stored as LOCAL time WITH the UTC offset, ISO 8601, e.g.
     #     2026-06-07T19:25:59.123456-07:00

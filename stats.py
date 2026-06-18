@@ -404,6 +404,8 @@ _NON_CRITTER = {
     "fence", "wall", "table", "plant", "pot", "hose", "shadow", "reflection", "leaf", "leaves",
     "rock", "stick", "sticks", "ground", "tree", "bush", "person", "people", "human", "vehicle",
     "car", "unknown", "unidentified", "nothing", "empty", "none", "background", "n/a", "na", "",
+    # clipfilter.py's general-CLIP gate writes this when a crop isn't an animal (food, bare deck).
+    "not an animal",
 }
 
 
