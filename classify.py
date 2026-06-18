@@ -29,6 +29,7 @@ from collections import Counter
 
 import config
 import db
+from clipfilter import NONANIMAL_LABEL
 
 # --- Your yard's candidate species. Common names work well. Keep it to species you actually
 # get (plus a few plausibles); a tighter list gives sharper zero-shot results. This is a
@@ -37,7 +38,7 @@ import db
 SPECIES_LABELS = [
     # --- Mammals: common in Pacific Northwest / Puget Sound lowland backyards ---
     "raccoon", "Virginia opossum", "eastern gray squirrel", "Douglas squirrel",
-    "eastern cottontail", "Townsend's chipmunk", "brown rat", "domestic cat",
+    "eastern cottontail", "Townsend's chipmunk", "brown rat", "domestic cat", "domestic dog",
     # --- Birds: common Puget Sound backyard / ground feeders (frequency-ranked from WA data:
     #     song sparrow, dark-eyed junco, black-capped chickadee and American crow are the top 4) ---
     "song sparrow", "dark-eyed junco", "golden-crowned sparrow", "white-crowned sparrow",
@@ -45,6 +46,11 @@ SPECIES_LABELS = [
     "black-capped chickadee", "chestnut-backed chickadee", "house finch", "American goldfinch",
     "American robin", "varied thrush", "northern flicker", "band-tailed pigeon",
     "European starling", "Bewick's wren", "Anna's hummingbird", "bushtit",
+    # NB: non-animal "decoy" labels (plate of food / food bowl / empty ground) were tried here to
+    # absorb MegaDetector false-fires, and were INERT -- BioCLIP 2 is an organism-only model, so
+    # its text encoder won't embed non-organism prompts strongly enough to ever out-score a real
+    # species. Food false-positives must be filtered another way (detector-confidence gate or a
+    # general-CLIP pre-filter), not by adding labels here.
 ]
 
 
@@ -61,6 +67,26 @@ def build_classifier(device: str):
         raise
 
 
+def build_nonanimal_filter(device: str):
+    """Build the general-CLIP non-animal gate (clipfilter.AnimalFilter) from config, or return None
+    if it's disabled (cfg.nonanimal_filter) or fails to load. Fail-open by design: if the gate
+    can't load, species naming still runs (just without the food/empty-frame filter) rather than
+    taking the whole live rig down."""
+    cfg = config.CONFIG
+    if not getattr(cfg, "nonanimal_filter", False):
+        return None
+    try:
+        from clipfilter import AnimalFilter
+        af = AnimalFilter(cfg.nonanimal_model, cfg.nonanimal_pretrained, device,
+                          cfg.nonanimal_threshold)
+        print(f"[naming] non-animal prefilter ON ({cfg.nonanimal_model}/{cfg.nonanimal_pretrained}"
+              f", reject>={cfg.nonanimal_threshold}) on {af.device}.")
+        return af
+    except Exception as e:
+        print(f"[naming] non-animal prefilter unavailable ({e}); naming without it.")
+        return None
+
+
 def fetch_pending(conn, min_confidence: float, redo: bool, limit: int = 0):
     """Rows still needing a species: animal crops above the usability gate, never human-verified.
     Unless --redo, only rows with species IS NULL (so it's resumable and watch-safe)."""
@@ -74,9 +100,15 @@ def fetch_pending(conn, min_confidence: float, redo: bool, limit: int = 0):
     return rows[:limit] if limit else rows
 
 
-def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | None = None):
+def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | None = None,
+                  afilter=None):
     """Classify (id, crop_path) rows in batches, writing species back. Returns
-    (tally, clf, device) -- clf/device may change if a GPU OOM forces a CPU fallback mid-run."""
+    (tally, clf, device) -- clf/device may change if a GPU OOM forces a CPU fallback mid-run.
+
+    If `afilter` (a clipfilter.AnimalFilter) is given, each crop is first asked "is this even an
+    animal?"; crops it rejects are labelled NONANIMAL_LABEL (source 'clip-filter') and skip BioCLIP
+    entirely, so MegaDetector's food / empty-frame false-fires never get forced onto a real
+    species the way they used to pile into 'brown rat'."""
     tally = Counter()
     done = 0
     total = total if total is not None else len(rows)
@@ -86,32 +118,48 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
         valid = [(rid, pth) for rid, pth in valid if os.path.exists(pth)]
         if not valid:
             continue
-        try:
-            preds = clf.predict([pth for _, pth in valid])
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() and device != "cpu":
-                print("  GPU out of memory -- switching to CPU for the remainder.")
-                import torch
-                from bioclip import CustomLabelsClassifier
-                torch.cuda.empty_cache()
-                device = "cpu"
-                clf = CustomLabelsClassifier(SPECIES_LABELS, device="cpu")
-                preds = clf.predict([pth for _, pth in valid])
-            else:
-                raise
+        n_batch = len(valid)   # crops actually processed this batch (animal + non-animal)
 
-        best: dict[str, tuple[str, float]] = {}
-        for d in preds:
-            fn, sc = d["file_name"], float(d.get("score", 0.0))
-            if fn not in best or sc > best[fn][1]:
-                best[fn] = (d["classification"], sc)
-        for rid, pth in valid:
-            if pth in best:
-                label, score = best[pth]
-                db.set_species(conn, rid, label, score)
-                tally[label] += 1
+        # Stage 0: general-CLIP non-animal gate. Rejected crops are labelled NONANIMAL_LABEL and
+        # dropped from the batch, so BioCLIP only ever sees things that are plausibly animals.
+        if afilter is not None:
+            kept = []
+            for (rid, pth), (is_animal, p_non) in zip(valid, afilter.judge([p for _, p in valid])):
+                if is_animal:
+                    kept.append((rid, pth))
+                else:
+                    db.set_species(conn, rid, NONANIMAL_LABEL, p_non, source="clip-filter")
+                    tally[NONANIMAL_LABEL] += 1
+            valid = kept
+
+        if valid:                          # anything left after the gate -> name it with BioCLIP
+            try:
+                preds = clf.predict([pth for _, pth in valid])
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and device != "cpu":
+                    print("  GPU out of memory -- switching to CPU for the remainder.")
+                    import torch
+                    from bioclip import CustomLabelsClassifier
+                    torch.cuda.empty_cache()
+                    device = "cpu"
+                    clf = CustomLabelsClassifier(SPECIES_LABELS, device="cpu")
+                    preds = clf.predict([pth for _, pth in valid])
+                else:
+                    raise
+
+            best: dict[str, tuple[str, float]] = {}
+            for d in preds:
+                fn, sc = d["file_name"], float(d.get("score", 0.0))
+                if fn not in best or sc > best[fn][1]:
+                    best[fn] = (d["classification"], sc)
+            for rid, pth in valid:
+                if pth in best:
+                    label, score = best[pth]
+                    db.set_species(conn, rid, label, score)
+                    tally[label] += 1
+
         conn.commit()
-        done += len(valid)
+        done += n_batch
         print(f"  {done}/{total} classified ...")
     return tally, clf, device
 
@@ -142,6 +190,7 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
     session = session if session is not None else Counter()
     _write_naming_status("loading", device=device)   # dashboard shows "warming up" until ready
     clf, device = build_classifier(device)
+    afilter = build_nonanimal_filter(device)
     print(f"[naming] BioCLIP 2 ready on {device}; naming new crops as they arrive "
           f"(checking every {interval:.0f}s).")
     _write_naming_status("ready", device=device, named=sum(session.values()))
@@ -149,7 +198,7 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
         rows = fetch_pending(conn, min_confidence, redo=False)
         if rows:
             print(f"[naming] {len(rows)} new crop(s) to name...")
-            tally, clf, device = classify_rows(conn, clf, device, rows, batch_size)
+            tally, clf, device = classify_rows(conn, clf, device, rows, batch_size, afilter=afilter)
             session.update(tally)
         _write_naming_status("ready", device=device, named=sum(session.values()))  # heartbeat
         stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
@@ -214,7 +263,9 @@ def main() -> int:
           f"(against {len(SPECIES_LABELS)} candidate species)...")
 
     clf, args.device = build_classifier(args.device)
-    tally, clf, args.device = classify_rows(conn, clf, args.device, rows, args.batch_size)
+    afilter = build_nonanimal_filter(args.device)
+    tally, clf, args.device = classify_rows(conn, clf, args.device, rows, args.batch_size,
+                                            afilter=afilter)
 
     conn.close()
     print("\nDone. Species tally this run:")

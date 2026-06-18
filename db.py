@@ -445,12 +445,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
-                confidence: float) -> None:
-    """Phase 2: write an auto-classified species + score onto a detection."""
+                confidence: float, source: str = "bioclip") -> None:
+    """Phase 2: write an auto-classified species + score onto a detection. `source` records WHICH
+    automatic stage decided it -- 'bioclip' (the species namer) or 'clip-filter' (the general-CLIP
+    non-animal gate in clipfilter.py). Human corrections go through correct_species (source
+    'human', verified) and are never overwritten by either stage."""
     conn.execute(
-        "UPDATE detections SET species = ?, species_confidence = ?, species_source = 'bioclip' "
+        "UPDATE detections SET species = ?, species_confidence = ?, species_source = ? "
         "WHERE id = ?",
-        (species, float(confidence), int(detection_id)),
+        (species, float(confidence), source, int(detection_id)),
     )
 
 
