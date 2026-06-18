@@ -87,6 +87,16 @@ def rank_templates(proto: np.ndarray, templates) -> list:
     return sorted(((n, s, v) for n, (s, v) in best.items()), key=lambda r: -r[1])
 
 
+def clip_match(vec: np.ndarray, templates: dict, threshold: float) -> list:
+    """Rank CLIP-space templates {name: (centroid, n_tracklets)} by cosine to `vec`, keeping only
+    matches >= `threshold`. Returns [(name, sim, n_tracklets), ...] best first. Used both ways:
+    vec = an un-blend cluster centroid (clip<->clip: "this separated animal looks like Elliot"),
+    and vec = a visit's still prototype (cross-space: flag a clip-templated individual in a new
+    still visit). Its own threshold because clip vectors sit lower than the still prototypes."""
+    ranked = sorted(((n, float(vec @ c), k) for n, (c, k) in templates.items()), key=lambda r: -r[1])
+    return [(n, s, k) for n, s, k in ranked if s >= threshold]
+
+
 def co_present_frames(rows, iou_max: float = 0.45) -> int:
     """How many timestamps in `rows` ([(timestamp, (x1,y1,x2,y2)), ...], one species) hold >= 2
     plausibly-separate boxes (pairwise IoU < iou_max). This is the "2+ raccoons at once" badge.
@@ -159,7 +169,43 @@ def _iso_overlap(a0, a1, b0, b1) -> bool:
         return False
 
 
-def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, cfg=None) -> dict:
+def clip_templates(conn, solo_visits: dict, *, cfg=None) -> dict:
+    """{name: (centroid, n_tracklets)} -- a per-individual CLIP-space appearance template = the
+    mean (re-normalized) of that individual's labelled tracklet prototypes. A tracklet is
+    attributed to an individual if EITHER it carries an explicit un-blend label
+    (clip_tracks.individual_id), OR its clip overlaps a confirmed SOLO visit of that individual
+    (`solo_visits` = {visit_id: name}). So the lone resident (Stan) gets a clip template for free,
+    while the never-solo pair member (Elliot) gets one the moment its cluster is un-blend-labelled
+    -- which is the whole point: it's how Elliot becomes findable. Clip space is its own regime,
+    matched with cfg.reid_clip_match_threshold, never the still novelty cut."""
+    rows = db.load_clip_track_embeddings(conn, EMBED_MODEL)
+    if not rows:
+        return {}
+    vmeta = {v["id"]: v for v in conn.execute(
+        "SELECT id, source, started_at, ended_at FROM visits")}
+    groups: dict = defaultdict(list)
+    for r in rows:
+        name = r["individual_id"]
+        if not name:                                   # not explicitly labelled -> try solo overlap
+            for vid, nm in solo_visits.items():
+                v = vmeta.get(vid)
+                if v and v["source"] == r["clip_source"] and _iso_overlap(
+                        r["clip_started_at"], r["clip_ended_at"] or r["clip_started_at"],
+                        v["started_at"], v["ended_at"]):
+                    name = nm
+                    break
+        if name:
+            groups[name].append(np.frombuffer(r["embedding"], dtype=np.float32))
+    out = {}
+    for name, vecs in groups.items():
+        c = np.stack(vecs).mean(axis=0)
+        nrm = np.linalg.norm(c)
+        out[name] = (c / nrm if nrm else c, len(vecs))
+    return out
+
+
+def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dict = None,
+                  cfg=None) -> dict:
     """Separate a multi-animal visit into its individuals using the CLIP TRACKLETS (which track
     each animal independently). Clusters the visit's tracklet appearance prototypes and returns
     the groups biggest-first -- in a true pair visit the two dominant clusters are the two animals
@@ -171,6 +217,7 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, cfg=None) -> d
     Tracklets are matched to the visit by clip<->visit time overlap on the same source. Returns
     {visit_id, n_tracklets, groups:[{track_ids, n, cohesion, rep_crops, label}], note}."""
     cfg = cfg or config.CONFIG
+    thr = cfg.reid_clip_match_threshold
     v = conn.execute("SELECT source, started_at, ended_at FROM visits WHERE id = ?",
                      (int(visit_id),)).fetchone()
     if v is None:
@@ -199,9 +246,15 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, cfg=None) -> d
         sub = X[idxs]
         sims = sub @ sub.T
         coh = float((sims.sum() - len(idxs)) / max(len(idxs) * (len(idxs) - 1), 1)) if len(idxs) > 1 else 1.0
+        # Who does this separated animal look like? Match the cluster's centroid against the known
+        # clip-space templates (clip<->clip) so each group comes pre-suggested -- confirm in a click.
+        cc = sub.mean(axis=0)
+        nrm = np.linalg.norm(cc)
+        suggestion = clip_match(cc / nrm if nrm else cc, templates, thr) if templates else []
         idxs.sort(key=lambda i: -rows[i]["n_hits"])           # sturdiest tracklets first
         labelled = {rows[i]["individual_id"] for i in idxs if rows[i]["individual_id"]}
         out["groups"].append({
+            "suggestion": [{"name": n, "similarity": round(s, 3)} for n, s, _ in suggestion[:3]],
             "track_ids": [rows[i]["track_id"] for i in idxs],
             "n": len(idxs), "cohesion": round(coh, 2),
             "rep_crops": [rows[i]["rep_crop"] for i in idxs if rows[i]["rep_crop"]][:8],
@@ -326,6 +379,10 @@ class VisitMatcher:
         self.confirmed = db.confirmed_visit_labels(conn, species)   # {visit_id: name}
         self._co_cache: dict = {}
         self.clip_co_presence = clip_co_presence_by_visit(conn, species)  # {visit_id: n_clips}
+        # CLIP-space templates: an individual's labelled tracklets, the only way a never-solo pair
+        # member (Elliot) gets matched. Built from confirmed SOLO visits + explicit un-blend labels.
+        solo = {vid: nm for vid, nm in self.confirmed.items() if not self.is_multi(vid)}
+        self.clip_templates = clip_templates(conn, solo, cfg=self.cfg)
 
     def co_presence(self, visit_id: int) -> int:
         """Frames in this visit with two separated boxes of this species (cached). Counted over
@@ -357,15 +414,23 @@ class VisitMatcher:
                "co_present_clips": self.clip_co_presence.get(visit_id, 0),
                "multi": self.is_multi(visit_id),
                "confirmed_as": self.confirmed.get(visit_id),
-               "candidates": [], "novel": False, "note": None}
+               "candidates": [], "clip_candidates": [], "novel": False, "note": None}
         if visit_id not in self.protos:
             out["note"] = ("no embedded crops yet -- run: python embed.py --min-confidence 0.5"
                            if not out["n_embedded"] else
                            f"only {out['n_embedded']} embedded crop(s) -- too thin to match")
             return out
+        # Cross-space clip match (still prototype vs each individual's clip-template centroid): an
+        # ADDITIONAL signal that can name a clip-templated individual -- including one with no still
+        # template at all (Elliot). Surfaced separately from the still-based candidates.
+        cm = clip_match(self.protos[visit_id], self.clip_templates, self.cfg.reid_clip_match_threshold)
+        out["clip_candidates"] = [{"name": n, "similarity": round(s, 3), "n_tracklets": k}
+                                  for n, s, k in cm[:3]]
         temps = self.templates()
         if not temps:
-            out["note"] = "no confirmed individuals yet -- name a visit (or bootstrap groups) first"
+            out["note"] = ("clip-template match only (no still templates yet)"
+                           if out["clip_candidates"] else
+                           "no confirmed individuals yet -- name a visit (or bootstrap groups) first")
             return out
         ranked = rank_templates(self.protos[visit_id], temps)
         out["candidates"] = [

@@ -269,6 +269,12 @@ anything is confirmed. Once you've named a few, it adds:
   Notch+Elliot visit splits 36/29), each shown with frame-crop thumbnails to name. This is how the
   pair member who is **never solo** finally gets a clean appearance template — the labels land on
   the tracklets (clip-space, separate from the still-space `detections.individual_id`).
+- **Clip-space match (findable again)** — once a pair member's tracklets are labelled, that
+  clip-space template *finds* them in new visits: un-blend a fresh pair visit and each cluster
+  comes **pre-suggested** ("✓ Elliot 86%"), and the review queue shows a distinct **clip-match**
+  flag. Measured: the bonded pair separate cleanly given one label each (5/7 new pair visits split
+  Notch vs Elliot, margins ~0.25); clip vectors sit in their own similarity regime, so they're
+  matched with their own threshold (`reid_clip_match_threshold`), never the still-still cut.
 
 Crops are **click-to-enlarge** everywhere, with ← / → to step through the strip you clicked.
 

@@ -332,6 +332,77 @@ def test_clip_co_presence_excluded_from_templates(conn, cfg):
     assert m.templates() == []         # blended-pair visit excluded despite being confirmed
 
 
+def _u(*xs):
+    v = np.asarray(xs, dtype=np.float32)
+    return v / np.linalg.norm(v)
+
+
+def _embedded_tracklet(conn, *, start_min, end_min, vec, n_hits=40, individual=None):
+    """A clip with one sustained tracklet carrying a clip-space appearance vector (clipembed
+    output), optionally pre-labelled with an individual (the un-blend output)."""
+    cid = db.insert_clip(conn, source=db.SOURCE_GLASS_DOOR_CAM, clip_path=f"clips/c{start_min}.mp4",
+                         started_at=_ts(start_min), ended_at=_ts(end_min), fps=10.0, width=1280,
+                         height=720, frame_count=300, detection_count=10, max_confidence=0.9)
+    db.insert_clip_tracks(conn, clip_id=cid, model="MDV6", n_samples=300,
+                          tracklets=[{"track_json": "[]", "n_hits": n_hits, "features": {}}])
+    tid = conn.execute("SELECT id FROM clip_tracks WHERE clip_id=?", (cid,)).fetchone()[0]
+    v = _u(*vec)
+    db.insert_clip_track_embedding(conn, track_id=tid, model=individuals.EMBED_MODEL,
+                                   dim=len(v), embedding=v.tobytes(), n_frames=8)
+    if individual:
+        db.set_clip_track_individual(conn, [tid], individual)
+    return tid
+
+
+def test_clip_match_keeps_only_above_threshold():
+    templates = {"Stan": (_u(1, 0, 0), 5), "Notch": (_u(0, 1, 0), 3)}
+    r = individuals.clip_match(_u(0.95, 0.1, 0), templates, 0.4)
+    assert r[0][0] == "Stan" and r[0][2] == 5 and r[0][1] > 0.9
+    assert all(s >= 0.4 for _, s, _ in r)
+    assert individuals.clip_match(_u(0, 0, 1), templates, 0.4) == []   # nothing close -> empty
+
+
+def test_clip_templates_from_explicit_labels(conn, cfg):
+    _embedded_tracklet(conn, start_min=0, end_min=1, vec=[1, 0, 0], individual="Elliot")
+    _embedded_tracklet(conn, start_min=2, end_min=3, vec=[0.9, 0.1, 0], individual="Elliot")
+    t = individuals.clip_templates(conn, {}, cfg=cfg)          # explicit-only (empty solo map)
+    assert set(t) == {"Elliot"} and t["Elliot"][1] == 2
+    assert t["Elliot"][0] @ _u(1, 0, 0) > 0.95
+
+
+def test_clip_templates_solo_attribution(conn, cfg):
+    d = _det(conn, minutes=0)
+    vid = _visit(conn, [d], start_min=0, end_min=5)
+    _embedded_tracklet(conn, start_min=1, end_min=2, vec=[0, 1, 0])   # overlaps the visit, unlabelled
+    t = individuals.clip_templates(conn, {vid: "Stan"}, cfg=cfg)
+    assert "Stan" in t and t["Stan"][1] == 1                          # attributed via the solo visit
+    assert individuals.clip_templates(conn, {}, cfg=cfg) == {}        # explicit-only ignores it
+
+
+def test_unblend_suggests_from_clip_templates(conn, cfg):
+    cfg.reid_co_presence_min = 1
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=5)
+    for k in range(3):
+        _embedded_tracklet(conn, start_min=0.2 * k, end_min=0.2 * k + 0.1, vec=[1, 0, 0.02 * k])
+    r = individuals.unblend_visit(conn, vid, templates={"Stan": (_u(1, 0, 0), 10)}, cfg=cfg)
+    assert r["groups"] and r["groups"][0]["suggestion"][0]["name"] == "Stan"
+    # No templates -> no suggestions (the honest cold start).
+    r0 = individuals.unblend_visit(conn, vid, cfg=cfg)
+    assert all(g["suggestion"] == [] for g in r0["groups"])
+
+
+def test_suggest_surfaces_clip_candidate_for_never_solo_individual(conn, cfg):
+    # Elliot has only a CLIP template (explicit un-blend label), no still template. A new still
+    # visit whose appearance matches Elliot's clip centroid must surface him as a clip_candidate
+    # -- the whole point: the never-solo pair member becomes findable.
+    _embedded_tracklet(conn, start_min=100, end_min=101, vec=[1, 0, 0], individual="Elliot")
+    qv = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    m = VisitMatcher(conn, "raccoon", cfg)
+    s = m.suggest(qv)
+    assert any(c["name"] == "Elliot" for c in s["clip_candidates"])
+    assert s["candidates"] == []                                     # no STILL template for Elliot
+
+
 def test_pose_groups_split_distinct_postures(conn, cfg):
     # Stan's crops fall into two embedding directions = two characteristic poses.
     ids = []
