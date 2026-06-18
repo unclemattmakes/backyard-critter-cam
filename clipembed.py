@@ -110,6 +110,21 @@ def extract_clip_crops(clip_path, tracks, n_frames):
     return crops
 
 
+def _save_rep_crop(track_id, crops):
+    """Save the largest (closest-to-camera = most readable) of a tracklet's sampled crops as the
+    UI thumbnail under config.clip_crops_dir; return its project-relative path (or None)."""
+    if not crops:
+        return None
+    best = max(crops, key=lambda im: im.size[0] * im.size[1])
+    out = config.CONFIG.clip_crops_dir / f"track_{int(track_id)}.jpg"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        best.convert("RGB").save(out, quality=85)
+        return str(out.relative_to(config.ROOT)).replace("\\", "/")
+    except Exception:
+        return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: per-tracklet appearance embeddings from clips.")
     p.add_argument("--device", default="cuda", help="cuda (default) or cpu.")
@@ -173,9 +188,10 @@ def main() -> int:
                     feats = F.normalize(model(batch), dim=1)
                 proto = F.normalize(feats.mean(dim=0, keepdim=True), dim=1)[0]
                 vec = proto.cpu().numpy().astype(np.float32)
+                rep = _save_rep_crop(tid, ims)
                 db.insert_clip_track_embedding(conn, track_id=tid, model=MODEL_NAME,
                                                dim=EMBED_DIM, embedding=vec.tobytes(),
-                                               n_frames=len(ims))
+                                               n_frames=len(ims), rep_crop=rep)
                 done += 1
             print(f"  clip #{clip_id}: embedded {sum(1 for v in crops.values() if v)}/{len(trows)} "
                   f"tracklet(s)  [{done}/{n_tracks}]")

@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS clip_track_embeddings (
     dim         INTEGER NOT NULL,
     embedding   BLOB    NOT NULL,   -- float32, L2-normalized (mean of the sampled frames).
     n_frames    INTEGER,            -- how many frames were pooled into this prototype.
+    rep_crop    TEXT,               -- path to a representative frame-crop of this tracklet (UI thumbnail).
     created_at  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_clip_track_emb ON clip_track_embeddings(track_id, model);
@@ -316,16 +317,29 @@ def clips_needing_tracks(conn: sqlite3.Connection, model: str):
 
 
 def insert_clip_track_embedding(conn: sqlite3.Connection, *, track_id: int, model: str, dim: int,
-                                embedding: bytes, n_frames: int) -> None:
+                                embedding: bytes, n_frames: int, rep_crop: Optional[str] = None) -> None:
     """Store one tracklet's appearance prototype (clipembed.py). Raw float32 bytes, already
-    L2-normalized so a dot product is cosine similarity. Idempotent per (track, model)."""
+    L2-normalized so a dot product is cosine similarity. `rep_crop` is a saved frame-crop path
+    for the UI. Idempotent per (track, model)."""
     conn.execute("DELETE FROM clip_track_embeddings WHERE track_id = ? AND model = ?",
                  (int(track_id), model))
     conn.execute(
-        "INSERT INTO clip_track_embeddings (track_id, model, dim, embedding, n_frames, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (int(track_id), model, int(dim), embedding, int(n_frames), now_local_iso()))
+        "INSERT INTO clip_track_embeddings (track_id, model, dim, embedding, n_frames, rep_crop, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(track_id), model, int(dim), embedding, int(n_frames), rep_crop, now_local_iso()))
     conn.commit()
+
+
+def set_clip_track_individual(conn: sqlite3.Connection, track_ids: Sequence[int],
+                              individual_id: Optional[str], source: str = "human") -> int:
+    """Assign (or clear) the individual a set of clip TRACKLETS belong to -- the un-blend action
+    (label cluster A 'Notch', cluster B 'Elliot'). Clip-space label, separate from the still-space
+    detections.individual_id. Returns rows changed."""
+    src = None if individual_id is None else source
+    conn.executemany("UPDATE clip_tracks SET individual_id = ?, individual_source = ? WHERE id = ?",
+                     [(individual_id, src, int(t)) for t in track_ids])
+    conn.commit()
+    return len(track_ids)
 
 
 def clip_tracks_needing_embedding(conn: sqlite3.Connection, model: str, min_hits: int):
@@ -349,8 +363,9 @@ def load_clip_track_embeddings(conn: sqlite3.Connection, model: str, *, species=
     clip_started_at, clip_source. (Visit/individual attribution is done by the caller via time
     overlap, as visits renumber on rebuild.)"""
     return conn.execute(
-        """SELECT e.track_id, t.clip_id, t.track_idx, t.n_hits, e.embedding,
-                  c.started_at AS clip_started_at, c.ended_at AS clip_ended_at, c.source AS clip_source
+        """SELECT e.track_id, t.clip_id, t.track_idx, t.n_hits, e.embedding, e.rep_crop,
+                  t.individual_id, c.started_at AS clip_started_at, c.ended_at AS clip_ended_at,
+                  c.source AS clip_source
            FROM clip_track_embeddings e
            JOIN clip_tracks t ON t.id = e.track_id
            JOIN clips c ON c.id = t.clip_id
@@ -417,6 +432,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col in ("stride_hz", "stride_strength", "walk_s"):
         if col not in ct_cols:
             conn.execute(f"ALTER TABLE clip_tracks ADD COLUMN {col} REAL")
+    # Un-blending (2026-06-16): a tracklet can be assigned to an individual (clip-space label,
+    # distinct from detections.individual_id which is the still-space label).
+    if "individual_id" not in ct_cols:
+        conn.execute("ALTER TABLE clip_tracks ADD COLUMN individual_id TEXT")
+    if "individual_source" not in ct_cols:
+        conn.execute("ALTER TABLE clip_tracks ADD COLUMN individual_source TEXT")
+    if conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='clip_track_embeddings'").fetchone():
+        if "rep_crop" not in {r[1] for r in conn.execute("PRAGMA table_info(clip_track_embeddings)")}:
+            conn.execute("ALTER TABLE clip_track_embeddings ADD COLUMN rep_crop TEXT")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,

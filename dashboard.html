@@ -1126,6 +1126,8 @@ function reidCard(v){
     <button class="gear" onclick="postVisitLabel({visit_id:${v.visit_id}},{verify:true},loadIndividuals)" title="confirm this species for the whole visit">✓</button>
     ${speciesSelect(spId,sp)}
     <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
+  const ub=v.multi?`<div style="margin-top:8px"><button class="gear" onclick="toggleUnblend(${v.visit_id})" title="separate the two animals using the clips, then name each">⚖ un-blend the animals</button>
+    <div id="ub-${v.visit_id}" style="display:none;margin-top:8px"></div></div>`:'';
   return `<div class="panel" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       ${thumb}
@@ -1135,7 +1137,49 @@ function reidCard(v){
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
     ${spRow}
+    ${ub}
   </div>`;
+}
+/* Un-blend: cluster a pair visit's clip tracklets into the two animals, name each. The labels
+   land on the tracklets (clip-space), giving the pair member who is never solo a clean template. */
+let REID_UNBLEND={};
+async function toggleUnblend(vid){
+  const box=document.getElementById('ub-'+vid); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; await renderUnblend(vid);
+}
+async function renderUnblend(vid){
+  const box=document.getElementById('ub-'+vid); if(!box) return;
+  box.innerHTML='<p class="lbl" style="opacity:.7">Separating the animals from the clips…</p>';
+  let d; try{ d=await fetch('/api/reid/unblend?visit_id='+vid).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
+  REID_UNBLEND[vid]=d.groups||[];
+  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). The two biggest are usually the pair — name each clean single animal (their clip-space template makes them findable later).</div>`
+    +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
+}
+function reidUnblendGroup(vid,g,i){
+  const thumbs=(g.rep_crops||[]).slice(0,8).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('')
+    || '<span class="lbl" style="opacity:.5">no thumbnails yet (clipembed --redo still running?)</span>';
+  const lab=g.label?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(g.label)} ✓</span>`:'';
+  const iid='ubn-'+vid+'-'+i;
+  return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
+    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
+    <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${lab}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
+  </div>`;
+}
+async function reidUnblendLabel(vid,i){
+  const inp=document.getElementById('ubn-'+vid+'-'+i); const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  try{
+    const r=await fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    renderUnblend(vid);
+  }catch(e){ alert('Could not save: '+e); }
 }
 function reidBootCard(g,i){
   const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;

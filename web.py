@@ -228,7 +228,8 @@ def _web_clip(src: Path, clips_root: Path, cache_root: Path):
 
 
 def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBridge):
-    allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir)]
+    allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir,
+                                          getattr(cfg, "clip_crops_dir", cfg.clips_dir))]
     stop_event = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
@@ -292,6 +293,9 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
+                elif path == "/api/reid/unblend":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(_reid_unblend(cfg, (q.get("visit_id") or [""])[0]))
                 elif path == "/api/reid/clips":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_clips(cfg, (q.get("individual") or [""])[0]))
@@ -333,6 +337,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._reid_confirm(data)
                 elif path == "/api/visit/label":
                     self._visit_label(data)
+                elif path == "/api/reid/unblend/label":
+                    self._unblend_label(data)
                 elif path.startswith("/api/detection/"):
                     self._detection_action(int(path.rsplit("/", 1)[-1]), data)
                 else:
@@ -344,6 +350,21 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json({"error": str(e)}, code=500)
                 except Exception:
                     pass
+
+        def _unblend_label(self, data):
+            """Assign an individual to a cluster of clip tracklets (the un-blend action):
+            {"track_ids": [...], "name": "Notch"}. name=""/null clears."""
+            ids = data.get("track_ids") or []
+            if not isinstance(ids, list) or not ids:
+                self._json({"error": "missing track_ids"}, code=400)
+                return
+            name = (str(data.get("name") or "").strip()) or None
+            conn = db.connect(cfg.db_path)
+            try:
+                n = db.set_clip_track_individual(conn, [int(t) for t in ids], name)
+                self._json({"ok": True, "labelled": n, "name": name})
+            finally:
+                conn.close()
 
         def _visit_label(self, data):
             """Confirm/correct a visit's SPECIES and/or name its INDIVIDUAL in one call -- the
@@ -614,6 +635,22 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
                 "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
                 "novel_threshold": cfg.reid_novel_threshold}
+    finally:
+        conn.close()
+
+
+def _reid_unblend(cfg, visit_id: str) -> dict:
+    """Separate a multi-animal visit into its individuals via clip-tracklet clustering."""
+    import individuals
+    try:
+        vid = int(visit_id)
+    except (TypeError, ValueError):
+        return {"visit_id": None, "groups": [], "note": "bad visit_id"}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"visit_id": vid, "groups": []}
+    try:
+        return individuals.unblend_visit(conn, vid, cfg=cfg)
     finally:
         conn.close()
 
