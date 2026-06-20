@@ -36,11 +36,14 @@ import behavior
 from stats import _NON_CRITTER
 
 
-def _parse(ts):
-    try:
-        return datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
+_parse = db.parse_local   # canonical ISO parser (tz-aware; normalises any legacy naive string)
+
+
+def _dwell_s(visit) -> float:
+    """Visit dwell in seconds, robust to a NULL / unparseable ended_at (returns 0 then) so a
+    half-written visit row never raises 'None - datetime' here."""
+    a, b = _parse(visit["started_at"]), _parse(visit["ended_at"])
+    return (b - a).total_seconds() if a and b else 0.0
 
 
 def _in_window(hour, win):
@@ -57,7 +60,7 @@ def species_fit(visit, prof):
         return "thin", ["species profile too thin to judge"]
     dt = _parse(visit["started_at"])
     hour = dt.hour if dt else None
-    dwell = (_parse(visit["ended_at"]) - dt).total_seconds() if dt else 0
+    dwell = _dwell_s(visit)
     notes = []
     arrival_ok = _in_window(hour, prof["typical_window"])
     win = prof["typical_window"]
@@ -91,7 +94,7 @@ def two_axis(conn, store, visit):
 
 def _print_visit(visit, readout, full=False):
     dt = _parse(visit["started_at"])
-    dwell = (_parse(visit["ended_at"]) - dt).total_seconds() if dt else 0
+    dwell = _dwell_s(visit)
     tag = {"FITS": "  ", "DISAGREES": "!!", "thin": "..", "skip": "  "}.get(readout["verdict"], "  ")
     print(f"{tag} visit #{visit['id']:<4} {visit['species'] or '(unknown)':18} "
           f"{dt.strftime('%m-%d %H:%M') if dt else '?'}  dwell {dwell:>4.0f}s  "
@@ -125,7 +128,7 @@ def main() -> int:
     try:
         from reid import EmbeddingStore
         from embed import model_tag
-        store = EmbeddingStore(conn, args.species, 0.0, model_tag(False))
+        store = EmbeddingStore(conn, args.species, 0.0, model_tag())
         if len(store) == 0:
             store = None
     except Exception:

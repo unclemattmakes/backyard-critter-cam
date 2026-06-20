@@ -1,0 +1,351 @@
+# Backyard Critter Cam — Code Review & Path to Sharing
+
+> Review date: 2026-06-19. Scope: the whole rig (~7,700 lines Python + a 107 KB single-file
+> dashboard), with a specific eye on the transition from *private tool* → *something friends
+> and family can install and run*. References are `file:line`.
+
+---
+
+## ✅ Implementation status (updated 2026-06-19, branch `claude/sharing-readiness`)
+
+All three tiers were implemented and verified: **133 tests pass** (up from 119), every module
+compiles, the dashboard backend was smoke-tested against the live DB (all endpoints 200 + valid
+JSON), and the dashboard JS was syntax-checked.
+
+**Tier 1 — correctness**
+- Fixed the broken trail-cam importer (the `save_crop` tuple bug) + added `tests/test_import_trailcam.py`.
+- Fixed the `individuals.py` nested-quote f-string; added a Python-3.10+ check at startup (`config.py`).
+- `tune.py` capture released in `finally`; NULL-guarded dwell (`twoaxis.py`); `prune_clips` stats
+  each file once inside a try; `detector.py` verifies download length before caching the weights.
+
+**Tier 2 — runnable by a friend**
+- `device` defaults to `auto` everywhere (live rig, importer, all ML CLIs) via a shared
+  `detector.build_with_fallback`; CUDA errors lead with the fix. Matt's strict-GPU preference is
+  preserved in his gitignored `config_local.py`.
+- `camera_index` default is now `0` (Matt's `1` moved to `config_local.py`).
+- `setup.bat` / `setup.sh` create the venv and install the torch build matching the hardware.
+- Species list, CLIP prompts, and the re-ID focus species are overridable in `config_local.py`
+  (no source edit); README reconciled (device default, Python floor, setup scripts).
+
+**Tier 3 — polish & trust**
+- Fixed the `onclick` name-injection (new `jarg()` helper); softened dev-shell empty-states;
+  genericised the raccoon/Stan/hardcoded-date copy.
+- The non-critter denylist is served from one place (`/api/denylist`) and merged by the dashboard,
+  so the JS mirror can't drift.
+- Removed the dead SAM background-removal experiment (`embed.py`/`reid.py` code + the 40 MB
+  `mobile_sam.pt`); consolidated the triplicated `_parse` into `db.parse_local` (with tz-normalize).
+- Split the stylesheet out to `dashboard.css` (HTML 107 KB → 81 KB), served via a new route.
+- Added `tests/test_stats.py` (empty-DB digest paths) and `tests/test_web.py` (range parse, whitelist,
+  path-traversal guard).
+
+**Deliberately left for later** (higher risk / lower value):
+- The broader shared-helper sweep beyond `_parse` (vector-decode, cosine, cluster, crop-abspath) —
+  touches the re-ID path that can't be runtime-verified headlessly; left as future cleanup.
+- A full `dashboard.html` JS split into per-tab files + a browser/visual regression pass (needs a
+  camera). The CSS split — the highest-value seam — is done; the JS split stays optional.
+- Real auth for `--host 0.0.0.0`: posture kept as "localhost-safe; LAN = trust your network"
+  (documented). Only the injection bug was fixed.
+
+The findings below are the original review, kept for reference.
+
+---
+
+## 1. What the app is today
+
+A genuinely impressive hobby system that has grown well past its "live capture skeleton"
+origin into the full four-phase pipeline the PLAN called for:
+
+1. **Capture** — MOG2 motion gate → MegaDetector v6 (Ultralytics) → crop + SQLite row + a
+   behaviour video clip, with a live preview window and a six-tab local web dashboard.
+2. **Name the species** — BioCLIP 2 zero-shot, live, behind a general-CLIP "is this even an
+   animal?" gate.
+3. **Name the individuals** — appearance embeddings (MegaDescriptor) + a *suggest-confirm*
+   loop that matches whole-visit prototypes across nights, with clip-based un-blending of
+   multi-animal visits.
+4. **Behaviour** — visit collapsing, arrival/dwell/co-occurrence profiles, motion/gait
+   fingerprints, and the two-axis "looks like X but isn't acting like X" readout.
+
+**Core purpose is intact and clear:** *augment the critter-knower, don't replace them* — keep
+appearance and behaviour on separate axes and surface both. The code honours that philosophy.
+
+**The headline gap for sharing:** the project is, in a hundred small ways, still shaped to
+*one machine and one yard* — Matt's RTX 5050, his Windows paths, his camera index, his
+raccoons (Stan/Notch), his Puget-Sound species list. None of that is wrong for a private
+tool; all of it is friction for a friend. That's the throughline of this review.
+
+---
+
+## 2. How it works (architecture)
+
+```
+backyard_cam.py ── capture loop (the conductor)
+  ├─ config.py        single source of truth for every knob (+ config_local.py for secrets)
+  ├─ detector.py      MegaDetector v6 via Ultralytics; resolve_device() is the canonical cuda/cpu/auto picker
+  ├─ quality.py       per-crop shot-quality score (sharpness × night eyeshine)
+  ├─ clips.py         rolling pre-roll buffer → one .mp4 per visit (h264 via ffmpeg pipe)
+  ├─ daynight.py      sun-driven day/night camera profile switch (astral)
+  ├─ db.py            ALL SQLite access (schema, migrations, inserts, label ops)
+  ├─ web.py           stdlib http.server dashboard (MJPEG + JSON APIs), serves dashboard.html
+  └─ classify.py --watch   spawned as a CHILD PROCESS for live species naming
+                           └─ clipfilter.py   non-animal prefilter (general CLIP)
+
+batch / analysis tools (run after data accumulates):
+  visits.py · behavior.py · twoaxis.py · embed.py · reid.py · individuals.py ·
+  clipmotion.py · clipembed.py · import_trailcam.py · tune.py · stats.py (digest engine)
+```
+
+Data spine is one SQLite DB (`detections` + `detection_embeddings`, `visits`, `clips`,
+`clip_tracks`, `clip_track_embeddings`). The schema was designed up front for all four phases,
+so each phase has been a pure insert, never a migration — that foresight paid off.
+
+**What's strong and worth preserving:**
+- The schema/`source`-column design; phases really did layer cleanly.
+- `detector.resolve_device()` is the *right* device-selection pattern (a real GPU compute
+  probe) and the live rig + trail-cam importer both route through it.
+- Graceful degradation is a recurring good habit: missing ffmpeg → mp4v fallback + a note;
+  missing astral → profiles disable with a warning; weights auto-download with a one-time msg.
+- Latitude/longitude are correctly kept out of git via a gitignored `config_local.py`.
+- ~1,976 lines of pure-logic tests, no GPU/camera/model needed.
+- The README and PLAN are excellent — better documented than most production code.
+
+---
+
+## 3. Overall assessment
+
+| Dimension | State | Notes |
+|-----------|-------|-------|
+| Architecture | **Strong** | Clean phase layering; the DB design aged well. |
+| Documentation (README/PLAN) | **Strong** | Thorough, honest about limitations. |
+| Test coverage (pure logic) | **Good** | …but with telling gaps (see §7). |
+| Correctness | **Mostly good, two real bugs** | One shipped feature is broken (§4). |
+| Code hygiene / duplication | **Fair** | Several primitives copy-pasted 4–10×; one dead experiment. |
+| Ready for a friend to install | **Not yet** | Manual GPU-specific setup, machine/yard assumptions (§5). |
+| Privacy / security for sharing | **Needs decisions** | No auth; a free-text injection bug; denylist double-source. |
+
+---
+
+## 4. Critical fixes (do these first)
+
+### 4.1 🔴 The trail-cam importer is broken — `import_trailcam.py:196`
+`import_trailcam.py:64` does `from backyard_cam import _rel, save_crop`. But `save_crop`
+(`backyard_cam.py:303-324`) was changed to return **`(Path, quality)`** — while the importer
+still treats it as a bare Path:
+
+```python
+crop = save_crop(frame, det, cfg, day, stamp, i)   # 196 — this is a 2-tuple now
+if crop is None: continue                          # 197
+...
+crop_path=_rel(crop),                              # 208 — _rel(tuple) → AttributeError
+```
+
+The comment at line 63 even promises "if save_crop changes, both rigs move" — but it changed
+and the importer didn't. **Result: every trail-cam import raises on the first real detection
+and saves zero crops.** This is a roadmap-✅ feature that does not work, and there's no test
+to catch it (§7).
+**Fix:** `crop_path, crop_q = save_crop(...)`; guard `if crop_path is None`; pass
+`crop_quality=crop_q` into `insert_detection` (which already accepts it, so trail-cam crops
+also get shot-quality scoring for free).
+
+### 4.2 🟠 `individuals.py:590` — nested-quote f-string is a SyntaxError before Python 3.12
+`f'#{x['visit_id']} {x['similarity']:.2f}'` reuses single quotes inside a single-quoted
+f-string (legal only on 3.12+, PEP 701). On 3.11/3.10 the *whole module fails to import*, so
+`--refit` and the Individuals tab die. Fine on Matt's 3.14; a landmine for a friend on a
+stock interpreter.
+**Fix:** use double quotes inside, and either pin/enforce the Python floor or avoid the
+syntax. (Quick audit for other PEP-701 nesting recommended.)
+
+### 4.3 🟠 `tune.py` can leave the webcam locked on any error
+The capture is opened with no `try/finally`, so an exception between open and `cap.release()`
+leaks the device handle and the live rig then can't reopen the camera. **Fix:** wrap the body
+in `try: … finally: cap.release()`.
+
+### 4.4 🟡 Smaller correctness items surfaced by the review
+- `twoaxis.py:60` (and `_print_visit`): `ended_at - started_at` with no guard that `ended_at`
+  parsed — `None - dt` raises if `ended_at` is NULL/garbage. `behavior.overview` guards it
+  correctly; copy that.
+- `clips.py` `_write` failure path sets `recording=False` but **not** `disabled=True`, so a
+  transient codec failure can thrash open/close a clip every detection.
+- `clips.prune_clips` calls `p.stat()` twice per file and aborts the *entire* prune if one
+  file vanishes mid-sweep (the live writer rotating). Stat once, per-file try.
+- `detector.py:142`: a truncated weight download that's non-empty is cached forever and loaded
+  as a corrupt model next run. Verify `Content-Length`/checksum before the atomic rename.
+
+---
+
+## 5. Getting ready to share (private → friends & family)
+
+This is the biggest body of work and the actual point of the request. Grouped by theme.
+
+### 5.1 Onboarding & install friction
+- **Setup is a manual, GPU-specific gauntlet.** README step 2 hand-installs a cu130 torch
+  build; step 1 hardcodes `C:\Python314\python.exe`. A non-technical relative cannot follow
+  this. Options, roughly in order of effort: (a) a `setup.bat`/`setup.sh` that creates the
+  venv, detects GPU vs CPU, and installs the right torch + requirements; (b) longer term, a
+  packaged build (PyInstaller one-folder) so there's no Python install at all.
+- **`start_critter_cam.bat` waits a fixed `timeout /t 16`** before opening the browser — model
+  load can take longer or shorter. Poll the port instead, or open the browser from the app once
+  the server is actually up.
+- **Python 3.14 is "what it was tested on," not enforced.** Combined with 4.2, a friend on
+  3.11 gets cryptic failures. Add a one-line version check at startup with a friendly message.
+
+### 5.2 "Matt's machine" assumptions baked into defaults
+| Where | Issue | Suggested default for sharing |
+|-------|-------|-------------------------------|
+| `config.py:30` | `camera_index = 1` (Matt's USB cam) — contradicts its own comment *and* the README, which both say 0 | `0`, or auto-probe the first working index |
+| `config.py:103` | `device = "cuda"` → a friend with no NVIDIA GPU gets a Blackwell/`sm_120`/`cu130` wall of text | `"auto"` (silently falls back to CPU; keep `cuda` as Matt's opt-in) |
+| `embed.py`, `clipembed.py`, `clipmotion.py`, `clipfilter.py` | `--device` defaults to `cuda` and several **don't even offer `auto`** | default `auto`, route through the existing `detector.resolve_device()` |
+| `detector.py:82` CUDA error | excellent for Matt, but *leads* with "RTX 50-series / Blackwell" jargon | lead with the actionable pip line; keep the arch detail as a tail |
+| `README` setup | `C:\Python314`, absolute project path, Windows-first | generic paths; a "no-GPU / Linux / Mac" quickstart up top |
+
+### 5.3 "Matt's yard" assumptions
+- **The species list is hardcoded in Python source**, not config: `classify.SPECIES_LABELS`
+  (~`classify.py:38`) and the CLIP prompt lists in `clipfilter.py` (~`:45`). The docstrings say
+  "edit it for your yard," but that means editing source and risking a syntax error. Move these
+  to `config.py` (or a `species.txt`) next to the already-externalized lat/long — the single
+  biggest "different yard" tripwire.
+- **The re-ID surface is hardwired to `raccoon`** (`web.py:291`, `web.py:538`, and the whole
+  Individuals tab) with **the author's pets as example names** (`Stan`/`Notch` placeholders,
+  "2+ raccoons" copy). A friend whose yard has possums and no raccoons opens an Individuals
+  tab for a species they don't have. Drive the species from the data (most-common confirmed
+  mammal) or config; genericise the example names.
+- **Hardcoded history dates** in the dashboard, e.g. "clips only exist from 2026-06-09 on"
+  (~`dashboard.html:1381`) — meaningless/false on a fresh install. Derive from the earliest
+  clip in the DB.
+
+### 5.4 Privacy & security
+- **No authentication anywhere.** Fine for the localhost default; but `--host 0.0.0.0`
+  (the LAN launcher, meant for phones) exposes the **live camera feed and all data** to anyone
+  on the Wi-Fi with zero auth. For sharing, decide: keep it "trust your LAN" (document loudly)
+  or add a simple shared-password/token gate. Do **not** let anyone port-forward this as-is.
+- **Path-traversal is actually handled well** — `web.py:478-482` resolves then containment-
+  checks against `allowed_dirs`. Good. (Noting it so it isn't "fixed" away.)
+- **Free-text name injection — `dashboard.html` ~1117/1129/1180/1230.** Individual names are
+  user-typed and interpolated into `onclick="...('${esc(name)}')"`, but `esc()` (`:453`)
+  doesn't escape apostrophes — so a raccoon named `O'Brien` silently breaks confirm, and a
+  crafted value executes JS. Self-inflicted (local user), so low *threat*, but a real bug.
+  Use `JSON.stringify(name)` for the argument or `data-`/`addEventListener` instead of inline
+  `onclick`.
+- **If a friend zips the folder to pass it on**, `config_local.py` (their real coordinates)
+  rides along. Worth a note in the share instructions; it's gitignored but not zip-ignored.
+- **AGPL-3.0 network clause** (via Ultralytics) — already well-documented in the README, but
+  relevant the moment a friend exposes the dashboard to others. Keep that note prominent.
+
+### 5.5 First-run experience (empty database)
+- **Strength:** all six tabs already have empty states — genuinely thoughtful.
+- **Weakness:** several of those empty states tell a non-technical user to run shell commands —
+  `python visits.py` (~`dashboard.html:1051`), `python embed.py` (~`:1409`, `:1267`),
+  `clipembed --redo` (~`:1176`). For a shared build, replace with plain language ("this fills
+  in as more animals visit") or hide dev hints behind a flag.
+- **No orientation on first run:** a live plate + five empty tabs, no "what is this / data
+  builds over days / the camera must be running" welcome. A one-time intro card on an empty
+  Live tab would do it.
+- **The MJPEG plate has no "camera offline" affordance** — if frames stall it's just a black
+  box, indistinguishable from "page broken." Add an `onerror`/timeout overlay.
+
+---
+
+## 6. Code cleanup
+
+### 6.1 Duplication → a small shared-helpers module
+The same primitives are copy-pasted across the codebase. Each is individually harmless; together
+they're a dozen places a single assumption (float32 dtype, backslash paths) can silently drift.
+
+| Primitive | Copies | Suggested home |
+|-----------|--------|----------------|
+| `_parse(ts)` ISO-timestamp parser | `visits.py:35`, `behavior.py:38`, `twoaxis.py:39` (+ importer) | `db.parse_local()` next to `now_local_iso()` — and fold in tz-normalization to also fix 4.4 |
+| `_rel(path)` project-relative path | `backyard_cam.py:295`, `clips.py:101` (re-implemented, not imported) | one `db.rel_to_root()` |
+| crop abspath `ROOT / p.replace("\\","/")` | ~10 sites across reid/individuals/web | one `config.crop_abspath()` — centralizes the "DB stores backslash paths" contract |
+| GPU→CPU model-build fallback | `classify.py:57`, `clipfilter.py:83`, `embed.py:67` (each re-prints a different message) | one `build_with_fallback(make_fn, device)` over `resolve_device()` |
+| `np.frombuffer(blob, np.float32)` | 7+ sites | one `db.decode_vector(row)` |
+| mean-pairwise-cosine cohesion | `reid.py:206`, `individuals.py` ×3 | `mean_pairwise_cosine(X)` |
+| agglomerative-cluster-on-cosine | 4 sites, 2 different call styles | `cluster_cosine(X, dist, method)` |
+
+A ~80–120 line `reidutil.py` / additions to `db.py` would absorb most of this and make the
+float32/path contracts explicit.
+
+### 6.2 Dead code & leftovers
+- **`mobile_sam.pt` (40 MB) sits in the repo root** — leftover from the SAM background-removal
+  experiment that (per project notes) was tested and didn't help. The matching `--segment` /
+  `_segment_image` path still lives in `embed.py`. Decide: delete both, or keep behind a clearly
+  "experimental, off by default" flag. Right now it's 40 MB + dead-ish code a reader has to
+  reason about.
+- **`classify.py --tag` (~`:244`)** is parsed but never read in-process; it exists only so
+  `backyard_cam.py` can grep the child's command line to kill it. Worth a one-line comment, or
+  it reads as a forgotten feature.
+
+### 6.3 The denylist is maintained in two languages by hand
+`stats._NON_CRITTER` (`stats.py:399-409`) is hand-mirrored as `NONCRITTER` in
+`dashboard.html:901-904` — the JS comment literally says "mirror of stats._NON_CRITTER." Two
+sources that must be edited in lockstep forever. **Fix:** serve it once from an API endpoint
+(`/api/labels` already exists nearby) and let the dashboard fetch it.
+
+### 6.4 Big files / structure
+- **`dashboard.html` is 107 KB, ~71% JavaScript in one `<script>`.** It works, but it's the
+  hardest-to-maintain artifact and the one a friend-contributor would touch. Recommended *first*
+  step: lift `<style>` → `dashboard.css` and `<script>` → `dashboard.js` (web.py already serves
+  files under `allowed_dirs`; ~10 lines to add a static route, zero behaviour change). Then,
+  optionally, split the JS along the comment banners (`live`, `dispatch`, `individuals`, …) and
+  extract three helpers that kill most of the duplication: `thumbImg(path,size)`,
+  `loadInto(el,url,render,label)`, and a card-shell builder. If only one thing: pull the CSS.
+- **`individuals.py` (641 lines) does too much** — visit matching, two kinds of co-presence,
+  pose groups, un-blend, clip lookup. `pose_groups`/`clips_for_individual`/co-presence could
+  move to a `reid_clips.py`. Not urgent; it's just the one file that's hard to hold in your head.
+
+---
+
+## 7. Testing gaps
+
+~1,976 lines of tests cover the pure-logic modules well (db, visits, behavior, twoaxis, clips,
+clipmotion, clipembed, clipfilter, quality, individuals). But the gaps line up exactly with
+where the bugs are:
+
+- **No `test_import_trailcam.py`** — which is *why* the §4.1 breakage shipped unnoticed. A test
+  that runs `ingest_file` against a fixture image with a stubbed detector would have caught it.
+- **No `test_stats.py`** — `stats.py` is 725 lines of the most intricate logic in the project
+  (the period digest, novelty/quiet flags, the denylist) and is completely untested. It's also
+  the module most likely to break on a fresh/empty DB.
+- **No tests for `web.py`** (request handlers, the label endpoints, range parsing) or the live
+  modules (`classify`, `embed`, `reid`, `detector`, `backyard_cam`) — understandable for the
+  GPU/camera ones, less so for the stdlib server handlers, which are testable with a fake DB.
+
+Priority: a smoke test for `import_trailcam` and a fresh-empty-DB test for `stats.period_digest`.
+
+---
+
+## 8. Consistency nits
+- **`db.connect()` doesn't set `row_factory`, but `connect_readonly()` does** — so callers
+  hand-set `conn.row_factory = sqlite3.Row` in module after module, and two row-access styles
+  (named vs positional) coexist. Make `db.connect()` set it too; delete the repeated lines.
+- **Connection cleanup is inconsistent** — some CLIs use `try/finally`, others leak on
+  exception (`visits`, `behavior`, `twoaxis`, and `classify.main`/`embed.main`). Standardize on
+  `try/finally`.
+- **Device-CLI surfaces diverge** — only `clipmotion.py` offers `cuda/cpu/auto`; the rest omit
+  `auto`. Adopt the three-way choice everywhere (ties into §5.2).
+- Minor: `sys.exit(main())` vs `raise SystemExit(main())`; inline `import` of `os`/`dataclasses`
+  in a few spots.
+
+---
+
+## 9. Suggested roadmap (prioritized)
+
+**Tier 1 — correctness (a few hours):**
+1. Fix the trail-cam importer (§4.1) **and add a smoke test** so it can't silently re-break.
+2. Fix `individuals.py:590` and add a Python-version check at startup (§4.2).
+3. `tune.py` capture `try/finally`; the `clips`/`twoaxis` guards in §4.4.
+
+**Tier 2 — make it runnable by a friend (a day or two):**
+4. Default `device="auto"` end-to-end via `resolve_device()`; lead the CUDA error with the fix.
+5. `camera_index` default 0 (or auto-probe); reconcile the README.
+6. A `setup.bat`/`setup.sh` that builds the venv and picks the right torch (GPU vs CPU).
+7. Move `SPECIES_LABELS` + CLIP prompts into config; genericise raccoon/Stan/Notch/dates.
+
+**Tier 3 — polish & trust (as time allows):**
+8. First-run onboarding card; replace dev-shell empty-states with plain language.
+9. Decide the auth posture for `--host 0.0.0.0`; fix the apostrophe injection.
+10. Serve the denylist from one place; split `dashboard.html` (CSS out first).
+11. Cleanup pass: delete/flag the SAM leftover; extract the shared helpers (§6.1).
+12. Add `test_stats.py` (empty-DB digest) and a few `web.py` handler tests.
+
+**None of this touches the core design** — appearance and behaviour stay on separate axes, the
+schema is untouched, the phases stay layered. It's all sanding down the edges that only ever
+fit one machine and one yard.

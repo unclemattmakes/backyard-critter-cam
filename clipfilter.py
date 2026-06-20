@@ -33,6 +33,7 @@ from collections import Counter
 
 import config
 import db
+import detector
 
 # The label written onto crops the gate judges non-animal. It is listed in stats._NON_CRITTER
 # (and the dashboard's mirror) so the digest/calendar/glances hide it, exactly like the
@@ -42,17 +43,20 @@ NONANIMAL_LABEL = "not an animal"
 # --- Prompt sets. Both are ensembled into a single prototype each, so list length doesn't tilt
 # the decision -- add phrasings freely. Tuned for a PNW glass-door cam (night IR, food plates set
 # out for raccoons, a wooden deck + brick patio). Common, concrete phrasings beat exotic ones.
-ANIMAL_PROMPTS = [
+_DEFAULT_ANIMAL_PROMPTS = [
     "a photo of an animal", "a wild animal", "an animal in a backyard at night",
     "a furry mammal", "a small mammal", "a bird", "a raccoon", "a squirrel",
     "an opossum", "a rat", "a cat", "a dog", "a crow", "an animal on a deck at night",
 ]
-NONANIMAL_PROMPTS = [
+_DEFAULT_NONANIMAL_PROMPTS = [
     "a plate of food", "a bowl of pet food", "a dish of leftover food",
     "a pile of food scraps", "food on the ground with no animal",
     "an empty wooden deck", "an empty patio at night", "bare ground", "a brick surface",
     "an empty scene with no animal", "leaves and dirt", "a blurry photo of nothing",
 ]
+# Per-yard overrides from config_local.py if set, else the PNW defaults above.
+ANIMAL_PROMPTS = config.CONFIG.clip_animal_prompts or _DEFAULT_ANIMAL_PROMPTS
+NONANIMAL_PROMPTS = config.CONFIG.clip_nonanimal_prompts or _DEFAULT_NONANIMAL_PROMPTS
 
 
 def decision(p_nonanimal: float, threshold: float) -> bool:
@@ -78,20 +82,12 @@ class AnimalFilter:
         self.model_name = model_name
         self.pretrained = pretrained
 
-        # Mirror build_classifier()'s policy: try the requested device, fall back to CPU if GPU
-        # init fails, so a wrong-arch torch build never takes the whole naming path down.
-        try:
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                model_name, pretrained=pretrained, device=device)
-            self.device = device
-        except Exception as e:
-            if device != "cpu":
-                print(f"  non-animal filter: {device} init failed ({e}); falling back to CPU.")
-                model, _, preprocess = open_clip.create_model_and_transforms(
-                    model_name, pretrained=pretrained, device="cpu")
-                self.device = "cpu"
-            else:
-                raise
+        # Resolve the device the one shared way (GPU when it genuinely computes, else CPU), so a
+        # wrong-arch torch never takes the naming path down -- see detector.build_with_fallback.
+        (model, _, preprocess), self.device = detector.build_with_fallback(
+            lambda dev: open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained, device=dev),
+            device, what="non-animal filter")
 
         model.eval()
         self.model = model
@@ -204,7 +200,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="General-CLIP non-animal prefilter (validation CLI).")
     p.add_argument("--sample", action="store_true",
                    help="Score real food vs known-animal crops and print a threshold sweep (no writes).")
-    p.add_argument("--device", default="cuda", help="cuda or cpu.")
+    p.add_argument("--device", default=config.CONFIG.device, choices=["cuda", "cpu", "auto"],
+                   help="cuda | cpu | auto (default from config).")
     p.add_argument("--model", default=config.CONFIG.nonanimal_model)
     p.add_argument("--pretrained", default=config.CONFIG.nonanimal_pretrained)
     p.add_argument("--threshold", type=float, default=config.CONFIG.nonanimal_threshold)

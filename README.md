@@ -78,29 +78,41 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
 - **Windows or Linux** (macOS too). Windows uses the fast DirectShow capture backend; off
   Windows the rig automatically falls back to OpenCV's native backend (V4L2 on Linux), so no
   config change is needed.
-- **NVIDIA GPU + CUDA recommended, but not required.** By default (`--device cuda`) inference
-  runs on the GPU and the app fails loud if the GPU can't execute. Pass **`--device cpu`** to
-  run without a GPU — slower per frame, but the motion gate only wakes the detector on real
-  motion, so a backyard rig stays usable on a laptop CPU — or **`--device auto`** to use the
-  GPU when present and fall back to CPU otherwise.
-- **Python 3.14** (what this project was built and tested against).
+- **NVIDIA GPU + CUDA recommended, but not required.** By default (`--device auto`) inference
+  runs on the GPU when it's usable and falls back to the CPU otherwise — so the rig runs on a
+  laptop with no GPU out of the box (slower per frame, but the motion gate only wakes the
+  detector on real motion, so it stays usable). Pass **`--device cpu`** to force CPU, or
+  **`--device cuda`** to require the GPU and fail loud if a wrong torch build can't use it.
+- **Python 3.10 or newer** (built and tested on 3.14; the app checks this at startup).
 
 > **Blackwell / RTX 50-series note (important).** This machine's RTX 5050 is compute
 > capability **sm_120**. A stock `pip install torch` (a CUDA 12.6 build) *appears* to work
 > (`torch.cuda.is_available()` returns `True`) but then dies at the first real GPU op with
 > `CUDA error: no kernel image is available for execution on the device`. You need a
-> **CUDA 12.8+ build of torch**. We use the **cu130** wheels below. The app also verifies
-> this at startup by running a real GPU op, so a wrong build fails loudly and early.
+> **CUDA 12.8+ build of torch**. `setup.bat` installs the right **cu130** wheels for you when it
+> detects an NVIDIA GPU. The app verifies this at startup by running a real GPU op: with
+> `--device cuda` a wrong build fails loudly and early; with the default `--device auto` it falls
+> back to the CPU instead (never stuck — just slower).
 
 ---
 
 ## Setup
 
-From the project folder (`C:\Users\you\projects\backyard`):
+**Easiest — run the setup script.** It creates the virtual environment and installs the torch
+build that matches your hardware (CUDA if you have an NVIDIA GPU, CPU otherwise), then the rest:
+
+- **Windows:** double-click **`setup.bat`**
+- **Linux / macOS:** `bash setup.sh`
+
+Then start the app (see [Running](#running)); the MegaDetector weights download on first run.
+
+### Manual setup (alternative)
+
+From the project folder, with Python 3.10+ on your PATH:
 
 ```powershell
-# 1. Create an isolated virtual environment (keeps your ComfyUI torch untouched)
-C:\Python314\python.exe -m venv .venv
+# 1. Create an isolated virtual environment (keeps any system torch untouched)
+py -m venv .venv
 
 # 2. Install a Blackwell-capable torch (CUDA 13.0 build) -- NOT the default PyPI torch
 .\.venv\Scripts\python.exe -m pip install torch==2.12.0 torchvision==0.27.0 `
@@ -165,7 +177,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--camera-index N` | Which webcam (default 0). |
 | `--width W --height H` | Requested capture resolution. |
 | `--model-version V` | `MDV6-yolov10-c` (default, fast) · `MDV6-yolov9-c` · `MDV6-rtdetr-c` · `MDV6-yolov10-e` / `MDV6-yolov9-e` (heavier, more accurate). |
-| `--device D` | `cuda` (default, needs an NVIDIA GPU) · `cpu` (no GPU, slower) · `auto` (GPU if usable, else CPU). |
+| `--device D` | `auto` (default; GPU if usable, else CPU) · `cuda` (require an NVIDIA GPU, fail loud) · `cpu` (force CPU, slower). |
 | `--min-confidence F` | Minimum detector confidence to draw/save (default 0.25). |
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
 | `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |

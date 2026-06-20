@@ -29,13 +29,14 @@ from collections import Counter
 
 import config
 import db
+import detector
 from clipfilter import NONANIMAL_LABEL
 
 # --- Your yard's candidate species. Common names work well. Keep it to species you actually
 # get (plus a few plausibles); a tighter list gives sharper zero-shot results. This is a
 # STARTER list (PNW backyard) -- edit it and re-run. Validated 2026-06-08: BioCLIP 2 nailed
 # raccoon / American crow / domestic cat and a dark-eyed junco from this set.
-SPECIES_LABELS = [
+_DEFAULT_SPECIES_LABELS = [
     # --- Mammals: common in Pacific Northwest / Puget Sound lowland backyards ---
     "raccoon", "Virginia opossum", "eastern gray squirrel", "Douglas squirrel",
     "eastern cottontail", "Townsend's chipmunk", "brown rat", "domestic cat", "domestic dog",
@@ -53,18 +54,18 @@ SPECIES_LABELS = [
     # general-CLIP pre-filter), not by adding labels here.
 ]
 
+# The active candidate set: a per-yard override from config_local.py (cfg.species_labels) if set,
+# else the PNW starter list above -- so a friend retunes for their region without editing source.
+SPECIES_LABELS = config.CONFIG.species_labels or _DEFAULT_SPECIES_LABELS
+
 
 def build_classifier(device: str):
-    """Construct a BioCLIP CustomLabelsClassifier, falling back to CPU if GPU init fails.
-    Returns (classifier, device_actually_used)."""
+    """Construct a BioCLIP CustomLabelsClassifier on the resolved device (GPU when it genuinely
+    runs, else CPU; see detector.build_with_fallback). Returns (classifier, device_used)."""
     from bioclip import CustomLabelsClassifier
-    try:
-        return CustomLabelsClassifier(SPECIES_LABELS, device=device), device
-    except Exception as e:
-        if device != "cpu":
-            print(f"  {device} init failed ({e}); falling back to CPU.")
-            return CustomLabelsClassifier(SPECIES_LABELS, device="cpu"), "cpu"
-        raise
+    return detector.build_with_fallback(
+        lambda dev: CustomLabelsClassifier(SPECIES_LABELS, device=dev),
+        device, what="species namer")
 
 
 def build_nonanimal_filter(device: str):
@@ -227,8 +228,8 @@ def run_watch(conn, args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 2: BioCLIP 2 species classification on crops.")
-    p.add_argument("--device", default=None,
-                   help="cuda or cpu. Default: cuda for a one-shot run, cpu for --watch "
+    p.add_argument("--device", default=None, choices=["cuda", "cpu", "auto"],
+                   help="cuda | cpu | auto. Default: auto for a one-shot run, cpu for --watch "
                         "(so the poller never fights the live detector for the GPU).")
     p.add_argument("--min-confidence", type=float, default=0.0,
                    help="Only classify crops with detector confidence >= this (usability gate).")
@@ -247,7 +248,7 @@ def main() -> int:
     args = p.parse_args()
 
     if args.device is None:
-        args.device = "cpu" if args.watch else "cuda"
+        args.device = config.CONFIG.classify_device if args.watch else config.CONFIG.device
 
     conn = db.connect(config.CONFIG.db_path)  # also runs the species_confidence migration
 

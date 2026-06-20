@@ -114,11 +114,13 @@ def prune_clips(cfg: config.Config, conn) -> int:
     budget = (cfg.clips_max_gb or 0) * (1024 ** 3)
     if budget <= 0 or not cfg.clips_dir.exists():
         return 0
-    try:
-        files = [(p.stat().st_mtime, p.stat().st_size, p)
-                 for p in cfg.clips_dir.rglob("*.mp4")]
-    except OSError:
-        return 0
+    files = []
+    for p in cfg.clips_dir.rglob("*.mp4"):
+        try:
+            st = p.stat()                  # one stat per file (was two), inside the try ...
+        except OSError:
+            continue                       # ... so a file vanishing mid-scan skips that file,
+        files.append((st.st_mtime, st.st_size, p))   # not the whole prune (live writer rotating)
     total = sum(sz for _, sz, _ in files)
     if total <= budget:
         return 0

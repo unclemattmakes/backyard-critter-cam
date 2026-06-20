@@ -586,9 +586,9 @@ def main() -> int:
             print(f"Re-fit of {r['n_fit'] + r['n_novel']} unconfirmed {args.species} visit(s) "
                   f"against the confirmed cast:\n")
             for name, lst in sorted(r["fits"].items(), key=lambda kv: -len(kv[1])):
+                preview = ", ".join(f"#{x['visit_id']} {x['similarity']:.2f}" for x in lst[:6])
                 print(f"  fits {name}: {len(lst)} visit(s)  "
-                      f"[{', '.join(f'#{x['visit_id']} {x['similarity']:.2f}' for x in lst[:6])}"
-                      f"{' ...' if len(lst) > 6 else ''}]")
+                      f"[{preview}{' ...' if len(lst) > 6 else ''}]")
             print(f"\n  NOVEL (look like nobody on file): {r['n_novel']} visit(s) in "
                   f"{len(r['novel_groups'])} candidate-new-individual group(s):")
             for i, g in enumerate(r["novel_groups"], 1):

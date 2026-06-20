@@ -257,6 +257,14 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                         self._send(200, "text/html; charset=utf-8", DASHBOARD_FILE.read_bytes())
                     else:
                         self._send(500, "text/plain", b"dashboard.html missing")
+                elif path == "/dashboard.css":
+                    # Stylesheet split out of dashboard.html (read fresh from disk, like the HTML,
+                    # so the design still iterates without a server restart).
+                    css = config.ROOT / "dashboard.css"
+                    if css.exists():
+                        self._send(200, "text/css; charset=utf-8", css.read_bytes())
+                    else:
+                        self._send(404, "text/plain", b"dashboard.css missing")
                 elif path == "/api/stats":
                     self._json(stats.compute_stats(cfg) or {"total_crops": 0})
                 elif path == "/api/species":
@@ -266,6 +274,10 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(stats.species_crops(cfg, name))
                 elif path == "/api/labels":
                     self._json(_candidate_labels(cfg))
+                elif path == "/api/denylist":
+                    # The dashboard mirrors this denylist (NONCRITTER); serve it so the two never
+                    # drift -- stats._NON_CRITTER is the single source of truth.
+                    self._json(sorted(stats._NON_CRITTER))
                 elif path == "/api/camera":
                     self._json(control_bridge.snapshot())
                 elif path == "/api/naming":
@@ -288,7 +300,7 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(stats.individuals_overview(cfg))
                 elif path == "/api/reid/queue":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self._json(_reid_queue(cfg, species=(q.get("species") or ["raccoon"])[0],
+                    self._json(_reid_queue(cfg, species=(q.get("species") or [cfg.reid_species])[0],
                                            limit=min(int((q.get("limit") or [30])[0]), 100)))
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)

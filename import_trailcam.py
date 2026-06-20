@@ -193,9 +193,10 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
 
     saved = 0
     for i, det in enumerate(saved_dets):
-        crop = save_crop(frame, det, cfg, day, stamp, i)
-        if crop is None:
+        result = save_crop(frame, det, cfg, day, stamp, i)
+        if result is None:
             continue
+        crop_path, crop_q = result   # save_crop returns (Path, shot-quality), exactly like the live rig
         db.insert_detection(
             conn,
             timestamp=iso,
@@ -205,13 +206,14 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
             bbox=det.bbox,
             frame_w=w,
             frame_h=h,
-            crop_path=_rel(crop),
+            crop_path=_rel(crop_path),
             frame_path=None,   # the SD card already holds the original full frame; don't copy it.
+            crop_quality=crop_q,   # score trail-cam crops too, so the dashboard can lead with the cutest
             # species / individual_id stay NULL -- classify.py / reid.py fill them later, same as
             # the live rig's crops. The 'source' column is the only thing marking these as trail-cam.
         )
         saved += 1
-        print(f"  [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop)}  ({path.name})")
+        print(f"  [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}  ({path.name})")
     return len(dets), saved
 
 

@@ -127,7 +127,8 @@ def _save_rep_crop(track_id, crops):
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: per-tracklet appearance embeddings from clips.")
-    p.add_argument("--device", default="cuda", help="cuda (default) or cpu.")
+    p.add_argument("--device", default=config.CONFIG.device, choices=["cuda", "cpu", "auto"],
+                   help="cuda | cpu | auto (default from config).")
     p.add_argument("--frames", type=int, default=10, help="Frames pooled per tracklet (default 10).")
     p.add_argument("--min-hits", type=int, default=SUSTAINED_HITS,
                    help=f"Only tracklets with >= this many boxes (default {SUSTAINED_HITS}).")
