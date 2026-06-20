@@ -6,7 +6,7 @@
     --mono:'Cascadia Code','Cascadia Mono',Consolas,'SFMono-Regular',ui-monospace,monospace;
   }
   *{box-sizing:border-box;}
-  html,body{margin:0;}
+  html,body{margin:0; overflow-x:hidden;}
   body{
     background:
       radial-gradient(120% 80% at 50% -10%, #211c11 0%, var(--bg) 55%),
@@ -309,3 +309,62 @@
     font-size:13px; color:var(--ink); background:rgba(16,13,7,.7); border:1px solid var(--rule);
     padding:6px 12px; border-radius:5px; max-width:90vw; text-align:center;}
   #lightbox .lb-hint{position:fixed; top:18px; right:22px; font-family:var(--mono); font-size:12px; color:var(--dim);}
+
+  /* =====================================================================
+     Phones & narrow tablets — tighten chrome, let things breathe and wrap.
+     The desktop layout above is built for ~1280px; below ~720px we reclaim
+     the side gutters, turn the nav into a swipeable strip, and shrink the
+     dense bits (tallies, calendar, dispatch) so nothing overflows.
+     ===================================================================== */
+  @media (max-width:720px){
+    /* reclaim the generous 26px gutters for small screens */
+    header.mast{ padding:18px 16px 0; }
+    main{ padding:18px 16px 64px; }
+    .foot{ padding:0 16px 34px; }
+
+    /* masthead: let the eyebrow labels centre & wrap instead of colliding */
+    .mast .top{ flex-wrap:wrap; gap:3px 12px; justify-content:center; }
+    .mast h1{ font-size:clamp(26px,8vw,40px); margin:12px 0 4px; }
+    .mast .sub{ margin-bottom:12px; }
+
+    /* nav: a horizontally scrollable tab strip (no more 6-tabs-on-one-line cram) */
+    nav.tabs{
+      margin:14px -16px 0; padding:0 16px; gap:22px;
+      justify-content:flex-start; flex-wrap:nowrap;
+      overflow-x:auto; -webkit-overflow-scrolling:touch;
+      scrollbar-width:none; border-bottom:1px solid var(--rule);
+    }
+    nav.tabs::-webkit-scrollbar{ display:none; }
+    nav.tabs button{ flex:0 0 auto; white-space:nowrap; font-size:16px; padding:9px 1px 11px; }
+    nav.tabs button.on::after{ bottom:4px; }
+
+    h2.sec{ margin:24px 0 12px; font-size:19px; }
+
+    /* field tallies: two per row, clean inner rules */
+    .tally{ flex:1 1 50%; padding:12px 14px; }
+    .tally:nth-child(even){ border-right:0; }
+    .tally .n{ font-size:22px; }
+
+    /* dispatch + reel + latest visitor: trim the tall minimums */
+    .reelhero{ min-height:200px; }
+    .latest-photo{ min-height:180px; }
+    .hero-info{ padding:16px 18px; }
+    .entry{ grid-template-columns:54px 1fr auto; gap:10px; padding:10px 12px; }
+
+    /* calendar: drop the fixed 240px month label and shrink the 7-col grid */
+    .cal-head{ gap:10px; }
+    .cal-head .mo{ min-width:0; font-size:19px; }
+    .cal-head .nav{ width:34px; height:34px; }
+    .cal-grid{ gap:3px; }
+    .cal-cell{ min-height:62px; padding:4px 4px; }
+    .cal-wd{ font-size:8px; letter-spacing:.06em; }
+    .cal-d{ font-size:11px; }
+    .cal-gl{ font-size:15px; gap:2px 4px; margin-top:5px; }
+    .cal-v{ top:4px; right:4px; }
+  }
+
+  /* very small phones: two mini cards per row reads better than three */
+  @media (max-width:430px){
+    .cards.mini{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .dsp-head{ gap:10px; }
+  }
