@@ -35,11 +35,7 @@ import db
 from stats import _NON_CRITTER   # shared denylist: false-trigger / non-visitor labels (door, blur, ...)
 
 
-def _parse(ts: str):
-    try:
-        return datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
+_parse = db.parse_local   # canonical ISO parser (tz-aware; normalises any legacy naive string)
 
 
 def typical_window(hour_counts: dict, coverage: float = 0.8):

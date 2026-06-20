@@ -61,9 +61,10 @@ def verify_cuda() -> str:
 
     if not torch.cuda.is_available():
         raise CudaUnavailableError(
-            "CUDA is not available to PyTorch. This rig requires an NVIDIA GPU and a CUDA "
-            "build of torch. Install one, e.g.:\n"
-            "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130"
+            "No usable NVIDIA GPU for PyTorch. Either install a CUDA build of torch:\n"
+            "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130\n"
+            "or run without a GPU by passing --device cpu (or --device auto to use the GPU only "
+            "when it's available)."
         )
 
     # is_available() can be True while the wheel has no kernels for this GPU's compute
@@ -80,13 +81,13 @@ def verify_cuda() -> str:
         except Exception:
             pass
         raise CudaUnavailableError(
-            f"PyTorch sees the GPU ({name}, compute capability {cap}) but cannot run CUDA "
-            f"kernels on it. The installed torch was almost certainly built for a different "
-            f"GPU architecture. For Blackwell (RTX 50-series, sm_120) install a CUDA 12.8+ "
-            f"build:\n"
-            f"  pip install torch==2.12.0 torchvision==0.27.0 "
-            f"--index-url https://download.pytorch.org/whl/cu130\n"
-            f"Underlying error: {e}"
+            "Your installed torch can't run on this GPU -- it was built for a different GPU "
+            "architecture. Install a matching CUDA build (for an NVIDIA RTX 50-series / Blackwell "
+            "card use the CUDA 12.8+ cu130 wheels):\n"
+            "  pip install torch==2.12.0 torchvision==0.27.0 "
+            "--index-url https://download.pytorch.org/whl/cu130\n"
+            "or pass --device cpu to run without the GPU.\n"
+            f"(GPU seen: {name}, compute capability {cap}. Underlying error: {e})"
         ) from e
 
     return torch.cuda.get_device_name(0)
@@ -123,6 +124,33 @@ def resolve_device(device: str) -> tuple[str, str]:
     raise ValueError(f"Unknown device '{device}'. Use 'cuda', 'cpu', or 'auto'.")
 
 
+def build_with_fallback(make, device: str, *, what: str = "model") -> tuple:
+    """Build a heavy ML model on the resolved device, degrading to CPU when the GPU can't run it.
+
+    Routes `device` through resolve_device() -- the SAME real GPU compute-probe the live detector
+    uses -- so a wrong-arch torch (the Blackwell sm_120 trap) is caught here, not at the first
+    inference. Then 'cpu' / auto-without-a-GPU build on CPU; 'cuda' / auto-with-a-GPU build on the
+    GPU, and if the model itself won't fit on the card it falls back to CPU with a note rather than
+    crash. `make(dev)` builds and returns the model (any object) on the concrete 'cuda'/'cpu'
+    string. Returns (model, concrete_device).
+
+    Shared by classify.py / embed.py / clipfilter.py so every ML tool selects its device the one
+    consistent way (it replaced three near-identical hand-rolled GPU->CPU fallback blocks)."""
+    dev, _ = resolve_device(device)        # 'cuda' raises with an actionable fix if it can't compute
+    try:
+        return make(dev), dev
+    except Exception as e:                  # the probe passed, but the full model wouldn't load
+        if dev != "cuda":
+            raise
+        print(f"  [device] {what} would not load on the GPU ({str(e).splitlines()[0]}) -- using CPU.")
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return make("cpu"), "cpu"
+
+
 def _ensure_weights(version: str, weights_dir: Path) -> Path:
     """Return the local path to the weight file, downloading it once if missing."""
     if version not in MDV6_WEIGHTS:
@@ -140,7 +168,16 @@ def _ensure_weights(version: str, weights_dir: Path) -> Path:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "backyard-cam/1.0"})
         with urllib.request.urlopen(req) as resp, open(tmp, "wb") as f:
+            expected = resp.getheader("Content-Length")
             shutil.copyfileobj(resp, f)
+        expected = int(expected) if expected and expected.isdigit() else None
+        got = tmp.stat().st_size
+        # A dropped connection can leave a non-empty but TRUNCATED .part. Without this check it
+        # gets cached as a valid weight (path.exists() and size > 0) and loads as a corrupt model
+        # on every later run -- a confusing failure miles from its cause.
+        if got == 0 or (expected is not None and got < expected):
+            raise RuntimeError(
+                f"incomplete download ({got}" + (f" of {expected}" if expected else "") + " bytes)")
         tmp.replace(path)
     except Exception as e:
         tmp.unlink(missing_ok=True)

@@ -182,8 +182,7 @@ def _cap(store, i):
 def do_cluster(conn, store, args):
     if len(store) == 0:
         print(f"No '{store.model}' embeddings for species='{args.species}'. "
-              f"Run: python embed.py --species \"{args.species}\""
-              f"{' --segment' if args.segment else ''}")
+              f"Run: python embed.py --species \"{args.species}\"")
         return 0
 
     labels = store.cluster(args.threshold, args.method)
@@ -297,9 +296,6 @@ def main() -> int:
                    help="Species to work on (default 'raccoon'). Use 'all' to ignore species.")
     p.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
                    help="Only consider crops with detector confidence >= this.")
-    p.add_argument("--segment", action="store_true",
-                   help="Use the SAM background-masked embeddings (embed.py --segment) instead "
-                        "of the full-crop ones.")
     p.add_argument("--threshold", type=float, default=0.45,
                    help="Cosine-distance cut for clustering (0..2). Lower = fewer, looser "
                         "clusters; higher = more, tighter. Default 0.45.")
@@ -327,7 +323,7 @@ def main() -> int:
     species = None if args.species.lower() == "all" else args.species
     conn = db.connect(config.CONFIG.db_path)
     conn.row_factory = sqlite3.Row  # load_embeddings returns rows accessed by column name
-    store = EmbeddingStore(conn, species, args.min_confidence, model_tag(args.segment))
+    store = EmbeddingStore(conn, species, args.min_confidence, model_tag())
 
     try:
         if args.name is not None:

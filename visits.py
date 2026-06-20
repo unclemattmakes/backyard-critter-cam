@@ -32,11 +32,7 @@ import config
 import db
 
 
-def _parse(ts: str):
-    try:
-        return datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
+_parse = db.parse_local   # canonical ISO parser (tz-aware; normalises any legacy naive string)
 
 
 def _dominant(counter: Counter):

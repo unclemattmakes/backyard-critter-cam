@@ -220,6 +220,19 @@ def now_local_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def parse_local(ts):
+    """Parse a stored ISO-8601 timestamp (the rig writes local-time-WITH-offset; see
+    now_local_iso). Returns a tz-aware datetime, or None if unparseable. A legacy NAIVE string is
+    made tz-aware in local time, so mixing it with the offset-bearing rows never raises
+    'can't subtract offset-naive and offset-aware'. This is the one ISO parser for the analysis
+    tools (visits / behavior / twoaxis), replacing three copy-pasted _parse helpers."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo is not None else dt.astimezone()
+
+
 def insert_detection(
     conn: sqlite3.Connection,
     *,

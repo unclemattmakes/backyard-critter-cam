@@ -49,7 +49,9 @@ def metrics(frame_bgr) -> dict:
 
 
 def open_cam(cfg) -> cv2.VideoCapture:
-    backend = cv2.CAP_DSHOW if cfg.use_dshow_backend else cv2.CAP_ANY
+    # DirectShow is Windows-only; off Windows use CAP_ANY so tune.py runs on Linux/macOS too
+    # (matches backyard_cam.capture_backend). The exposure sweep below still assumes a UVC webcam.
+    backend = cv2.CAP_DSHOW if (cfg.use_dshow_backend and sys.platform == "win32") else cv2.CAP_ANY
     cap = cv2.VideoCapture(cfg.camera_index, backend)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
@@ -128,43 +130,45 @@ def main() -> int:
     outdir = config.ROOT / "tuning" / datetime.now().astimezone().strftime("%Y-%m-%dT%H-%M-%S")
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"\nTuning run -> {outdir}\n")
-    probe(cap)
 
     tiles, results = [], []
+    try:
+        probe(cap)
 
-    # 1) Baseline at the camera's current AUTO settings (what the rig uses now).
-    base = grab(cap, settle=12)
-    if base is not None:
-        m = metrics(base)
-        results.append(("auto", cap.get(cv2.CAP_PROP_EXPOSURE), m))
-        cv2.imwrite(str(outdir / "00_baseline_auto.jpg"), base)
-        tiles.append(_label(base, f"AUTO (current)\nsharp {m['sharpness']:.0f}\n"
-                                   f"bright {m['brightness']:.0f}\nblown {m['blown_pct']:.1f}%"))
-        print(f"\nbaseline AUTO: sharp={m['sharpness']:.0f} bright={m['brightness']:.0f} "
-              f"blown={m['blown_pct']:.2f}% black={m['black_pct']:.2f}%")
+        # 1) Baseline at the camera's current AUTO settings (what the rig uses now).
+        base = grab(cap, settle=12)
+        if base is not None:
+            m = metrics(base)
+            results.append(("auto", cap.get(cv2.CAP_PROP_EXPOSURE), m))
+            cv2.imwrite(str(outdir / "00_baseline_auto.jpg"), base)
+            tiles.append(_label(base, f"AUTO (current)\nsharp {m['sharpness']:.0f}\n"
+                                       f"bright {m['brightness']:.0f}\nblown {m['blown_pct']:.1f}%"))
+            print(f"\nbaseline AUTO: sharp={m['sharpness']:.0f} bright={m['brightness']:.0f} "
+                  f"blown={m['blown_pct']:.2f}% black={m['black_pct']:.2f}%")
 
-    # 2) Sweep manual exposure.
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, args.manual_flag)
-    time.sleep(0.2)
-    exposures = [float(x) for x in args.exposures.split(",") if x.strip()]
-    print("\nexposure sweep (requested -> actual readback):")
-    for e in exposures:
-        cap.set(cv2.CAP_PROP_EXPOSURE, e)
-        frame = grab(cap, settle=10)
-        if frame is None:
-            continue
-        actual = cap.get(cv2.CAP_PROP_EXPOSURE)
-        m = metrics(frame)
-        results.append((e, actual, m))
-        cv2.imwrite(str(outdir / f"exp_{e:g}.jpg"), frame)
-        tiles.append(_label(frame, f"exp={e:g}\nsharp {m['sharpness']:.0f}\n"
-                                    f"bright {m['brightness']:.0f}\nblown {m['blown_pct']:.1f}%"))
-        print(f"  {e:>6g} -> {actual:>8g}   sharp={m['sharpness']:>6.0f} "
-              f"bright={m['brightness']:>5.0f} blown={m['blown_pct']:>5.2f}%")
+        # 2) Sweep manual exposure.
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, args.manual_flag)
+        time.sleep(0.2)
+        exposures = [float(x) for x in args.exposures.split(",") if x.strip()]
+        print("\nexposure sweep (requested -> actual readback):")
+        for e in exposures:
+            cap.set(cv2.CAP_PROP_EXPOSURE, e)
+            frame = grab(cap, settle=10)
+            if frame is None:
+                continue
+            actual = cap.get(cv2.CAP_PROP_EXPOSURE)
+            m = metrics(frame)
+            results.append((e, actual, m))
+            cv2.imwrite(str(outdir / f"exp_{e:g}.jpg"), frame)
+            tiles.append(_label(frame, f"exp={e:g}\nsharp {m['sharpness']:.0f}\n"
+                                        f"bright {m['brightness']:.0f}\nblown {m['blown_pct']:.1f}%"))
+            print(f"  {e:>6g} -> {actual:>8g}   sharp={m['sharpness']:>6.0f} "
+                  f"bright={m['brightness']:>5.0f} blown={m['blown_pct']:>5.2f}%")
 
-    # Restore auto exposure so the next app/rig isn't stuck in manual.
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-    cap.release()
+        # Restore auto exposure so the next app/rig isn't stuck in manual.
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+    finally:
+        cap.release()    # always release, even if the sweep raised -- else the webcam stays locked
 
     if tiles:
         sheet = contact_sheet(tiles)

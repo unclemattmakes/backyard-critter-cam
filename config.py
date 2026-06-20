@@ -12,8 +12,19 @@ pipeline later via the `source` column. See PLAN.md for the full four-phase road
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Built and tested on Python 3.14, but runs on 3.10+. Fail early with a plain message on older
+# interpreters rather than later with a cryptic SyntaxError deep in a submodule (a modern f-string,
+# say) -- baffling for a non-developer setting this up for the first time. config is imported by
+# every entry point, so this one check covers them all.
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        "Backyard Critter Cam needs Python 3.10 or newer (built/tested on 3.14); you're running "
+        f"{sys.version.split()[0]}. Install a newer Python and recreate the .venv (see README Setup)."
+    )
 
 # Project root = the folder containing this file. All default paths hang off it, so the
 # whole rig (code + db + crops) is relocatable as one directory.
@@ -27,7 +38,7 @@ NAMING_STATUS_FILE = ROOT / ".naming_status.json"
 @dataclass
 class Config:
     # ---- Camera (OpenCV capture) ------------------------------------------------
-    camera_index: int = 1           # USB webcam index; 0 = default device.
+    camera_index: int = 0           # USB webcam index (0 = first/default). Set yours in config_local.py; --list-cameras finds it.
     frame_width: int = 1280         # Requested width  (the webcam may snap to the nearest).
     frame_height: int = 720         # Requested height (the webcam may snap to the nearest).
     # CAP_DSHOW = DirectShow backend: fast init on Windows and avoids the slow MSMF path.
@@ -97,10 +108,11 @@ class Config:
     #   MDV6-yolov9-e / MDV6-yolov10-e                  -> heavy, 1280px, more accurate
     # yolov10-c is NMS-free and quick -> sensible default for a live rig on a laptop GPU.
     model_version: str = "MDV6-yolov10-c"
-    # 'cuda' (default): require an NVIDIA GPU and fail loud if it can't compute (catches a
-    # wrong-arch torch build). 'cpu': no GPU needed, slower -- fine here because the motion gate
-    # only wakes the detector on real motion. 'auto': GPU if usable, else CPU. (--device overrides.)
-    device: str = "cuda"
+    # 'auto' (default): use the GPU when it genuinely computes, else fall back to CPU -- so the rig
+    # runs out-of-the-box on a laptop with no NVIDIA GPU. 'cuda': REQUIRE a working GPU and fail
+    # loud if it can't compute (catches a wrong-arch torch build -- the Blackwell sm_120 trap); set
+    # device='cuda' in config_local.py if you want that strictness. 'cpu': force CPU. (--device overrides.)
+    device: str = "auto"
     # A detection must score at least this to come back from the detector (passed as
     # MegaDetector's det_conf_thres) -- so weaker boxes are never drawn or saved.
     min_confidence: float = 0.25
@@ -255,6 +267,19 @@ class Config:
     # sits with margin above that cliff. The residual ~2% low-confidence (det 0.25-0.45) collateral
     # is flat across 0.55-0.65 (and some of it is non-animal junk anyway).
     nonanimal_threshold: float = 0.60
+
+    # ---- Per-yard overrides (species & re-ID focus) -----------------------------
+    # These default to the Pacific-Northwest backyard starter lists baked into classify.py /
+    # clipfilter.py. Override them for YOUR yard in config_local.py -- plain lists of strings, no
+    # source edit (so a typo can't break a module import). species_labels is the zero-shot
+    # candidate set BioCLIP forces every crop onto; the two prompt lists drive the general-CLIP
+    # "is this an animal?" gate. None = use the module's built-in default.
+    species_labels: list | None = None
+    clip_animal_prompts: list | None = None
+    clip_nonanimal_prompts: list | None = None
+    # Which species the dashboard's Individuals (re-ID) tab works on by default. 'raccoon' suits a
+    # PNW yard; set it to your most-identifiable mammal (opossum, fox, ...) in config_local.py.
+    reid_species: str = "raccoon"
 
     # ---- Timezone convention ----------------------------------------------------
     # Timestamps are stored as LOCAL time WITH the UTC offset, ISO 8601, e.g.
