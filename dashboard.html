@@ -32,9 +32,10 @@
 <main>
   <!-- ============ LIVE ============ -->
   <section id="view-live" class="view on">
+    <div class="firstrun" id="firstrun" hidden></div>
     <div class="obs">
       <div class="panel plate">
-        <div class="frame"><i></i><img src="/stream.mjpg" alt="live feed"></div>
+        <div class="frame" id="live-frame"><i></i><img src="/stream.mjpg" alt="live feed" onerror="setFeed(false)"><div class="feed-msg"><b>Camera feed unavailable</b><span>The rig may be warming up, or the camera isn&rsquo;t running.</span></div></div>
         <div class="cap">
           <span class="lbl">Plate I · glass door cam</span>
           <span class="cap-right">
@@ -311,6 +312,7 @@ async function refreshCamera(){
 /* ---------- live stats + species ---------- */
 async function refreshLive(){
   let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ return; }
+  maybeFirstRun(s);
   if(s.period){ $('#period').textContent=s.period; }
   if(s.span){ $('#span').textContent=`${s.span.start.slice(0,10)} → ${s.span.end.slice(0,10)}`; }
   $('#cap-period').textContent=(window.__period||'live');
@@ -869,7 +871,7 @@ async function renderUnblend(vid){
 function reidUnblendGroup(vid,g,i){
   const thumbs=(g.rep_crops||[]).slice(0,8).map(c=>
     `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('')
-    || '<span class="lbl" style="opacity:.5">no thumbnails yet (clipembed --redo still running?)</span>';
+    || '<span class="lbl" style="opacity:.5">no thumbnails yet — they appear once this visit&rsquo;s clips have been processed.</span>';
   const lab=g.label?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(g.label)} ✓</span>`:'';
   const iid='ubn-'+vid+'-'+i;
   const top=(g.suggestion||[])[0];
@@ -1102,7 +1104,7 @@ function renderIndividuals(d,q){
   REID_REFIT=(q&&q.refit)||null;
   const queueHTML=reidQueueHTML(q);
   const groups=(d&&d.groups)||[];
-  if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals yet — let visits accumulate, run <code>python embed.py</code>, then name the look-alike groups that appear here.</p>'; return; }
+  if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals to name yet. As more animals visit, look-alike groups will appear here for you to name — this is the slowest part, since it needs a good number of clear photos first.</p>'; return; }
   if(!groups.length){ body.innerHTML=queueHTML; return; }
   const named=groups.filter(g=>!g.placeholder), prop=groups.filter(g=>g.placeholder);
   let html=queueHTML;
@@ -1208,10 +1210,33 @@ async function refreshNaming(){
       : n.state==='stopped' ? 'The species identifier is not running right now.'
       : 'New visitors are being named automatically.';
 }
-refreshLive(); refreshCamera(); refreshNaming();
+/* ---------- live-feed liveness: show an overlay when the camera isn't actually streaming ---------- */
+/* An MJPEG <img> goes black (not "errored") when frames merely stall, so onerror alone isn't
+   enough -- poll /snapshot.jpg, which 503s whenever the capture thread has no current frame. */
+function setFeed(up){ const f=document.getElementById('live-frame'); if(f) f.classList.toggle('offline',!up); }
+async function checkFeed(){ try{ const r=await fetch('/snapshot.jpg',{cache:'no-store'}); setFeed(r.ok); }catch(e){ setFeed(false); } }
+/* ---------- first-run orientation: shown only while the database is still empty ---------- */
+function maybeFirstRun(s){
+  const el=document.getElementById('firstrun'); if(!el) return;
+  const empty=!(s&&s.total_crops);
+  if(empty && localStorage.getItem('cc-introDismissed')!=='1'){
+    if(!el.dataset.filled){
+      el.innerHTML='<div class="fr-card"><div class="fr-title">Welcome to your Backyard Observatory</div>'
+        +'<p>The camera is watching the yard right now &mdash; there&rsquo;s nothing else to start. As real animals visit, this log fills in by itself: their photographs, the species name, and over days, who comes and when.</p>'
+        +'<p class="fr-soft">It can take a while for the first visitor to appear. Leave it running and check back later.</p>'
+        +'<button class="fr-x" type="button" onclick="dismissIntro()">Got it</button></div>';
+      el.dataset.filled='1';
+    }
+    el.hidden=false;
+  } else { el.hidden=true; }
+}
+function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
+
+refreshLive(); refreshCamera(); refreshNaming(); checkFeed();
 setInterval(refreshLive,6000);
 setInterval(refreshCamera,4000);
 setInterval(refreshNaming,4000);
+setInterval(checkFeed,8000);
 /* ---------- lightbox: click any crop/frame to enlarge ---------- */
 /* Delegated so it covers every served image across all tabs (review queue, cast, species
    browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.

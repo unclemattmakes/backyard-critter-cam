@@ -368,3 +368,24 @@
     .cards.mini{ grid-template-columns:repeat(2,minmax(0,1fr)); }
     .dsp-head{ gap:10px; }
   }
+
+  /* live-feed offline overlay: revealed by JS (setFeed) when /snapshot.jpg has no current frame,
+     so a stalled or not-yet-started camera reads as a clear message instead of a black box. */
+  .plate .frame .feed-msg{ display:none; position:absolute; inset:0; z-index:2; flex-direction:column;
+    align-items:center; justify-content:center; gap:6px; text-align:center; padding:22px;
+    background:rgba(10,9,6,.78); color:var(--dim); }
+  .plate .frame .feed-msg b{ font-family:var(--serif); font-size:18px; color:var(--ink); font-weight:500; }
+  .plate .frame .feed-msg span{ font-style:italic; font-size:13px; max-width:32ch; }
+  .plate .frame.offline .feed-msg{ display:flex; }
+
+  /* first-run orientation card (Live tab) -- shown only while the database is still empty */
+  .firstrun{ margin:0 0 20px; animation:fade .5s both; }
+  .firstrun .fr-card{ background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--rule2);
+    border-radius:6px; padding:20px 24px; }
+  .firstrun .fr-title{ font-family:var(--serif); font-size:22px; color:var(--ink); margin-bottom:8px; }
+  .firstrun p{ color:var(--dim); margin:6px 0; max-width:66ch; }
+  .firstrun .fr-soft{ color:var(--faint); font-style:italic; }
+  .firstrun .fr-x{ margin-top:14px; font-family:var(--mono); font-size:11px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--gilt); background:none; border:1px solid var(--rule2);
+    border-radius:3px; padding:7px 14px; cursor:pointer; }
+  .firstrun .fr-x:hover{ border-color:var(--gilt); }

@@ -12,6 +12,7 @@ restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/s
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import shutil
 import subprocess
@@ -104,6 +105,21 @@ def _is_within(target: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_lan_client(host: str) -> bool:
+    """True if `host` (a client's IP) is loopback or on a private/local network -- the only
+    addresses allowed when the dashboard is bound to the LAN (cfg.lan_only). A public internet
+    address returns False and the request is refused, so a forwarded port never exposes the rig to
+    the world. Covers loopback, RFC1918 private ranges, link-local, and IPv4-mapped IPv6."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
 # Media types served from /media (crops, frames, and now behaviour clips). Video needs a correct
@@ -249,7 +265,22 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             self._send(code, "application/json",
                        json.dumps(obj).encode("utf-8"), {"Cache-Control": "no-store"})
 
+        def _lan_guard(self) -> bool:
+            """Refuse non-local clients when bound to the network (cfg.lan_only). Returns True if
+            the request may proceed. Localhost is always allowed; on the LAN launcher this keeps the
+            dashboard reachable from your own devices but invisible to the wider internet."""
+            if not getattr(cfg, "lan_only", True):
+                return True
+            host = self.client_address[0] if self.client_address else ""
+            if _is_lan_client(host):
+                return True
+            self._send(403, "text/plain",
+                       b"forbidden: this dashboard only accepts connections from your local network")
+            return False
+
         def do_GET(self):
+            if not self._lan_guard():
+                return
             path = urllib.parse.urlparse(self.path).path
             try:
                 if path in ("/", "/index.html"):
@@ -332,6 +363,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     pass
 
         def do_POST(self):
+            if not self._lan_guard():
+                return
             path = urllib.parse.urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             raw = self.rfile.read(length) if length else b"{}"
