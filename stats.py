@@ -166,72 +166,74 @@ def compute_stats(cfg) -> dict | None:
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return None
-    rows = conn.execute(
-        "SELECT id, source, timestamp, detection_class, species, confidence, "
-        "species_confidence, crop_path "
-        "FROM detections ORDER BY timestamp"
-    ).fetchall()
-    clips = load_clips(conn)
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT id, source, timestamp, detection_class, species, confidence, "
+            "species_confidence, crop_path "
+            "FROM detections ORDER BY timestamp"
+        ).fetchall()
+        clips = load_clips(conn)
 
-    gap = cfg.visit_gap_minutes
-    visits = compute_visits(rows, gap)
+        gap = cfg.visit_gap_minutes
+        visits = compute_visits(rows, gap)
 
-    def day(ts): return ts[:10]
-    def web(p):  return p.replace("\\", "/") if p else None
+        def day(ts): return ts[:10]
+        def web(p):  return p.replace("\\", "/") if p else None
 
-    days_set = sorted({day(r["timestamp"]) for r in rows}) if rows else []
-    src_crops = Counter(r["source"] for r in rows)
-    src_visits = Counter(v["source"] for v in visits)
-    cls_crops = Counter((r["species"] or r["detection_class"]) for r in rows)
-    visits_by_day = Counter(v["start"].strftime("%Y-%m-%d") for v in visits)
-    hour_counts = Counter(v["start"].hour for v in visits)
+        days_set = sorted({day(r["timestamp"]) for r in rows}) if rows else []
+        src_crops = Counter(r["source"] for r in rows)
+        src_visits = Counter(v["source"] for v in visits)
+        cls_crops = Counter((r["species"] or r["detection_class"]) for r in rows)
+        visits_by_day = Counter(v["start"].strftime("%Y-%m-%d") for v in visits)
+        hour_counts = Counter(v["start"].hour for v in visits)
 
-    by_day = []
-    for d in days_set:
-        drows = [r for r in rows if day(r["timestamp"]) == d]
-        cls = Counter((r["species"] or r["detection_class"]) for r in drows)
-        by_day.append({"day": d, "crops": len(drows),
-                       "visits": visits_by_day.get(d, 0), "classes": dict(cls.most_common())})
+        by_day = []
+        for d in days_set:
+            drows = [r for r in rows if day(r["timestamp"]) == d]
+            cls = Counter((r["species"] or r["detection_class"]) for r in drows)
+            by_day.append({"day": d, "crops": len(drows),
+                           "visits": visits_by_day.get(d, 0), "classes": dict(cls.most_common())})
 
-    latest = [{
-        "timestamp": r["timestamp"],
-        "source": r["source"],
-        "detection_class": r["detection_class"],
-        "species": r["species"],
-        "confidence": round(r["confidence"], 3),
-        "species_confidence": (round(r["species_confidence"], 3)
-                               if r["species_confidence"] is not None else None),
-        "crop_path": web(r["crop_path"]),
-        # The clip rolling when this crop was caught (so the live card can play it), or None.
-        "clip": _clip_out(clip_at(clips, r["source"], _parse(r["timestamp"]))),
-    } for r in list(reversed(rows))[:LATEST_LIMIT]]
+        latest = [{
+            "timestamp": r["timestamp"],
+            "source": r["source"],
+            "detection_class": r["detection_class"],
+            "species": r["species"],
+            "confidence": (round(r["confidence"], 3) if r["confidence"] is not None else None),
+            "species_confidence": (round(r["species_confidence"], 3)
+                                   if r["species_confidence"] is not None else None),
+            "crop_path": web(r["crop_path"]),
+            # The clip rolling when this crop was caught (so the live card can play it), or None.
+            "clip": _clip_out(clip_at(clips, r["source"], _parse(r["timestamp"]))),
+        } for r in list(reversed(rows))[:LATEST_LIMIT]]
 
-    recent_visits = [{
-        "source": v["source"],
-        "start": v["start"].isoformat(),
-        "end": v["end"].isoformat(),
-        "count": v["count"],
-        "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
-        "max_conf": round(v["max_conf"], 3),
-        "classes": dict(v["classes"].most_common()),
-        "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
-    } for v in sorted(visits, key=lambda v: v["start"], reverse=True)[:RECENT_VISITS_LIMIT]]
+        recent_visits = [{
+            "source": v["source"],
+            "start": v["start"].isoformat(),
+            "end": v["end"].isoformat(),
+            "count": v["count"],
+            "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
+            "max_conf": round(v["max_conf"], 3),
+            "classes": dict(v["classes"].most_common()),
+            "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
+        } for v in sorted(visits, key=lambda v: v["start"], reverse=True)[:RECENT_VISITS_LIMIT]]
 
-    return {
-        "db_path": str(cfg.db_path),
-        "gap_minutes": gap,
-        "total_crops": len(rows),
-        "total_visits": len(visits),
-        "span": ({"start": rows[0]["timestamp"], "end": rows[-1]["timestamp"]} if rows else None),
-        "by_source": [{"source": s, "crops": src_crops[s], "visits": src_visits.get(s, 0)}
-                      for s in sorted(src_crops)],
-        "by_class": [{"name": c, "crops": n} for c, n in cls_crops.most_common()],
-        "by_day": by_day,
-        "by_hour": [{"hour": h, "visits": hour_counts[h]} for h in range(24) if hour_counts.get(h)],
-        "latest": latest,
-        "recent_visits": recent_visits,
-    }
+        return {
+            "db_path": str(cfg.db_path),
+            "gap_minutes": gap,
+            "total_crops": len(rows),
+            "total_visits": len(visits),
+            "span": ({"start": rows[0]["timestamp"], "end": rows[-1]["timestamp"]} if rows else None),
+            "by_source": [{"source": s, "crops": src_crops[s], "visits": src_visits.get(s, 0)}
+                          for s in sorted(src_crops)],
+            "by_class": [{"name": c, "crops": n} for c, n in cls_crops.most_common()],
+            "by_day": by_day,
+            "by_hour": [{"hour": h, "visits": hour_counts[h]} for h in range(24) if hour_counts.get(h)],
+            "latest": latest,
+            "recent_visits": recent_visits,
+        }
+    finally:
+        conn.close()
 
 
 def species_overview(cfg) -> dict | None:
@@ -240,25 +242,27 @@ def species_overview(cfg) -> dict | None:
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return None
-    rows = conn.execute(
-        "SELECT species, COUNT(*) n, ROUND(AVG(species_confidence), 3) avg_conf, "
-        "SUM(CASE WHEN species_verified = 1 THEN 1 ELSE 0 END) verified, "
-        "SUM(CASE WHEN species_verified = 0 THEN 1 ELSE 0 END) rejected "
-        "FROM detections WHERE species IS NOT NULL GROUP BY species ORDER BY n DESC"
-    ).fetchall()
-    species = []
-    for r in rows:
-        s = conn.execute(
-            "SELECT crop_path FROM detections WHERE species = ? "
-            "ORDER BY (species_verified = 1) DESC, species_confidence DESC LIMIT 1",
-            (r["species"],)).fetchone()
-        species.append({
-            "species": r["species"], "count": r["n"], "avg_conf": r["avg_conf"],
-            "verified": r["verified"], "rejected": r["rejected"],
-            "sample": (s["crop_path"].replace("\\", "/") if s and s["crop_path"] else None),
-        })
-    conn.close()
-    return {"species": species, "total": sum(s["count"] for s in species)}
+    try:
+        rows = conn.execute(
+            "SELECT species, COUNT(*) n, ROUND(AVG(species_confidence), 3) avg_conf, "
+            "SUM(CASE WHEN species_verified = 1 THEN 1 ELSE 0 END) verified, "
+            "SUM(CASE WHEN species_verified = 0 THEN 1 ELSE 0 END) rejected "
+            "FROM detections WHERE species IS NOT NULL GROUP BY species ORDER BY n DESC"
+        ).fetchall()
+        species = []
+        for r in rows:
+            s = conn.execute(
+                "SELECT crop_path FROM detections WHERE species = ? "
+                "ORDER BY (species_verified = 1) DESC, species_confidence DESC LIMIT 1",
+                (r["species"],)).fetchone()
+            species.append({
+                "species": r["species"], "count": r["n"], "avg_conf": r["avg_conf"],
+                "verified": r["verified"], "rejected": r["rejected"],
+                "sample": (s["crop_path"].replace("\\", "/") if s and s["crop_path"] else None),
+            })
+        return {"species": species, "total": sum(s["count"] for s in species)}
+    finally:
+        conn.close()
 
 
 def individuals_overview(cfg, thumbs: int = 6) -> dict:
@@ -269,31 +273,33 @@ def individuals_overview(cfg, thumbs: int = 6) -> dict:
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return {"groups": [], "total_crops": 0}
-    rows = conn.execute(
-        "SELECT individual_id iid, COUNT(*) n, MIN(timestamp) first_seen, MAX(timestamp) last_seen "
-        "FROM detections WHERE individual_id IS NOT NULL GROUP BY individual_id"
-    ).fetchall()
-    groups = []
-    for r in rows:
-        sp = conn.execute(
-            "SELECT species, COUNT(*) c FROM detections WHERE individual_id = ? AND species IS "
-            "NOT NULL GROUP BY species ORDER BY c DESC LIMIT 1", (r["iid"],)).fetchone()
-        crops = conn.execute(
-            "SELECT crop_path FROM detections WHERE individual_id = ? "
-            "ORDER BY confidence DESC LIMIT ?", (r["iid"], thumbs)).fetchall()
-        # Placeholder = reid.py --write-clusters output ('<species>_cNN'); named = anything else.
-        is_placeholder = "_c" in r["iid"] and r["iid"].rsplit("_c", 1)[-1].isdigit()
-        groups.append({
-            "id": r["iid"], "n_crops": r["n"], "placeholder": is_placeholder,
-            "species": sp["species"] if sp else None,
-            "first_seen": r["first_seen"], "last_seen": r["last_seen"],
-            "crops": [c["crop_path"].replace("\\", "/") for c in crops if c["crop_path"]],
-        })
-    conn.close()
-    # Named individuals first (the cast), then placeholders by size (biggest worth naming first).
-    groups.sort(key=lambda g: (g["placeholder"], -g["n_crops"]))
-    return {"groups": groups, "total_crops": sum(g["n_crops"] for g in groups),
-            "named": sum(1 for g in groups if not g["placeholder"])}
+    try:
+        rows = conn.execute(
+            "SELECT individual_id iid, COUNT(*) n, MIN(timestamp) first_seen, MAX(timestamp) last_seen "
+            "FROM detections WHERE individual_id IS NOT NULL GROUP BY individual_id"
+        ).fetchall()
+        groups = []
+        for r in rows:
+            sp = conn.execute(
+                "SELECT species, COUNT(*) c FROM detections WHERE individual_id = ? AND species IS "
+                "NOT NULL GROUP BY species ORDER BY c DESC LIMIT 1", (r["iid"],)).fetchone()
+            crops = conn.execute(
+                "SELECT crop_path FROM detections WHERE individual_id = ? "
+                "ORDER BY confidence DESC LIMIT ?", (r["iid"], thumbs)).fetchall()
+            # Placeholder = reid.py --write-clusters output ('<species>_cNN'); named = anything else.
+            is_placeholder = "_c" in r["iid"] and r["iid"].rsplit("_c", 1)[-1].isdigit()
+            groups.append({
+                "id": r["iid"], "n_crops": r["n"], "placeholder": is_placeholder,
+                "species": sp["species"] if sp else None,
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "crops": [c["crop_path"].replace("\\", "/") for c in crops if c["crop_path"]],
+            })
+        # Named individuals first (the cast), then placeholders by size (biggest worth naming first).
+        groups.sort(key=lambda g: (g["placeholder"], -g["n_crops"]))
+        return {"groups": groups, "total_crops": sum(g["n_crops"] for g in groups),
+                "named": sum(1 for g in groups if not g["placeholder"])}
+    finally:
+        conn.close()
 
 
 def species_crops(cfg, species: str, limit: int = 160) -> list:
@@ -301,40 +307,46 @@ def species_crops(cfg, species: str, limit: int = 160) -> list:
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return []
-    rows = conn.execute(
-        "SELECT id, crop_path, ROUND(species_confidence, 3) conf, species_verified, "
-        "timestamp, source FROM detections WHERE species = ? ORDER BY id DESC LIMIT ?",
-        (species, int(limit))).fetchall()
-    conn.close()
-    return [{"id": r["id"], "crop_path": (r["crop_path"] or "").replace("\\", "/"),
-             "confidence": r["conf"], "verified": r["species_verified"],
-             "timestamp": r["timestamp"], "source": r["source"]} for r in rows]
+    try:
+        rows = conn.execute(
+            "SELECT id, crop_path, ROUND(species_confidence, 3) conf, species_verified, "
+            "timestamp, source FROM detections WHERE species = ? ORDER BY id DESC LIMIT ?",
+            (species, int(limit))).fetchall()
+        return [{"id": r["id"], "crop_path": (r["crop_path"] or "").replace("\\", "/"),
+                 "confidence": r["conf"], "verified": r["species_verified"],
+                 "timestamp": r["timestamp"], "source": r["source"]} for r in rows]
+    finally:
+        conn.close()
 
 
 def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limit=60) -> dict:
     """A filtered, paginated slice of detection crops (newest first) for the explorer drill-down.
     Filters (all optional, AND-combined): day='YYYY-MM-DD', species exact, start/end ISO timestamp
     bounds. Returns {crops, total, offset, limit} so the UI can show "loaded of total"."""
+    limit = max(1, min(int(limit), 200))      # clamp so a negative/huge ?limit can't dump the table
+    offset = max(0, int(offset))
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return {"crops": [], "total": 0, "offset": 0, "limit": limit}
-    where, args = [], []
-    if day:     where.append("timestamp LIKE ?"); args.append(str(day) + "%")
-    if species: where.append("species = ?");      args.append(species)
-    if start:   where.append("timestamp >= ?");   args.append(start)
-    if end:     where.append("timestamp <= ?");   args.append(end)
-    clause = ("WHERE " + " AND ".join(where)) if where else ""
-    total = conn.execute(f"SELECT COUNT(*) FROM detections {clause}", args).fetchone()[0]
-    rows = conn.execute(
-        f"SELECT id, timestamp, species, confidence, species_confidence, species_verified, "
-        f"crop_path FROM detections {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
-        args + [int(limit), int(offset)]).fetchall()
-    conn.close()
-    crops = [{"id": r["id"], "timestamp": r["timestamp"], "species": r["species"],
-              "confidence": r["confidence"], "species_confidence": r["species_confidence"],
-              "verified": r["species_verified"],
-              "crop_path": (r["crop_path"] or "").replace("\\", "/")} for r in rows]
-    return {"crops": crops, "total": total, "offset": int(offset), "limit": int(limit)}
+    try:
+        where, args = [], []
+        if day:     where.append("timestamp LIKE ?"); args.append(str(day) + "%")
+        if species: where.append("species = ?");      args.append(species)
+        if start:   where.append("timestamp >= ?");   args.append(start)
+        if end:     where.append("timestamp <= ?");   args.append(end)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        total = conn.execute(f"SELECT COUNT(*) FROM detections {clause}", args).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT id, timestamp, species, confidence, species_confidence, species_verified, "
+            f"crop_path FROM detections {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            args + [int(limit), int(offset)]).fetchall()
+        crops = [{"id": r["id"], "timestamp": r["timestamp"], "species": r["species"],
+                  "confidence": r["confidence"], "species_confidence": r["species_confidence"],
+                  "verified": r["species_verified"],
+                  "crop_path": (r["crop_path"] or "").replace("\\", "/")} for r in rows]
+        return {"crops": crops, "total": total, "offset": int(offset), "limit": int(limit)}
+    finally:
+        conn.close()
 
 
 def visits_page(cfg, day=None, limit=300) -> dict:
@@ -343,30 +355,32 @@ def visits_page(cfg, day=None, limit=300) -> dict:
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return {"visits": [], "total": 0}
-    clause, args = ("WHERE timestamp LIKE ?", [str(day) + "%"]) if day else ("", [])
-    rows = conn.execute(
-        f"SELECT id, source, timestamp, detection_class, species, confidence, species_confidence, "
-        f"crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
-        f"FROM detections {clause} ORDER BY timestamp", args).fetchall()
-    clips = load_clips(conn)
-    conn.close()
+    try:
+        clause, args = ("WHERE timestamp LIKE ?", [str(day) + "%"]) if day else ("", [])
+        rows = conn.execute(
+            f"SELECT id, source, timestamp, detection_class, species, confidence, species_confidence, "
+            f"crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
+            f"FROM detections {clause} ORDER BY timestamp", args).fetchall()
+        clips = load_clips(conn)
 
-    visits = compute_visits(rows, cfg.visit_gap_minutes, rep_key=_shot_score)
-    visits.sort(key=lambda v: v["start"], reverse=True)
-    out = []
-    for v in visits[:limit]:
-        title = v["classes"].most_common(1)[0][0] if v["classes"] else "animal"
-        out.append({
-            "start": v["start"].isoformat(), "end": v["end"].isoformat(), "source": v["source"],
-            "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
-            "max_conf": round(v["max_conf"], 3), "title": title,
-            "classes": dict(v["classes"].most_common()),
-            "rep_crop": ((v.get("rep_crop") or "").replace("\\", "/") or None),
-            # The clips that rolled during this visit (busiest first) -> click the card, watch the
-            # video. Empty for visits before clip recording was on (e.g. daytime pre-06-09).
-            "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
-        })
-    return {"visits": out, "total": len(visits)}
+        visits = compute_visits(rows, cfg.visit_gap_minutes, rep_key=_shot_score)
+        visits.sort(key=lambda v: v["start"], reverse=True)
+        out = []
+        for v in visits[:limit]:
+            title = v["classes"].most_common(1)[0][0] if v["classes"] else "animal"
+            out.append({
+                "start": v["start"].isoformat(), "end": v["end"].isoformat(), "source": v["source"],
+                "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
+                "max_conf": round(v["max_conf"], 3), "title": title,
+                "classes": dict(v["classes"].most_common()),
+                "rep_crop": ((v.get("rep_crop") or "").replace("\\", "/") or None),
+                # The clips that rolled during this visit (busiest first) -> click the card, watch the
+                # video. Empty for visits before clip recording was on (e.g. daytime pre-06-09).
+                "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
+            })
+        return {"visits": out, "total": len(visits)}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -123,6 +123,7 @@ def main() -> int:
     cfg = replace(c, camera_index=args.camera_index, frame_width=args.width, frame_height=args.height)
     cap = open_cam(cfg)
     if not cap.isOpened():
+        cap.release()           # the VideoCapture object exists even on a failed open -- free it
         print(f"Could not open camera index {cfg.camera_index}. Is the capture rig still "
               f"running? Stop it first (only one process can hold the webcam).")
         return 1
@@ -149,7 +150,11 @@ def main() -> int:
         # 2) Sweep manual exposure.
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, args.manual_flag)
         time.sleep(0.2)
-        exposures = [float(x) for x in args.exposures.split(",") if x.strip()]
+        try:
+            exposures = [float(x) for x in args.exposures.split(",") if x.strip()]
+        except ValueError:
+            print(f"--exposures must be comma-separated numbers; got '{args.exposures}'.")
+            return 1
         print("\nexposure sweep (requested -> actual readback):")
         for e in exposures:
             cap.set(cv2.CAP_PROP_EXPOSURE, e)

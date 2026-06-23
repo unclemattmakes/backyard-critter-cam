@@ -70,7 +70,9 @@ def backfill(cfg: config.Config, *, redo: bool = False, limit: int = 0, batch: i
         print(f"Scoring {total} crop(s){' (rescore)' if redo else ''} ...")
         done, missing, pending = 0, 0, []
         for r in rows:
-            q = score_file(config.ROOT / r["crop_path"])
+            # crop_path is stored with the writer's separators (backslashes on Windows); normalize
+            # so the backfill also works on macOS/Linux against a DB written on Windows.
+            q = score_file(config.ROOT / r["crop_path"].replace("\\", "/"))
             if q is None:
                 missing += 1
                 continue

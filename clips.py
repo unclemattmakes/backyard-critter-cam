@@ -83,14 +83,14 @@ class _FfmpegWriter:
         except (BrokenPipeError, OSError, ValueError):
             self._ok = False                            # ffmpeg died -> recorder drops the clip
 
-    def release(self) -> None:
+    def release(self, timeout: float = 30) -> None:
         try:
             if self.proc.stdin and not self.proc.stdin.closed:
                 self.proc.stdin.close()
         except OSError:
             pass
         try:
-            self.proc.wait(timeout=30)                  # let ffmpeg flush + write the moov atom
+            self.proc.wait(timeout=timeout)             # let ffmpeg flush + write the moov atom
         except Exception:
             try:
                 self.proc.kill()
@@ -238,6 +238,13 @@ class ClipRecorder:
         want_h264 = str(cfg.clip_codec).lower() in _H264_ALIASES
         self.use_ffmpeg = want_h264 and _FFMPEG is not None
         self.cv2_codec = "mp4v" if want_h264 else str(cfg.clip_codec)
+        # An OpenCV fourcc must be exactly 4 characters; a typo'd or 3-char codec ('vp9', 'mjpg ')
+        # would otherwise raise inside cv2.VideoWriter_fourcc and crash the whole capture rig on
+        # the first clip. Fall back to a safe codec rather than take the rig down over a config typo.
+        if len(self.cv2_codec) != 4:
+            print(f"[clips] clip_codec '{cfg.clip_codec}' is not a 4-character fourcc -- "
+                  f"recording 'mp4v' instead.")
+            self.cv2_codec = "mp4v"
         if want_h264 and _FFMPEG is None:
             print("[clips] ffmpeg not found on PATH -- recording mp4v instead of H.264 "
                   "(clips still record; the dashboard will transcode them for playback).")
@@ -344,6 +351,7 @@ class ClipRecorder:
                 wr = _FfmpegWriter(self.clip_path, self.fps, (w, h))
                 if wr.isOpened():
                     return wr
+                wr.release()        # opened but immediately dead -- close the pipe/proc, don't leak it
             except Exception as e:  # noqa: BLE001 -- fall back to cv2 rather than lose the clip
                 print(f"[clips] ffmpeg writer failed ({e}); falling back to OpenCV mp4v.")
             self.use_ffmpeg = False                 # don't retry ffmpeg for the rest of the run
@@ -351,6 +359,8 @@ class ClipRecorder:
                                self.fps, (w, h))
 
     def _write(self, frame) -> None:
+        if self.disabled:           # a prior open failed -- don't re-attempt for every buffered frame
+            return
         if self.writer is None:
             h, w = frame.shape[:2]
             self.size = (w, h)
@@ -365,15 +375,20 @@ class ClipRecorder:
         self.writer.write(frame)
         self.frame_count += 1
 
-    def finalize(self) -> None:
-        """Close the current clip (if any) and write its DB row. Safe to call when not recording
-        and to call repeatedly; the capture loop calls it on shutdown."""
+    def finalize(self, shutdown: bool = False) -> None:
+        """Close the current clip (if any) and write its DB row. Safe to call when not recording and
+        to call repeatedly. Called inline mid-session when a clip auto-stops (shutdown=False -> a
+        short writer-flush timeout, so a stuck ffmpeg can't stall the single capture thread) and
+        once on rig shutdown (shutdown=True -> a generous timeout to finish the final flush)."""
         if not self.recording:
             return
         self.recording = False
         if self.writer is not None:
             try:
-                self.writer.release()
+                if isinstance(self.writer, _FfmpegWriter):
+                    self.writer.release(timeout=30 if shutdown else 5)
+                else:
+                    self.writer.release()
             except Exception:
                 pass
         self.writer = None

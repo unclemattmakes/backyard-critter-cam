@@ -264,7 +264,8 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
     return out
 
 
-def clips_for_individual(conn, individual_id: str, species: str = "raccoon", limit: int = 24) -> list:
+def clips_for_individual(conn, individual_id: str, species: str = "raccoon", limit: int = 24,
+                         cfg=None) -> list:
     """Behaviour clips attributable to one confirmed individual: clips that overlap (in time, same
     source) a visit labelled `individual_id`. Newest first. Each clip carries `multi=True` when its
     visit holds 2+ animals -- then the footage shows the individual ALONGSIDE another, so it's
@@ -276,6 +277,7 @@ def clips_for_individual(conn, individual_id: str, species: str = "raccoon", lim
     if not vrows:
         return []
     multi = clip_co_presence_by_visit(conn, species)
+    multi_min = cfg.reid_clip_co_presence_min_clips if cfg is not None else 2
     clips = conn.execute(
         "SELECT id, source, clip_path, started_at, ended_at, frame_count, fps FROM clips").fetchall()
     out = []
@@ -295,7 +297,7 @@ def clips_for_individual(conn, individual_id: str, species: str = "raccoon", lim
                             "clip_path": (c["clip_path"] or "").replace("\\", "/"),
                             "started_at": c["started_at"],
                             "duration_s": round(dur, 1) if dur else None,
-                            "visit_id": v["id"], "multi": multi.get(v["id"], 0) >= 2})
+                            "visit_id": v["id"], "multi": multi.get(v["id"], 0) >= multi_min})
                 break
     out.sort(key=lambda r: r["started_at"], reverse=True)
     return out[:limit]

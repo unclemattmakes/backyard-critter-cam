@@ -87,3 +87,19 @@ def test_ingest_file_handles_unreadable_image(conn, tmp_path):
 
     assert (n_reported, n_saved) == (-1, 0)
     assert conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 0
+
+
+def test_reimport_recovers_underscored_stem(conn, tmp_path):
+    """Re-import idempotency via DB recovery (the fallback when the ledger sidecar is gone) must
+    recognise a file whose name carries an internal underscore. A past bug recovered only the prefix
+    before the first underscore (IMG_0042 -> 'IMG') AND compared against the full filename, so the
+    DB-recovery skip-set never matched and a re-run re-imported (duplicated) everything."""
+    cfg = replace(config.CONFIG, crops_dir=tmp_path / "crops")
+    img = _write_image(tmp_path / "IMG_0042.JPG")
+    import_trailcam.ingest_file(img, _StubDetector(), conn, cfg, source="trail_cam_sd")
+
+    recovered = import_trailcam.imported_basenames(conn, "trail_cam_sd")
+    assert "IMG_0042" in recovered                 # the FULL stem, not the truncated 'IMG'
+    # import_folder keys its skip-set on EITHER the filename or the stem, so the DB-recovery set
+    # (which holds stems, since the crop name doesn't preserve the extension) matches on re-run.
+    assert img.name in recovered or img.stem in recovered

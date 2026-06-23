@@ -271,7 +271,11 @@ def do_name(conn, store, args):
     if not cluster_tag.startswith("cluster_"):
         print("First arg to --name is the montage tag, e.g. cluster_03.")
         return 1
-    rank = int(cluster_tag.split("_")[1])
+    try:
+        rank = int(cluster_tag.split("_")[1])
+    except (IndexError, ValueError):
+        print(f"Bad cluster tag '{cluster_tag}'. Expected cluster_NN, e.g. cluster_03.")
+        return 1
 
     labels = store.cluster(args.threshold, args.method)
     uniq, counts = np.unique(labels, return_counts=True)

@@ -55,3 +55,14 @@ def test_period_digest_with_data_does_not_crash(conn, db_path):
     visits.build_visits(conn, config.CONFIG.visit_gap_minutes, verbose=False)
     d = stats.period_digest(_cfg(db_path))
     assert isinstance(d, dict)
+
+
+def test_crops_page_clamps_negative_limit(conn, db_path):
+    """A negative ?limit must not pass through to SQLite, where LIMIT -1 means UNBOUNDED and would
+    dump the entire detections table. crops_page clamps limit to >=1 and offset to >=0 itself, so
+    it's safe regardless of the caller (the dashboard's /api/crops takes the value from the URL)."""
+    for _ in range(3):
+        _add_detection(conn)
+    page = stats.crops_page(_cfg(db_path), limit=-1, offset=-5)
+    assert page["limit"] == 1 and page["offset"] == 0
+    assert len(page["crops"]) <= 1

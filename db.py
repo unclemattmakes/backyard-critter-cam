@@ -14,7 +14,7 @@ Only stdlib sqlite3 is used.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -210,7 +210,9 @@ def connect_readonly(db_path: Path | str) -> Optional[sqlite3.Connection]:
     p = Path(db_path)
     if not p.exists():
         return None
-    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    # Build the file: URI safely -- as_uri() percent-encodes characters like '#' and '?' that, raw,
+    # would be parsed as a URI fragment/query and silently open the wrong (empty) database.
+    conn = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -382,7 +384,8 @@ def load_clip_track_embeddings(conn: sqlite3.Connection, model: str, *, species=
            FROM clip_track_embeddings e
            JOIN clip_tracks t ON t.id = e.track_id
            JOIN clips c ON c.id = t.clip_id
-           WHERE e.model = ? ORDER BY c.started_at, t.track_idx""", (model,)).fetchall()
+           WHERE e.model = ? AND e.n_frames > 0
+           ORDER BY c.started_at, t.track_idx""", (model,)).fetchall()
 
 
 def clear_visits(conn: sqlite3.Connection) -> None:
@@ -648,7 +651,24 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
     if visit_id is not None:
         where, params = "visit_id = ?", [int(visit_id)]
     elif source and start and end:
-        where, params = "source = ? AND timestamp >= ? AND timestamp <= ?", [source, start, end]
+        # Resolve the span to explicit detection ids by INSTANT, not lexical string order: ISO
+        # timestamps with different UTC offsets (a DST seam inside one visit) don't sort by instant,
+        # so a lexical BETWEEN would grab the wrong rows at the fall-back/spring-forward hour. A
+        # visit is small, so an id list is fine. Pad the coarse lexical pre-filter by a day each
+        # side (offsets are <= 14 h) to guarantee a superset, then filter exactly via parse_local.
+        lo, hi = parse_local(start), parse_local(end)
+        if lo is None or hi is None:
+            return {"detections": 0, "error": "bad start/end timestamp"}
+        lo_pad, hi_pad = (lo - timedelta(days=1)).isoformat(), (hi + timedelta(days=1)).isoformat()
+        cand = conn.execute(
+            "SELECT id, timestamp FROM detections "
+            "WHERE source = ? AND timestamp >= ? AND timestamp <= ?",
+            (source, lo_pad, hi_pad)).fetchall()
+        ids = [row[0] for row in cand
+               if (p := parse_local(row[1])) is not None and lo <= p <= hi]
+        if not ids:
+            return {"detections": 0}
+        where, params = "id IN (%s)" % ",".join("?" * len(ids)), list(ids)
     else:
         return {"detections": 0, "error": "need visit_id or source+start+end"}
 

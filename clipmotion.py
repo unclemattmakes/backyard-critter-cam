@@ -257,31 +257,35 @@ def extract_tracks(clip_path, detector, sample_hz: float | None):
     cap = cv2.VideoCapture(str(clip_path))
     if not cap.isOpened():
         return None, 0
-    fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
-    step = 1 if not sample_hz else max(1, round(fps / sample_hz))
-    samples = []
-    n_samples = 0
-    idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx % step == 0:
-            n_samples += 1
-            try:
-                dets = detector.detect(frame)
-            except Exception:  # one bad frame never kills the clip
-                dets = []
-            h, w = frame.shape[:2]
-            boxes = []
-            for d in dets:
-                x1, y1, x2, y2 = d.bbox
-                boxes.append((round(((x1 + x2) / 2) / w, 4), round(((y1 + y2) / 2) / h, 4),
-                              round((x2 - x1) / w, 4), round((y2 - y1) / h, 4),
-                              round(d.confidence, 3)))
-            samples.append((round(idx / fps, 3), nms_boxes(boxes)))
-        idx += 1
-    cap.release()
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not (fps and fps > 0 and np.isfinite(fps)):   # some containers report 0.0 or NaN here
+            fps = 15.0
+        step = 1 if not sample_hz else max(1, round(fps / sample_hz))
+        samples = []
+        n_samples = 0
+        idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                n_samples += 1
+                try:
+                    dets = detector.detect(frame)
+                except Exception:  # one bad frame never kills the clip
+                    dets = []
+                h, w = frame.shape[:2]
+                boxes = []
+                for d in dets:
+                    x1, y1, x2, y2 = d.bbox
+                    boxes.append((round(((x1 + x2) / 2) / w, 4), round(((y1 + y2) / 2) / h, 4),
+                                  round((x2 - x1) / w, 4), round((y2 - y1) / h, 4),
+                                  round(d.confidence, 3)))
+                samples.append((round(idx / fps, 3), nms_boxes(boxes)))
+            idx += 1
+    finally:
+        cap.release()
     return build_tracks(samples), n_samples
 
 
@@ -290,7 +294,7 @@ def fingerprint_line(clip_id, idx, feats, n_hits, n_samples) -> str:
     def f(v, fmt="{:.2f}"):
         return fmt.format(v) if v is not None else "--"
     stride = (f"{s['stride_hz']:.1f}Hz({s['stride_strength']:.2f})"
-              if s.get("stride_hz") else "--")
+              if s.get("stride_hz") and s.get("stride_strength") is not None else "--")
     return (f"  clip #{clip_id:<4}.{idx} {n_hits}/{n_samples} hits  "
             f"dur {f(s['duration_s'], '{:.1f}')}s  path {f(s['path_len'])}  "
             f"straight {f(s['straightness'])}  v_avg {f(s['avg_speed'])}  "

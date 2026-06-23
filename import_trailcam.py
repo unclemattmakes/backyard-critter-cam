@@ -124,7 +124,11 @@ def imported_basenames(conn, source: str) -> set[str]:
         i = stem.find(SRC_TAG)
         if i != -1:
             rest = stem[i + len(SRC_TAG):]
-            out.add(rest.split("_", 1)[0])  # 'src-<orig-stem>_<idx>_<class>_<conf>.jpg'
+            # crop name = 'src-<orig-stem>_<idx>_<class>_<conf>.jpg'. save_crop appends exactly THREE
+            # underscore-fields (idx, class, conf), so strip those from the RIGHT to recover the full
+            # original stem -- a left split mangles any source name that itself contains an underscore
+            # (e.g. IMG_0042 -> 'IMG'), which then never matches the file again on a DB-recovery re-run.
+            out.add(rest.rsplit("_", 3)[0])
     return out
 
 
@@ -262,7 +266,9 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
           f"{' (recursive)' if recursive else ''}. Importing as source='{source}' ...")
     imported = saved_total = skipped = 0
     for path in images:
-        if path.name in skip:
+        # The ledger keys on the full filename; the DB-recovery fallback keys on the stem (the
+        # extension isn't stored in the crop name) -- accept either so both skip-sources match.
+        if path.name in skip or path.stem in skip:
             skipped += 1
             continue
         n_reported, n_saved = ingest_file(path, detector, conn, cfg, source)

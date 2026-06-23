@@ -320,3 +320,12 @@ def test_detection_count_and_max_conf_tracked(clip_cfg, clip_conn):
         "SELECT detection_count, max_confidence FROM clips ORDER BY id DESC LIMIT 1").fetchone()
     assert row[0] == 3                       # 2 + 1 detections
     assert row[1] == pytest.approx(0.95)
+
+
+def test_bad_clip_codec_falls_back_to_mp4v(conn, tmp_path):
+    """A non-4-character clip_codec (a config typo like 'vp9') must NOT reach
+    cv2.VideoWriter_fourcc -- that raises a TypeError which, unguarded, crashed the whole capture
+    rig on the first clip. The recorder coerces it to a safe 'mp4v' instead."""
+    cfg = dataclasses.replace(config.CONFIG, clip_codec="vp9", clips_dir=tmp_path / "clips")
+    rec = clips.ClipRecorder(cfg, conn)
+    assert rec.cv2_codec == "mp4v"

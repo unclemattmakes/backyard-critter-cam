@@ -183,6 +183,12 @@ def main() -> int:
                 continue
             for tid, ims in crops.items():
                 if not ims:
+                    # No usable crop for this sustained tracklet (all sampled frames degenerate or
+                    # undecodable). Write a zero-frame MARKER so clip_tracks_needing_embedding won't
+                    # re-select it (and re-decode the clip) on every run; load_clip_track_embeddings
+                    # filters n_frames > 0, so the marker never reaches matching/analysis.
+                    db.insert_clip_track_embedding(conn, track_id=tid, model=MODEL_NAME,
+                                                   dim=0, embedding=b"", n_frames=0, rep_crop=None)
                     continue
                 batch = torch.stack([transform(im) for im in ims]).to(device)
                 with torch.no_grad():

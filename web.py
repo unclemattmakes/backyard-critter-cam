@@ -129,6 +129,7 @@ _MEDIA_TYPES = {
     ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
 }
 _RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
+_MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
 
 
 def _parse_range(header: str, size: int):
@@ -168,6 +169,7 @@ _FFPROBE = shutil.which("ffprobe")
 _transcode_guard = threading.Lock()
 _transcode_locks: dict = {}
 _codec_cache: dict = {}        # clip path -> video codec_name, so each clip is probed at most once
+_CACHE_MAX = 4096              # bound the two caches above so a long session can't grow them forever
 
 
 def _is_h264(path: Path) -> bool:
@@ -183,9 +185,12 @@ def _is_h264(path: Path) -> bool:
                 [_FFPROBE, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
                 capture_output=True, text=True, timeout=15)
-            _codec_cache[key] = (r.stdout or "").strip()
+            val = (r.stdout or "").strip()
         except Exception:
-            _codec_cache[key] = ""
+            val = ""
+        if len(_codec_cache) >= _CACHE_MAX:           # bound the cache over a long-running session
+            _codec_cache.pop(next(iter(_codec_cache)), None)
+        _codec_cache[key] = val
     return _codec_cache[key] == "h264"
 
 
@@ -194,6 +199,8 @@ def _lock_for(key: str) -> threading.Lock:
     with _transcode_guard:
         lk = _transcode_locks.get(key)
         if lk is None:
+            if len(_transcode_locks) >= _CACHE_MAX:   # bound the lock table over a long session
+                _transcode_locks.pop(next(iter(_transcode_locks)), None)
             lk = _transcode_locks[key] = threading.Lock()
         return lk
 
@@ -249,6 +256,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
     stop_event = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30   # drop a stalled / slowloris connection instead of blocking a worker forever
+
         def log_message(self, *args):
             pass
 
@@ -318,7 +327,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(stats.crops_page(
                         cfg, day=(q.get("day") or [None])[0], species=(q.get("species") or [None])[0],
                         start=(q.get("start") or [None])[0], end=(q.get("end") or [None])[0],
-                        offset=int((q.get("offset") or [0])[0]), limit=min(int((q.get("limit") or [60])[0]), 200)))
+                        offset=max(0, int((q.get("offset") or [0])[0])),
+                        limit=max(1, min(int((q.get("limit") or [60])[0]), 200))))
                 elif path == "/api/visits":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.visits_page(cfg, day=(q.get("day") or [None])[0]))
@@ -332,7 +342,7 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 elif path == "/api/reid/queue":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_queue(cfg, species=(q.get("species") or [cfg.reid_species])[0],
-                                           limit=min(int((q.get("limit") or [30])[0]), 100)))
+                                           limit=max(1, min(int((q.get("limit") or [30])[0]), 100))))
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
@@ -366,7 +376,13 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             if not self._lan_guard():
                 return
             path = urllib.parse.urlparse(self.path).path
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):     # a non-numeric Content-Length must not 500 us
+                length = 0
+            if length > _MAX_POST_BYTES:
+                self._send(413, "text/plain", b"payload too large")
+                return
             raw = self.rfile.read(length) if length else b"{}"
             try:
                 data = json.loads(raw or b"{}")
@@ -538,6 +554,17 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             rng = self.headers.get("Range")
             if not rng:
                 # Whole file. Advertise Accept-Ranges so a <video> knows it can seek next time.
+                if ctype.startswith("video/"):
+                    # Stream a clip in chunks rather than buffering a whole (tens-of-MB) video in RAM.
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Cache-Control", "max-age=86400")
+                    self.end_headers()
+                    with open(serve, "rb") as fsrc:
+                        shutil.copyfileobj(fsrc, self.wfile, _RANGE_CHUNK)
+                    return
                 self._send(200, ctype, serve.read_bytes(),
                            {"Cache-Control": "max-age=86400", "Accept-Ranges": "bytes"})
                 return
@@ -659,9 +686,13 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
         if has_templates:
             r = matcher.refit()
             started = matcher.visit_started
-            fits = {name: {"visits": [{**x, "rep_crop": _rep_crop(conn.execute(
-                        "SELECT representative_detection_id FROM visits WHERE id=?",
-                        (x["visit_id"],)).fetchone()[0])} for x in lst]}
+            def _rep_for_visit(vid):
+                # The visit may have been renumbered/removed by a rebuild since refit() listed it,
+                # so guard the row (fetchone() can be None) rather than index None[0] -> 500.
+                row = conn.execute(
+                    "SELECT representative_detection_id FROM visits WHERE id=?", (vid,)).fetchone()
+                return _rep_crop(row[0] if row else None)
+            fits = {name: {"visits": [{**x, "rep_crop": _rep_for_visit(x["visit_id"])} for x in lst]}
                     for name, lst in r["fits"].items()}
             refit = {
                 "fits": fits,
@@ -732,7 +763,7 @@ def _reid_clips(cfg, individual: str) -> dict:
     if conn is None:
         return {"individual": individual, "clips": []}
     try:
-        clips = individuals.clips_for_individual(conn, individual)
+        clips = individuals.clips_for_individual(conn, individual, species=cfg.reid_species, cfg=cfg)
         return {"individual": individual, "n_clips": len(clips), "clips": clips}
     finally:
         conn.close()
