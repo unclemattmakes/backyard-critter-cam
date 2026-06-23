@@ -240,11 +240,12 @@ glass-door shot without restarting (a live companion to `tune.py`).
 - Built on Python's stdlib `http.server` — **no web framework, no new dependencies**.
 - **Localhost only** by default (it shows your camera). To watch from a phone on the same
   network add `--host 0.0.0.0`. Even then the dashboard accepts connections **only from your
-  local network** (loopback + private/LAN addresses) and refuses anything from the wider
-  internet, so a forwarded port can't expose it to the world — devices on your own Wi-Fi keep
-  full access, including label edits. There's still no per-user login, so it's "trust everyone
-  on your network": set `lan_only = False` in `config_local.py` only if you front it with your
-  own auth/VPN.
+  local network** (loopback + private/LAN addresses): it refuses *direct* connections from the
+  wider internet **and** validates the `Host` header to block DNS-rebinding from a malicious site
+  you visit. That stops the common exposure paths — but it is **not a login**, so anyone already
+  on your Wi-Fi has full access (including label edits). Don't port-forward it or put it on an
+  untrusted network; for real remote access, front it with a VPN or an authenticating reverse
+  proxy. Set `lan_only = False` in `config_local.py` only if you've done exactly that.
 - Runs in the same process as capture; combine with `--no-preview` for a headless,
   browser-only rig, or keep the native window too.
 - **Species names appear on their own:** the rig starts the naming **helper** (`classify.py

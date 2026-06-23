@@ -1,5 +1,5 @@
 const $=s=>document.querySelector(s);
-const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // A user-typed name (e.g. an individual's) embedded as a JS-string ARGUMENT in an inline onclick:
 // JSON.stringify makes a valid JS string literal (so an apostrophe like O'Brien can't break it),
 // and esc neutralises it for the double-quoted HTML attribute. Use jarg(x), never '${esc(x)}', for
@@ -910,13 +910,16 @@ function indivRow(g){
   const span=(g.first_seen&&g.last_seen)?`${g.first_seen.slice(5,10)} → ${g.last_seen.slice(5,10)}`:'';
   const thumbs=(g.crops||[]).map(c=>
     `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+  // onclick string args go through jarg (JSON.stringify + esc), NOT '${esc(x)}': esc does not
+  // neutralize a single quote, so a name with a ' would break out of the JS string literal and
+  // inject code. See the esc/jarg note at the top of this file.
   const act = g.placeholder
     ? `<input id="nm-${esc(g.id)}" placeholder="name… (e.g. Notch)" style="width:130px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">
-       <button class="gear" onclick="nameIndiv('${esc(g.id)}')">Name</button>`
-    : `<button class="gear" onclick="togglePoses('${esc(g.id)}')" title="cluster this individual's crops into characteristic poses">Poses</button>
-       <button class="gear" onclick="toggleClips('${esc(g.id)}')" title="watch this individual's behaviour clips">Clips</button>
-       <button class="gear" onclick="nameIndiv('${esc(g.id)}')" title="rename">Rename</button>
-       <button class="gear" onclick="clearIndiv('${esc(g.id)}')" title="unassign these crops">Clear</button>
+       <button class="gear" onclick="nameIndiv(${jarg(g.id)})">Name</button>`
+    : `<button class="gear" onclick="togglePoses(${jarg(g.id)})" title="cluster this individual's crops into characteristic poses">Poses</button>
+       <button class="gear" onclick="toggleClips(${jarg(g.id)})" title="watch this individual's behaviour clips">Clips</button>
+       <button class="gear" onclick="nameIndiv(${jarg(g.id)})" title="rename">Rename</button>
+       <button class="gear" onclick="clearIndiv(${jarg(g.id)})" title="unassign these crops">Clear</button>
        <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:90px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
   return `<div class="panel" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">

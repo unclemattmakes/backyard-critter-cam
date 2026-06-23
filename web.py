@@ -91,11 +91,35 @@ class CameraControlBridge:
             return dict(self._current)
 
 
+# A few controls have small, platform-stable valid sets; clamp those so a LAN/DNS-rebind client
+# can't push a nonsensical value. EXPOSURE/GAIN/FOCUS/BRIGHTNESS/etc. use camera- and OS-specific
+# scales (negative log2-seconds on Windows DirectShow, positive absolute units on V4L2), so we do
+# NOT pin those -- the driver clamps them and the effect is transient anyway. Non-finite values
+# (NaN / +-inf) are rejected for EVERY control below, which is the genuinely dangerous garbage.
+_CONTROL_RANGES = {
+    "AUTO_EXPOSURE": (0.0, 4.0), "AUTOFOCUS": (0.0, 1.0),
+    "AUTO_WB": (0.0, 1.0), "BACKLIGHT": (0.0, 3.0),
+}
+
+
 def _clean_settings(data: dict) -> dict:
     out = {}
     for k, v in (data or {}).items():
-        if k in _ALLOWED_CONTROLS:
-            out[k] = None if v is None else float(v)
+        if k not in _ALLOWED_CONTROLS:
+            continue
+        if v is None:                           # exposure/gain: None = auto-expose
+            out[k] = None
+            continue
+        try:
+            val = float(v)
+        except (TypeError, ValueError):
+            continue
+        if val != val or val in (float("inf"), float("-inf")):   # drop NaN / +-inf
+            continue
+        lo, hi = _CONTROL_RANGES.get(k, (None, None))
+        if lo is not None:
+            val = max(lo, min(hi, val))
+        out[k] = val
     return out
 
 
@@ -122,6 +146,38 @@ def _is_lan_client(host: str) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def _host_name(raw: str) -> str:
+    """The hostname portion of a Host header, minus any :port and IPv6 brackets."""
+    h = (raw or "").strip()
+    if h.startswith("["):                      # [::1]:8000 -> ::1
+        return h[1:].split("]", 1)[0]
+    if h.count(":") == 1:                       # host:port -> host (a bare IPv6 literal has >1 colon)
+        h = h.split(":", 1)[0]
+    return h
+
+
+def _is_allowed_host(raw: str, web_host: str = "") -> bool:
+    """DNS-rebinding guard. The peer-IP check (_is_lan_client) can't stop a malicious site that
+    resolves its OWN name to this rig's LAN IP: the request then comes from the victim's own (local)
+    browser, so the peer IP looks fine, but the Host header still carries the ATTACKER's hostname.
+    Accept only a Host that is 'localhost', a loopback/private/link-local IP literal, or the
+    operator's configured web_host. A real browser/curl always sends Host, so a rebinding fetch
+    can't omit it; an absent Host (rare, HTTP/1.0 tooling) is allowed through."""
+    if not raw:
+        return True
+    host = _host_name(raw).lower()
+    if host == "localhost" or host == str(web_host or "").lower():
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
 # Media types served from /media (crops, frames, and now behaviour clips). Video needs a correct
 # Content-Type AND HTTP Range support, or a browser <video> won't stream or seek.
 _MEDIA_TYPES = {
@@ -130,6 +186,8 @@ _MEDIA_TYPES = {
 }
 _RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
 _MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
+_MAX_STREAMS = 6                 # cap concurrent MJPEG viewers so one LAN client can't exhaust threads
+_stream_slots = threading.BoundedSemaphore(_MAX_STREAMS)
 
 
 def _parse_range(header: str, size: int):
@@ -281,11 +339,17 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             if not getattr(cfg, "lan_only", True):
                 return True
             host = self.client_address[0] if self.client_address else ""
-            if _is_lan_client(host):
-                return True
-            self._send(403, "text/plain",
-                       b"forbidden: this dashboard only accepts connections from your local network")
-            return False
+            if not _is_lan_client(host):
+                self._send(403, "text/plain",
+                           b"forbidden: this dashboard only accepts connections from your local network")
+                return False
+            # Peer is local -- but also validate the Host header, so a malicious site can't use DNS
+            # rebinding (its name -> this rig's LAN IP) to drive the dashboard from your own browser.
+            if not _is_allowed_host(self.headers.get("Host"), getattr(cfg, "web_host", "")):
+                self._send(403, "text/plain",
+                           b"forbidden: unrecognized Host header (DNS-rebinding guard)")
+                return False
+            return True
 
         def do_GET(self):
             if not self._lan_guard():
@@ -375,8 +439,12 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
+                try:                            # log detail server-side; don't leak it to the client
+                    print(f"[web] GET {self.path} failed: {e}")
+                except Exception:
+                    pass
                 try:
-                    self._send(500, "text/plain", f"error: {e}".encode())
+                    self._send(500, "text/plain", b"internal error")
                 except Exception:
                     pass
 
@@ -415,8 +483,12 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
+                try:                            # log detail server-side; don't leak it to the client
+                    print(f"[web] POST {self.path} failed: {e}")
+                except Exception:
+                    pass
                 try:
-                    self._json({"error": str(e)}, code=500)
+                    self._json({"error": "internal error"}, code=500)
                 except Exception:
                     pass
 
@@ -530,19 +602,25 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 conn.close()
 
         def _stream(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
-            self.send_header("Cache-Control", "no-store, private")
-            self.end_headers()
-            last = -1
-            while not stop_event.is_set():
-                frame, last = frame_buffer.wait(last, timeout=4.0)
-                if frame is None:
-                    continue
-                self.wfile.write(b"--FRAME\r\nContent-Type: image/jpeg\r\n")
-                self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
-                self.wfile.write(frame)
-                self.wfile.write(b"\r\n")
+            if not _stream_slots.acquire(blocking=False):
+                self._send(503, "text/plain", b"too many active streams; try again shortly")
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
+                self.send_header("Cache-Control", "no-store, private")
+                self.end_headers()
+                last = -1
+                while not stop_event.is_set():
+                    frame, last = frame_buffer.wait(last, timeout=4.0)
+                    if frame is None:
+                        continue
+                    self.wfile.write(b"--FRAME\r\nContent-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+            finally:
+                _stream_slots.release()
 
         def _media(self, rel):
             target = (config.ROOT / urllib.parse.unquote(rel)).resolve()

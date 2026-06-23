@@ -19,7 +19,7 @@ echo   On a phone or tablet on the SAME Wi-Fi, open:   http://%LANIP%:8000
 echo   (First launch may show a Windows Firewall prompt -- click Allow on Private networks.)
 echo.
 echo   Only devices on your own network can connect (you can confirm and even correct
-echo   sightings from them); the dashboard refuses connections from the wider internet.
+echo   sightings from them); it refuses direct internet connections, but has no password.
 echo.
 echo   ===  TO STOP THE APP  ==========================================
 echo      On this PC, click the live VIDEO window and press  Q.

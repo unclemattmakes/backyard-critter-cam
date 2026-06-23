@@ -13,6 +13,7 @@ The first run downloads the chosen weight into weights/ (stdlib urllib); later r
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import urllib.request
 from dataclasses import dataclass
@@ -35,13 +36,18 @@ class Detection:
 
 
 # Official MegaDetector v6 releases (Microsoft AI for Good Lab, Zenodo record 15398270).
-# version -> (download URL, local filename). This is the same table PytorchWildlife uses.
-MDV6_WEIGHTS: dict[str, tuple[str, str]] = {
-    "MDV6-yolov9-c":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1",       "MDV6-yolov9-c.pt"),
-    "MDV6-yolov9-e":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-e-1280.pt?download=1",  "MDV6-yolov9-e-1280.pt"),
-    "MDV6-yolov10-c": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-c.pt?download=1",      "MDV6-yolov10-c.pt"),
-    "MDV6-yolov10-e": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-e-1280.pt?download=1", "MDV6-yolov10-e-1280.pt"),
-    "MDV6-rtdetr-c":  ("https://zenodo.org/records/15398270/files/MDV6-rtdetr-c.pt?download=1",       "MDV6-rtdetr-c.pt"),
+# version -> (download URL, local filename, SHA-256). A YOLO .pt is a pickle that EXECUTES code when
+# Ultralytics loads it (torch.load is called with weights_only=False), so a tampered weight = remote
+# code execution. We verify every downloaded AND cached file against the pinned SHA-256 and refuse to
+# load on a mismatch. sha256=None means "not pinned yet": it downloads as before but prints a note
+# that integrity isn't verified. To pin one, download it once and run:
+#   python -c "import hashlib;print(hashlib.sha256(open('weights/<file>','rb').read()).hexdigest())"
+MDV6_WEIGHTS: dict[str, tuple[str, str, str | None]] = {
+    "MDV6-yolov9-c":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1",       "MDV6-yolov9-c.pt", None),
+    "MDV6-yolov9-e":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-e-1280.pt?download=1",  "MDV6-yolov9-e-1280.pt", None),
+    "MDV6-yolov10-c": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-c.pt?download=1",      "MDV6-yolov10-c.pt", "21ee78a2d4887128e2a4920937d3295b493f44d788d13e1a635378c16dd74ef7"),
+    "MDV6-yolov10-e": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-e-1280.pt?download=1", "MDV6-yolov10-e-1280.pt", None),
+    "MDV6-rtdetr-c":  ("https://zenodo.org/records/15398270/files/MDV6-rtdetr-c.pt?download=1",       "MDV6-rtdetr-c.pt", None),
 }
 
 # MegaDetector's coarse classes. The weights carry model.names too; we prefer those at
@@ -151,19 +157,37 @@ def build_with_fallback(make, device: str, *, what: str = "model") -> tuple:
         return make("cpu"), "cpu"
 
 
+def _sha256(path: Path) -> str:
+    """Streaming SHA-256 of a file (chunked so a ~100 MB weight isn't read whole into RAM)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _ensure_weights(version: str, weights_dir: Path) -> Path:
-    """Return the local path to the weight file, downloading it once if missing."""
+    """Return the local path to the weight file, downloading it once if missing and verifying its
+    SHA-256 against the pinned digest (the file is loaded as a code-executing pickle, so integrity
+    matters). A cached file that fails the check is discarded and re-downloaded; a download that
+    fails the check is refused rather than loaded. Weights with no pinned hash (None) behave as
+    before, with a one-line 'integrity not verified' note."""
     if version not in MDV6_WEIGHTS:
         raise ValueError(
             f"Unknown model_version '{version}'. Valid: {', '.join(MDV6_WEIGHTS)}"
         )
-    url, fname = MDV6_WEIGHTS[version]
+    url, fname, sha256 = MDV6_WEIGHTS[version]
     weights_dir.mkdir(parents=True, exist_ok=True)
     path = weights_dir / fname
     if path.exists() and path.stat().st_size > 0:
-        return path
+        if sha256 is None or _sha256(path) == sha256:
+            return path
+        print(f"  [weights] cached {path.name} failed its SHA-256 check -- re-downloading.")
+        path.unlink(missing_ok=True)
 
     print(f"  downloading MegaDetector v6 weights '{version}' -> {path.name} (one time) ...")
+    if sha256 is None:
+        print(f"  [weights] note: no pinned checksum for '{version}' -- integrity is NOT verified.")
     tmp = path.with_suffix(path.suffix + ".part")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "backyard-cam/1.0"})
@@ -178,6 +202,14 @@ def _ensure_weights(version: str, weights_dir: Path) -> Path:
         if got == 0 or (expected is not None and got < expected):
             raise RuntimeError(
                 f"incomplete download ({got}" + (f" of {expected}" if expected else "") + " bytes)")
+        # Integrity gate: a YOLO .pt is unpickled with weights_only=False, so a substituted file is
+        # code execution. Verify before we publish it to the cache, and refuse on mismatch.
+        if sha256 is not None:
+            actual = _sha256(tmp)
+            if actual != sha256:
+                raise RuntimeError(
+                    f"SHA-256 mismatch (expected {sha256}, got {actual}) -- refusing to load a "
+                    "weight that may have been tampered with")
         tmp.replace(path)
     except Exception as e:
         tmp.unlink(missing_ok=True)
