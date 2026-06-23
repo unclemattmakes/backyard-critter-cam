@@ -1,0 +1,1149 @@
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// A user-typed name (e.g. an individual's) embedded as a JS-string ARGUMENT in an inline onclick:
+// JSON.stringify makes a valid JS string literal (so an apostrophe like O'Brien can't break it),
+// and esc neutralises it for the double-quoted HTML attribute. Use jarg(x), never '${esc(x)}', for
+// any onclick string argument.
+const jarg=s=>esc(JSON.stringify(s==null?'':String(s)));
+const cap1=s=>s.replace(/\b\w/g,c=>c.toUpperCase());
+const media=p=>'/media/'+encodeURI(p);
+// playful pseudo-taxonomic labels (flavour only)
+const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','eastern gray squirrel':'Sciurus carolinensis',
+  'dark-eyed junco':'Junco hyemalis','domestic cat':'Felis catus','virginia opossum':'Didelphis virginiana',
+  'spotted towhee':'Pipilo maculatus','brown rat':'Rattus norvegicus','steller’s jay':'Cyanocitta stelleri',
+  'black-capped chickadee':'Poecile atricapillus','house finch':'Haemorhous mexicanus','american robin':'Turdus migratorius',
+  'european starling':'Sturnus vulgaris','northern flicker':'Colaptes auratus','varied thrush':'Ixoreus naevius',
+  'band-tailed pigeon':'Patagioenas fasciata','eastern cottontail':'Sylvilagus floridanus','house sparrow':'Passer domesticus',
+  'townsend’s chipmunk':'Neotamias townsendii'};
+const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
+const fmtDur=s=>{ s=Math.round(s||0); return s>=60?`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`:`${s}s`; };
+
+/* ---------- clip player (lightbox; plays one clip or a whole reel as a playlist) ----------
+   Everywhere a thumbnail has clip(s) behind it, clicking plays them here. A reel auto-advances
+   (the <video> 'ended' event steps to the next), with a filmstrip + ‹ › + arrow keys to scrub. */
+let __clips=[], __ci=0, __reelMode=false;
+function playClips(clips,i,title){
+  clips=(clips||[]).filter(c=>c&&c.clip_path);
+  if(!clips.length) return;
+  __clips=clips; __ci=Math.max(0,Math.min(i||0,clips.length-1)); __reelMode=clips.length>1;
+  const box=$('#clipbox'); if(!box) return;
+  $('#clip-title').textContent=title||(__reelMode?`Reel · ${clips.length} clips`:'Clip');
+  box.hidden=false;
+  const strip=$('#clip-strip'); strip.style.display=__reelMode?'flex':'none';
+  strip.innerHTML=__reelMode?__clips.map((c,k)=>`
+    <div class="fs" data-i="${k}" onclick="reelGo(${k})">
+      <div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
+      <div class="lab">${esc(fmtClock(c.start)||'')}${c.species?' · '+esc(nameOf(c.species)):''}</div>
+    </div>`).join(''):'';
+  const v=$('#clip-video');
+  v.onended=()=>{ if(__reelMode && __ci<__clips.length-1) reelStep(1); };
+  document.addEventListener('keydown',clipKeys);
+  showClip();
+}
+function showClip(){
+  const c=__clips[__ci]; if(!c) return;
+  const v=$('#clip-video');
+  // Poster = the clip's best frame, shown while the H.264 transcode streams in on first view
+  // (a cold clip can take a few seconds; cached instantly after).
+  if(c.thumb) v.poster=media(c.thumb); else v.removeAttribute('poster');
+  v.src=media(c.clip_path);
+  const pr=v.play(); if(pr&&pr.catch) pr.catch(()=>{});
+  $('#clip-cap').innerHTML=`${c.species?`<span class="nm">${esc(nameOf(c.species))}</span>`:''}
+    ${c.start?`<span class="mono" style="font-size:12px">${esc(fmtClock(c.start))}</span>`:''}
+    ${c.seconds?`<span class="mono" style="font-size:12px">· ${fmtDur(c.seconds)}</span>`:''}
+    ${c.dets?`<span class="mono" style="font-size:12px">· ${c.dets} detection${c.dets===1?'':'s'}</span>`:''}
+    ${c.conf!=null?`<span class="c mono" style="font-size:12px">· ~${Math.round(c.conf*100)}%</span>`:''}
+    ${__reelMode?`<span class="mono" style="font-size:12px;margin-left:auto;color:var(--faint)">${__ci+1} / ${__clips.length}</span>`:''}`;
+  const prev=$('#clip-prev'), next=$('#clip-next');
+  prev.style.display=next.style.display=__reelMode?'flex':'none';
+  prev.disabled=__ci<=0; next.disabled=__ci>=__clips.length-1;
+  $('#clip-strip').querySelectorAll('.fs').forEach(el=>{
+    const on=+el.dataset.i===__ci; el.classList.toggle('on',on); if(on) el.scrollIntoView({inline:'center',block:'nearest'}); });
+}
+function reelStep(d){ const n=__ci+d; if(n<0||n>=__clips.length) return; __ci=n; showClip(); }
+function reelGo(i){ if(i>=0&&i<__clips.length){ __ci=i; showClip(); } }
+function closeClipbox(){ const m=$('#clipbox'); if(!m) return; m.hidden=true;
+  const v=$('#clip-video'); v.pause(); v.onended=null; v.removeAttribute('src'); v.load();
+  document.removeEventListener('keydown',clipKeys); }
+function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='ArrowRight') reelStep(1); else if(e.key==='ArrowLeft') reelStep(-1); }
+/* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
+const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
+
+function show(v){
+  closeSettings();
+  $('#view-live').classList.toggle('on',v==='live');
+  $('#view-dispatch').classList.toggle('on',v==='dispatch');
+  $('#view-behavior').classList.toggle('on',v==='behavior');
+  $('#view-indiv').classList.toggle('on',v==='indiv');
+  $('#view-calendar').classList.toggle('on',v==='calendar');
+  $('#view-cat').classList.toggle('on',v==='cat');
+  $('#view-explore').classList.toggle('on',v==='explore');
+  $('#tab-live').classList.toggle('on',v==='live');
+  $('#tab-dispatch').classList.toggle('on',v==='dispatch');
+  $('#tab-behavior').classList.toggle('on',v==='behavior');
+  $('#tab-indiv').classList.toggle('on',v==='indiv');
+  $('#tab-calendar').classList.toggle('on',v==='calendar');
+  $('#tab-cat').classList.toggle('on',v==='cat');
+  if(v==='cat') loadCatalogue();
+  if(v==='dispatch') loadDispatch();
+  if(v==='behavior') loadBehavior();
+  if(v==='indiv') loadIndividuals();
+  if(v==='calendar') loadCalendar();
+}
+
+/* ---------- camera controls ---------- */
+const CONTROLS=[
+  {key:'exposure',label:'Exposure',min:-13,max:0,step:1,auto:'auto_exposure'},
+  {key:'gain',label:'Gain',min:0,max:255,step:1},
+  {key:'focus',label:'Focus',min:0,max:1023,step:5,auto:'autofocus'},
+  {key:'brightness',label:'Brightness',min:0,max:255,step:1},
+  {key:'contrast',label:'Contrast',min:0,max:255,step:1},
+  {key:'saturation',label:'Saturation',min:0,max:255,step:1},
+  {key:'sharpness',label:'Sharpness',min:0,max:255,step:1},
+  {key:'wb',label:'White balance',min:2000,max:8000,step:100,auto:'auto_wb'},
+];
+function buildControls(){
+  $('#controls').innerHTML=CONTROLS.map(c=>`
+    <div class="ctrl" data-k="${c.key}">
+      <div class="row">
+        <span class="name">${c.label}</span>
+        <span style="display:flex;gap:10px;align-items:center">
+          ${c.auto?`<label class="auto"><input type="checkbox" data-auto="${c.auto}"> auto</label>`:''}
+          <span class="val" data-val>—</span>
+        </span>
+      </div>
+      <input type="range" min="${c.min}" max="${c.max}" step="${c.step}" data-slider>
+    </div>`).join('');
+  $('#controls').querySelectorAll('.ctrl').forEach(el=>{
+    const key=el.dataset.k, sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]');
+    sl.addEventListener('input',()=>{ val.textContent=sl.value; touchedAt[key]=Date.now(); sendControl(key,parseFloat(sl.value)); });
+    const auto=el.querySelector('[data-auto]');
+    if(auto) auto.addEventListener('change',()=>{ sl.disabled=auto.checked; touchedAt[key]=Date.now(); sendAuto(auto.dataset.auto,auto.checked,sl); });
+  });
+}
+let postTimer={}, touchedAt={};   // touchedAt[key] = Date.now() of the user's last interaction with that control
+function postCamera(obj){ fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
+function sendControl(key,v){
+  let p;
+  if(key==='exposure')p={exposure:v};
+  else if(key==='gain')p={gain:v};
+  else if(key==='focus')p={AUTOFOCUS:0,FOCUS:v};
+  else if(key==='wb')p={AUTO_WB:0,WB_TEMPERATURE:v};
+  else p={[key.toUpperCase()]:v};
+  clearTimeout(postTimer[key]); postTimer[key]=setTimeout(()=>postCamera(p),60);
+}
+function sendAuto(autoKey,on,slider){
+  if(autoKey==='auto_exposure')postCamera({exposure:on?null:parseFloat(slider.value)});
+  else if(autoKey==='autofocus')postCamera(on?{AUTOFOCUS:1}:{AUTOFOCUS:0,FOCUS:parseFloat(slider.value)});
+  else if(autoKey==='auto_wb')postCamera(on?{AUTO_WB:1}:{AUTO_WB:0,WB_TEMPERATURE:parseFloat(slider.value)});
+}
+async function refreshCamera(){
+  let v; try{ v=await fetch('/api/camera').then(r=>r.json()); }catch(e){ return; }
+  if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
+  if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+  CONTROLS.forEach(c=>{
+    const el=$(`.ctrl[data-k="${c.key}"]`); if(!el)return;
+    const sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]'), au=el.querySelector('[data-auto]');
+    // Hardware lock: the driver rejects writes to this control (e.g. this webcam can't set
+    // manual FOCUS), so the slider stays locked no matter what -- see probe_writable_controls.
+    const locked = !!(v.writable && v.writable[c.key]===false);
+    el.classList.toggle('locked', locked);
+    el.title = locked ? `${c.label} can't be set on this camera (the driver rejects it).` : '';
+    if(au){
+      // Mirror the camera's auto/manual state only UNTIL the user takes control of this control;
+      // afterwards the checkbox is user-owned and the camera read-back never touches it again.
+      // (This webcam keeps reporting AUTOFOCUS=1.0 even after we set it to 0 -- the old code
+      // re-checked the box and disabled the Focus slider a few seconds after the user went manual.)
+      const a=v[c.auto];
+      if(!touchedAt[c.key] && a!=null && document.activeElement!==au){
+        au.checked = c.auto==='auto_exposure' ? !(Math.abs(a-0.25)<0.05) : (a>=0.5);
+      }
+    }
+    sl.disabled = locked || (au ? au.checked : false);   // hardware lock OR the local auto checkbox
+    if(locked){ val.textContent='locked'; return; }      // value read-back is meaningless when locked
+    // Don't fight the user: for ~10s after they last touched a control, leave its slider value
+    // alone -- the read-back can briefly lag the change we just POSTed and would yank it back.
+    if(Date.now()-(touchedAt[c.key]||0) < 10000) return;
+    let raw=v[c.key];
+    if(raw!=null && !document.activeElement.isEqualNode(sl)){ sl.value=raw; val.textContent=Math.round(raw); }
+  });
+}
+
+/* ---------- live stats + species ---------- */
+async function refreshLive(){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ return; }
+  maybeFirstRun(s);
+  if(s.period){ $('#period').textContent=s.period; }
+  if(s.span){ $('#span').textContent=`${s.span.start.slice(0,10)} → ${s.span.end.slice(0,10)}`; }
+  $('#cap-period').textContent=(window.__period||'live');
+  const days=(s.by_day||[]).length;
+  $('#tallies').innerHTML=[
+    ['observations',(s.total_crops||0).toLocaleString(),'obs'],
+    ['visits <small>est</small>',s.total_visits||0,'visits'],
+    ['species',(s.by_class||[]).length,'species'],
+    ['days afield',days,'days'],
+  ].map(([k,n,go])=>`<div class="tally" data-go="${go}"><div class="n">${n}</div><div class="k lbl">${k}</div></div>`).join('');
+  $('#tallies').querySelectorAll('.tally').forEach(el=>el.onclick=()=>goTally(el.dataset.go));
+
+  // Feature the most recent IDENTIFIED visitor; fall back to the newest detection if none are classified yet.
+  renderLatest((s.latest||[]).find(x=>x.species) || (s.latest||[])[0]);
+
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  const sp=(o.species||[]);
+  window.__species=sp;
+  const top=sp.slice(0,3), rare=sp.slice().reverse().filter(x=>!top.includes(x)).slice(0,3);
+  $('#most').innerHTML=top.map((x,i)=>card(x,i+1)).join('')||'<p class="empty">No specimens yet.</p>';
+  $('#least').innerHTML=rare.map(x=>card(x,null)).join('')||'<p class="empty">—</p>';
+  bindCards();
+}
+function timeAgo(iso){
+  if(!iso) return '';
+  const t=new Date(iso).getTime(); if(isNaN(t)) return '';
+  const s=Math.max(0,(Date.now()-t)/1000);
+  if(s<60) return 'just now';
+  if(s<3600){ const m=Math.floor(s/60); return `${m} min ago`; }
+  if(s<86400){ const h=Math.floor(s/3600); return `${h} hr${h>1?'s':''} ago`; }
+  const d=Math.floor(s/86400); return `${d} day${d>1?'s':''} ago`;
+}
+function renderLatest(d){
+  const el=$('#latest'); if(!el) return;
+  if(!d){ el.innerHTML='<p class="empty" style="padding:20px">No visitors logged yet.</p>'; el.onclick=null; return; }
+  // No species yet => the live rig saved it but the classifier (classify.py --watch) hasn't
+  // named it. Show "Identifying…" rather than the coarse detector label ("animal").
+  const name=d.species||(d.detection_class==='animal'?'Identifying…':(d.detection_class||'unknown'));
+  const latin=d.species?latinOf(d.species):'';
+  const conf=(d.species_confidence!=null)?d.species_confidence:null;
+  el.innerHTML=`
+    <div class="latest-eyebrow lbl">Most Recent Visitor</div>
+    <div class="latest-photo playable" style="background-image:url('${d.crop_path?media(d.crop_path):''}')">${d.clip?playBadge(1):''}</div>
+    <div class="latest-info">
+      <div class="latest-name">${esc(cap1(name))}</div>
+      <div class="latest-latin">${esc(latin)}</div>
+      <div class="latest-when"><span>${esc(timeAgo(d.timestamp))}</span>${conf!=null?`<span class="dot">·</span><span class="conf">~${Math.round(conf*100)}%</span>`:''}${d.clip?`<span class="dot">·</span><span>${fmtDur(d.clip.seconds)} clip</span>`:''}</div>
+    </div>`;
+  el.onclick = d.species ? ()=>{ show('cat'); openSheet(d.species); } : null;
+  // The ▶ on the photo plays the clip that was rolling for this visitor; the rest of the card
+  // still opens the species sheet. (No clip => no badge, card behaves as before.)
+  const pb=el.querySelector('[data-play]');
+  if(pb) pb.onclick=(e)=>{ e.stopPropagation(); playClips([d.clip],0,cap1(name)); };
+  flagLatest(d, el);   // async: appends an "off-pattern hour" chip only when behaviour disagrees
+}
+/* Live two-axis awareness (species level): if the most recent visitor arrived OUTSIDE its
+   species' typical window, say so right on the card. Quiet when everything fits — the
+   disagreement is the information (PLAN.md). Windows come from /api/behavior, cached 5 min. */
+let __bwinCache=null, __bwinAt=0;
+async function behaviorWindows(){
+  if(__bwinCache && Date.now()-__bwinAt<300000) return __bwinCache;
+  try{
+    const d=await fetch('/api/behavior').then(r=>r.json());
+    const m={}; (d.species||[]).forEach(s=>{ if(s.typical_window && s.n_visits>=3) m[s.species]=s.typical_window; });
+    __bwinCache=m; __bwinAt=Date.now(); return m;
+  }catch(e){ return __bwinCache||{}; }
+}
+function hourInWin(h,w){ return w.start_hour<=w.end_hour ? (h>=w.start_hour&&h<=w.end_hour) : (h>=w.start_hour||h<=w.end_hour); }
+async function flagLatest(d,el){
+  try{
+    if(!d||!d.species||!d.timestamp) return;
+    const wins=await behaviorWindows(); const w=wins[d.species]; if(!w) return;
+    const h=new Date(d.timestamp).getHours();
+    if(isNaN(h)||hourInWin(h,w)) return;
+    const info=el.querySelector('.latest-info'); if(!info||info.querySelector('.offpat')) return;
+    const f=document.createElement('div'); f.className='offpat';
+    f.style.cssText='margin-top:8px;font-size:12px;color:#d9a441;border:1px solid rgba(217,164,65,.4);border-radius:4px;padding:4px 8px;display:inline-block';
+    f.textContent=`⚑ off-pattern hour — ${nameOf(d.species)} usually ${String(w.start_hour).padStart(2,'0')}–${String(w.end_hour).padStart(2,'0')}h`;
+    info.appendChild(f);
+  }catch(e){ /* a missing chip is never worth breaking the live card */ }
+}
+function card(x,rank){
+  const latin=latinOf(x.species);
+  return `<div class="card" data-sp="${esc(x.species)}" style="animation-delay:${(rank||1)*40}ms">
+    <div class="thumb" style="background-image:url('${x.sample?media(x.sample):''}')">${rank?`<span class="rank">№${rank}</span>`:''}</div>
+    <div class="body">
+      <div class="common">${esc(cap1(x.species))}</div>
+      <div class="latin">${esc(latin)}</div>
+      <div class="meta"><span class="count">${x.count.toLocaleString()}<small> obs</small></span><span class="conf">~${Math.round((x.avg_conf||0)*100)}%</span></div>
+    </div></div>`;
+}
+function bindCards(){ document.querySelectorAll('.card[data-sp]').forEach(c=>c.onclick=()=>{ show('cat'); openSheet(c.dataset.sp); }); }
+
+/* ---------- catalogue + species sheet ---------- */
+async function loadCatalogue(){
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  const sp=o.species||[]; window.__species=sp;
+  $('#cat-count').textContent=`${sp.length} species · ${(o.total||0).toLocaleString()} observations`;
+  $('#catalogue').innerHTML=sp.map((x,i)=>card(x,i+1)).join('')||'<p class="empty">Catalogue is empty.</p>';
+  bindCards();
+}
+let LABELS=[];
+fetch('/api/labels').then(r=>r.json()).then(l=>LABELS=l).catch(()=>{});
+async function openSheet(name){
+  $('#cat-index').style.display='none'; $('#cat-sheet').style.display='block';
+  $('#sheet-name').textContent=cap1(name); $('#sheet-latin').textContent=latinOf(name);
+  $('#sheet-crops').innerHTML='<p class="empty">Loading plates…</p>';
+  let rows; try{ rows=await fetch('/api/species/'+encodeURIComponent(name)).then(r=>r.json()); }catch(e){ rows=[]; }
+  if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">No plates.</p>'; return; }
+  $('#sheet-crops').innerHTML=rows.map(r=>cropTile(r,name)).join('');
+}
+function cropTile(r,name){
+  const v=r.verified; const cls=v===1?'v-1':v===0?'v-0':'';
+  const stamp=v===1?'<span class="stamp v1">✓ confirmed</span>':v===0?'<span class="stamp v0">✗ wrong</span>':'';
+  const opts=['<option value="">— correct to —</option>'].concat(
+    LABELS.map(l=>`<option value="${esc(l)}"${l===name?' selected':''}>${esc(cap1(l))}</option>`),
+    ['<option value="__other__">+ other (type a label)…</option>']).join('');
+  return `<div class="crop ${cls}" data-id="${r.id}">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    ${stamp}
+    <div class="ft"><span class="c">${Math.round((r.confidence||0)*100)}%</span>
+      <span class="acts">
+        <button class="b up" title="confirm" onclick="act(${r.id},'verify',this)">✓</button>
+        <button class="b dn" title="wrong" onclick="act(${r.id},'reject',this)">✗</button>
+        <button class="b" title="correct" onclick="toggleEdit(this)">✎</button>
+      </span></div>
+    <select onchange="correct(${r.id},this.value)">${opts}</select>
+  </div>`;
+}
+function toggleEdit(btn){ btn.closest('.crop').classList.toggle('editing'); }
+async function act(id,action,btn){
+  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+  const crop=btn.closest('.crop');
+  crop.classList.remove('v-1','v-0'); crop.querySelectorAll('.stamp').forEach(s=>s.remove());
+  if(action==='verify'){ crop.classList.add('v-1'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v1">✓ confirmed</span>'); }
+  if(action==='reject'){ crop.classList.add('v-0'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v0">✗ wrong</span>'); crop.classList.add('editing'); }
+}
+async function correct(id,species){
+  if(species==='__other__'){ species=(prompt('New label for this crop (e.g. cat food):')||'').trim(); }
+  if(!species)return;
+  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})});
+  const crop=document.querySelector(`.crop[data-id="${id}"]`);
+  crop.style.transition='opacity .4s'; crop.style.opacity='.25';
+}
+function closeSheet(){ $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
+
+/* ---------- explorer: drill into the field tallies ---------- */
+let exploreStack=[], visitsData=[], obsState=null;
+function goTally(t){
+  if(t==='species'){ show('cat'); return; }   // species => the existing Specimen Catalogue
+  exploreStack=[];
+  explore(t, {}, t==='obs'?'Observations':t==='visits'?'Visits':'Days Afield');
+}
+function explore(screen,params,title,sub){
+  exploreStack.push({screen,params:params||{},title:title||'',sub:sub||''});
+  renderExplore();
+}
+function exploreBack(){ exploreStack.pop(); exploreStack.length?renderExplore():show('live'); }
+function renderExplore(){
+  const cur=exploreStack[exploreStack.length-1]; if(!cur)return;
+  show('explore');
+  $('#explore-title').textContent=cur.title;
+  $('#explore-sub').textContent=cur.sub||'';
+  const body=$('#explore-body'); body.innerHTML='<p class="empty">Loading…</p>';
+  ({obs:renderObs,visits:renderVisits,days:renderDays,day:renderDay}[cur.screen]||(()=>{}))(cur.params,body);
+}
+const fmtDateTime=iso=>{ const d=new Date(iso); return isNaN(d)?iso:d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
+const fmtDay=ymd=>{ const d=new Date(ymd+'T12:00:00'); return isNaN(d)?ymd:d.toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric',year:'numeric'}); };
+
+async function renderObs(params,body){
+  obsState={day:params.day||null,species:params.species||null,start:params.start||null,end:params.end||null,offset:0};
+  body.innerHTML='<div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>';
+  await loadMoreObs();
+}
+async function loadMoreObs(){
+  const s=obsState; if(!s)return;
+  const qs=new URLSearchParams();
+  ['day','species','start','end'].forEach(k=>{ if(s[k]) qs.set(k,s[k]); });
+  qs.set('offset',s.offset); qs.set('limit',60);
+  let o; try{ o=await fetch('/api/crops?'+qs).then(r=>r.json()); }catch(e){ return; }
+  s.offset+=o.crops.length;
+  const grid=$('#obs-grid'); if(!grid)return;
+  grid.insertAdjacentHTML('beforeend', o.crops.map(obsTile).join(''));
+  if(!grid.children.length) grid.innerHTML='<p class="empty">No observations here.</p>';
+  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} total`;
+  if(!s.species) grid.querySelectorAll('.crop[data-sp]').forEach(el=>el.onclick=()=>explore('obs',{species:el.dataset.sp},cap1(el.dataset.sp)));
+  const more=$('#obs-more'); if(more) more.innerHTML = s.offset<o.total ? `<button class="back" onclick="loadMoreObs()">Load more &middot; ${(o.total-s.offset).toLocaleString()} left</button>` : '';
+}
+function obsTile(r){
+  const sp=r.species?cap1(r.species):'unidentified';
+  const conf=r.species_confidence!=null?r.species_confidence:r.confidence;
+  const v=r.verified;
+  return `<div class="crop ${v===1?'v-1':v===0?'v-0':''}"${r.species?` data-sp="${esc(r.species)}"`:''} title="${esc(fmtDateTime(r.timestamp))}">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    <div class="ft"><span class="c">${Math.round((conf||0)*100)}%</span><span class="obs-sp">${esc(sp)}</span></div>
+  </div>`;
+}
+
+async function renderVisits(params,body){
+  const qs=params.day?('?day='+encodeURIComponent(params.day)):'';
+  let o; try{ o=await fetch('/api/visits'+qs).then(r=>r.json()); }catch(e){ body.innerHTML='<p class="empty">Could not load visits.</p>'; return; }
+  visitsData=o.visits||[];
+  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
+  if(!visitsData.length){ body.innerHTML='<p class="empty">No visits.</p>'; return; }
+  body.innerHTML='<div class="cards">'+visitsData.map(visitCard).join('')+'</div>';
+  // A visit with clips plays its video on click (what you asked for); one without falls back to
+  // its crop grid (the old behaviour, for visits before clip recording was on).
+  body.querySelectorAll('[data-vi]').forEach(el=>{ const v=visitsData[+el.dataset.vi];
+    el.onclick=(v.clips&&v.clips.length)
+      ? ()=>playClips(v.clips,0,`${cap1(v.title||'animal')} · ${fmtDateTime(v.start)}`)
+      : ()=>explore('obs',{start:v.start,end:v.end},`Visit · ${cap1(v.title||'animal')}`,fmtDateTime(v.start)); });
+}
+function visitCard(v,i){
+  const nclips=(v.clips||[]).length;
+  const sp=(v.title&&v.title!=='animal')?v.title:'';
+  // The label footer stops click-propagation so using it never triggers the card's play/drill.
+  const footer=`<div class="vlabel" onclick="event.stopPropagation()" style="margin-top:8px;display:flex;flex-direction:column;gap:5px">
+      <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
+        <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+        ${speciesSelect('vsp-'+i,sp)}
+        <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
+      <div style="display:flex;gap:5px;align-items:center">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
+      <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
+    </div>`;
+  return `<div class="card vcard" data-vi="${i}">
+    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
+    <div class="body">
+      <div class="common">${esc(cap1(v.title||'animal'))}</div>
+      <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
+      <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
+      ${footer}
+    </div></div>`;
+}
+function _visitTarget(i){ const v=visitsData[i]||{}; return {source:v.source,start:v.start,end:v.end}; }
+function visitSaved(i,msg){ const s=document.getElementById('vst-'+i); if(s){ s.textContent=msg; s.style.color='var(--ok)'; } }
+function explorerName(i){
+  const inp=document.getElementById('vn-'+i); const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  postVisitLabel(_visitTarget(i),{name},()=>visitSaved(i,'✓ named '+name));
+}
+function explorerSpecies(i){
+  visitSpeciesCorrect(_visitTarget(i),'vsp-'+i,r=>visitSaved(i,'✓ '+nameOf(r.species_set||r.dominant_species||'')));
+}
+
+async function renderDays(params,body){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ body.innerHTML='<p class="empty">Could not load.</p>'; return; }
+  const days=(s.by_day||[]).slice().reverse();
+  $('#explore-sub').textContent=`${days.length} day${days.length===1?'':'s'}`;
+  if(!days.length){ body.innerHTML='<p class="empty">No days yet.</p>'; return; }
+  body.innerHTML='<div class="daygrid">'+days.map(dayCard).join('')+'</div>';
+  body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
+}
+function dayCard(d){
+  const nsp=Object.keys(d.classes||{}).length;
+  return `<div class="daycard" data-day="${esc(d.day)}">
+    <div class="daycard-date">${esc(fmtDay(d.day))}</div>
+    <div class="daycard-stats"><span><b>${(d.crops||0).toLocaleString()}</b> obs</span><span><b>${d.visits||0}</b> visits</span><span><b>${nsp}</b> species</span></div>
+  </div>`;
+}
+
+async function renderDay(params,body){
+  const date=params.date;
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ s={}; }
+  const d=(s.by_day||[]).find(x=>x.day===date)||{crops:0,visits:0,classes:{}};
+  $('#explore-sub').textContent=`${(d.crops||0).toLocaleString()} obs · ${d.visits||0} visits`;
+  const chips=Object.entries(d.classes||{}).map(([sp,n])=>`<button class="chip" data-sp="${esc(sp)}">${esc(cap1(sp))} <i>${n}</i></button>`).join('');
+  body.innerHTML=`
+    <div class="day-summary">
+      <button class="back" id="day-visits">${d.visits||0} visits this day &rarr;</button>
+      ${chips?`<div class="chips">${chips}</div>`:''}
+    </div>
+    <div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>`;
+  const dv=$('#day-visits'); if(dv) dv.onclick=()=>explore('visits',{day:date},`Visits · ${fmtDay(date)}`);
+  body.querySelectorAll('.chip[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
+  obsState={day:date,species:null,start:null,end:null,offset:0};
+  await loadMoreObs();
+}
+
+/* ---------- shared: species glyphs (calendar + dispatch) ---------- */
+// Non-visitor human-correction labels -- mirror of stats._NON_CRITTER. Hidden from glances.
+const NONCRITTER=new Set(['bricks','brick','blur','blurry','cat food','catfood','food','homeowner',
+  'door','porch','broom','chair','fence','wall','table','plant','pot','hose','shadow','reflection','leaf','leaves',
+  'rock','stick','sticks','ground','tree','bush','person','people','human','vehicle','car','unknown','unidentified',
+  'nothing','empty','none','background','n/a','na','','not an animal']);
+// The server (stats._NON_CRITTER) is the source of truth: merge its list in on load so this set
+// never drifts out of sync with the backend. The literal above is only a fallback if the fetch fails.
+fetch('/api/denylist').then(r=>r.json()).then(a=>{(a||[]).forEach(x=>NONCRITTER.add(String(x).toLowerCase()))}).catch(()=>{});
+const GLYPH_MAP={'raccoon':'🦝','domestic cat':'🐱','cat':'🐱','brown rat':'🐀','rat':'🐀',
+  'eastern cottontail':'🐰','american crow':'🐦‍⬛','animal':'🐾'};
+// {e:emoji} where a clear one exists, else {m:monogram} -- so any species the classifier emits
+// still renders. Opossum has no emoji, so it gets a small-caps monogram.
+function glyphInfo(sp){
+  const k=(sp||'').toLowerCase().replace(/’/g,"'");
+  if(GLYPH_MAP[k]) return {e:GLYPH_MAP[k]};
+  if(/squirrel|chipmunk/.test(k)) return {e:'🐿️'};
+  if(k.includes('opossum')) return {m:'Op'};
+  if(/sparrow|finch|wren|warbler|junco|towhee|thrush|jay|crow|raven|robin|starling|flicker|pigeon|dove|chickadee|hummingbird|waxwing|siskin|bushtit|nuthatch|woodpecker|blackbird|grosbeak|kinglet|tanager|swallow|\bbird\b/.test(k)) return {e:'🐦'};
+  if(/\brat\b|mouse|vole|mole|shrew/.test(k)) return {e:'🐀'};
+  if(/rabbit|cottontail|hare/.test(k)) return {e:'🐰'};
+  if(/coyote|fox|\bdog\b/.test(k)) return {e:'🐾'};
+  if(/deer|elk/.test(k)) return {e:'🦌'};
+  if(/skunk/.test(k)) return {e:'🦨'};
+  const m=k.split(/[\s-]+/).slice(0,2).map(w=>w[0]||'').join('').toUpperCase()||'?';
+  return {m};
+}
+const glyphHTML=g=>g.e?g.e:`<b class="mono-gl">${esc(g.m)}</b>`;
+const nameOf=sp=>sp==='animal'?'Unidentified':cap1(sp);
+const fmtHourJS=h=>`${(h%12)||12}${h<12?'am':'pm'}`;
+const fmtClock=iso=>{ const d=new Date(iso); return isNaN(d)?'':d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}); };
+
+/* ---------- The Dispatch (period digest) ---------- */
+let dispatchEdition='auto';
+function setDispatch(ed){ dispatchEdition=ed; loadDispatch(); }
+async function loadDispatch(){
+  const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the dispatch…</p>';
+  let d; try{ d=await fetch('/api/digest?edition='+dispatchEdition).then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
+  renderDispatch(d);
+}
+function dispatchHeader(d){
+  const ed=d.edition;
+  const masthead = ed==='night' ? 'The Morning Dispatch' : ed==='day' ? 'The Evening Dispatch' : 'The Dispatch';
+  const range = d.start ? `${fmtDateTime(d.start)} – ${fmtDateTime(d.end)}` : '';
+  return `<div class="dsp-head">
+    <div>
+      <div class="dsp-title">${esc(masthead)}<span style="color:var(--gilt)"> · </span>${esc(d.title||'')}</div>
+      <div class="dsp-sub">${esc(range)}${d.backed_off?' · last period with activity':''}</div>
+    </div>
+    <div class="dsp-toggle">
+      <button class="${ed==='night'?'on':''}" onclick="setDispatch('night')">☾ Night</button>
+      <button class="${ed==='day'?'on':''}" onclick="setDispatch('day')">☀ Day</button>
+    </div>
+  </div>`;
+}
+function renderDispatch(d){
+  const body=$('#dispatch-body');
+  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`; return; }
+  let html=dispatchHeader(d);
+  const flags=[];
+  (d.novel||[]).forEach(sp=>{ const s=(d.species||[]).find(x=>x.species===sp); const n=s&&s.novelty;
+    const lead = n&&n.first_ever ? 'First ever recorded' : (n&&n.days_since ? `First in ${n.days_since} days` : 'Notable');
+    flags.push(`<span class="flag new">❋ ${lead}: ${esc(nameOf(sp))}</span>`); });
+  (d.quiet||[]).forEach(q=>{ flags.push(`<span class="flag quiet">— No ${esc(nameOf(q.species))} this ${esc(d.edition)} (usually ${Math.round(q.frac*100)}% of ${esc(d.edition)}s)</span>`); });
+  if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
+  if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
+  if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`; return; }
+  // Highlight reel — the night's clips, played back-to-back. Poster is the sharpest still
+  // (the plate); the filmstrip lets you jump straight to any moment.
+  window.__reel=d.reel||[];
+  if(window.__reel.length){
+    const total=window.__reel.reduce((a,c)=>a+(c.seconds||0),0);
+    const poster=(d.plate&&d.plate.crop_path)||window.__reel[0].thumb;
+    html+=`<h2 class="sec">Highlight Reel <span class="n">${window.__reel.length} clip${window.__reel.length>1?'s':''} · ${fmtDur(total)}</span></h2>`;
+    html+=`<div class="panel reelhero" id="reelhero" style="background-image:url('${poster?media(poster):''}')">
+      <div class="big-play">&#9654;</div>
+      <div class="scrim">
+        <div class="rh-eyebrow lbl">Watch the ${d.edition==='night'?'night':'day'}</div>
+        <div class="rh-title">The visitors, in sequence</div>
+        <div class="rh-meta">${window.__reel.length} clips · ${fmtDur(total)} of footage · press play</div>
+      </div></div>`;
+    html+=`<div class="filmstrip" id="dsp-strip">`+window.__reel.map((c,i)=>`
+      <div class="fs" data-i="${i}"><div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
+        <div class="lab">${esc(fmtClock(c.start))} · ${esc(nameOf(c.species||'·'))}</div></div>`).join('')+`</div>`;
+  }
+  if(d.plate){ const p=d.plate;
+    html+=`<div class="panel hero">
+      <div class="hero-photo playable" style="background-image:url('${p.crop_path?media(p.crop_path):''}')">${p.clip?playBadge(1):''}</div>
+      <div class="hero-info">
+        <div class="hero-eyebrow lbl">Plate of the ${d.edition==='night'?'Night':'Day'}</div>
+        <div class="hero-name">${esc(nameOf(p.species))}</div>
+        <div class="hero-latin">${esc(latinOf(p.species))}</div>
+        <div class="hero-meta">${esc(fmtClock(p.time))}<br><span class="c">~${Math.round((p.conf||0)*100)}%</span> · sharpest frame</div>
+      </div></div>`;
+  }
+  const t=[['visits',(d.visits||0).toLocaleString()],['species',(d.species||[]).length],
+    ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
+  if(d.moon) t.push(['moon',d.moon.illum_pct+'%']);
+  html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
+  window.__rollClips=(d.species||[]).map(s=> s.clip?{...s.clip, species:s.species}:null);
+  html+=`<h2 class="sec">The Roll <span class="n">${(d.species||[]).length} species</span></h2>`;
+  html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
+  body.innerHTML=html;
+  body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
+  // Reel: the hero plays the whole thing; each filmstrip cell jumps straight to that clip.
+  const rh=$('#reelhero'); if(rh) rh.onclick=()=>playClips(window.__reel,0,'Highlight Reel — '+(d.title||''));
+  const ds=$('#dsp-strip'); if(ds) ds.querySelectorAll('.fs').forEach(el=>el.onclick=()=>playClips(window.__reel,+el.dataset.i,'Highlight Reel — '+(d.title||'')));
+  // ▶ on the plate (when a clip caught the sharpest frame) and on each roll row.
+  const pp=body.querySelector('.hero-photo .play-badge'); if(pp&&d.plate&&d.plate.clip) pp.onclick=(e)=>{ e.stopPropagation(); playClips([d.plate.clip],0,nameOf(d.plate.species)); };
+  body.querySelectorAll('.entry .play-badge[data-ci]').forEach(el=>el.onclick=(e)=>{ e.stopPropagation(); const c=(window.__rollClips||[])[+el.dataset.ci]; if(c) playClips([c],0,nameOf(c.species||'')); });
+}
+function entryRow(s,i){
+  const n=s.novelty||{}, badges=[];
+  if(n.first_ever) badges.push('<span class="badge new">New</span>');
+  else if((n.days_since||0)>=3) badges.push(`<span class="badge gap">first in ${n.days_since}d</span>`);
+  if((s.streak||0)>=3) badges.push(`<span class="badge streak">${s.streak} in a row</span>`);
+  const active=new Set(s.active_hours||[]);
+  const hrs=s.hours||[], max=Math.max(1,...hrs);
+  const clock=hrs.map((c,h)=>{const ht=c?Math.max(2,Math.round(Math.sqrt(c/max)*18)):1;return `<span class="hbar${active.has(h)?' on':''}" style="height:${ht}px" title="${fmtHourJS(h)}: ${c}"></span>`;}).join('');
+  const g=glyphInfo(s.species), clickable=s.species!=='animal';
+  return `<div class="entry"${clickable?` data-sp="${esc(s.species)}"`:' style="cursor:default"'}>
+    <div class="entry-thumb${s.clip?' playable':''}" style="background-image:url('${s.rep_crop?media(s.rep_crop):''}')">${s.clip?`<span class="play-badge sm" data-ci="${i}"></span>`:''}</div>
+    <div class="entry-main">
+      <div class="entry-name"><span class="gx">${glyphHTML(g)}</span> ${esc(nameOf(s.species))} <span class="latin">${esc(latinOf(s.species))}</span></div>
+      <div class="entry-when">${fmtClock(s.first)}–${fmtClock(s.last)}${s.typical?` · <span class="typ">usually ${esc(s.typical)}</span>`:''}</div>
+      ${badges.length?`<div class="badges">${badges.join('')}</div>`:''}
+    </div>
+    <div class="entry-right">
+      <div class="entry-count">${s.visits}<small> visit${s.visits===1?'':'s'}</small></div>
+      <div class="clock" title="all-time activity by hour; gold = this period">${clock}</div>
+    </div>
+  </div>`;
+}
+
+/* ---------- Calendar ---------- */
+let calYear=null, calMonth=null, calByDay={};
+const ymdLocal=dt=>{const p=n=>String(n).padStart(2,'0');return dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate());};
+/* ---------- behaviour (phase 4: visits, profiles, the two-axis read-out) ---------- */
+async function loadBehavior(){
+  const body=$('#behavior-body'); body.innerHTML='<p class="empty">Reading the field notes…</p>';
+  let d; try{ d=await fetch('/api/behavior').then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load behaviour.</p>'; return; }
+  renderBehavior(d);
+}
+function behaviorClock(hours, win){
+  const max=Math.max(1,...hours);
+  const inWin=h=> win ? (win.start_hour<=win.end_hour ? (h>=win.start_hour&&h<=win.end_hour)
+                                                       : (h>=win.start_hour||h<=win.end_hour)) : false;
+  return hours.map((c,h)=>{ const ht=c?Math.max(2,Math.round(Math.sqrt(c/max)*18)):1;
+    return `<span title="${fmtHourJS(h)}: ${c} visit(s)" style="display:inline-block;width:4px;height:${ht}px;`
+      +`background:${inWin(h)?'var(--gilt,#c8a45a)':'rgba(255,255,255,.22)'}"></span>`; }).join('');
+}
+function renderBehavior(d){
+  const body=$('#behavior-body');
+  if(!d || d.need_rebuild){ body.innerHTML='<p class="empty">No visits yet — they appear here as animals come and go (the visit ledger refreshes automatically when the app stops).</p>'; return; }
+  if(!d.visits){ body.innerHTML='<p class="empty">No visits recorded yet.</p>'; return; }
+  const flags=(d.flags||[]).filter(f=>f.verdict==='DISAGREES');
+  let html=`<div class="tallies">
+    <div class="tally" style="cursor:default"><div class="n">${d.visits.toLocaleString()}</div><div class="k lbl">visits</div></div>
+    <div class="tally" style="cursor:default"><div class="n">${d.species.length}</div><div class="k lbl">species</div></div>
+    <div class="tally" style="cursor:default"><div class="n">${flags.length}</div><div class="k lbl">off-pattern</div></div></div>`;
+  if(flags.length){
+    html+=`<h2 class="sec">Off-Pattern <span class="n">appearance vs behaviour</span></h2>`;
+    html+=`<div class="lede">`+flags.map(f=>
+      `<span class="flag quiet">⚑ ${esc(nameOf(f.species))} at ${esc((f.started_at||'').slice(11,16))} — ${esc((f.notes&&f.notes[0])||'unusual')}</span>`
+    ).join('')+`</div>`;
+  }
+  html+=`<h2 class="sec">Field Notes <span class="n">${d.species.length} species</span></h2>`;
+  html+=`<div style="display:flex;flex-direction:column;gap:8px">`+d.species.map(s=>{
+    const hours=Array.from({length:24},(_,h)=>s.arrival_hours[h]||s.arrival_hours[String(h)]||0);
+    const win=s.typical_window;
+    const wtxt=win?`${String(win.start_hour).padStart(2,'0')}–${String(win.end_hour).padStart(2,'0')}h`:'—';
+    const dwell=s.dwell_median_s>=60?Math.round(s.dwell_median_s/60)+'m':Math.round(s.dwell_median_s)+'s';
+    return `<div class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px">
+      <div><div style="font-weight:600">${esc(nameOf(s.species))}</div>
+        <div class="lbl" style="opacity:.72">${s.n_visits} visits · ${s.visits_per_day}/day · dwell ~${dwell} · usually ${wtxt}</div></div>
+      <div style="display:flex;align-items:flex-end;gap:1px;height:20px" title="arrivals by hour (0–23h); highlighted = typical window">${behaviorClock(hours,win)}</div>
+    </div>`;
+  }).join('')+`</div>`;
+  if((d.co_occurrence||[]).length){
+    html+=`<h2 class="sec">Seen Together <span class="n">who shares a visit</span></h2>`;
+    html+=`<div class="lede">`+d.co_occurrence.map(c=>
+      `<span class="flag">${esc(nameOf(c.a))} + ${esc(nameOf(c.b))} · ${c.n}</span>`).join('')+`</div>`;
+  }
+  body.innerHTML=html;
+}
+
+/* ---------- individuals (phase 3: suggest-confirm loop + hand-label the clusters) ---------- */
+async function loadIndividuals(){
+  const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
+  let d=null,q=null;
+  try{
+    [q,d]=await Promise.all([
+      fetch('/api/reid/queue').then(r=>r.json()).catch(()=>null),
+      fetch('/api/individuals').then(r=>r.json())]);
+  }catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
+  renderIndividuals(d,q);
+}
+
+/* The review queue: every recent visit gets a "who is this?" suggestion; you confirm or
+   correct. Each confirmation becomes a new appearance template, so suggestions sharpen as the
+   cast grows. Before anything is confirmed, name the bootstrap visit-GROUPS instead. */
+let REID_BOOT=[];
+function reidWhen(ts){ return ts? ts.slice(5,16).replace('T',' ') : '?'; }
+function reidInput(id,ph){ return `<input id="${id}" placeholder="${ph}" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit" onkeydown="if(event.key==='Enter')this.nextElementSibling.click()">`; }
+function reidCard(v){
+  const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
+  const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
+  const multiEv=[v.co_present_frames? `${v.co_present_frames} still frame(s)`:'', v.co_present_clips? `${v.co_present_clips} clip(s)`:''].filter(Boolean).join(' + ');
+  const multi=v.multi? `<span class="flag" style="background:rgba(255,170,60,.16);border-color:rgba(255,170,60,.4)" title="${multiEv||'two animals'} show two animals at once — co-arrival is behaviour signal; the appearance suggestion is a blend">2+ animals</span>` : '';
+  let sugg='', act='';
+  if(v.confirmed_as){
+    sugg=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(v.confirmed_as)} ✓</span>`;
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},null,true)" title="unconfirm this visit">Clear</button>`;
+  }else if((v.candidates||[]).length){
+    const top=v.candidates[0];
+    const rest=v.candidates.slice(1).map(c=>`${esc(c.name)} ${Math.round(c.similarity*100)}%`).join(' · ');
+    sugg=`<span class="flag" title="nearest confirmed visit: #${top.via_visit} (${reidWhen(top.via_started)})">looks like <b>${esc(top.name)}</b> ${Math.round(top.similarity*100)}%</span>`
+        +(v.novel? `<span class="flag" style="background:rgba(255,120,90,.14);border-color:rgba(255,120,90,.4)" title="best match is below the novelty threshold">possibly someone new</span>`:'')
+        +(rest? `<span class="lbl" style="opacity:.6">${rest}</span>`:'');
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(top.name)})" title="yes, it's ${esc(top.name)}">✓ ${esc(top.name)}</button>
+         ${reidInput('rq-'+v.visit_id,'or who…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
+  }else{
+    sugg=`<span class="lbl" style="opacity:.65">${esc(v.note||'no suggestion yet')}</span>`;
+    act=`${reidInput('rq-'+v.visit_id,'who is this…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
+  }
+  // Clip-space match: a SEPARATE signal from the un-blended tracklets — the only way a never-solo
+  // pair member (Elliot) gets named in a new visit. Shown distinctly; offers a confirm when it's
+  // the only suggestion on offer.
+  const clipTop=(v.clip_candidates||[])[0];
+  const clipSugg=clipTop?`<span class="flag" style="background:rgba(120,160,220,.16);border-color:rgba(120,160,220,.45)" title="clip-space appearance match (from un-blended individuals) — a separate signal from the still match">clip-match <b>${esc(clipTop.name)}</b> ${Math.round(clipTop.similarity*100)}%</span>`:'';
+  if(clipTop && !v.confirmed_as && !(v.candidates||[]).length){
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(clipTop.name)})" title="confirm from the clip-space match">✓ ${esc(clipTop.name)}</button> `+act;
+  }
+  const sp=v.species||'raccoon', spId='rqsp-'+v.visit_id;
+  const spRow=`<div style="display:flex;gap:6px;align-items:center;margin-top:8px;border-top:1px solid var(--rule);padding-top:8px;flex-wrap:wrap">
+    <span class="lbl" style="opacity:.72">species: <b>${esc(nameOf(sp))}</b></span>
+    <button class="gear" onclick="postVisitLabel({visit_id:${v.visit_id}},{verify:true},loadIndividuals)" title="confirm this species for the whole visit">✓</button>
+    ${speciesSelect(spId,sp)}
+    <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
+  const ub=v.multi?`<div style="margin-top:8px"><button class="gear" onclick="toggleUnblend(${v.visit_id})" title="separate the two animals using the clips, then name each">⚖ un-blend the animals</button>
+    <div id="ub-${v.visit_id}" style="display:none;margin-top:8px"></div></div>`:'';
+  return `<div class="panel" style="padding:10px 14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      ${thumb}
+      <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
+        <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi}</div>
+      <div style="display:flex;gap:6px;align-items:center">${act}</div>
+    </div>
+    ${spRow}
+    ${ub}
+  </div>`;
+}
+/* Un-blend: cluster a pair visit's clip tracklets into the two animals, name each. The labels
+   land on the tracklets (clip-space), giving the pair member who is never solo a clean template. */
+let REID_UNBLEND={};
+async function toggleUnblend(vid){
+  const box=document.getElementById('ub-'+vid); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; await renderUnblend(vid);
+}
+async function renderUnblend(vid){
+  const box=document.getElementById('ub-'+vid); if(!box) return;
+  box.innerHTML='<p class="lbl" style="opacity:.7">Separating the animals from the clips…</p>';
+  let d; try{ d=await fetch('/api/reid/unblend?visit_id='+vid).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
+  REID_UNBLEND[vid]=d.groups||[];
+  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
+  const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
+  const hint=anySugg
+    ? `The two biggest groups are usually the pair. ✓ a clip-match to confirm, or correct it — each label sharpens the next visit.`
+    : `The two biggest groups are usually the pair — name each clean single animal. Once you've named both pair members once, future pair visits will <b>auto-suggest</b> them from the clips.`;
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
+    +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
+}
+function reidUnblendGroup(vid,g,i){
+  const thumbs=(g.rep_crops||[]).slice(0,8).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('')
+    || '<span class="lbl" style="opacity:.5">no thumbnails yet — they appear once this visit&rsquo;s clips have been processed.</span>';
+  const lab=g.label?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(g.label)} ✓</span>`:'';
+  const iid='ubn-'+vid+'-'+i;
+  const top=(g.suggestion||[])[0];
+  const sugg=(!g.label&&top)?`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(top.name)})" title="clip-space match — confirm this group is ${esc(top.name)}">✓ ${esc(top.name)} ${Math.round(top.similarity*100)}%</button>`:'';
+  return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
+    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
+    <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${lab}${sugg}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
+  </div>`;
+}
+function reidUnblendConfirm(vid,i,name){
+  const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json()).then(r=>{
+      if(r.error){ alert(r.error); return; } renderUnblend(vid);
+    }).catch(e=>alert('Could not save: '+e));
+}
+async function reidUnblendLabel(vid,i){
+  const inp=document.getElementById('ubn-'+vid+'-'+i); const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  try{
+    const r=await fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    renderUnblend(vid);
+  }catch(e){ alert('Could not save: '+e); }
+}
+function reidBootCard(g,i){
+  const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;
+  const nmulti=(g.multi||[]).filter(Boolean).length;
+  const thumbs=(g.crops||[]).slice(0,6).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">look-alike group ${i+1}</div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti? ` · ${nmulti}× 2+ animals`:''}</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${reidInput('rg-'+i,'name this individual…')}<button class="gear" onclick="reidNameGroup(${i})">Name all</button></div>
+  </div>`;
+}
+/* Re-fit: once a cast exists, sort the unconfirmed remainder into "looks like <name>" buckets
+   (bulk-confirm) and candidate-new-individual groups, and flag anyone named only on a pair visit. */
+let REID_REFIT=null;
+function reidFitCard(name,bucket){
+  const vs=bucket.visits||[];
+  const thumbs=vs.slice(0,8).map(x=>x.rep_crop?
+    `<img src="/media/${encodeURI(x.rep_crop)}" loading="lazy" title="visit #${x.visit_id} · ${Math.round(x.similarity*100)}%" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`:'').join('');
+  const lo=Math.round(vs[vs.length-1].similarity*100), hi=Math.round(vs[0].similarity*100);
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:150px"><div style="font-weight:600">looks like ${esc(name)}</div>
+      <div class="lbl" style="opacity:.72">${vs.length} unconfirmed visit(s) · ${lo}–${hi}% match</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="gear" onclick="reidConfirmFit(${jarg(name)})" title="confirm all ${vs.length} visits as ${esc(name)}">✓ All ${vs.length} as ${esc(name)}</button></div>
+  </div>`;
+}
+function reidNovelCard(g,i){
+  const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;
+  const nmulti=(g.multi||[]).filter(Boolean).length;
+  const thumbs=(g.crops||[]).slice(0,8).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('');
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">possible new individual ${i+1}</div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti?` · ${nmulti}× 2+ animals`:''}</div></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+    <div style="display:flex;gap:6px;align-items:center">${reidInput('rn-'+i,'name…')}<button class="gear" onclick="reidNameNovel(${i})">Name all</button></div>
+  </div>`;
+}
+function reidRefitHTML(refit){
+  if(!refit) return '';
+  const fitNames=Object.keys(refit.fits||{});
+  if(!fitNames.length && !(refit.novel_groups||[]).length && !(refit.untemplated||[]).length) return '';
+  let html=`<h2 class="sec">Fit to the Cast <span class="n">sort the rest by who they resemble — confirm in bulk</span></h2>`;
+  if((refit.untemplated||[]).length){
+    html+=`<p class="lbl" style="margin:2px 0 10px;color:var(--rust)">⚠ ${refit.untemplated.map(esc).join(', ')} ${refit.untemplated.length>1?'were':'was'} confirmed only on a <b>multi-animal visit</b>, so the appearance template is a blend of two raccoons and can't be matched. Confirm a <b>solo</b> visit for ${refit.untemplated.length>1?'each':'them'} (find one in the queue below without a “2+ raccoons” badge) to make ${refit.untemplated.length>1?'them':'it'} findable.</p>`;
+  }
+  if(fitNames.length){
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">${
+      fitNames.sort((a,b)=>refit.fits[b].visits.length-refit.fits[a].visits.length)
+        .map(n=>reidFitCard(n,refit.fits[n])).join('')}</div>`;
+  }
+  if((refit.novel_groups||[]).length){
+    html+=`<p class="lbl" style="opacity:.75;margin:8px 0 6px">Looks like nobody on file yet — ${refit.n_novel} visit(s) clustered into candidate new individuals:</p>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${refit.novel_groups.map(reidNovelCard).join('')}</div>`;
+  }
+  return html;
+}
+function reidQueueHTML(q){
+  if(!q||(!q.queue.length&&!q.bootstrap.length&&!q.refit)) return '';
+  let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
+  if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops aren't analysed for appearance yet — naming suggestions sharpen once the re-ID step has run (see the README's “Individual re-identification”).</p>`;
+  if(q.bootstrap.length){
+    html+=`<p class="lbl" style="opacity:.75;margin:4px 0 10px">Nothing confirmed yet, so here are the corpus' look-alike <b>visit groups</b> (each is probably one animal — your eye decides; skip the 2+-animal ones first pass). Naming a group confirms every visit in it.</p>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${q.bootstrap.map(reidBootCard).join('')}</div>`;
+  }
+  html+=reidRefitHTML(q.refit);
+  if(q.queue.length){
+    const cast=(q.cast||[]).map(c=>`<span class="flag">${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}</span>`).join(' ');
+    if(cast) html+=`<h2 class="sec">Visit-by-Visit <span class="n">${q.queue.length} recent</span></h2><div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`;
+  }
+  return html;
+}
+/* Shared per-visit labelling (species confirm/correct + individual name), used by BOTH the
+   "Who is this?" queue (targets a visit_id) and the Explorer Visits list (targets a
+   source+start+end span). One backend: POST /api/visit/label. */
+function speciesSelect(id, current){
+  const opts=['<option value="">— correct species… —</option>']
+    .concat(LABELS.map(l=>`<option value="${esc(l)}"${l===current?' selected':''}>${esc(cap1(l))}</option>`),
+            ['<option value="__other__">+ other…</option>']).join('');
+  return `<select id="${id}" style="padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit;font:inherit;max-width:150px">${opts}</select>`;
+}
+async function postVisitLabel(target, body, after){
+  try{
+    const r=await fetch('/api/visit/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(Object.assign({}, target, body))}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    if(after) after(r);
+  }catch(e){ alert('Could not save: '+e); }
+}
+function visitSpeciesCorrect(target, selectId, after){
+  const sel=document.getElementById(selectId); if(!sel) return;
+  let sp=sel.value;
+  if(sp==='__other__'){ sp=(prompt('New species label (e.g. striped skunk):')||'').trim(); }
+  if(!sp) return;
+  postVisitLabel(target, {species:sp}, after);
+}
+async function reidConfirmMany(visitIds,name){
+  try{
+    for(const vid of visitIds)
+      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({visit_id:vid,name})});
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+async function reidConfirmFit(name){
+  const b=REID_REFIT&&REID_REFIT.fits&&REID_REFIT.fits[name]; if(!b) return;
+  const ids=b.visits.map(x=>x.visit_id);
+  if(!confirm(`Confirm all ${ids.length} visits as ${name}?`)) return;
+  reidConfirmMany(ids,name);
+}
+async function reidNameNovel(i){
+  const inp=document.getElementById('rn-'+i);
+  const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=REID_REFIT&&REID_REFIT.novel_groups&&REID_REFIT.novel_groups[i]; if(!g) return;
+  reidConfirmMany(g.visits,name);
+}
+async function reidConfirm(vid,name,clear){
+  if(clear&&!confirm('Unconfirm this visit?')) return;
+  if(!clear&&!name){
+    const inp=document.getElementById('rq-'+vid);
+    name=(inp&&inp.value||'').trim();
+    if(!name){ if(inp) inp.focus(); return; }
+  }
+  try{
+    const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({visit_id:vid,name:clear?null:name})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+async function reidNameGroup(i){
+  const inp=document.getElementById('rg-'+i);
+  const name=(inp&&inp.value||'').trim();
+  if(!name){ if(inp) inp.focus(); return; }
+  const g=REID_BOOT[i]; if(!g) return;
+  try{
+    for(const vid of g.visits)
+      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({visit_id:vid,name})});
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+function indivRow(g){
+  const span=(g.first_seen&&g.last_seen)?`${g.first_seen.slice(5,10)} → ${g.last_seen.slice(5,10)}`:'';
+  const thumbs=(g.crops||[]).map(c=>
+    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+  const act = g.placeholder
+    ? `<input id="nm-${esc(g.id)}" placeholder="name… (e.g. Notch)" style="width:130px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">
+       <button class="gear" onclick="nameIndiv('${esc(g.id)}')">Name</button>`
+    : `<button class="gear" onclick="togglePoses('${esc(g.id)}')" title="cluster this individual's crops into characteristic poses">Poses</button>
+       <button class="gear" onclick="toggleClips('${esc(g.id)}')" title="watch this individual's behaviour clips">Clips</button>
+       <button class="gear" onclick="nameIndiv('${esc(g.id)}')" title="rename">Rename</button>
+       <button class="gear" onclick="clearIndiv('${esc(g.id)}')" title="unassign these crops">Clear</button>
+       <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:90px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
+  return `<div class="panel" style="padding:10px 14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
+        <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div></div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
+      <div style="display:flex;gap:6px;align-items:center">${act}</div>
+    </div>
+    ${g.placeholder?'':`<div id="poses-${esc(g.id)}" style="display:none;margin-top:10px;border-top:1px solid var(--rule);padding-top:10px"></div>
+    <div id="clips-${esc(g.id)}" style="display:none;margin-top:10px;border-top:1px solid var(--rule);padding-top:10px"></div>`}
+  </div>`;
+}
+async function toggleClips(name){
+  const box=document.getElementById('clips-'+name); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; box.innerHTML='<p class="lbl" style="opacity:.7">Gathering '+esc(name)+"'s clips…</p>";
+  let d; try{ d=await fetch('/api/reid/clips?individual='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not load clips.</p>'; return; }
+  const clips=d.clips||[];
+  if(!clips.length){ box.innerHTML='<p class="lbl" style="opacity:.7">No clips overlap '+esc(name)+"'s visits yet.</p>"; return; }
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:8px">${esc(name)}'s footage — ${d.n_clips} clip(s), newest first. ⚠ marks clips during a 2+-animal visit (shows ${esc(name)} with another).</div>`
+    +`<div style="display:flex;flex-wrap:wrap;gap:12px">`+clips.map(c=>
+      `<div style="flex:0 0 auto;width:240px"><video src="/media/${encodeURI(c.clip_path)}" controls preload="metadata" style="width:240px;border-radius:5px;background:#000"></video>`
+      +`<div class="lbl" style="opacity:.6;font-family:var(--mono);font-size:11px;margin-top:2px">${reidWhen(c.started_at)}${c.duration_s?` · ${Math.round(c.duration_s)}s`:''}${c.multi?' · ⚠ 2+':''}</div></div>`).join('')
+    +`</div>`;
+}
+async function togglePoses(name){
+  const box=document.getElementById('poses-'+name); if(!box) return;
+  if(box.style.display!=='none'){ box.style.display='none'; return; }
+  box.style.display=''; box.innerHTML='<p class="lbl" style="opacity:.7">Clustering '+esc(name)+"'s poses…</p>";
+  let d; try{ d=await fetch('/api/reid/poses?individual='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ box.innerHTML='<p class="lbl">Could not load poses.</p>'; return; }
+  const poses=d.poses||[];
+  if(!poses.length){ box.innerHTML='<p class="lbl" style="opacity:.7">Not enough embedded crops to cluster poses yet.</p>'; return; }
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:8px">${esc(name)}'s characteristic poses — ${d.n_groups} group(s) of crops that share a body posture/viewpoint (the biggest ${poses.length} shown):</div>`
+    +`<div style="display:flex;flex-wrap:wrap;gap:14px">`+poses.map((p,i)=>
+      `<div style="flex:0 0 auto"><div class="lbl" style="opacity:.6;font-family:var(--mono);font-size:11px;margin-bottom:3px">pose ${i+1} · ${p.n} crops</div>`
+      +`<div style="display:flex;gap:3px;flex-wrap:wrap;max-width:300px">`+(p.rep_crops||[]).map(c=>
+        `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:60px;height:60px;object-fit:cover;border-radius:4px">`).join('')+`</div></div>`).join('')
+    +`</div>`;
+}
+function renderIndividuals(d,q){
+  const body=$('#indiv-body');
+  REID_BOOT=(q&&q.bootstrap)||[];
+  REID_REFIT=(q&&q.refit)||null;
+  const queueHTML=reidQueueHTML(q);
+  const groups=(d&&d.groups)||[];
+  if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals to name yet. As more animals visit, look-alike groups will appear here for you to name — this is the slowest part, since it needs a good number of clear photos first.</p>'; return; }
+  if(!groups.length){ body.innerHTML=queueHTML; return; }
+  const named=groups.filter(g=>!g.placeholder), prop=groups.filter(g=>g.placeholder);
+  let html=queueHTML;
+  if(named.length){
+    html+=`<h2 class="sec">The Cast <span class="n">${named.length} named</span></h2>`;
+    html+=`<div style="display:flex;flex-direction:column;gap:8px">${named.map(indivRow).join('')}</div>`;
+  }
+  html+=`<h2 class="sec">Crop-Level Look-Alike Clusters <span class="n">${prop.length} proposed — the visit queue above is the sharper tool</span></h2>`;
+  html+=`<p class="lbl" style="opacity:.75;margin:4px 0 14px">Each group is a set of crops that LOOK alike (appearance clustering — proposals, not certainties).
+    Naming a group adds it to the cast; giving two groups the same name merges them. Through-glass appearance is weak — when unsure, leave it unnamed.</p>`;
+  html+=`<div style="display:flex;flex-direction:column;gap:8px">${prop.slice(0,30).map(indivRow).join('')}</div>`;
+  if(prop.length>30) html+=`<p class="empty">…and ${prop.length-30} smaller groups (name the big ones first).</p>`;
+  body.innerHTML=html;
+}
+async function nameIndiv(from){
+  const inp=document.getElementById('nm-'+from);
+  const to=(inp&&inp.value||'').trim();
+  if(!to){ if(inp) inp.focus(); return; }
+  await postIndiv(from,to);
+}
+async function clearIndiv(from){
+  if(!confirm(`Unassign all crops labelled "${from}"?`)) return;
+  await postIndiv(from,null);
+}
+async function postIndiv(from,to){
+  try{
+    const r=await fetch('/api/individual',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({from,to})}).then(r=>r.json());
+    if(r.error){ alert(r.error); return; }
+    loadIndividuals();
+  }catch(e){ alert('Could not save: '+e); }
+}
+
+async function loadCalendar(){
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }
+  catch(e){ $('#calendar-body').innerHTML='<p class="empty">Could not load the calendar.</p>'; return; }
+  calByDay={}; (s.by_day||[]).forEach(d=>{ calByDay[d.day]=d; });
+  if(calYear==null){
+    const days=Object.keys(calByDay).sort();
+    const base=days.length?new Date(days[days.length-1]+'T12:00:00'):new Date();
+    calYear=base.getFullYear(); calMonth=base.getMonth();
+  }
+  renderCalendar();
+}
+function calNav(delta){ calMonth+=delta; if(calMonth<0){calMonth=11;calYear--;} else if(calMonth>11){calMonth=0;calYear++;} renderCalendar(); }
+function glyphsForDay(entry){
+  if(!entry||!entry.classes) return '';
+  return Object.entries(entry.classes).filter(([sp])=>!NONCRITTER.has(sp.toLowerCase()))
+    .sort((a,b)=>b[1]-a[1]).slice(0,4)
+    .map(([sp,nn])=>{const g=glyphInfo(sp);return `<span class="gl" title="${esc(nameOf(sp))} · ${nn}">${glyphHTML(g)}${nn>1?`<i>${nn>99?'99+':nn}</i>`:''}</span>`;}).join('');
+}
+function renderCalendar(){
+  const body=$('#calendar-body');
+  const first=new Date(calYear,calMonth,1);
+  const start=new Date(calYear,calMonth,1); start.setDate(1-first.getDay());   // back to Sunday
+  const monthName=first.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  const todayStr=ymdLocal(new Date());
+  const wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(w=>`<div class="cal-wd">${w}</div>`).join('');
+  const monthSpecies={};
+  let cells='';
+  for(let i=0;i<42;i++){
+    const dt=new Date(start); dt.setDate(start.getDate()+i);
+    const ymd=ymdLocal(dt), inMonth=dt.getMonth()===calMonth, entry=calByDay[ymd];
+    if(inMonth&&entry&&entry.classes) Object.entries(entry.classes).forEach(([sp,nn])=>{ if(!NONCRITTER.has(sp.toLowerCase())) monthSpecies[sp]=(monthSpecies[sp]||0)+nn; });
+    cells+=`<div class="cal-cell${inMonth?'':' out'}${ymd===todayStr?' today':''}${entry&&inMonth?' has':''}"${entry&&inMonth?` data-day="${ymd}"`:''}>
+      <div class="cal-d">${dt.getDate()}</div>
+      ${entry&&inMonth?`<div class="cal-v" title="${entry.visits||0} visits">${entry.visits||0}</div>`:''}
+      <div class="cal-gl">${inMonth?glyphsForDay(entry):''}</div>
+    </div>`;
+  }
+  const legend=Object.entries(monthSpecies).sort((a,b)=>b[1]-a[1])
+    .map(([sp])=>{const g=glyphInfo(sp);return `<span class="li"><b>${glyphHTML(g)}</b> ${esc(nameOf(sp))}</span>`;}).join('');
+  body.innerHTML=`
+    <div class="cal-head">
+      <button class="nav" onclick="calNav(-1)" title="Previous month">‹</button>
+      <div class="mo">${esc(monthName)}</div>
+      <button class="nav" onclick="calNav(1)" title="Next month">›</button>
+    </div>
+    <div class="cal-grid">${wd}${cells}</div>
+    ${legend?`<div class="cal-legend">${legend}</div>`:'<p class="empty" style="padding:16px 2px">No visitors recorded this month.</p>'}`;
+  body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
+}
+
+/* ---------- settings popout ---------- */
+function openSettings(){ const m=$('#settings'); if(m) m.hidden=false; }
+function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
+
+/* ---------- boot ---------- */
+buildControls();
+async function refreshNaming(){
+  let n; try{ n=await fetch('/api/naming').then(r=>r.json()); }catch(e){ return; }
+  const el=document.getElementById('naming'); if(!el) return;
+  const map={ loading:['#d9a23b','Identifier: warming up…'],
+              ready:['#5b8c5a','Identifier: on'],
+              stopped:['#b4503f','Identifier: stopped'] };
+  const m=map[n.state];
+  if(!m){ el.style.display='none'; return; }
+  el.style.display='';
+  el.innerHTML='<span style="color:'+m[0]+'">●</span> '+m[1];
+  el.title = n.state==='loading'
+      ? 'The species identifier is loading its model (about a minute). New visitors get named once it is ready.'
+      : n.state==='stopped' ? 'The species identifier is not running right now.'
+      : 'New visitors are being named automatically.';
+}
+/* ---------- live-feed liveness: show an overlay when the camera isn't actually streaming ---------- */
+/* An MJPEG <img> goes black (not "errored") when frames merely stall, so onerror alone isn't
+   enough -- poll /snapshot.jpg, which 503s whenever the capture thread has no current frame. */
+function setFeed(up){ const f=document.getElementById('live-frame'); if(f) f.classList.toggle('offline',!up); }
+async function checkFeed(){ try{ const r=await fetch('/snapshot.jpg',{cache:'no-store'}); setFeed(r.ok); }catch(e){ setFeed(false); } }
+/* ---------- first-run orientation: shown only while the database is still empty ---------- */
+function maybeFirstRun(s){
+  const el=document.getElementById('firstrun'); if(!el) return;
+  const empty=!(s&&s.total_crops);
+  if(empty && localStorage.getItem('cc-introDismissed')!=='1'){
+    if(!el.dataset.filled){
+      el.innerHTML='<div class="fr-card"><div class="fr-title">Welcome to your Backyard Observatory</div>'
+        +'<p>The camera is watching the yard right now &mdash; there&rsquo;s nothing else to start. As real animals visit, this log fills in by itself: their photographs, the species name, and over days, who comes and when.</p>'
+        +'<p class="fr-soft">It can take a while for the first visitor to appear. Leave it running and check back later.</p>'
+        +'<button class="fr-x" type="button" onclick="dismissIntro()">Got it</button></div>';
+      el.dataset.filled='1';
+    }
+    el.hidden=false;
+  } else { el.hidden=true; }
+}
+function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
+
+refreshLive(); refreshCamera(); refreshNaming(); checkFeed();
+setInterval(refreshLive,6000);
+setInterval(refreshCamera,4000);
+setInterval(refreshNaming,4000);
+setInterval(checkFeed,8000);
+/* ---------- lightbox: click any crop/frame to enlarge ---------- */
+/* Delegated so it covers every served image across all tabs (review queue, cast, species
+   browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.
+   The thumbnails are full-res crops sized down by CSS, so the same src shown at natural size
+   IS the enlargement; no separate big-image endpoint needed. */
+(function(){
+  const lb=document.createElement('div');
+  lb.id='lightbox';
+  lb.innerHTML='<div class="lb-hint">← → or click image to browse · Esc to close</div>'
+              +'<img alt="enlarged crop"><div class="lb-cap"></div>';
+  document.body.appendChild(lb);   // this script runs at end of <body>, so body exists
+  const img=lb.querySelector('img'), cap=lb.querySelector('.lb-cap');
+  let gallery=[], idx=-1;
+  function captionFor(el){
+    // Nearest visit/individual label if there is one, else the filename; + position in the set.
+    const card=el.closest('.panel'); let label='';
+    if(card){ const h=card.querySelector('div[style*="font-weight:600"]'); if(h) label=h.textContent.trim(); }
+    const file=decodeURI((el.getAttribute('src')||'').split('/').pop());
+    const base=label? label+' — '+file : file;
+    return gallery.length>1? `${base}   ·   ${idx+1} / ${gallery.length}` : base;
+  }
+  function showIdx(i){
+    if(!gallery.length) return;
+    idx=(i+gallery.length)%gallery.length;        // wrap both directions
+    img.src=gallery[idx].src; cap.textContent=captionFor(gallery[idx]);
+  }
+  function openFrom(el){
+    // The gallery is every crop/frame currently on the page, in document order, so ← → walk the
+    // strip you clicked from (a visit's crops, the cast, the explorer) without per-view wiring.
+    gallery=[...document.querySelectorAll('img[src*="/media/"]')].filter(x=>!lb.contains(x));
+    const at=gallery.indexOf(el);
+    gallery=gallery.length?gallery:[el];
+    showIdx(at<0?0:at); lb.classList.add('open');
+  }
+  function close(){ lb.classList.remove('open'); img.removeAttribute('src'); gallery=[]; idx=-1; }
+  lb.addEventListener('click',e=>{ e.target===img? showIdx(idx+1) : close(); });  // image=next, backdrop=close
+  document.addEventListener('keydown',e=>{
+    if(!lb.classList.contains('open')) return;
+    if(e.key==='Escape') close();
+    else if(e.key==='ArrowRight'){ e.preventDefault(); showIdx(idx+1); }
+    else if(e.key==='ArrowLeft'){ e.preventDefault(); showIdx(idx-1); }
+  });
+  document.addEventListener('click',e=>{
+    const t=e.target;
+    if(t&&t.tagName==='IMG'&&!lb.contains(t)&&/\/media\//.test(t.getAttribute('src')||'')){
+      e.preventDefault();
+      openFrom(t);
+    }
+  });
+})();

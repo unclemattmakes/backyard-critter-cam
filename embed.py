@@ -97,7 +97,7 @@ def embed_rows(conn, model, transform, device, rows, *, batch_size, total=None,
         chunk = rows[i:i + batch_size]
         tensors, ids = [], []
         for rid, cp in chunk:
-            img = _load_image(str(config.ROOT / cp.replace("\\", "/")))
+            img = _load_image(str(db.crop_abspath(cp)))
             if img is None:
                 continue
             tensors.append(transform(img))

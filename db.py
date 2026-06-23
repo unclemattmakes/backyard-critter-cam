@@ -18,6 +18,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
+# Project root (the folder holding this file; identical to config.ROOT, but resolved here without a
+# config import so db stays import-light). Every stored crop/clip path is relative to this root.
+_ROOT = Path(__file__).resolve().parent
+
 # Known `source` values. V1 only ever writes the first; the rest document the plan so the
 # meaning of the column is obvious to whoever reads the DB later.
 SOURCE_GLASS_DOOR_CAM = "glass_door_cam"  # V1: live webcam at the glass door. Primary rig, all species, day+night.
@@ -233,6 +237,23 @@ def parse_local(ts):
     except (ValueError, TypeError):
         return None
     return dt if dt.tzinfo is not None else dt.astimezone()
+
+
+def rel_to_root(path) -> str:
+    """Stored form of a crop/clip path: relative to the project root, with the OS's native
+    separators (backslashes on Windows). Falls back to the absolute string if `path` is outside the
+    root. crop_abspath() is the inverse. Consolidates the per-module _rel helpers."""
+    try:
+        return str(Path(path).relative_to(_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def crop_abspath(rel) -> Path:
+    """Absolute filesystem path for a stored crop/clip path. The DB stores paths relative to the
+    project root with the writer's native separators (backslashes on Windows); normalize to forward
+    slashes so the join also resolves on macOS/Linux. The inverse of rel_to_root()."""
+    return _ROOT / str(rel).replace("\\", "/")
 
 
 def insert_detection(

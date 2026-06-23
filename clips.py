@@ -98,12 +98,8 @@ class _FfmpegWriter:
                 pass
 
 
-def _rel(path: Path) -> str:
-    """Project-root-relative path when possible (keeps the DB portable), like backyard_cam._rel."""
-    try:
-        return str(path.relative_to(config.ROOT))
-    except ValueError:
-        return str(path)
+# Project-root-relative stored path -- the shared db helper (was a local copy of backyard_cam._rel).
+_rel = db.rel_to_root
 
 
 def prune_clips(cfg: config.Config, conn) -> int:

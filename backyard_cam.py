@@ -292,12 +292,9 @@ class MotionGate:
 
 
 # ---- Saving ------------------------------------------------------------------------
-def _rel(path: Path) -> str:
-    """Store paths relative to the project root when possible (keeps the DB portable)."""
-    try:
-        return str(path.relative_to(config.ROOT))
-    except ValueError:
-        return str(path)
+# Project-root-relative stored path. Aliased to the shared db helper (kept importable under this
+# name because import_trailcam does `from backyard_cam import _rel`).
+_rel = db.rel_to_root
 
 
 def save_crop(frame_bgr, det: Detection, cfg: config.Config, day: str, stamp: str, idx: int):

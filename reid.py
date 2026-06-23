@@ -41,6 +41,7 @@ import numpy as np
 
 import config
 import db
+import reidutil
 from embed import DEFAULT_MIN_CONFIDENCE, model_tag
 
 
@@ -58,7 +59,7 @@ class EmbeddingStore:
         self.individual_ids = [r["individual_id"] for r in rows]
         if rows:
             # Vectors are stored already L2-normalized, so X @ X.T is the cosine-similarity matrix.
-            self.X = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
+            self.X = np.stack([reidutil.decode_vector(r["embedding"]) for r in rows])
         else:
             self.X = np.zeros((0, 0), dtype=np.float32)
         self._index = {rid: i for i, rid in enumerate(self.ids)}
@@ -131,15 +132,9 @@ class EmbeddingStore:
 
     def cluster(self, threshold, method):
         """Agglomerative clustering on cosine distance. Returns labels[] (1-based cluster id per
-        crop, as scipy.fcluster gives) aligned to self.ids."""
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import pdist
-        if len(self) < 2:
-            return np.ones(len(self), dtype=int)
-        # X is L2-normalized -> 'cosine' pdist is 1 - cos_sim, in [0, 2].
-        condensed = pdist(self.X, metric="cosine")
-        Z = linkage(condensed, method=method)
-        return fcluster(Z, t=threshold, criterion="distance")
+        crop, as scipy.fcluster gives) aligned to self.ids. X is L2-normalized, so the 'cosine'
+        distance is 1 - cos_sim, in [0, 2]; < 2 crops is one trivial cluster."""
+        return reidutil.cluster_cosine(self.X, threshold=threshold, method=method)
 
 
 def _grid_montage(items, out_path, *, cols=5, thumb=180, pad=6, label_h=16):
@@ -150,7 +145,7 @@ def _grid_montage(items, out_path, *, cols=5, thumb=180, pad=6, label_h=16):
     cells = []
     for cp, caption in items:
         try:
-            im = Image.open(config.ROOT / cp.replace("\\", "/")).convert("RGB")
+            im = Image.open(db.crop_abspath(cp)).convert("RGB")
         except Exception:  # noqa: BLE001 -- a missing crop shouldn't sink the sheet
             continue
         im.thumbnail((thumb, thumb))
@@ -200,9 +195,7 @@ def do_cluster(conn, store, args):
     for rank, (cid, n) in enumerate(big, 1):
         members = [i for i in range(len(store)) if labels[i] == cid]
         # Cohesion = mean pairwise cosine sim within the cluster (1.0 = identical-looking).
-        sub = store.X[members]
-        sims = sub @ sub.T
-        cohesion = float((sims.sum() - len(members)) / max(len(members) * (len(members) - 1), 1))
+        cohesion = reidutil.mean_pairwise_cosine(store.X[members])
         # Show the most readable crops first (highest detector confidence).
         members.sort(key=lambda i: -store.confidences[i])
         shown = members[:args.max_per_montage]

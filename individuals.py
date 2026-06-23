@@ -44,6 +44,7 @@ import numpy as np
 
 import config
 import db
+import reidutil
 
 EMBED_MODEL = "megadescriptor-l-384"
 
@@ -136,11 +137,8 @@ def pose_groups(conn, individual_id: str, *, distance: float = 0.35, max_crops: 
     if len(rows) < max(min_group, 2):
         return []
     rows = sorted(rows, key=lambda r: -(r["crop_quality"] or 0))[:max_crops]
-    X = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import pdist
-    Z = linkage(pdist(X, metric="cosine"), method="average")
-    labels = fcluster(Z, t=distance, criterion="distance")
+    X = np.stack([reidutil.decode_vector(r["embedding"]) for r in rows])
+    labels = reidutil.cluster_cosine(X, threshold=distance)
     groups = defaultdict(list)
     for i, l in enumerate(labels):
         groups[l].append(i)
@@ -148,9 +146,7 @@ def pose_groups(conn, individual_id: str, *, distance: float = 0.35, max_crops: 
     for idxs in groups.values():
         if len(idxs) < min_group:
             continue
-        sub = X[idxs]
-        sims = sub @ sub.T
-        coh = float((sims.sum() - len(idxs)) / max(len(idxs) * (len(idxs) - 1), 1))
+        coh = reidutil.mean_pairwise_cosine(X[idxs])
         idxs.sort(key=lambda i: -(rows[i]["crop_quality"] or 0))
         ts = sorted(rows[i]["timestamp"] for i in idxs)
         out.append({"n": len(idxs), "cohesion": round(coh, 2),
@@ -195,7 +191,7 @@ def clip_templates(conn, solo_visits: dict, *, cfg=None) -> dict:
                     name = nm
                     break
         if name:
-            groups[name].append(np.frombuffer(r["embedding"], dtype=np.float32))
+            groups[name].append(reidutil.decode_vector(r["embedding"]))
     out = {}
     for name, vecs in groups.items():
         c = np.stack(vecs).mean(axis=0)
@@ -231,21 +227,17 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
         out["note"] = ("no embedded tracklets for this visit yet -- run clipmotion.py then "
                        "clipembed.py" if not rows else "only one tracklet -- nothing to separate")
         return out
-    X = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import squareform
+    X = np.stack([reidutil.decode_vector(r["embedding"]) for r in rows])
     S = X @ X.T
     D = np.clip(1.0 - S, 0.0, None)
     np.fill_diagonal(D, 0.0)
-    labels = fcluster(linkage(squareform(D, checks=False), method="average"),
-                      t=distance, criterion="distance")
+    labels = reidutil.cluster_cosine(dist=D, threshold=distance)
     groups = defaultdict(list)
     for i, l in enumerate(labels):
         groups[l].append(i)
     for idxs in groups.values():
         sub = X[idxs]
-        sims = sub @ sub.T
-        coh = float((sims.sum() - len(idxs)) / max(len(idxs) * (len(idxs) - 1), 1)) if len(idxs) > 1 else 1.0
+        coh = reidutil.mean_pairwise_cosine(sub) if len(idxs) > 1 else 1.0
         # Who does this separated animal look like? Match the cluster's centroid against the known
         # clip-space templates (clip<->clip) so each group comes pre-suggested -- confirm in a click.
         cc = sub.mean(axis=0)
@@ -355,7 +347,7 @@ class VisitMatcher:
         vecs: dict = defaultdict(list)
         for r in rows:
             self._by_visit[r["visit_id"]].append(r)
-            vecs[r["visit_id"]].append(np.frombuffer(r["embedding"], dtype=np.float32))
+            vecs[r["visit_id"]].append(reidutil.decode_vector(r["embedding"]))
 
         # Co-presence reads ALL of the species' boxes, with NO confidence gate -- the second
         # animal of a huddled pair is usually a low-confidence, occluded box that never gets an
@@ -460,22 +452,18 @@ class VisitMatcher:
             return [{"visits": vids, "cohesion": 1.0,
                      "started": [self.visit_started[vids[0]]],
                      "multi": [self.is_multi(vids[0])]}]
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import squareform
         P = np.stack([self.protos[v] for v in vids])
         S = P @ P.T
         D = np.clip(1.0 - S, 0.0, None)
         np.fill_diagonal(D, 0.0)
-        Z = linkage(squareform(D, checks=False), method="average")
-        labels = fcluster(Z, t=distance, criterion="distance")
+        labels = reidutil.cluster_cosine(dist=D, threshold=distance)
         groups = defaultdict(list)
         for v, l in zip(vids, labels):
             groups[l].append(v)
         out = []
         for vs in groups.values():
             ii = [vids.index(v) for v in vs]
-            sub = S[np.ix_(ii, ii)]
-            coh = float((sub.sum() - len(vs)) / max(len(vs) * (len(vs) - 1), 1)) if len(vs) > 1 else 1.0
+            coh = reidutil.mean_pairwise_cosine(P[ii]) if len(vs) > 1 else 1.0
             out.append({"visits": sorted(vs), "cohesion": round(coh, 2),
                         "started": [self.visit_started[v] for v in sorted(vs)],
                         "multi": [self.is_multi(v) for v in sorted(vs)]})

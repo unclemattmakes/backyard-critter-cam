@@ -154,7 +154,7 @@ def _cohort(conn, where: str, params, limit: int):
     import os
     out = []
     for rid, cp in rows:
-        pth = str(config.ROOT / cp.replace("\\", "/"))
+        pth = str(db.crop_abspath(cp))
         if os.path.exists(pth):
             out.append(pth)
         if limit and len(out) >= limit:

@@ -305,6 +305,14 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                         self._send(200, "text/css; charset=utf-8", css.read_bytes())
                     else:
                         self._send(404, "text/plain", b"dashboard.css missing")
+                elif path == "/dashboard.js":
+                    # Behaviour script, likewise split out of dashboard.html and read fresh per
+                    # request (no restart needed to iterate). The HTML loads it via <script src>.
+                    js = config.ROOT / "dashboard.js"
+                    if js.exists():
+                        self._send(200, "application/javascript; charset=utf-8", js.read_bytes())
+                    else:
+                        self._send(404, "text/plain", b"dashboard.js missing")
                 elif path == "/api/stats":
                     self._json(stats.compute_stats(cfg) or {"total_crops": 0})
                 elif path == "/api/species":

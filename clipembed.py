@@ -172,7 +172,7 @@ def main() -> int:
         done = 0
         missing = 0
         for (clip_id, clip_path), trows in by_clip.items():
-            full = config.ROOT / str(clip_path).replace("\\", "/")
+            full = db.crop_abspath(clip_path)
             if not full.exists():
                 missing += len(trows)
                 continue

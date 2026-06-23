@@ -115,7 +115,7 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
     total = total if total is not None else len(rows)
     for i in range(0, len(rows), batch_size):
         chunk = rows[i:i + batch_size]
-        valid = [(rid, str(config.ROOT / cp.replace("\\", "/"))) for rid, cp in chunk]
+        valid = [(rid, str(db.crop_abspath(cp))) for rid, cp in chunk]
         valid = [(rid, pth) for rid, pth in valid if os.path.exists(pth)]
         if not valid:
             continue

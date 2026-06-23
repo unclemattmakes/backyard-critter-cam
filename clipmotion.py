@@ -486,7 +486,7 @@ def main() -> int:
         t0 = time.time()
         done = 0
         for r in rows:
-            clip_path = config.ROOT / str(r["clip_path"]).replace("\\", "/")
+            clip_path = db.crop_abspath(r["clip_path"])
             if not clip_path.exists():
                 print(f"  clip #{r['id']}: file missing ({r['clip_path']}) -- skipped.")
                 continue

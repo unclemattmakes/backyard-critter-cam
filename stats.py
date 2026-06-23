@@ -20,11 +20,9 @@ RECENT_VISITS_LIMIT = 20   # how many recent visit events to surface
 REEL_LIMIT = 24            # max clips in a dispatch "highlight reel" (busiest kept, then time-ordered)
 
 
-def _parse(ts: str):
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None
+# One ISO-timestamp parser for the whole project: db.parse_local (tz-normalizing, so a legacy naive
+# row never trips offset-naive/aware subtraction). Aliased here to keep the local call sites terse.
+_parse = db.parse_local
 
 
 def compute_visits(rows, gap_minutes: float, rep_key=None):
