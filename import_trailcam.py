@@ -67,6 +67,27 @@ from detector import CudaUnavailableError, Detection, Detector
 # Image extensions we ingest. Trail cams write JPEG; PNG is accepted for completeness / exports.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 
+# Largest image we'll decode from an (untrusted) SD card. cv2.imread allocates a full uncompressed
+# buffer sized from the file header, so a 'decompression bomb' (tiny file, huge declared dimensions)
+# can OOM the import. We reject anything over this via a cheap Pillow header read (no full decode)
+# before imread -- a real trail-cam frame is far under it.
+MAX_DECODE_PIXELS = 120_000_000   # ~120 MP; typical trail cams are <= ~12 MP
+
+
+def _within_pixel_budget(path: Path) -> bool:
+    """True if `path`'s declared dimensions are sane to decode; False if oversized. Uses Pillow's
+    lazy header read (.size does NOT decode the pixels), so a bomb image costs microseconds. An
+    unreadable header returns True -- let cv2.imread try and the existing corrupt-file path handle it
+    (this guard targets only the 'huge declared size' OOM, not general decode failures)."""
+    try:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS   # also trips Pillow's own bomb guard on decode
+        with Image.open(path) as im:
+            w, h = im.size
+        return (w * h) <= MAX_DECODE_PIXELS
+    except Exception:
+        return True
+
 # A short marker baked into each crop's filename component so the original SD-card filename is
 # recoverable from crop_path -- that's what powers the default duplicate skip-set (see module
 # docstring). Kept filesystem-safe and unlikely to collide with a real stem.
@@ -171,6 +192,9 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
     Mirrors backyard_cam.run()'s per-detection block, minus the motion gate / preview: a trail cam
     already motion-triggered every shot, so every frame is worth a detector pass.
     """
+    if not _within_pixel_budget(path):
+        print(f"  skip (image too large to decode safely): {path.name}")
+        return -1, 0
     frame = cv2.imread(str(path))
     if frame is None:
         print(f"  skip (unreadable/corrupt): {path.name}")

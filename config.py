@@ -166,10 +166,12 @@ class Config:
     web_jpeg_quality: int = 80   # JPEG quality for the live stream (lighter than saved crops).
     # When the dashboard is bound to the network (web_host = "0.0.0.0", the LAN launcher), accept
     # connections ONLY from your local network -- loopback + private ranges (192.168.x, 10.x,
-    # 172.16-31.x, link-local). A request from a PUBLIC internet address is refused (HTTP 403), so
-    # even if the port were somehow forwarded past your router, the rig is never exposed to the
-    # world. Other machines and phones ON your Wi-Fi still work fully, INCLUDING label edits --
-    # this restricts WHO can reach it, not what they can do. No effect when bound to localhost
+    # 172.16-31.x, link-local). A DIRECT request from a public internet address is refused (HTTP
+    # 403), and the Host header is validated so a malicious website you visit can't use DNS
+    # rebinding to reach the rig from your own browser. That blocks the common exposure paths --
+    # but it is NOT a login: anyone already ON your Wi-Fi has full access, INCLUDING label edits.
+    # So don't port-forward it or put it on an untrusted network; for real remote access, front it
+    # with your own VPN or an authenticating reverse proxy. No effect when bound to localhost
     # (already machine-only). Set False only if you deliberately front it with your own auth/VPN.
     lan_only: bool = True
 

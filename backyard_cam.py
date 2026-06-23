@@ -580,7 +580,12 @@ def run(cfg: config.Config) -> None:
                         snap = read_camera_controls(cap)
                         snap["period"] = active_period
                         snap["writable"] = writable
-                        snap["lat"], snap["lon"] = cfg.latitude, cfg.longitude
+                        # Coarsen to ~1 decimal (~10 km) before publishing to the dashboard API:
+                        # a LAN/DNS-rebind client can read /api/camera, so don't hand it the rig's
+                        # exact home coordinates. The sun-driven profiles read cfg.latitude/longitude
+                        # directly (above) -- this published value is display-only.
+                        snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
+                        snap["lon"] = round(cfg.longitude, 1) if cfg.longitude is not None else None
                         control_bridge.publish(snap)
 
                 # --- Motion gate ---

@@ -37,6 +37,8 @@ weights/
 *.db-shm
 *.sqlite
 *.sqlite3
+# trail-cam import ledger written beside the DB (private SD-card filenames; not matched by *.db)
+*.imported-*.txt
 
 # ===== Local private config (real coordinates / machine-specific overrides) =====
 config_local.py
