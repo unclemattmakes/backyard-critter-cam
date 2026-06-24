@@ -209,6 +209,79 @@ def test_set_individual_bulk_records_source(conn):
 
 
 # ---------------------------------------------------------------------------
+# Live sightings: naming the visit AS IT HAPPENS (the dashboard Live tab).
+# ---------------------------------------------------------------------------
+
+def test_record_live_sighting_solo_stamps_the_span(conn):
+    """One name = a live solo confirm: it stamps the span's crops (feeding the templates)."""
+    d1, d2 = _det(conn, minutes=0), _det(conn, minutes=0.5)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan"],
+                                span_start=_ts(0), span_end=_ts(1))
+    assert r["multi"] is False and r["stamped"] == 2 and r["names"] == ["Stan"]
+    ind = {x["id"]: (x["individual_id"], x["individual_source"])
+           for x in conn.execute("SELECT id, individual_id, individual_source FROM detections")}
+    assert ind[d1] == ("Stan", "human") and ind[d2] == ("Stan", "human")
+    # The sighting itself is logged.
+    assert db.recent_live_sightings(conn)[0]["names"] == ["Stan"]
+
+
+def test_record_live_sighting_pair_does_not_stamp(conn):
+    """Two+ names = co-presence: the names are logged, but NO single id is stamped on both
+    animals (the documented pair gotcha that contaminates a template)."""
+    d1, d2 = _det(conn, minutes=0), _det(conn, minutes=0.5)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Notch", "Elliot"],
+                                span_start=_ts(0), span_end=_ts(1))
+    assert r["multi"] is True and r["stamped"] == 0 and r["names"] == ["Notch", "Elliot"]
+    ids = [x["individual_id"] for x in conn.execute("SELECT individual_id FROM detections")]
+    assert ids == [None, None]
+    rec = db.recent_live_sightings(conn)[0]
+    assert rec["names"] == ["Notch", "Elliot"] and rec["stamped"] == 0
+
+
+def test_record_live_sighting_dedupes_case_insensitively(conn):
+    _det(conn, minutes=0)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM,
+                                names=["Notch", "notch", " Notch "], span_start=_ts(0), span_end=_ts(1))
+    # Collapses to one name -> treated as solo (and so it stamps).
+    assert r["names"] == ["Notch"] and r["multi"] is False and r["stamped"] == 1
+
+
+def test_record_live_sighting_requires_a_name(conn):
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["", "  "])
+    assert r.get("error") and r["sighting_id"] is None
+
+
+def test_record_live_sighting_without_span_logs_but_does_not_stamp(conn):
+    """No active visit (no span) -> the note is still recorded, just nothing to stamp."""
+    _det(conn, minutes=0)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan"])
+    assert r["stamped"] == 0 and r["sighting_id"] is not None
+    assert [x["individual_id"] for x in conn.execute("SELECT individual_id FROM detections")] == [None]
+
+
+def test_recent_live_sightings_newest_first_and_limited(conn):
+    for i in range(3):
+        db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=[f"A{i}"])
+    out = db.recent_live_sightings(conn, limit=2)
+    assert [s["names"][0] for s in out] == ["A2", "A1"]   # newest first, capped at the limit
+
+
+def test_co_present_sighting_names_unions_overlapping(conn):
+    src = db.SOURCE_GLASS_DOOR_CAM
+    db.record_live_sighting(conn, source=src, names=["Notch", "Elliot"],
+                            span_start=_ts(0), span_end=_ts(10))
+    db.record_live_sighting(conn, source=src, names=["Stan"],
+                            span_start=_ts(100), span_end=_ts(110))     # a different window
+    # A visit window inside the pair's span picks up the logged pair...
+    co = db.co_present_sighting_names(conn, src, _ts(2), _ts(8))
+    assert co["names"] == ["Notch", "Elliot"] and co["n"] == 2 and co["observed_at"]
+    # ...the Stan window picks up only Stan...
+    assert db.co_present_sighting_names(conn, src, _ts(101), _ts(109))["names"] == ["Stan"]
+    # ...and a window overlapping neither is empty.
+    assert db.co_present_sighting_names(conn, src, _ts(50), _ts(60))["names"] == []
+
+
+# ---------------------------------------------------------------------------
 # VisitMatcher end-to-end on synthetic vectors.
 # ---------------------------------------------------------------------------
 
@@ -517,6 +590,37 @@ def test_unblend_visit_handles_no_tracklets(conn, cfg):
     vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
     r = individuals.unblend_visit(conn, vid)
     assert r["groups"] == [] and "tracklet" in (r["note"] or "")
+
+
+def test_unblend_seeds_logged_pair_as_quick_picks_cold_start(conn, cfg):
+    """A logged co-presence pair pre-fills both clusters for one-tap assignment, even with no
+    template yet (the honest cold start: it can't say WHICH is which, so no elimination)."""
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
+    _clip_tracklets_in_visit(conn, vid, [[1, 0, 0], [1, .05, 0], [.98, .1, 0], [0, 1, 0], [0, .97, .1]],
+                             start_min=1, end_min=2)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Notch", "Elliot"],
+                            span_start=_ts(0), span_end=_ts(10))
+    r = individuals.unblend_visit(conn, vid, distance=0.45)            # no templates -> cold start
+    assert r["co_present"]["names"] == ["Notch", "Elliot"]
+    top2 = r["groups"][:2]
+    assert all(g.get("co_names") == ["Notch", "Elliot"] for g in top2)   # both pre-filled for one tap
+    assert all("co_elim" not in g for g in top2)                         # nothing to disambiguate yet
+
+
+def test_unblend_names_never_solo_member_by_elimination(conn, cfg):
+    """The cold-start UNLOCK: one member has a template + the human logged the pair => the OTHER
+    cluster is named by ELIMINATION, though that member has no template of his own."""
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0, end_min=10)
+    _clip_tracklets_in_visit(conn, vid, [[1, 0, 0], [1, .05, 0], [.98, .1, 0], [0, 1, 0], [0, .97, .1]],
+                             start_min=1, end_min=2)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Notch", "Elliot"],
+                            span_start=_ts(0), span_end=_ts(10))
+    # Only Notch has a (clip) template; Elliot has none.
+    r = individuals.unblend_visit(conn, vid, distance=0.45, templates={},
+                                  elim_templates={"Notch": (_u(1, 0, 0), 5)})
+    big, small = r["groups"][0], r["groups"][1]      # big cluster ([1,0,0]) = Notch; the other = Elliot
+    assert big["n"] == 3 and big["co_elim"] == "Notch"
+    assert small["n"] == 2 and small["co_elim"] == "Elliot"
 
 
 def test_set_clip_track_individual_round_trip(conn, cfg):

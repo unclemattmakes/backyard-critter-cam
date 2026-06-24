@@ -217,7 +217,12 @@ has grown from a single live feed into **six tabs**:
 
 - **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
   how-long-ago, confidence, a ▶ badge to play its clip, and a live *off-pattern* flag if it
-  arrived at an odd hour for its species), running tallies, and most-/least-common species.
+  arrived at an odd hour for its species), running tallies, and most-/least-common species. A
+  **Who's visiting right now?** panel lets you name the live visit as it happens: tap a known
+  critter (or add a new name) and **Log who's here** — one name tags that visit's crops with the
+  individual (a live solo confirm that feeds the [re-ID](#individual-re-identification-phase-3)
+  templates), two or more record who came *together* (co-presence, without mislabelling both
+  animals as one). A short *recently logged* list shows your notes landing.
 - **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day): a back-to-back
   highlight reel of clips, the "plate of the night" hero shot, novelty & quiet flags ("first
   raccoon in 9 days"), moon phase, and a full species roll with per-hour activity clocks.
@@ -226,7 +231,10 @@ has grown from a single live feed into **six tabs**:
 - **Individuals** — the "name the cast" workspace (see
   [phase 3](#individual-re-identification-phase-3)): a *Who is this?* review queue with
   one-click confirm / correct / clear, bulk **Fit to the Cast**, per-individual **Poses** and
-  **Clips**, and **Un-blend** for multi-animal visits.
+  **Clips**, and **Un-blend** for multi-animal visits. If you named the visit live (above),
+  Un-blend reads that log: it shows *"📓 you logged Notch + Elliot here"* and, once one cluster
+  matches a known template, names the **other by elimination** — so a never-solo pair member gets
+  identified from co-presence alone, before he has any template of his own.
 - **Calendar** — a month grid; each day shows its visit count and top-species emoji, click
   through to a day's crops and visits.
 - **Specimen Catalogue** — every species as a card; open one to confirm (✓) / reject (✗) /

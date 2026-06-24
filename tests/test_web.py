@@ -6,8 +6,11 @@ relies on. (web.py imports only stdlib + db/stats/behavior/config, so importing 
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+import config
+import db
 import web
 
 
@@ -52,3 +55,22 @@ def test_is_within_true_for_child(tmp_path):
 
 def test_is_within_false_for_outside(tmp_path):
     assert web._is_within(Path("/etc/passwd"), tmp_path / "crops") is False
+
+
+# ---- _live_now: the Live tab's "who's here now?" payload (visit + cast + recent log) ----
+def test_live_now_lists_human_cast_and_recent_sightings(conn, db_path):
+    cfg = replace(config.CONFIG, db_path=db_path)
+    # A human-confirmed individual is offered as a quick-pick chip; a cluster placeholder is not.
+    d = db.insert_detection(conn, timestamp=db.now_local_iso(), source=db.SOURCE_GLASS_DOOR_CAM,
+                            detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                            frame_w=100, frame_h=100, crop_path="crops/x.jpg", species="raccoon")
+    db.set_individual_bulk(conn, [d], "Stan", source="human")
+    other = db.insert_detection(conn, timestamp=db.now_local_iso(), source=db.SOURCE_GLASS_DOOR_CAM,
+                                detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                                frame_w=100, frame_h=100, crop_path="crops/y.jpg", species="raccoon")
+    db.set_individual_bulk(conn, [other], "raccoon_c01", source="cluster")
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Notch", "Elliot"])
+    out = web._live_now(cfg)
+    assert out["cast"] == ["Stan"]                       # only the human-named individual
+    assert out["recent"] and out["recent"][0]["names"] == ["Notch", "Elliot"]
+    assert "visit" in out and out["source"] == cfg.source

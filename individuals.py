@@ -201,7 +201,7 @@ def clip_templates(conn, solo_visits: dict, *, cfg=None) -> dict:
 
 
 def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dict = None,
-                  cfg=None) -> dict:
+                  elim_templates: dict = None, cfg=None) -> dict:
     """Separate a multi-animal visit into its individuals using the CLIP TRACKLETS (which track
     each animal independently). Clusters the visit's tracklet appearance prototypes and returns
     the groups biggest-first -- in a true pair visit the two dominant clusters are the two animals
@@ -210,8 +210,18 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
     already on its tracklets. The caller labels each cluster (db.set_clip_track_individual), which
     is how the pair member who is never solo finally gets a clean appearance template.
 
+    CO-PRESENCE SEED: if a human logged who was visiting (live_sightings overlapping this visit),
+    the two biggest clusters carry that logged pair as `co_names` (one-click assign, no typing), and
+    when the appearance signal resolves ONE side, the OTHER is named by ELIMINATION (`co_elim`) --
+    e.g. a cluster matches Notch's template, you logged "Notch + Elliot", so the other cluster is
+    Elliot. That's how a never-solo pair member gets named from co-presence alone, before he has any
+    template of his own. `templates` drives the displayed `suggestion` (explicit clip-labels only,
+    by design); `elim_templates` (richer: solo-attributed + explicit) is used ONLY to break the tie
+    between the two logged names -- safe because the choice is constrained to that human-attested pair.
+
     Tracklets are matched to the visit by clip<->visit time overlap on the same source. Returns
-    {visit_id, n_tracklets, groups:[{track_ids, n, cohesion, rep_crops, label}], note}."""
+    {visit_id, n_tracklets, groups:[{track_ids, n, cohesion, rep_crops, label, suggestion, co_names,
+    co_elim}], co_present:{names, observed_at}, note}."""
     cfg = cfg or config.CONFIG
     thr = cfg.reid_clip_match_threshold
     v = conn.execute("SELECT source, started_at, ended_at FROM visits WHERE id = ?",
@@ -222,7 +232,8 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
     rows = [r for r in db.load_clip_track_embeddings(conn, EMBED_MODEL)
             if r["clip_source"] == src and _iso_overlap(
                 r["clip_started_at"], r["clip_ended_at"] or r["clip_started_at"], vs, ve)]
-    out = {"visit_id": visit_id, "n_tracklets": len(rows), "groups": [], "note": None}
+    out = {"visit_id": visit_id, "n_tracklets": len(rows), "groups": [], "note": None,
+           "co_present": db.co_present_sighting_names(conn, src, vs, ve)}
     if len(rows) < 2:
         out["note"] = ("no embedded tracklets for this visit yet -- run clipmotion.py then "
                        "clipembed.py" if not rows else "only one tracklet -- nothing to separate")
@@ -235,6 +246,7 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
     groups = defaultdict(list)
     for i, l in enumerate(labels):
         groups[l].append(i)
+    built = []          # (group_dict, normalized_centroid) -- centroid kept for elimination below.
     for idxs in groups.values():
         sub = X[idxs]
         coh = reidutil.mean_pairwise_cosine(sub) if len(idxs) > 1 else 1.0
@@ -242,18 +254,58 @@ def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dic
         # clip-space templates (clip<->clip) so each group comes pre-suggested -- confirm in a click.
         cc = sub.mean(axis=0)
         nrm = np.linalg.norm(cc)
-        suggestion = clip_match(cc / nrm if nrm else cc, templates, thr) if templates else []
+        ccn = cc / nrm if nrm else cc
+        suggestion = clip_match(ccn, templates, thr) if templates else []
         idxs.sort(key=lambda i: -rows[i]["n_hits"])           # sturdiest tracklets first
         labelled = {rows[i]["individual_id"] for i in idxs if rows[i]["individual_id"]}
-        out["groups"].append({
+        built.append(({
             "suggestion": [{"name": n, "similarity": round(s, 3)} for n, s, _ in suggestion[:3]],
             "track_ids": [rows[i]["track_id"] for i in idxs],
             "n": len(idxs), "cohesion": round(coh, 2),
             "rep_crops": [rows[i]["rep_crop"] for i in idxs if rows[i]["rep_crop"]][:8],
             "label": sorted(labelled)[0] if len(labelled) == 1 else None,
-        })
-    out["groups"].sort(key=lambda g: -g["n"])
+        }, ccn))
+    built.sort(key=lambda gc: -gc[0]["n"])
+    out["groups"] = [gd for gd, _ in built]
+    _seed_unblend_from_co_presence(out["co_present"]["names"], built,
+                                   elim_templates or templates or {}, thr)
     return out
+
+
+def _seed_unblend_from_co_presence(co_names, built, elim_templates, thr) -> None:
+    """Fold a human co-presence log into the two biggest un-blend clusters (mutates `built`'s group
+    dicts). Attaches the logged pair as `co_names` (quick-pick), then tries ELIMINATION: match each
+    of the two clusters against `elim_templates` RESTRICTED to the logged names; if exactly one side
+    resolves, the other gets the leftover name (`co_elim`). Restricting to the logged pair is what
+    makes using the coarser solo-attributed templates safe here -- it's a 2-way choice the human
+    already vouched for, not an open guess across the whole cast. No-op unless >=2 names and >=2
+    clusters; ambiguous matches (both sides land on the same name) fall back to the quick-pick."""
+    if len(co_names) < 2 or len(built) < 2:
+        return
+    top = built[:2]
+    for gd, _ in top:
+        gd["co_names"] = list(co_names)
+    restricted = {n: elim_templates[n] for n in co_names if n in elim_templates}
+    if not restricted:
+        return                                       # cold start: no template yet -> quick-pick only
+    picks = []
+    for _, ccn in top:
+        m = clip_match(ccn, restricted, thr)
+        picks.append(m[0][0] if m else None)         # best logged-name match for this cluster, or None
+    m0, m1 = picks
+    assign = {}
+    if m0 and m1 and m0 != m1:                        # both sides resolved by appearance
+        assign = {0: m0, 1: m1}
+    elif m0 and not m1:                               # one side resolved -> the other by elimination
+        other = [n for n in co_names if n != m0]
+        if len(other) == 1:
+            assign = {0: m0, 1: other[0]}
+    elif m1 and not m0:
+        other = [n for n in co_names if n != m1]
+        if len(other) == 1:
+            assign = {0: other[0], 1: m1}
+    for gi, nm in assign.items():
+        top[gi][0]["co_elim"] = nm
 
 
 def clips_for_individual(conn, individual_id: str, species: str = "raccoon", limit: int = 24,

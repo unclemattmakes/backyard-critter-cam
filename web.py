@@ -394,6 +394,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._json(control_bridge.snapshot())
                 elif path == "/api/naming":
                     self._json(_naming_status())
+                elif path == "/api/live/now":
+                    self._json(_live_now(cfg))
                 elif path == "/api/crops":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.crops_page(
@@ -474,6 +476,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self._reid_confirm(data)
                 elif path == "/api/visit/label":
                     self._visit_label(data)
+                elif path == "/api/live/sighting":
+                    self._live_sighting(data)
                 elif path == "/api/reid/unblend/label":
                     self._unblend_label(data)
                 elif path.startswith("/api/detection/"):
@@ -536,6 +540,33 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             conn = db.connect(cfg.db_path)
             try:
                 self._json({"ok": True, **db.apply_visit_label(conn, **kw)})
+            finally:
+                conn.close()
+
+        def _live_sighting(self, data):
+            """Log who's visiting RIGHT NOW from the Live tab. Body: {names: [...], note?}. The
+            visit span is resolved server-side from the live source's recent detections (the client
+            only knows the names it recognises), so a stale client clock can't mislabel the span.
+            One name also stamps that individual onto the span (a live solo confirm, feeding the
+            re-ID templates); two+ names record co-presence only (no single contaminating stamp --
+            the documented pair gotcha). Deliberately does NOT rebuild visits."""
+            names = data.get("names")
+            if isinstance(names, str):
+                names = [names]
+            if not isinstance(names, list) or not any(str(n).strip() for n in names):
+                self._json({"error": "need at least one name"}, code=400)
+                return
+            visit = stats.current_live_visit(cfg)
+            conn = db.connect(cfg.db_path)
+            try:
+                res = db.record_live_sighting(
+                    conn, source=cfg.source, names=names,
+                    span_start=visit.get("start"), span_end=visit.get("end"),
+                    note=data.get("note"))
+                if res.get("error"):
+                    self._json({"error": res["error"]}, code=400)
+                    return
+                self._json({"ok": True, "visit": visit, **res})
             finally:
                 conn.close()
 
@@ -818,7 +849,17 @@ def _reid_unblend(cfg, visit_id: str) -> dict:
         # coarse and, for a never-solo animal, impossible). So pass an empty solo map: the
         # suggestions stay quiet until the first cluster is labelled, then they sharpen.
         templates = individuals.clip_templates(conn, {}, cfg=cfg)
-        return individuals.unblend_visit(conn, vid, templates=templates, cfg=cfg)
+        # The RICHER set (solo-attributed + explicit) is used only to break the tie between two
+        # human-logged co-present names (unblend_visit restricts it to that pair, so the coarseness
+        # that bars it from open suggestions is harmless here). Build it from a matcher's solo map;
+        # best-effort, since it's only a disambiguation aid on top of the quick-pick.
+        elim = templates
+        try:
+            elim = individuals.VisitMatcher(conn, cfg.reid_species, cfg=cfg).clip_templates
+        except Exception:
+            pass
+        return individuals.unblend_visit(conn, vid, templates=templates,
+                                         elim_templates=elim, cfg=cfg)
     finally:
         conn.close()
 
@@ -853,6 +894,25 @@ def _reid_clips(cfg, individual: str) -> dict:
         return {"individual": individual, "n_clips": len(clips), "clips": clips}
     finally:
         conn.close()
+
+
+def _live_now(cfg) -> dict:
+    """Powers the Live tab's "who's here now?" control: the current visit span, the named cast to
+    pick from (human-confirmed individuals, so you tag a known animal in one tap), and a short log
+    of recent live sightings so a just-logged note visibly lands."""
+    visit = stats.current_live_visit(cfg)
+    cast, recent = [], []
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is not None:
+        try:
+            cast = [r[0] for r in conn.execute(
+                "SELECT DISTINCT individual_id FROM detections "
+                "WHERE individual_id IS NOT NULL AND individual_source = 'human' "
+                "ORDER BY individual_id COLLATE NOCASE")]
+            recent = db.recent_live_sightings(conn, limit=8)
+        finally:
+            conn.close()
+    return {"visit": visit, "cast": cast, "recent": recent, "source": cfg.source}
 
 
 def _candidate_labels(cfg) -> list:

@@ -196,6 +196,82 @@ async function refreshLive(){
   $('#least').innerHTML=rare.map(x=>card(x,null)).join('')||'<p class="empty">—</p>';
   bindCards();
 }
+/* ---------- "Who's here now?": name the live visit as it happens ----------
+   One name tags the current visit's crops with that individual (a live solo confirm that feeds
+   the appearance templates); two or more record who came TOGETHER without stamping a single name
+   on both animals (the pair gotcha). The span is resolved server-side, so the client only sends
+   the names it recognises. State: WH_SEL = the names currently picked. */
+let WH_CAST=[], WH_SEL=new Set(), WH_BUSY=false, WH_CHIPSIG='';
+async function refreshWhoshere(){
+  let d; try{ d=await fetch('/api/live/now').then(r=>r.json()); }catch(e){ return; }
+  const sec=$('#whoshere'); if(!sec) return;
+  sec.hidden=false;
+  WH_CAST=d.cast||[];
+  const v=d.visit||{};
+  $('#wh-span').textContent = v.count
+    ? (v.active ? `active now · ${v.count} frame${v.count===1?'':'s'} this visit`
+                : `quiet — last seen ${timeAgo(v.latest)}`)
+    : 'all quiet — log it anyway and it attaches to the next frames';
+  whRenderChips();
+  whRenderRecent(d.recent||[]);
+}
+function whRenderChips(){
+  const names=[...new Set([...WH_CAST, ...WH_SEL])];
+  // Only rebuild the chip row when its contents change, so a 6s refresh can't wipe a hover or
+  // re-trigger the fade. The Log button's enabled state is cheap, so always sync it.
+  const sig=names.map(n=>(WH_SEL.has(n)?'*':'')+n).join('|');
+  if(sig!==WH_CHIPSIG){
+    WH_CHIPSIG=sig;
+    $('#wh-cast').innerHTML = names.length
+      ? names.map(n=>`<button type="button" class="wh-chip${WH_SEL.has(n)?' on':''}" onclick="whToggle(${jarg(n)})">${esc(cap1(n))}</button>`).join('')
+      : '<span class="lbl" style="opacity:.6">No named critters yet — add the first below.</span>';
+  }
+  const log=$('#wh-log'); if(log) log.disabled = WH_SEL.size===0 || WH_BUSY;
+}
+function whToggle(n){ if(WH_SEL.has(n)) WH_SEL.delete(n); else WH_SEL.add(n); whRenderChips(); }
+function whAddName(){
+  const inp=$('#wh-new'); if(!inp) return;
+  const n=(inp.value||'').trim(); if(!n) return;
+  // Reuse an existing name if it only differs by case, so "notch" doesn't fork from "Notch".
+  const hit=[...WH_CAST, ...WH_SEL].find(x=>x.toLowerCase()===n.toLowerCase());
+  WH_SEL.add(hit||n); inp.value=''; whRenderChips(); inp.focus();
+}
+async function whLog(){
+  if(!WH_SEL.size || WH_BUSY) return;
+  WH_BUSY=true; whRenderChips();
+  const names=[...WH_SEL];
+  try{
+    const r=await fetch('/api/live/sighting',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({names})}).then(r=>r.json());
+    if(r.error){ whMsg(r.error,true); }
+    else{
+      const who=names.map(cap1).join(' + ');
+      whMsg(r.multi
+        ? `Logged ${who} together — co-presence noted.`
+        : `Logged ${who}${r.stamped?` · tagged ${r.stamped} frame${r.stamped===1?'':'s'}`:''}.`);
+      WH_SEL.clear();
+    }
+  }catch(e){ whMsg('Could not save: '+e,true); }
+  finally{ WH_BUSY=false; refreshWhoshere(); }
+}
+function whMsg(t,err){
+  const m=$('#wh-msg'); if(!m) return;
+  m.textContent=t; m.className='wh-msg '+(err?'err':'ok');
+  if(!err) setTimeout(()=>{ if(m.textContent===t){ m.textContent=''; m.className='wh-msg'; } },6000);
+}
+function whRenderRecent(list){
+  const box=$('#wh-recent'); if(!box) return;
+  if(!list.length){ box.innerHTML=''; return; }
+  box.innerHTML='<div class="lbl wh-rec-h">Recently logged</div>'
+    +list.map(s=>{
+      const who=(s.names||[]).map(cap1).join(' + ');
+      const tag=s.stamped? `tagged ${s.stamped}` : ((s.names||[]).length>1?'together':'');
+      return `<div class="wh-rec"><span class="who">${esc(who)}</span>`
+        +`<span class="when lbl">${esc(fmtClock(s.observed_at)||reidWhen(s.observed_at))}</span>`
+        +(tag?`<span class="lbl tag">${esc(tag)}</span>`:'')+`</div>`;
+    }).join('');
+}
+
 function timeAgo(iso){
   if(!iso) return '';
   const t=new Date(iso).getTime(); if(isNaN(t)) return '';
@@ -721,11 +797,20 @@ async function renderUnblend(vid){
   catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
   REID_UNBLEND[vid]=d.groups||[];
   if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
+  const co=(d.co_present&&d.co_present.names)||[];
   const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
-  const hint=anySugg
+  const hint=co.length>=2
+    ? `The two biggest groups are the pair you logged. ✓ a suggested name and the other is filled in by elimination — or just tap a name onto each.`
+    : anySugg
     ? `The two biggest groups are usually the pair. ✓ a clip-match to confirm, or correct it — each label sharpens the next visit.`
     : `The two biggest groups are usually the pair — name each clean single animal. Once you've named both pair members once, future pair visits will <b>auto-suggest</b> them from the clips.`;
+  // If a human logged who was here, surface that pair up top — it's what drives the one-click
+  // assign + elimination on the groups below.
+  const coLog=co.length>=2
+    ? `<div class="ub-colog">📓 You logged <b>${co.map(n=>esc(cap1(n))).join(' + ')}</b> here together${d.co_present.observed_at?` · ${esc(fmtClock(d.co_present.observed_at)||'')}`:''}.</div>`
+    : '';
   box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
+    +coLog
     +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
 }
 function reidUnblendGroup(vid,g,i){
@@ -736,10 +821,16 @@ function reidUnblendGroup(vid,g,i){
   const iid='ubn-'+vid+'-'+i;
   const top=(g.suggestion||[])[0];
   const sugg=(!g.label&&top)?`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(top.name)})" title="clip-space match — confirm this group is ${esc(top.name)}">✓ ${esc(top.name)} ${Math.round(top.similarity*100)}%</button>`:'';
+  // Elimination from the co-presence log: the OTHER cluster matched, so by your logged pair this
+  // one must be ${g.co_elim}. The recommended one-click — distinct from a raw appearance match.
+  const elim=(!g.label&&g.co_elim)?`<button class="gear ub-elim" onclick="reidUnblendConfirm(${vid},${i},${jarg(g.co_elim)})" title="from your co-presence log — the other group is the pair member, so this one is ${esc(g.co_elim)}">★ ${esc(cap1(g.co_elim))} · from your log</button>`:'';
+  // Quick-pick the logged pair onto this cluster (no typing), minus any name already offered above.
+  const quick=(!g.label?(g.co_names||[]):[]).filter(n=>n!==g.co_elim && !(top&&n===top.name))
+    .map(n=>`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(n)})" title="you logged this pair as here together">＋ ${esc(cap1(n))}</button>`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
     <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
-    <div style="display:flex;gap:6px;align-items:center">${lab}${sugg}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${lab}${elim}${sugg}${quick}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
   </div>`;
 }
 function reidUnblendConfirm(vid,i,name){
@@ -1095,11 +1186,12 @@ function maybeFirstRun(s){
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-refreshLive(); refreshCamera(); refreshNaming(); checkFeed();
+refreshLive(); refreshCamera(); refreshNaming(); checkFeed(); refreshWhoshere();
 setInterval(refreshLive,6000);
 setInterval(refreshCamera,4000);
 setInterval(refreshNaming,4000);
 setInterval(checkFeed,8000);
+setInterval(refreshWhoshere,6000);
 /* ---------- lightbox: click any crop/frame to enlarge ---------- */
 /* Delegated so it covers every served image across all tabs (review queue, cast, species
    browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.

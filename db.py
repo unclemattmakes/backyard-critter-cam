@@ -13,6 +13,7 @@ Only stdlib sqlite3 is used.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -191,6 +192,28 @@ CREATE TABLE IF NOT EXISTS clip_track_embeddings (
     created_at  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_clip_track_emb ON clip_track_embeddings(track_id, model);
+
+-- Phase 3 (re-ID), LIVE ground truth: the human names who is visiting AS IT HAPPENS, from the
+-- dashboard's Live tab ("Notch and Elliot are here right now"). That real-time recognition is the
+-- gold input the whole suggest-confirm loop is built on -- captured at the moment, not reconstructed
+-- from crops later. One row = one "who's here" log over the current visit span on `source`.
+--   * SOLO (one name): record_live_sighting ALSO stamps that individual_id onto the span's crops
+--     (a live equivalent of confirming a solo visit -- it feeds the appearance templates).
+--   * PAIR (2+ names): the names are kept here as co-presence ground truth ONLY; we do NOT stamp a
+--     single name across the span, because one label on two animals mislabels both (the documented
+--     pair gotcha) and contaminates the template. The un-blend step is what splits a pair later;
+--     this row tells it WHO the two clusters are.
+CREATE TABLE IF NOT EXISTS live_sightings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT    NOT NULL,            -- which rig was being watched (matches detections.source).
+    observed_at TEXT    NOT NULL,            -- when the human logged it (local ISO 8601 w/ offset).
+    span_start  TEXT,                        -- first detection of the named visit span (NULL if none active).
+    span_end    TEXT,                        -- last detection of the span.
+    names       TEXT    NOT NULL,            -- JSON array of individuals present, e.g. ["Notch","Elliot"].
+    stamped     INTEGER NOT NULL DEFAULT 0,  -- crops whose individual_id this set (solo case); 0 for co-presence.
+    note        TEXT                         -- optional free-text remark.
+);
+CREATE INDEX IF NOT EXISTS idx_live_sightings_observed ON live_sightings(observed_at);
 """
 
 
@@ -745,3 +768,123 @@ def confirmed_visit_labels(conn: sqlite3.Connection, species: Optional[str] = No
     for r in rows:                       # first row per visit = dominant (ordered by n DESC)
         out.setdefault(r[0], r[1])
     return out
+
+
+_MAX_SIGHTING_NAMES = 12   # a "who's here now" log of more than a dozen named animals isn't real.
+
+
+def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
+                         span_start: Optional[str] = None, span_end: Optional[str] = None,
+                         note: Optional[str] = None, observed_at: Optional[str] = None) -> dict:
+    """Log a human's real-time identification of who is visiting NOW (the dashboard Live tab).
+    `names` is the list of individuals present over [span_start, span_end] on `source`.
+
+    SOLO (exactly one name): ALSO stamp that individual_id onto the span's crops via
+    apply_visit_label -- the live equivalent of confirming a solo visit, so the appearance
+    templates grow from it. PAIR (two or more): record the co-presence note ONLY, with NO stamp
+    -- one name on two animals mislabels both (the pair gotcha); the names ride here as ground
+    truth the un-blend step consumes. De-dupes names case-insensitively, keeping first-seen order.
+    Returns {sighting_id, stamped, multi, names}."""
+    ordered, seen = [], set()
+    for n in (names or []):
+        s = str(n).strip()
+        k = s.casefold()
+        if s and k not in seen:
+            seen.add(k)
+            ordered.append(s)
+        if len(ordered) >= _MAX_SIGHTING_NAMES:
+            break
+    if not ordered:
+        return {"error": "no names", "sighting_id": None, "stamped": 0, "multi": False, "names": []}
+
+    multi = len(ordered) > 1
+    stamped = 0
+    # Solo => stamp the span (feeds re-ID). Pair => never stamp a single name across two animals.
+    if not multi and span_start and span_end:
+        res = apply_visit_label(conn, source=source, start=span_start, end=span_end,
+                                name=ordered[0])
+        stamped = int(res.get("detections") or 0)
+
+    observed = observed_at or now_local_iso()
+    note_clean = (str(note).strip() or None) if note else None
+    cur = conn.execute(
+        "INSERT INTO live_sightings (source, observed_at, span_start, span_end, names, stamped, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (source, observed, span_start, span_end, json.dumps(ordered), int(stamped), note_clean))
+    conn.commit()
+    return {"sighting_id": cur.lastrowid, "stamped": stamped, "multi": multi, "names": ordered}
+
+
+def recent_live_sightings(conn: sqlite3.Connection, *, source: Optional[str] = None,
+                          limit: int = 8) -> list:
+    """The most-recent live sightings (newest first) for the Live tab's running log. Works on a
+    read-only or read-write connection -- columns are read positionally so no row_factory is
+    required."""
+    where, params = "", []
+    if source:
+        where = "WHERE source = ?"
+        params.append(source)
+    try:
+        rows = conn.execute(
+            f"SELECT id, source, observed_at, span_start, span_end, names, stamped, note "
+            f"FROM live_sightings {where} ORDER BY id DESC LIMIT ?",
+            params + [int(limit)]).fetchall()
+    except sqlite3.OperationalError:
+        # The table is created on the first read-write connect(); a read-only dashboard pointed at
+        # a DB no writer has migrated yet simply has no sightings to show.
+        return []
+    out = []
+    for r in rows:
+        sid, src, observed, sstart, send, names_json, stamped, note = tuple(r)
+        try:
+            names = json.loads(names_json) if names_json else []
+        except (ValueError, TypeError):
+            names = []
+        out.append({"id": sid, "source": src, "observed_at": observed,
+                    "span_start": sstart, "span_end": send, "names": names,
+                    "stamped": stamped, "note": note})
+    return out
+
+
+def _spans_overlap(a0, a1, b0, b1) -> bool:
+    """True if the two timestamp spans overlap at all, compared by INSTANT (parse_local handles
+    the stored offsets / a legacy naive string)."""
+    pa0, pa1, pb0, pb1 = parse_local(a0), parse_local(a1), parse_local(b0), parse_local(b1)
+    if None in (pa0, pa1, pb0, pb1):
+        return False
+    return pa0 <= pb1 and pb0 <= pa1
+
+
+def co_present_sighting_names(conn: sqlite3.Connection, source: str,
+                              started_at: str, ended_at: str) -> dict:
+    """Who a human logged as present during a visit's window: the union of every live sighting on
+    `source` whose span overlaps [started_at, ended_at] (a sighting with no span falls back to its
+    observed_at instant). This is the ground truth that seeds un-blend -- the human said WHO the two
+    animals are, even before any appearance template exists. De-dupes case-insensitively, newest
+    first; `observed_at` is the most recent overlapping sighting (for display). Returns {names,
+    observed_at, n}. Matched by absolute time, so it survives the visit-id renumbering of a rebuild."""
+    try:
+        rows = conn.execute(
+            "SELECT observed_at, span_start, span_end, names FROM live_sightings WHERE source = ? "
+            "ORDER BY id DESC", (source,)).fetchall()
+    except sqlite3.OperationalError:        # table not created yet (read-only, un-migrated DB)
+        return {"names": [], "observed_at": None, "n": 0}
+    names, seen, observed = [], set(), None
+    for r in rows:
+        observed_at_r, span_start, span_end, names_json = tuple(r)
+        s0 = span_start or observed_at_r
+        s1 = span_end or observed_at_r
+        if not _spans_overlap(s0, s1, started_at, ended_at):
+            continue
+        if observed is None:
+            observed = observed_at_r
+        try:
+            nm = json.loads(names_json) if names_json else []
+        except (ValueError, TypeError):
+            nm = []
+        for n in nm:
+            k = str(n).casefold()
+            if k not in seen:
+                seen.add(k)
+                names.append(n)
+    return {"names": names, "observed_at": observed, "n": len(names)}

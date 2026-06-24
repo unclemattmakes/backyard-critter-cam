@@ -47,6 +47,25 @@
       <aside class="panel latest" id="latest"><p class="empty" style="padding:20px">Awaiting the first visitor&hellip;</p></aside>
     </div>
 
+    <!-- Who's here now? — name the live visit as it happens; one name tags the visit (and feeds
+         the cast), two or more record who came together. -->
+    <section class="panel whoshere" id="whoshere" hidden>
+      <div class="wh-head">
+        <span class="lbl">Who&rsquo;s visiting right now?</span>
+        <span class="wh-span" id="wh-span"></span>
+      </div>
+      <p class="wh-hint">Tap the critters you can see, or add a new name. One name tags this visit and teaches the cast; two or more records that they came together.</p>
+      <div class="wh-cast" id="wh-cast"></div>
+      <div class="wh-add">
+        <input id="wh-new" placeholder="+ a new name…" autocomplete="off" spellcheck="false"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();whAddName();}">
+        <button class="gear" type="button" onclick="whAddName()">Add</button>
+        <button class="wh-log" type="button" id="wh-log" onclick="whLog()" disabled>Log who&rsquo;s here</button>
+      </div>
+      <div class="wh-msg" id="wh-msg"></div>
+      <div class="wh-recent" id="wh-recent"></div>
+    </section>
+
     <div class="lbl span" id="span"></div>
     <div class="tallies" id="tallies"></div>
 
