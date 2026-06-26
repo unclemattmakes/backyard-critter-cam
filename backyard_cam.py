@@ -14,16 +14,19 @@ Run `python backyard_cam.py --list-cameras` to find your webcam's index.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 import clips
 import config
@@ -135,19 +138,55 @@ def capture_backend(cfg: config.Config) -> int:
     return cv2.CAP_ANY
 
 
-def open_camera(cfg: config.Config) -> cv2.VideoCapture:
-    """Open the webcam with the configured backend/resolution and warm it up."""
-    cap = cv2.VideoCapture(cfg.camera_index, capture_backend(cfg))
-    if cfg.frame_width:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
-    if cfg.frame_height:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
-    if cfg.exposure is not None:  # lock manual exposure (0.25 = manual on most UVC/DSHOW cams)
+def _eff(spec: config.CameraSpec, cfg: config.Config, field: str):
+    """A CameraSpec field's effective value: the per-camera override if set, else the Config
+    default. This is what lets a spec stay terse -- only the fields that differ are filled in."""
+    v = getattr(spec, field, None)
+    return v if v is not None else getattr(cfg, field)
+
+
+def _backend_for(spec: config.CameraSpec, cfg: config.Config) -> int:
+    """OpenCV capture backend for a camera. A stream URL -> FFMPEG (what reads rtsp://, http MJPEG).
+    A local index -> DirectShow on Windows (fast init) else the native backend. An explicit
+    spec.backend wins; 'dshow' off Windows degrades to the native backend (as capture_backend does)."""
+    b = spec.backend
+    if b is None:
+        b = "ffmpeg" if spec.is_url else ("dshow" if cfg.use_dshow_backend else "any")
+    if b == "ffmpeg":
+        return cv2.CAP_FFMPEG
+    if b == "dshow" and sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
+def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCapture | None:
+    """Open ONE camera from its CameraSpec, warm it up, and return the VideoCapture (or None if it
+    won't open). Handles a local webcam index (DirectShow on Windows) and a networked stream URL
+    (FFMPEG backend + a 1-frame buffer, so decoded frames can't pile up into seconds of lag while
+    the detector is busy). Exposure/gain/UVC tweaks are applied for local cams; on a network stream
+    they're harmless no-ops (the camera, not OpenCV, owns those)."""
+    cap = cv2.VideoCapture(spec.src, _backend_for(spec, cfg))
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        return None
+    if spec.is_network:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep only the freshest frame (kills RTSP lag)
+        except Exception:
+            pass
+    w, h = _eff(spec, cfg, "frame_width"), _eff(spec, cfg, "frame_height")
+    if w:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    if h:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    exposure, gain = _eff(spec, cfg, "exposure"), _eff(spec, cfg, "gain")
+    if exposure is not None:   # lock manual exposure (0.25 = manual on most UVC/DSHOW cams)
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        cap.set(cv2.CAP_PROP_EXPOSURE, cfg.exposure)
-    if cfg.gain is not None:
-        cap.set(cv2.CAP_PROP_GAIN, cfg.gain)
-    for _name, _val in cfg.camera_controls.items():  # static UVC tweaks (e.g. BACKLIGHT off)
+        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    if gain is not None:
+        cap.set(cv2.CAP_PROP_GAIN, gain)
+    for _name, _val in (_eff(spec, cfg, "camera_controls") or {}).items():
         _prop = getattr(cv2, f"CAP_PROP_{_name}", None)
         if _prop is not None:
             cap.set(_prop, _val)
@@ -156,28 +195,41 @@ def open_camera(cfg: config.Config) -> cv2.VideoCapture:
     return cap
 
 
-def reopen_camera(cap: cv2.VideoCapture, cfg: config.Config) -> cv2.VideoCapture | None:
-    """Camera-disconnect handling: release and retry up to the configured limit.
+def open_camera(cfg: config.Config) -> cv2.VideoCapture | None:
+    """Back-compat shim: open the single (or primary) camera from the legacy flat config fields."""
+    return open_capture(cfg.camera_specs()[0], cfg)
 
-    Returns a working capture, or None if it never came back (caller shuts down cleanly --
-    we never let a disconnect crash the loop with a traceback).
-    """
-    print("[camera] read failed -- attempting to reopen ...")
-    try:
-        cap.release()
-    except Exception:
-        pass
-    for attempt in range(1, cfg.reopen_max_retries + 1):
-        time.sleep(cfg.reopen_delay_s)
-        new_cap = open_camera(cfg)
-        if new_cap is not None and new_cap.isOpened():
-            ok, _ = new_cap.read()
+
+def reconnect_capture(spec: config.CameraSpec, cfg: config.Config,
+                      stop_event: threading.Event) -> cv2.VideoCapture | None:
+    """Re-open a camera after a read failure. A NETWORK camera (the AP, switch, or camera itself
+    rebooted) gets indefinite exponential backoff -- it will come back, so never give up. A LOCAL
+    camera (a USB unplug) retries cfg.reopen_max_retries times then gives up (the device is gone).
+    Honours stop_event so a shutdown isn't blocked waiting on a dead network cam, and uses
+    stop_event.wait() (not sleep) so the wait ends the instant we're told to stop. Returns a
+    working capture, or None if it gave up / we're shutting down."""
+    tag = f"[{spec.source}]"
+    print(f"{tag} read failed -- reconnecting ...")
+    attempt, delay = 0, cfg.reopen_delay_s
+    while not stop_event.is_set():
+        attempt += 1
+        cap = open_capture(spec, cfg)
+        if cap is not None and cap.isOpened():
+            ok, _ = cap.read()
             if ok:
-                print(f"[camera] reopened on attempt {attempt}.")
-                return new_cap
-            new_cap.release()
-        print(f"[camera] reopen attempt {attempt}/{cfg.reopen_max_retries} failed.")
-    print("[camera] giving up after exhausting reopen retries.")
+                print(f"{tag} reconnected on attempt {attempt}.")
+                return cap
+            cap.release()
+        if spec.is_network:
+            print(f"{tag} reconnect attempt {attempt} failed; retrying in {delay:.0f}s.")
+            stop_event.wait(delay)
+            delay = min(30.0, delay * 2)        # exponential backoff, capped at 30 s
+        else:
+            print(f"{tag} reopen attempt {attempt}/{cfg.reopen_max_retries} failed.")
+            if attempt >= cfg.reopen_max_retries:
+                print(f"{tag} giving up after exhausting reopen retries.")
+                return None
+            stop_event.wait(cfg.reopen_delay_s)
     return None
 
 
@@ -363,6 +415,42 @@ def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
         cv2.putText(frame, "REC", (frame.shape[1] - 52, 48), FONT, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
 
 
+# ---- Multi-camera preview grid -----------------------------------------------------
+def _fit_cell(frame, w: int, h: int):
+    """Letterbox `frame` into a w x h black cell (preserving aspect). A None frame -- a camera
+    that hasn't produced its first frame yet -- becomes a plain black cell, so the grid is stable."""
+    cell = np.zeros((h, w, 3), dtype=np.uint8)
+    if frame is None or frame.size == 0:
+        return cell
+    fh, fw = frame.shape[:2]
+    scale = min(w / fw, h / fh)
+    nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    x, y = (w - nw) // 2, (h - nh) // 2
+    cell[y:y + nh, x:x + nw] = resized
+    return cell
+
+
+def compose_grid(frames: list):
+    """Tile per-camera annotated frames into one image for the native preview window (the web
+    dashboard renders its own grid). ONE camera -> its frame as-is, so the single-camera preview is
+    pixel-identical to before. Several -> a near-square grid of fixed cells. Returns None only when
+    there's nothing to show yet (a single camera with no frame)."""
+    n = len(frames)
+    if n == 0:
+        return None
+    if n == 1:
+        return frames[0]
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    cw, ch = 640, 360
+    canvas = np.zeros((rows * ch, cols * cw, 3), dtype=np.uint8)
+    for i, f in enumerate(frames):
+        r, c = divmod(i, cols)
+        canvas[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw] = _fit_cell(f, cw, ch)
+    return canvas
+
+
 # ---- Naming subprocess ------------------------------------------------------------
 def _naming_pids(tag: str) -> list:
     """PIDs of python processes whose command line carries our unique --tag (the live-naming
@@ -410,106 +498,315 @@ def _stop_naming(proc, tag: str | None = None) -> None:
         time.sleep(0.4)
 
 
-# ---- Main loop ---------------------------------------------------------------------
-def run(cfg: config.Config) -> None:
-    cfg.crops_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.save_full_frame:
-        cfg.frames_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.record_clips:
-        cfg.clips_dir.mkdir(parents=True, exist_ok=True)
+# ---- Per-camera capture worker -----------------------------------------------------
+def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
+                latest_frames, latest_lock, stop_event, results):
+    """One camera's whole capture pipeline, run in its own thread:
+        read -> MOG2 motion gate -> (shared) MegaDetector on motion -> save crop + DB row + clip,
+        then publish an annotated frame to this camera's web FrameBuffer and the preview grid.
+    Each worker owns its OWN capture, motion gate, DB connection and clip recorder, and tags every
+    row with spec.source -- so N cameras never interfere. The one shared resource is the detector,
+    serialized by det_lock (PyTorch inference isn't guaranteed thread-safe, and the motion gate
+    keeps detector calls rare, so the lock almost never contends). Does NO cv2 GUI -- the main
+    thread owns the window. Tallies are reported back via results[spec.source]."""
+    tag = f"[{spec.source}]"
+    fb = frame_buffers.get(spec.source)         # None when not serving the dashboard
+    bridge = control_bridges.get(spec.source)   # None when not serving
+    eff_motion_min_area = _eff(spec, cfg, "motion_min_area")
+    eff_profiles = _eff(spec, cfg, "camera_profiles") or {}
+    record = _eff(spec, cfg, "record_clips")
+    clip_trigger = cfg.clip_classes or cfg.save_classes
 
     conn = db.connect(cfg.db_path)
-
-    # All the long-lived handles, pre-initialised so the finally below can tear down cleanly even
-    # if a setup step raises (wrong-arch GPU, busy camera, a hand-edited bad camera profile) --
-    # otherwise a startup failure would orphan the naming child and leak the camera / DB / server.
     cap = None
-    server = None
-    frame_buffer = None
-    control_bridge = None
-    classify_proc = None
     recorder = None
-    classify_tag = f"backyard-naming-{os.getpid()}"   # unique marker for a clean, total shutdown
-
+    saved = 0
     try:
-        # Build the detector first: this resolves the device (a real GPU compute-check for
-        # 'cuda'/'auto') and downloads the model weights on first run. With device='cuda' and no
-        # usable GPU we fail here with a clear message (before touching the camera).
-        print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
-        print("  (first run downloads the model weights from Zenodo -- one time only)")
-        detector = Detector(cfg.model_version, cfg.device, cfg.min_confidence,
-                            classes=cfg.detect_classes)
-        if detector.device == "cuda":
-            print(f"  detector ready on GPU: {detector.device_name}")
-        else:
-            print("  detector ready on CPU -- slower per frame, but the motion gate keeps it usable.")
+        cap = open_capture(spec, cfg)
+        if cap is None and spec.is_network:
+            cap = reconnect_capture(spec, cfg, stop_event)   # an IP cam may still be booting -- wait
+        if cap is None:
+            msg = f"{tag} could not open camera src={spec.src!r}; this camera will not run."
+            if not spec.is_url:
+                msg += "  (try `python backyard_cam.py --list-cameras` to find the right index)"
+            print(msg)
+            return
+        print(f"{tag} open ({spec.src!r}).")
 
-        cap = open_camera(cfg)
-        if cap is None or not cap.isOpened():
-            cap = None                       # the finally tears down the DB / web server / child
-            raise RuntimeError(
-                f"Could not open camera index {cfg.camera_index}. "
-                f"Try `python backyard_cam.py --list-cameras` to find the right index."
-            )
-        print(f"Camera {cfg.camera_index} open. Watching for critters -- press 'q' to quit.\n")
+        recorder = clips.ClipRecorder(cfg, conn, source=spec.source) if record else None
 
-        # Optional local web dashboard (live stream + stats + camera controls), same process.
-        server = None
-        frame_buffer = None
-        control_bridge = None
-        if cfg.serve:
-            frame_buffer = web.FrameBuffer()
-            control_bridge = web.CameraControlBridge()
-            try:
-                server = web.start(cfg, frame_buffer, control_bridge)
-                print(f"  dashboard: http://{cfg.web_host}:{cfg.web_port}  (open in a browser)\n")
-            except OSError as e:
-                print(f"  [web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
-                print("  [web] continuing without it -- try another port with --port N.\n")
-                server, frame_buffer, control_bridge = None, None, None
-
-        # Resizable preview window (drag any edge); KEEPRATIO avoids stretching the feed.
-        if cfg.show_preview:
-            cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-            cv2.resizeWindow(cfg.window_name, cfg.frame_width, cfg.frame_height)
-
-        # Sun-driven day/night camera profile, re-applied whenever the period changes. Disabled
-        # when a manual --exposure/--gain was given (those force the static settings instead).
-        profiles_on = (cfg.use_time_of_day_profiles and cfg.exposure is None and cfg.gain is None
+        # Sun-driven day/night camera profile -- LOCAL cams only (a network stream exposes no UVC
+        # exposure controls), and only when no manual exposure/gain is forcing static settings.
+        profiles_on = (_eff(spec, cfg, "use_time_of_day_profiles") and not spec.is_url
+                       and _eff(spec, cfg, "exposure") is None and _eff(spec, cfg, "gain") is None
                        and cfg.latitude is not None and cfg.longitude is not None)
         active_period = None
         last_profile_check = 0.0
         if profiles_on:
+            active_period = daynight.current_period(cfg.latitude, cfg.longitude)
+            apply_camera_settings(cap, eff_profiles.get(active_period, {}))
+            print(f"{tag} camera profile: '{active_period}'")
+
+        # Probe writable sliders once (local cams only; a network cam has none we can set).
+        writable = {} if spec.is_url else (probe_writable_controls(cap) if bridge is not None else {})
+
+        gate = MotionGate(cfg)
+        last_detect_t = last_dets_t = 0.0
+        last_dets: list[Detection] = []
+        frame_count = read_fails = fps_n = 0
+        fps = 0.0
+        fps_t = time.monotonic()
+        last_ctrl_pub = 0.0
+
+        while not stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                read_fails += 1
+                if read_fails >= READ_FAIL_TOLERANCE:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = reconnect_capture(spec, cfg, stop_event)
+                    read_fails = 0
+                    if cap is None:
+                        break                       # gave up (local) or shutting down
+                    active_period = None            # re-apply the profile after a reconnect
+                    last_profile_check = 0.0
+                continue
+            read_fails = 0
+            frame_count += 1
+
+            # --- FPS (rolling, ~ once per second) ---
+            fps_n += 1
+            now = time.monotonic()
+            if now - fps_t >= 1.0:
+                fps = fps_n / (now - fps_t)
+                fps_t, fps_n = now, 0
+
+            # --- Time-of-day camera profile (sun-driven; checked ~every 30 s) ---
+            if profiles_on and now - last_profile_check >= 30.0:
+                last_profile_check = now
+                period = daynight.current_period(cfg.latitude, cfg.longitude)
+                if period != active_period:
+                    active_period = period
+                    apply_camera_settings(cap, eff_profiles.get(period, {}))
+                    print(f"{tag} sun crossed -- switched to '{period}' profile")
+
+            # --- Live camera controls from the dashboard (web thread -> this capture thread) ---
+            if bridge is not None:
+                pending = bridge.take_pending()
+                if pending and not spec.is_url:
+                    apply_camera_settings(cap, pending)
+                if now - last_ctrl_pub >= 1.0:
+                    last_ctrl_pub = now
+                    snap = {} if spec.is_url else read_camera_controls(cap)
+                    snap["period"] = active_period
+                    snap["writable"] = writable
+                    snap["network"] = spec.is_url   # the dashboard hides sliders for a network cam
+                    # Coarsen the published coords (~10 km) -- a LAN/DNS-rebind client can read this.
+                    snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
+                    snap["lon"] = round(cfg.longitude, 1) if cfg.longitude is not None else None
+                    bridge.publish(snap)
+
+            # --- Motion gate (per-camera background model + threshold) ---
+            motion_area = gate.update(frame)
+            motion = (frame_count > MOTION_WARMUP_FRAMES) and (motion_area > eff_motion_min_area)
+
+            # --- Behaviour clip: buffer pre-roll every frame; write + auto-stop while recording ---
+            if recorder is not None:
+                recorder.note_frame(frame, now, loop_fps=fps)
+
+            # --- Detector (only on motion, rate-limited, under the shared-detector lock) ---
+            if motion and (now - last_detect_t) >= cfg.detector_min_interval_s:
+                last_detect_t = now
+                try:
+                    with det_lock:
+                        dets = detector.detect(frame)
+                except Exception as e:  # never let one bad frame kill the loop
+                    print(f"{tag} detector error on a frame (skipping): {e}")
+                    dets = []
+                if dets:
+                    last_dets, last_dets_t = dets, now
+                    saved_dets = [d for d in dets if d.class_name in cfg.save_classes]
+                    if recorder is not None:
+                        clip_dets = [d for d in dets if d.class_name in clip_trigger]
+                        if clip_dets:
+                            recorder.note_detection(now, clip_dets)
+                    dt = datetime.now().astimezone()
+                    iso = dt.isoformat()
+                    day = dt.strftime("%Y-%m-%d")
+                    stamp = dt.strftime("%Y-%m-%dT%H-%M-%S-") + f"{dt.microsecond // 1000:03d}"
+                    h, w = frame.shape[:2]
+                    frame_path = None
+                    if cfg.save_full_frame:
+                        fp = save_frame(frame, cfg, day, stamp)
+                        frame_path = _rel(fp) if fp else None
+                    for i, det in enumerate(saved_dets):
+                        s = save_crop(frame, det, cfg, day, stamp, i)
+                        if s is None:
+                            continue
+                        crop_path, crop_q = s
+                        db.insert_detection(
+                            conn, timestamp=iso, source=spec.source,
+                            detection_class=det.class_name, confidence=det.confidence,
+                            bbox=det.bbox, frame_w=w, frame_h=h,
+                            crop_path=_rel(crop_path), frame_path=frame_path, crop_quality=crop_q)
+                        saved += 1
+                        print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
+
+            # --- Annotate for the dashboard feed + the native preview grid (NO cv2 GUI here) ---
+            if fb is not None or cfg.show_preview:
+                disp = frame.copy()
+                show = last_dets if (now - last_dets_t) <= cfg.box_display_ttl_s else []
+                draw_detections(disp, show)
+                draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion, saved=saved,
+                         source=spec.display_name, model=cfg.model_version, period=active_period,
+                         recording=recorder is not None and recorder.recording)
+                if fb is not None:
+                    ok_enc, buf = cv2.imencode(".jpg", disp,
+                                               [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
+                    if ok_enc:
+                        fb.update(buf.tobytes())
+                if cfg.show_preview:
+                    with latest_lock:
+                        latest_frames[spec.source] = disp
+    except Exception as e:  # never let one camera's crash take down the whole rig
+        print(f"{tag} capture thread stopped on error: {e}")
+    finally:
+        if recorder is not None:
+            try:
+                recorder.finalize(shutdown=True)    # flush any clip mid-record (writes its DB row)
+            except Exception:
+                pass
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        results[spec.source] = {"saved": saved,
+                                "clips": recorder.clips_saved if recorder is not None else 0}
+
+
+# ---- Native preview window (main thread owns all cv2 GUI) ---------------------------
+def _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads):
+    """Composite each camera's latest annotated frame into a grid, show it, and watch for 'q' or a
+    window close. ALL cv2 GUI lives on the main thread (imshow/waitKey aren't thread-safe), so the
+    capture workers only ever hand frames over. Sets stop_event when the user quits or every camera
+    thread has exited (so a single dead camera still ends the rig instead of hanging on a blank window)."""
+    sources = [s.source for s in specs]
+    while not stop_event.is_set():
+        with latest_lock:
+            frames = [latest_frames.get(s) for s in sources]
+        grid = compose_grid(frames)
+        if grid is not None:
+            cv2.imshow(cfg.window_name, grid)
+        if (cv2.waitKey(30) & 0xFF) == ord("q"):
+            print("\n'q' pressed -- shutting down.")
+            break
+        try:
+            # Closing the video window (its X button) shuts the rig down too, so a teen can just
+            # close the window instead of remembering the 'q' key.
+            if cv2.getWindowProperty(cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                print("\nVideo window closed -- shutting down.")
+                break
+        except cv2.error:
+            pass
+        if not any(t.is_alive() for t in threads):
+            print("\nAll cameras stopped -- shutting down.")
+            break
+    stop_event.set()
+
+
+# ---- Main loop ---------------------------------------------------------------------
+def run(cfg: config.Config) -> None:
+    """Drive every configured camera at once: one capture thread each, sharing one MegaDetector and
+    one dashboard. Single-camera mode is just the N=1 case (cfg.camera_specs() synthesizes one spec
+    from the flat fields), so existing setups behave exactly as before."""
+    specs = cfg.camera_specs()
+    seen = set()
+    for s in specs:                                 # a duplicate source would silently merge two cams
+        if s.source in seen:
+            raise RuntimeError(
+                f"Duplicate camera source '{s.source}' in cfg.cameras -- give each camera a unique source name.")
+        seen.add(s.source)
+
+    cfg.crops_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.save_full_frame:
+        cfg.frames_dir.mkdir(parents=True, exist_ok=True)
+    if any(_eff(s, cfg, "record_clips") for s in specs):
+        cfg.clips_dir.mkdir(parents=True, exist_ok=True)
+
+    # Networked cams read rtsp:// through FFMPEG; force TCP transport (UDP packet loss tears H.264
+    # frames). Must be set before any VideoCapture opens a stream -- so set it here, once, up front.
+    if any(isinstance(s.src, str) and s.src.lower().startswith("rtsp") for s in specs):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+    conn = db.connect(cfg.db_path)                  # ensures schema first; reused for the shutdown rebuild
+    server = None
+    frame_buffers: dict = {}
+    control_bridges: dict = {}
+    classify_proc = None
+    classify_tag = f"backyard-naming-{os.getpid()}"   # unique marker for a clean, total shutdown
+    threads: list[threading.Thread] = []
+    stop_event = threading.Event()
+    latest_frames: dict = {}
+    latest_lock = threading.Lock()
+    results: dict = {}
+
+    try:
+        # Build the (shared) detector first: resolves the device (a real GPU compute-check for
+        # 'cuda'/'auto') and downloads the weights on first run, failing loud with device='cuda'.
+        print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
+        print("  (first run downloads the model weights from Zenodo -- one time only)")
+        detector = Detector(cfg.model_version, cfg.device, cfg.min_confidence, classes=cfg.detect_classes)
+        if detector.device == "cuda":
+            print(f"  detector ready on GPU: {detector.device_name}")
+        else:
+            print("  detector ready on CPU -- slower per frame, but the motion gate keeps it usable.")
+        det_lock = threading.Lock()
+
+        n = len(specs)
+        print(f"  {n} camera{'' if n == 1 else 's'}: "
+              + ", ".join(f"{s.display_name} ({s.src!r})" for s in specs))
+        if cfg.latitude is not None and cfg.longitude is not None:
             try:
                 st = daynight.sun_times(cfg.latitude, cfg.longitude)
                 print("  sun today: " + "  ".join(f"{k} {v.strftime('%H:%M')}" for k, v in st.items()))
             except Exception:
                 pass
-            active_period = daynight.current_period(cfg.latitude, cfg.longitude)
-            apply_camera_settings(cap, cfg.camera_profiles.get(active_period, {}))
-            print(f"  camera profile: '{active_period}'\n")
+        if any(_eff(s, cfg, "record_clips") for s in specs):
+            print(f"  behaviour clips: ON -- short videos to {_rel(cfg.clips_dir)}/<source>/ "
+                  f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, cap {cfg.clip_max_s:g}s).")
 
-        # Probe once which sliders this camera actually honors (many webcams reject manual FOCUS);
-        # the dashboard locks the rest. Only when serving -- it briefly nudges supported controls.
-        writable = probe_writable_controls(cap) if control_bridge is not None else {}
+        # Optional local web dashboard: one FrameBuffer + control bridge PER camera, so the Live tab
+        # can show a grid of feeds and control each camera independently.
+        if cfg.serve:
+            for s in specs:
+                frame_buffers[s.source] = web.FrameBuffer()
+                control_bridges[s.source] = web.CameraControlBridge()
+            try:
+                server = web.start(cfg, frame_buffers, control_bridges)
+                print(f"  dashboard: http://{cfg.web_host}:{cfg.web_port}  (open in a browser)\n")
+            except OSError as e:
+                print(f"  [web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
+                print("  [web] continuing without it -- try another port with --port N.\n")
+                server, frame_buffers, control_bridges = None, {}, {}
 
-        # Species naming runs as a managed CHILD PROCESS (classify.py --watch), not a thread: the
-        # BioCLIP model can only be BUILT on a process's main thread -- constructing it in a
-        # background thread deadlocks -- so naming gets its own process. That also loads the model
-        # in parallel, so the camera and preview still come up instantly. The child shares THIS
-        # console (its logs print here; no extra window), and we kill it on shutdown, so there's
-        # still one launch and one stop with nothing left running.
-        classify_proc = None
-        classify_tag = f"backyard-naming-{os.getpid()}"   # unique marker for a clean, total shutdown
+        # ONE shared species-naming child (classify.py --watch): it names any crop lacking a species
+        # regardless of source, so a single helper covers every camera (one launch, one stop). Runs
+        # as a child PROCESS because BioCLIP must be built on a process's main thread (a thread deadlocks).
         if cfg.classify_live:
             try:
                 classify_proc = subprocess.Popen(
                     [sys.executable, str(config.ROOT / "classify.py"), "--watch",
                      "--device", str(cfg.classify_device),
-                     "--interval", str(cfg.classify_interval_s),
-                     "--tag", classify_tag],
-                    cwd=str(config.ROOT),
-                )
+                     "--interval", str(cfg.classify_interval_s), "--tag", classify_tag],
+                    cwd=str(config.ROOT))
                 print("  species naming: ON -- a helper is warming up the model (~1-2 min), then it\n"
                       "  names new crops automatically. The dashboard shows when it's ready.\n")
             except Exception as e:
@@ -517,176 +814,38 @@ def run(cfg: config.Config) -> None:
                       f"(detection still works): {e}\n")
                 classify_proc = None
 
-        # Optional behaviour-clip recorder (phase 4 capture): records a short video around each
-        # visit. Off unless cfg.record_clips / --record-clips. Lives in this (capture) thread.
-        recorder = clips.ClipRecorder(cfg, conn) if cfg.record_clips else None
-        clip_trigger = cfg.clip_classes or cfg.save_classes   # which classes start a clip
-        if recorder is not None:
-            print(f"  behaviour clips: ON -- recording short videos to {_rel(cfg.clips_dir)}/ "
-                  f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, "
-                  f"cap {cfg.clip_max_s:g}s; triggers on {', '.join(clip_trigger)}).\n")
+        # One capture thread per camera, all sharing the single detector.
+        for s in specs:
+            t = threading.Thread(
+                target=_run_camera, name=f"cam-{s.source}",
+                args=(s, cfg, detector, det_lock, frame_buffers, control_bridges,
+                      latest_frames, latest_lock, stop_event, results),
+                daemon=True)
+            t.start()
+            threads.append(t)
+        print("Watching for critters -- press 'q' in the window (or close it) to quit.\n")
 
-        gate = MotionGate(cfg)
-        last_detect_t = 0.0          # monotonic time of last detector run (for rate limiting)
-        last_dets: list[Detection] = []
-        last_dets_t = 0.0            # monotonic time the persisted boxes were produced
-        total_saved = 0
-        frame_count = 0
-        read_fails = 0
-        fps = 0.0
-        fps_t = time.monotonic()
-        fps_n = 0
-        last_ctrl_pub = 0.0
-
-        try:
-            while True:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    read_fails += 1
-                    if read_fails >= READ_FAIL_TOLERANCE:
-                        cap = reopen_camera(cap, cfg)
-                        read_fails = 0
-                        if cap is None:
-                            break  # graceful shutdown -- camera never came back
-                        active_period = None       # camera reset on reopen -- re-apply profile
-                        last_profile_check = 0.0
-                    continue
-                read_fails = 0
-                frame_count += 1
-
-                # --- FPS (rolling, ~ once per second) ---
-                fps_n += 1
-                now = time.monotonic()
-                if now - fps_t >= 1.0:
-                    fps = fps_n / (now - fps_t)
-                    fps_t, fps_n = now, 0
-
-                # --- Time-of-day camera profile (sun-driven; checked ~every 30 s) ---
-                if profiles_on and now - last_profile_check >= 30.0:
-                    last_profile_check = now
-                    period = daynight.current_period(cfg.latitude, cfg.longitude)
-                    if period != active_period:
-                        active_period = period
-                        apply_camera_settings(cap, cfg.camera_profiles.get(period, {}))
-                        print(f"[camera] sun crossed -- switched to '{period}' profile")
-
-                # --- Live camera controls from the dashboard (web thread -> capture thread) ---
-                if control_bridge is not None:
-                    pending = control_bridge.take_pending()
-                    if pending:
-                        apply_camera_settings(cap, pending)
-                    if now - last_ctrl_pub >= 1.0:
-                        last_ctrl_pub = now
-                        snap = read_camera_controls(cap)
-                        snap["period"] = active_period
-                        snap["writable"] = writable
-                        # Coarsen to ~1 decimal (~10 km) before publishing to the dashboard API:
-                        # a LAN/DNS-rebind client can read /api/camera, so don't hand it the rig's
-                        # exact home coordinates. The sun-driven profiles read cfg.latitude/longitude
-                        # directly (above) -- this published value is display-only.
-                        snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
-                        snap["lon"] = round(cfg.longitude, 1) if cfg.longitude is not None else None
-                        control_bridge.publish(snap)
-
-                # --- Motion gate ---
-                motion_area = gate.update(frame)
-                motion = (frame_count > MOTION_WARMUP_FRAMES) and (motion_area > cfg.motion_min_area)
-
-                # --- Behaviour clip: buffer pre-roll every frame; write + auto-stop while recording ---
-                if recorder is not None:
-                    recorder.note_frame(frame, now, loop_fps=fps)
-
-                # --- Detector (only on motion, rate-limited) ---
-                if motion and (now - last_detect_t) >= cfg.detector_min_interval_s:
-                    last_detect_t = now
-                    try:
-                        dets = detector.detect(frame)
-                    except Exception as e:  # never let one bad frame kill the loop
-                        print(f"[detector] error on a frame (skipping): {e}")
-                        dets = []
-
-                    if dets:
-                        last_dets, last_dets_t = dets, now
-                        saved_dets = [d for d in dets if d.class_name in cfg.save_classes]
-                        # Clips trigger on clip_trigger (default = save_classes), independent of what
-                        # gets cropped -- so a person can record a test clip without a DB selfie.
-                        if recorder is not None:
-                            clip_dets = [d for d in dets if d.class_name in clip_trigger]
-                            if clip_dets:
-                                recorder.note_detection(now, clip_dets)
-                        dt = datetime.now().astimezone()
-                        iso = dt.isoformat()
-                        day = dt.strftime("%Y-%m-%d")
-                        stamp = dt.strftime("%Y-%m-%dT%H-%M-%S-") + f"{dt.microsecond // 1000:03d}"
-                        h, w = frame.shape[:2]
-                        frame_path = None
-                        if cfg.save_full_frame:
-                            fp = save_frame(frame, cfg, day, stamp)
-                            frame_path = _rel(fp) if fp else None
-
-                        for i, det in enumerate(saved_dets):
-                            saved = save_crop(frame, det, cfg, day, stamp, i)
-                            if saved is None:
-                                continue
-                            crop_path, crop_q = saved
-                            db.insert_detection(
-                                conn,
-                                timestamp=iso,
-                                source=cfg.source,
-                                detection_class=det.class_name,
-                                confidence=det.confidence,
-                                bbox=det.bbox,
-                                frame_w=w,
-                                frame_h=h,
-                                crop_path=_rel(crop_path),
-                                frame_path=frame_path,
-                                crop_quality=crop_q,
-                                # species / individual_id stay NULL in V1.
-                            )
-                            total_saved += 1
-                            print(f"  [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
-
-                # --- Live preview + optional web stream ---
-                if cfg.show_preview or server is not None:
-                    disp = frame.copy()
-                    show = last_dets if (now - last_dets_t) <= cfg.box_display_ttl_s else []
-                    draw_detections(disp, show)
-                    draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion,
-                             saved=total_saved, source=cfg.source, model=cfg.model_version,
-                             period=active_period,
-                             recording=recorder is not None and recorder.recording)
-                    if server is not None:
-                        ok_enc, buf = cv2.imencode(".jpg", disp,
-                                                   [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
-                        if ok_enc:
-                            frame_buffer.update(buf.tobytes())
-                    if cfg.show_preview:
-                        cv2.imshow(cfg.window_name, disp)
-                        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                            print("\n'q' pressed -- shutting down.")
-                            break
-                        # Closing the video window (its X button) shuts the rig down too, so a teen
-                        # can just close the window instead of remembering the 'q' key.
-                        if cv2.getWindowProperty(cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                            print("\nVideo window closed -- shutting down.")
-                            break
-        except KeyboardInterrupt:
-            print("\nInterrupted -- shutting down.")
+        if cfg.show_preview:
+            # The MAIN thread owns the cv2 window (GUI calls must be single-threaded).
+            cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+            cv2.resizeWindow(cfg.window_name, cfg.frame_width, cfg.frame_height)
+            _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads)
+        else:
+            # Headless: idle until Ctrl+C or every camera thread has exited.
+            while not stop_event.is_set() and any(t.is_alive() for t in threads):
+                stop_event.wait(0.3)
+    except KeyboardInterrupt:
+        print("\nInterrupted -- shutting down.")
     finally:
-        if recorder is not None:
-            recorder.finalize(shutdown=True)        # flush any clip mid-record (writes its DB row)
+        stop_event.set()                            # tell every worker (and any reconnect wait) to stop
+        for t in threads:
+            t.join(timeout=10)
         _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
         if server is not None:
             web.shutdown(server)
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
         cv2.destroyAllWindows()
-        # Keep the visit ledger fresh: collapse this session's detections into visit events so
-        # the dashboard's Behaviour tab is current without a manual `python visits.py` run.
-        # A full rebuild is subsecond at this scale; never let it block a clean shutdown.
+        # Keep the visit ledger fresh: collapse this session's detections into visit events so the
+        # dashboard's Behaviour tab is current without a manual `python visits.py`. Subsecond here.
         try:
             conn.row_factory = sqlite3.Row
             visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
@@ -694,7 +853,9 @@ def run(cfg: config.Config) -> None:
         except Exception as e:
             print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
         conn.close()
-        clips_note = f"  Recorded {recorder.clips_saved} clip(s)." if recorder is not None else ""
+        total_saved = sum(r.get("saved", 0) for r in results.values())
+        total_clips = sum(r.get("clips", 0) for r in results.values())
+        clips_note = f"  Recorded {total_clips} clip(s)." if total_clips else ""
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.{clips_note}")
 
 
@@ -705,7 +866,12 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         description="Backyard critter detection -- V1 live glass-door cam.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--camera-index", type=int, default=c.camera_index)
+    p.add_argument("--camera-index", type=int, default=c.camera_index,
+                   help="Which webcam (single-camera mode; --list-cameras finds it). For SEVERAL "
+                        "cameras at once -- USB + networked -- set cfg.cameras in config_local.py.")
+    p.add_argument("--source", default=c.source,
+                   help="DB 'source' label for this camera's rows (single-camera mode). Defaults to "
+                        "'glass_door_cam'; set it when running a second live rig into the same DB.")
     p.add_argument("--width", type=int, default=c.frame_width)
     p.add_argument("--height", type=int, default=c.frame_height)
     p.add_argument("--exposure", type=float, default=c.exposure,
@@ -758,6 +924,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     cfg = replace(
         c,
         camera_index=args.camera_index,
+        source=args.source,
         frame_width=args.width,
         frame_height=args.height,
         exposure=args.exposure,

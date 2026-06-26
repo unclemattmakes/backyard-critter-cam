@@ -234,6 +234,55 @@ def compute_stats(cfg) -> dict | None:
         conn.close()
 
 
+def current_live_visit(cfg, source: str | None = None, lookback: int = 600) -> dict:
+    """The visit happening (or most recently) on a live source -- the span the Live tab's
+    "who's here now?" control names. Walks back from the newest detection on `source`,
+    accumulating while consecutive gaps stay under `visit_gap_minutes`; the first larger gap
+    ends the span. Returns {source, count, start, end, minutes, latest, latest_age_s, active,
+    species}; `active` = the newest detection is still within the gap (the animal hasn't left).
+    Just {source, count: 0} when nothing is on that source yet."""
+    source = source or cfg.source
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"source": source, "count": 0}
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, species FROM detections WHERE source = ? "
+            "ORDER BY id DESC LIMIT ?", (source, int(lookback))).fetchall()
+        # Walk back over the recent window by INSTANT, not insertion id: the live rig writes in
+        # time order so the two agree, but sorting by parsed time keeps the gap detection correct
+        # even if a backfill or clock hiccup left an out-of-order row in the window.
+        cand = sorted(((t, r["species"]) for r in rows
+                       if (t := _parse(r["timestamp"])) is not None),
+                      key=lambda x: x[0], reverse=True)
+        gap = timedelta(minutes=cfg.visit_gap_minutes)
+        span, prev = [], None      # newest-first; stop at the first gap >= visit_gap.
+        for t, sp in cand:
+            if prev is not None and (prev - t) >= gap:
+                break
+            span.append((t, sp))
+            prev = t
+        if not span:
+            return {"source": source, "count": 0}
+        times = [t for t, _ in span]
+        start, end = min(times), max(times)
+        now = datetime.now().astimezone()
+        species = Counter(s for _, s in span if s)
+        return {
+            "source": source,
+            "count": len(span),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "minutes": round((end - start).total_seconds() / 60.0, 1),
+            "latest": end.isoformat(),
+            "latest_age_s": round((now - end).total_seconds(), 1),
+            "active": (now - end) < gap,
+            "species": dict(species.most_common()),
+        }
+    finally:
+        conn.close()
+
+
 def species_overview(cfg) -> dict | None:
     """Per-species rollup for the most/least-frequent display: count, avg confidence, review
     tallies, and a representative (verified-or-most-confident) crop. None if no DB yet."""

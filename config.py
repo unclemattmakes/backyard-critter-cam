@@ -36,6 +36,66 @@ NAMING_STATUS_FILE = ROOT / ".naming_status.json"
 
 
 @dataclass
+class CameraSpec:
+    """One camera in a multi-camera rig.
+
+    The live rig can watch several cameras at once -- a USB webcam at the glass door PLUS
+    networked cameras around the yard -- each writing its own `source` into the DB so all the
+    downstream phases (species ID, re-ID, behaviour, the dashboard) keep them separate. List them
+    in `Config.cameras` (typically in config_local.py); leave it None to stay single-camera (the
+    flat `camera_index`/`source` fields below are then used, unchanged).
+
+    Only `source` and `src` are required; every other field defaults to None and INHERITS the
+    matching Config value at runtime, so a spec stays terse:
+
+        cfg.cameras = [
+            CameraSpec("glass_door_cam", 0, name="Glass door"),              # USB webcam, index 0
+            CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
+                       name="Yard (night IR)"),                              # Reolink PoE, sub-stream
+            CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
+                       name="Feeder (ESP32)", motion_min_area=300),         # ESP32-CAM MJPEG
+        ]
+
+    `src` is whatever cv2.VideoCapture accepts: an int webcam index, or a URL string -- an RTSP
+    URL for an IP/PoE camera (best for night: real IR + one-cable PoE), or an http .../stream
+    MJPEG URL for an ESP32-CAM (a fun daytime angle; weak in the dark). A networked camera is
+    opened through OpenCV's FFMPEG backend with a 1-frame buffer and reconnected with indefinite
+    backoff (a network blip is transient; a USB unplug is not -- see backyard_cam.py)."""
+    source: str                              # DB 'source' label; MUST be unique across cameras.
+    src: int | str = 0                       # cv2.VideoCapture arg: int webcam index OR stream URL.
+    name: str | None = None                  # Display name in the dashboard (defaults to `source`).
+    # Everything below: None = inherit the same-named Config field at runtime.
+    frame_width: int | None = None
+    frame_height: int | None = None
+    backend: str | None = None               # 'dshow' | 'ffmpeg' | 'any'; None = auto by src type + OS.
+    exposure: float | None = None
+    gain: float | None = None
+    camera_controls: dict | None = None
+    camera_profiles: dict | None = None
+    use_time_of_day_profiles: bool | None = None
+    # Motion-gate trigger area is RESOLUTION-DEPENDENT (pixels), so a lower-res networked cam wants
+    # a smaller value than the 1280x720 default -- set it per camera here. None = inherit Config.
+    motion_min_area: int | None = None
+    record_clips: bool | None = None
+
+    @property
+    def is_url(self) -> bool:
+        """True when `src` is a stream URL (a string) rather than an int webcam index."""
+        return isinstance(self.src, str)
+
+    @property
+    def is_network(self) -> bool:
+        """True for a networked stream (rtsp://, http://...): gets the FFMPEG backend, a 1-frame
+        buffer, and indefinite-backoff reconnect. A plain local file path (str without '://')
+        counts as non-network so a recorded-file test source reconnects like a local device."""
+        return isinstance(self.src, str) and "://" in self.src
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.source
+
+
+@dataclass
 class Config:
     # ---- Camera (OpenCV capture) ------------------------------------------------
     camera_index: int = 0           # USB webcam index (0 = first/default). Set yours in config_local.py; --list-cameras finds it.
@@ -59,6 +119,19 @@ class Config:
     camera_controls: dict = field(default_factory=lambda: {"BACKLIGHT": 0})
     reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).
+
+    # ---- Multiple cameras (optional) --------------------------------------------
+    # None = single-camera mode: the flat camera_index/source fields above are the one camera.
+    # Set a list of CameraSpec to run SEVERAL cameras at once (USB + networked), each on its own
+    # capture thread, all sharing one detector and one dashboard (a grid of live feeds). Define it
+    # in config_local.py, e.g.:
+    #   from config import CameraSpec
+    #   cfg.cameras = [CameraSpec("glass_door_cam", 0, name="Glass door"),
+    #                  CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
+    #                             name="Yard (night IR)")]
+    # Each camera's `source` is written to its detections/clips, so stats/re-ID/behaviour keep the
+    # cameras separate automatically. See CameraSpec (above) for the per-camera fields.
+    cameras: list | None = None
 
     # ---- Time-of-day camera profiles (sun-driven) -------------------------------
     # The live app selects a camera profile by SUN position, so "day" vs "night" tracks the
@@ -297,6 +370,23 @@ class Config:
     # Produced by datetime.now().astimezone().isoformat(): the wall-clock time you'd read
     # off a window-side clock, but the trailing offset keeps it globally unambiguous and
     # correctly sortable across DST changes. See db.now_local_iso().
+
+    def camera_specs(self) -> "list[CameraSpec]":
+        """The cameras to run, as a list of CameraSpec -- ALWAYS at least one. With `cameras` set
+        it's returned as-is; otherwise a single spec is synthesized from the flat single-camera
+        fields, so the legacy one-camera path is just the N=1 case of the multi-camera one (no
+        separate code path, and every existing config keeps working untouched)."""
+        if self.cameras:
+            return list(self.cameras)
+        return [CameraSpec(
+            source=self.source, src=self.camera_index, name=None,
+            frame_width=self.frame_width, frame_height=self.frame_height,
+            backend=("dshow" if self.use_dshow_backend else "any"),
+            exposure=self.exposure, gain=self.gain,
+            camera_controls=self.camera_controls, camera_profiles=self.camera_profiles,
+            use_time_of_day_profiles=self.use_time_of_day_profiles,
+            motion_min_area=self.motion_min_area, record_clips=self.record_clips,
+        )]
 
 
 # The single shared default instance. backyard_cam.py copies this and applies CLI overrides.

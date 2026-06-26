@@ -7,6 +7,7 @@ check. Pure DB logic; no GPU / camera / model.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 import config
 import db
@@ -66,3 +67,41 @@ def test_crops_page_clamps_negative_limit(conn, db_path):
     page = stats.crops_page(_cfg(db_path), limit=-1, offset=-5)
     assert page["limit"] == 1 and page["offset"] == 0
     assert len(page["crops"]) <= 1
+
+
+# ---- current_live_visit: the span the Live tab's "who's here now?" control names ----
+def _at(conn, dt, species="raccoon"):
+    db.insert_detection(conn, timestamp=dt.isoformat(), source="glass_door_cam",
+                        detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                        frame_w=100, frame_h=100, crop_path="crops/x.jpg",
+                        species=species, crop_quality=1.0)
+
+
+def test_current_live_visit_empty_db(conn, db_path):
+    v = stats.current_live_visit(_cfg(db_path))
+    assert v["count"] == 0
+
+
+def test_current_live_visit_active_run(conn, db_path):
+    now = datetime.now().astimezone()
+    for s in (40, 25, 10, 1):                         # four detections in the last minute
+        _at(conn, now - timedelta(seconds=s))
+    conn.commit()
+    v = stats.current_live_visit(_cfg(db_path))
+    assert v["count"] == 4 and v["active"] is True
+    assert v["species"] == {"raccoon": 4} and v["latest_age_s"] < 30
+
+
+def test_current_live_visit_stops_at_the_gap(conn, db_path):
+    """A gap >= visit_gap_minutes ends the span: only the most recent run is the 'current' visit."""
+    now = datetime.now().astimezone()
+    gap = config.CONFIG.visit_gap_minutes
+    # Insert in capture order (oldest first), like the live rig -- so id order == time order, which
+    # is what current_live_visit walks back over. The older run is separated by more than the gap.
+    for m in (gap + 31, gap + 30):                    # an older run, must NOT be folded in
+        _at(conn, now - timedelta(minutes=m))
+    for s in (20, 5):                                 # the current run (last ~20s)
+        _at(conn, now - timedelta(seconds=s))
+    conn.commit()
+    v = stats.current_live_visit(_cfg(db_path))
+    assert v["count"] == 2 and v["active"] is True

@@ -70,6 +70,17 @@
   .plate img{display:block; width:100%; height:auto;}
   .plate .cap{display:flex; justify-content:space-between; padding:10px 4px 2px; color:var(--dim);}
 
+  /* Live grid: one pane per camera (loadCameras builds them). Auto-fit so 2-4 cameras tile
+     responsively; .single collapses to one full-width pane identical to the old single feed. The
+     .plate .frame / .plate img / .feed-msg / .offline rules already apply inside each pane. */
+  .live-grid{display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));}
+  .live-grid.single{grid-template-columns:1fr;}
+  .live-pane{margin:0; cursor:pointer; border:1px solid transparent; border-radius:3px;
+    transition:border-color .2s; padding:2px;}
+  .live-pane.sel{border-color:var(--gilt);}             /* the camera the controls + who's-here act on */
+  .live-grid.single .live-pane{cursor:default; border-color:transparent; padding:0;}
+  .live-pane .cap{padding:8px 2px 0;}
+
   .panel.instr{padding:16px 16px 18px;}
   .instr h3{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500; font-size:17px;}
   .instr .hint{color:var(--faint); font-style:italic; font-size:13px; margin:0 0 14px;}
@@ -150,6 +161,45 @@
   .latest-latin{font-style:italic; color:var(--faint); font-size:13px; margin-top:1px; min-height:16px;}
   .latest-when{font-family:var(--mono); font-size:12px; color:var(--dim); margin-top:9px; display:flex; gap:8px; align-items:center;}
   .latest-when .conf{color:var(--sage);} .latest-when .dot{color:var(--faint);}
+
+  /* ---- "Who's here now?" — name the live visit as it happens ---- */
+  .whoshere{padding:16px 18px; margin-top:18px;}
+  .whoshere[hidden]{display:none;}
+  .wh-head{display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap;}
+  .wh-head .lbl{color:var(--gilt);}
+  .wh-span{font-family:var(--mono); font-size:12px; color:var(--dim);}
+  .wh-hint{color:var(--faint); font-style:italic; font-size:13px; margin:7px 0 13px;}
+  .wh-cast{display:flex; flex-wrap:wrap; gap:8px;}
+  .wh-chip{font-family:var(--serif); font-size:15px; padding:6px 14px; border-radius:999px;
+    background:var(--panel); border:1px solid var(--rule2); color:var(--dim); cursor:pointer;
+    transition:border-color .15s, color .15s, background .15s;}
+  .wh-chip:hover{border-color:var(--gilt); color:var(--ink);}
+  .wh-chip.on{background:rgba(201,162,75,.16); border-color:var(--gilt); color:var(--ink);}
+  .wh-chip.on::before{content:"✓ "; color:var(--gilt);}
+  .wh-add{display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:14px;}
+  #wh-new{flex:1 1 160px; max-width:240px; padding:8px 11px; background:rgba(0,0,0,.25);
+    border:1px solid var(--rule2); border-radius:4px; color:var(--ink); font:inherit; font-size:14px;}
+  #wh-new::placeholder{color:var(--faint);}
+  .wh-log{margin-left:auto; font-family:var(--mono); font-size:11px; letter-spacing:.12em;
+    text-transform:uppercase; padding:9px 16px; border-radius:4px; cursor:pointer; color:#14110a;
+    background:var(--gilt); border:1px solid var(--gilt); transition:opacity .15s, filter .15s;}
+  .wh-log:hover:not(:disabled){filter:brightness(1.08);}
+  .wh-log:disabled{opacity:.4; cursor:not-allowed; background:none; color:var(--faint); border-color:var(--rule2);}
+  .wh-msg{min-height:0; font-size:13px; margin-top:10px; font-style:italic;}
+  .wh-msg.ok{color:var(--sage);} .wh-msg.err{color:var(--rust); font-style:normal;}
+  .wh-recent{margin-top:14px;}
+  .wh-rec-h{color:var(--faint); margin-bottom:6px;}
+  .wh-rec{display:flex; align-items:baseline; gap:10px; padding:5px 0; border-top:1px dotted var(--rule);}
+  .wh-rec .who{font-variant:small-caps; font-size:16px; letter-spacing:.02em; color:var(--ink);}
+  .wh-rec .when{font-family:var(--mono);}
+  .wh-rec .tag{margin-left:auto; opacity:.6;}
+
+  /* ---- un-blend: co-presence seed (logged pair drives the cluster assignment) ---- */
+  .ub-colog{font-size:13px; color:var(--ink); background:rgba(201,162,75,.10);
+    border:1px solid rgba(201,162,75,.35); border-radius:4px; padding:7px 11px; margin:0 0 8px;}
+  .ub-colog b{color:var(--gilt);}
+  .gear.ub-elim{border-color:var(--gilt); color:var(--gilt); background:rgba(201,162,75,.12);}
+  .gear.ub-elim:hover{background:rgba(201,162,75,.22); color:var(--ink);}
 
   .duo{display:grid; grid-template-columns:1fr 1fr; gap:0 30px;}
   @media(max-width:780px){.duo{grid-template-columns:1fr;}}

@@ -122,7 +122,7 @@ function buildControls(){
   });
 }
 let postTimer={}, touchedAt={};   // touchedAt[key] = Date.now() of the user's last interaction with that control
-function postCamera(obj){ fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
+function postCamera(obj){ fetch('/api/camera?source='+encodeURIComponent(LIVE.sel||''),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
 function sendControl(key,v){
   let p;
   if(key==='exposure')p={exposure:v};
@@ -137,10 +137,68 @@ function sendAuto(autoKey,on,slider){
   else if(autoKey==='autofocus')postCamera(on?{AUTOFOCUS:1}:{AUTOFOCUS:0,FOCUS:parseFloat(slider.value)});
   else if(autoKey==='auto_wb')postCamera(on?{AUTO_WB:1}:{AUTO_WB:0,WB_TEMPERATURE:parseFloat(slider.value)});
 }
-async function refreshCamera(){
-  let v; try{ v=await fetch('/api/camera').then(r=>r.json()); }catch(e){ return; }
+/* The live cameras. LIVE.sel is the camera the controls + "who's here" act on (click a pane to
+   change it); LIVE.primary is the main feed the masthead period/coords come from. A single-camera
+   rig has one pane and behaves exactly as before. */
+let LIVE={ cams:[], sel:null, primary:null };
+async function loadCameras(){
+  let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); }catch(e){ return; }
+  const cams=d.cameras||[];
+  if(!cams.length) return;
+  LIVE.cams=cams; LIVE.primary=d.primary||cams[0].source;
+  if(!LIVE.sel || !cams.find(c=>c.source===LIVE.sel)) LIVE.sel=LIVE.primary;
+  const grid=$('#live-grid'); if(!grid) return;
+  grid.classList.toggle('single', cams.length<=1);
+  grid.innerHTML=cams.map(c=>`
+    <figure class="live-pane${c.source===LIVE.sel?' sel':''}" data-source="${esc(c.source)}" onclick="selectCamera(${jarg(c.source)})">
+      <div class="frame"><i></i>
+        <img src="/stream.mjpg?source=${encodeURIComponent(c.source)}" alt="live feed" onerror="paneFeed(${jarg(c.source)},false)">
+        <div class="feed-msg"><b>Camera feed unavailable</b><span>This camera may be warming up, or isn&rsquo;t running.</span></div>
+      </div>
+      <figcaption class="cap">
+        <span class="lbl">${esc(c.name||c.source)}${c.network?' · net':''}${c.primary&&cams.length>1?' · main':''}</span>
+        <button class="gear" type="button" onclick="event.stopPropagation();openSettings(${jarg(c.source)})" title="Camera settings">&#9881;</button>
+      </figcaption>
+    </figure>`).join('');
+  checkFeeds();
+}
+function paneFor(source){ return [...document.querySelectorAll('.live-pane')].find(p=>p.dataset.source===source); }
+function paneFeed(source,up){ const p=paneFor(source); if(p){ const f=p.querySelector('.frame'); if(f) f.classList.toggle('offline',!up); } }
+async function checkFeeds(){
+  // An MJPEG <img> goes black (not "errored") when frames merely stall, so poll /snapshot.jpg per
+  // camera -- it 503s whenever that camera's capture thread has no current frame.
+  for(const c of LIVE.cams){
+    try{ const r=await fetch('/snapshot.jpg?source='+encodeURIComponent(c.source),{cache:'no-store'}); paneFeed(c.source,r.ok); }
+    catch(e){ paneFeed(c.source,false); }
+  }
+}
+function selectCamera(source){
+  if(LIVE.sel===source) return;
+  LIVE.sel=source; touchedAt={};   // a fresh camera's read-back shouldn't be suppressed by the last one's edits
+  document.querySelectorAll('.live-pane').forEach(p=>p.classList.toggle('sel',p.dataset.source===source));
+  refreshWhoshere();               // re-scope "who's here" to the newly selected camera
+  if(!$('#settings').hidden) refreshControls();
+}
+function camName(source){ const c=(LIVE.cams||[]).find(x=>x.source===source); return c?(c.name||c.source):source; }
+
+/* The masthead period/coords come from the PRIMARY camera (period is global -- one sun). */
+async function refreshHeader(){
+  const src=LIVE.primary; if(!src) return;
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
   if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
   if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+}
+
+/* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no
+   settable controls, so we show a note instead of sliders. Only refreshed while the modal is open. */
+async function refreshControls(){
+  const src=LIVE.sel; if(!src) return;
+  $('#instr-cam').textContent = (LIVE.cams.length>1?'· '+camName(src):'');
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
+  const net=!!v.network;
+  $('#instr-net').hidden=!net;
+  $('#controls').style.display=net?'none':'';
+  if(net) return;
   CONTROLS.forEach(c=>{
     const el=$(`.ctrl[data-k="${c.key}"]`); if(!el)return;
     const sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]'), au=el.querySelector('[data-auto]');
@@ -196,6 +254,83 @@ async function refreshLive(){
   $('#least').innerHTML=rare.map(x=>card(x,null)).join('')||'<p class="empty">—</p>';
   bindCards();
 }
+/* ---------- "Who's here now?": name the live visit as it happens ----------
+   One name tags the current visit's crops with that individual (a live solo confirm that feeds
+   the appearance templates); two or more record who came TOGETHER without stamping a single name
+   on both animals (the pair gotcha). The span is resolved server-side, so the client only sends
+   the names it recognises. State: WH_SEL = the names currently picked. */
+let WH_CAST=[], WH_SEL=new Set(), WH_BUSY=false, WH_CHIPSIG='';
+async function refreshWhoshere(){
+  let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); }catch(e){ return; }
+  const sec=$('#whoshere'); if(!sec) return;
+  sec.hidden=false;
+  const wc=$('#wh-cam'); if(wc) wc.textContent=((LIVE.cams||[]).length>1?' · '+camName(LIVE.sel):'');
+  WH_CAST=d.cast||[];
+  const v=d.visit||{};
+  $('#wh-span').textContent = v.count
+    ? (v.active ? `active now · ${v.count} frame${v.count===1?'':'s'} this visit`
+                : `quiet — last seen ${timeAgo(v.latest)}`)
+    : 'all quiet — log it anyway and it attaches to the next frames';
+  whRenderChips();
+  whRenderRecent(d.recent||[]);
+}
+function whRenderChips(){
+  const names=[...new Set([...WH_CAST, ...WH_SEL])];
+  // Only rebuild the chip row when its contents change, so a 6s refresh can't wipe a hover or
+  // re-trigger the fade. The Log button's enabled state is cheap, so always sync it.
+  const sig=names.map(n=>(WH_SEL.has(n)?'*':'')+n).join('|');
+  if(sig!==WH_CHIPSIG){
+    WH_CHIPSIG=sig;
+    $('#wh-cast').innerHTML = names.length
+      ? names.map(n=>`<button type="button" class="wh-chip${WH_SEL.has(n)?' on':''}" onclick="whToggle(${jarg(n)})">${esc(cap1(n))}</button>`).join('')
+      : '<span class="lbl" style="opacity:.6">No named critters yet — add the first below.</span>';
+  }
+  const log=$('#wh-log'); if(log) log.disabled = WH_SEL.size===0 || WH_BUSY;
+}
+function whToggle(n){ if(WH_SEL.has(n)) WH_SEL.delete(n); else WH_SEL.add(n); whRenderChips(); }
+function whAddName(){
+  const inp=$('#wh-new'); if(!inp) return;
+  const n=(inp.value||'').trim(); if(!n) return;
+  // Reuse an existing name if it only differs by case, so "notch" doesn't fork from "Notch".
+  const hit=[...WH_CAST, ...WH_SEL].find(x=>x.toLowerCase()===n.toLowerCase());
+  WH_SEL.add(hit||n); inp.value=''; whRenderChips(); inp.focus();
+}
+async function whLog(){
+  if(!WH_SEL.size || WH_BUSY) return;
+  WH_BUSY=true; whRenderChips();
+  const names=[...WH_SEL];
+  try{
+    const r=await fetch('/api/live/sighting',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({names, source:LIVE.sel})}).then(r=>r.json());
+    if(r.error){ whMsg(r.error,true); }
+    else{
+      const who=names.map(cap1).join(' + ');
+      whMsg(r.multi
+        ? `Logged ${who} together — co-presence noted.`
+        : `Logged ${who}${r.stamped?` · tagged ${r.stamped} frame${r.stamped===1?'':'s'}`:''}.`);
+      WH_SEL.clear();
+    }
+  }catch(e){ whMsg('Could not save: '+e,true); }
+  finally{ WH_BUSY=false; refreshWhoshere(); }
+}
+function whMsg(t,err){
+  const m=$('#wh-msg'); if(!m) return;
+  m.textContent=t; m.className='wh-msg '+(err?'err':'ok');
+  if(!err) setTimeout(()=>{ if(m.textContent===t){ m.textContent=''; m.className='wh-msg'; } },6000);
+}
+function whRenderRecent(list){
+  const box=$('#wh-recent'); if(!box) return;
+  if(!list.length){ box.innerHTML=''; return; }
+  box.innerHTML='<div class="lbl wh-rec-h">Recently logged</div>'
+    +list.map(s=>{
+      const who=(s.names||[]).map(cap1).join(' + ');
+      const tag=s.stamped? `tagged ${s.stamped}` : ((s.names||[]).length>1?'together':'');
+      return `<div class="wh-rec"><span class="who">${esc(who)}</span>`
+        +`<span class="when lbl">${esc(fmtClock(s.observed_at)||reidWhen(s.observed_at))}</span>`
+        +(tag?`<span class="lbl tag">${esc(tag)}</span>`:'')+`</div>`;
+    }).join('');
+}
+
 function timeAgo(iso){
   if(!iso) return '';
   const t=new Date(iso).getTime(); if(isNaN(t)) return '';
@@ -721,11 +856,20 @@ async function renderUnblend(vid){
   catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
   REID_UNBLEND[vid]=d.groups||[];
   if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
+  const co=(d.co_present&&d.co_present.names)||[];
   const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
-  const hint=anySugg
+  const hint=co.length>=2
+    ? `The two biggest groups are the pair you logged. ✓ a suggested name and the other is filled in by elimination — or just tap a name onto each.`
+    : anySugg
     ? `The two biggest groups are usually the pair. ✓ a clip-match to confirm, or correct it — each label sharpens the next visit.`
     : `The two biggest groups are usually the pair — name each clean single animal. Once you've named both pair members once, future pair visits will <b>auto-suggest</b> them from the clips.`;
+  // If a human logged who was here, surface that pair up top — it's what drives the one-click
+  // assign + elimination on the groups below.
+  const coLog=co.length>=2
+    ? `<div class="ub-colog">📓 You logged <b>${co.map(n=>esc(cap1(n))).join(' + ')}</b> here together${d.co_present.observed_at?` · ${esc(fmtClock(d.co_present.observed_at)||'')}`:''}.</div>`
+    : '';
   box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
+    +coLog
     +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
 }
 function reidUnblendGroup(vid,g,i){
@@ -736,10 +880,16 @@ function reidUnblendGroup(vid,g,i){
   const iid='ubn-'+vid+'-'+i;
   const top=(g.suggestion||[])[0];
   const sugg=(!g.label&&top)?`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(top.name)})" title="clip-space match — confirm this group is ${esc(top.name)}">✓ ${esc(top.name)} ${Math.round(top.similarity*100)}%</button>`:'';
+  // Elimination from the co-presence log: the OTHER cluster matched, so by your logged pair this
+  // one must be ${g.co_elim}. The recommended one-click — distinct from a raw appearance match.
+  const elim=(!g.label&&g.co_elim)?`<button class="gear ub-elim" onclick="reidUnblendConfirm(${vid},${i},${jarg(g.co_elim)})" title="from your co-presence log — the other group is the pair member, so this one is ${esc(g.co_elim)}">★ ${esc(cap1(g.co_elim))} · from your log</button>`:'';
+  // Quick-pick the logged pair onto this cluster (no typing), minus any name already offered above.
+  const quick=(!g.label?(g.co_names||[]):[]).filter(n=>n!==g.co_elim && !(top&&n===top.name))
+    .map(n=>`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(n)})" title="you logged this pair as here together">＋ ${esc(cap1(n))}</button>`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
     <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
-    <div style="display:flex;gap:6px;align-items:center">${lab}${sugg}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${lab}${elim}${sugg}${quick}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
   </div>`;
 }
 function reidUnblendConfirm(vid,i,name){
@@ -1051,8 +1201,8 @@ function renderCalendar(){
   body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
 }
 
-/* ---------- settings popout ---------- */
-function openSettings(){ const m=$('#settings'); if(m) m.hidden=false; }
+/* ---------- settings popout (scoped to the selected camera) ---------- */
+function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); }
 function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
 
@@ -1073,11 +1223,6 @@ async function refreshNaming(){
       : n.state==='stopped' ? 'The species identifier is not running right now.'
       : 'New visitors are being named automatically.';
 }
-/* ---------- live-feed liveness: show an overlay when the camera isn't actually streaming ---------- */
-/* An MJPEG <img> goes black (not "errored") when frames merely stall, so onerror alone isn't
-   enough -- poll /snapshot.jpg, which 503s whenever the capture thread has no current frame. */
-function setFeed(up){ const f=document.getElementById('live-frame'); if(f) f.classList.toggle('offline',!up); }
-async function checkFeed(){ try{ const r=await fetch('/snapshot.jpg',{cache:'no-store'}); setFeed(r.ok); }catch(e){ setFeed(false); } }
 /* ---------- first-run orientation: shown only while the database is still empty ---------- */
 function maybeFirstRun(s){
   const el=document.getElementById('firstrun'); if(!el) return;
@@ -1095,11 +1240,13 @@ function maybeFirstRun(s){
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-refreshLive(); refreshCamera(); refreshNaming(); checkFeed();
+loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
 setInterval(refreshLive,6000);
-setInterval(refreshCamera,4000);
+setInterval(refreshHeader,4000);
 setInterval(refreshNaming,4000);
-setInterval(checkFeed,8000);
+setInterval(checkFeeds,8000);
+setInterval(refreshWhoshere,6000);
+setInterval(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); },2000);   // live controls while the panel's open
 /* ---------- lightbox: click any crop/frame to enlarge ---------- */
 /* Delegated so it covers every served image across all tabs (review queue, cast, species
    browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.
