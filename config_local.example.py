@@ -21,6 +21,27 @@ def apply(cfg):
     #   python backyard_cam.py --list-cameras
     # cfg.camera_index = 1
 
+    # ---- Several cameras at once (USB + networked) ----------------------------------
+    # Leave cfg.cameras unset for the single glass-door webcam above. To watch MORE of the yard,
+    # add networked cameras here: each runs on its own capture thread, all share one detector, and
+    # the dashboard shows a live grid. Each camera's `source` is written to its rows, so stats /
+    # re-ID / behaviour keep the cameras separate automatically. (Tip for a nocturnal yard: a PoE
+    # IR camera is the night workhorse; an ESP32-CAM is a fun, cheap DAYTIME angle -- weak in the dark.)
+    #
+    # from config import CameraSpec
+    # cfg.cameras = [
+    #     # The existing glass-door USB webcam (keep it as the primary).
+    #     CameraSpec("glass_door_cam", 0, name="Glass door"),
+    #     # A Reolink (or any RTSP/ONVIF) PoE camera -- use the lower-res SUB-stream for the motion
+    #     # gate so decoding stays cheap. Put your camera's user/pass and LAN IP in the URL.
+    #     CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
+    #                name="Yard (night IR)"),
+    #     # An ESP32-CAM streaming MJPEG over HTTP (Arduino CameraWebServer). Lower-res, so give it a
+    #     # smaller motion_min_area than the 1280x720 default (the trigger is in pixels).
+    #     CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
+    #                name="Feeder (ESP32)", frame_width=640, frame_height=480, motion_min_area=300),
+    # ]
+
     # Retune the species list + re-ID focus for YOUR yard (no source edit needed). The defaults are
     # a Pacific-Northwest backyard set; replace with your region's animals.
     # cfg.species_labels = ["raccoon", "red fox", "white-tailed deer", "American crow", "blue jay"]

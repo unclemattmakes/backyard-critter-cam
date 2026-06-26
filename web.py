@@ -186,8 +186,8 @@ _MEDIA_TYPES = {
 }
 _RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
 _MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
-_MAX_STREAMS = 6                 # cap concurrent MJPEG viewers so one LAN client can't exhaust threads
-_stream_slots = threading.BoundedSemaphore(_MAX_STREAMS)
+_MAX_STREAMS = 6                 # base cap on concurrent MJPEG viewers (one LAN client can't exhaust
+                                 # threads); make_server scales it up with the number of cameras.
 
 
 def _parse_range(header: str, size: int):
@@ -308,10 +308,28 @@ def _web_clip(src: Path, clips_root: Path, cache_root: Path):
             return None
 
 
-def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBridge):
+def make_server(cfg, frame_buffers: dict, control_bridges: dict):
+    """`frame_buffers` / `control_bridges` are dicts keyed by camera `source` -- one entry per
+    live camera. A single-camera rig passes one-entry dicts; the Live tab then shows one pane.
+    The dashboard discovers the cameras via /api/cameras and routes /stream.mjpg, /snapshot.jpg,
+    /api/camera and /api/live/* with a ?source= query param (defaulting to the primary camera, so
+    an old client with no source param still works)."""
     allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir,
                                           getattr(cfg, "clip_crops_dir", cfg.clips_dir))]
     stop_event = threading.Event()
+
+    # The primary camera (the Live tab's default / "Plate I"): the one matching cfg.source if it's
+    # among the live cameras, else the first one. Insertion order of frame_buffers = camera order.
+    primary = cfg.source if cfg.source in frame_buffers else next(iter(frame_buffers))
+    _specs = {s.source: s for s in cfg.camera_specs()}
+    _cam_order = [primary] + [s for s in frame_buffers if s != primary]
+    cameras_meta = [{"source": s, "primary": s == primary,
+                     "name": (_specs[s].display_name if s in _specs else s),
+                     "network": bool(_specs[s].is_network) if s in _specs else False}
+                    for s in _cam_order]
+    # Each live pane opens its own MJPEG stream, so scale the concurrent-stream cap with the camera
+    # count (the flat _MAX_STREAMS=6 was sized for one camera + a few viewers).
+    stream_slots = threading.BoundedSemaphore(max(_MAX_STREAMS, 4 * len(frame_buffers)))
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 30   # drop a stalled / slowloris connection instead of blocking a worker forever
@@ -331,6 +349,14 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
         def _json(self, obj, code=200):
             self._send(code, "application/json",
                        json.dumps(obj).encode("utf-8"), {"Cache-Control": "no-store"})
+
+        def _src(self):
+            """The camera `source` this request targets, from a ?source= query param. Falls back
+            to the primary camera for an unknown/absent value, so an old client (or a hand-typed
+            /stream.mjpg with no param) still gets the main feed instead of a 404."""
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            s = (q.get("source") or [None])[0]
+            return s if s in frame_buffers else primary
 
         def _lan_guard(self) -> bool:
             """Refuse non-local clients when bound to the network (cfg.lan_only). Returns True if
@@ -391,11 +417,14 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     # drift -- stats._NON_CRITTER is the single source of truth.
                     self._json(sorted(stats._NON_CRITTER))
                 elif path == "/api/camera":
-                    self._json(control_bridge.snapshot())
+                    self._json(control_bridges[self._src()].snapshot())
+                elif path == "/api/cameras":
+                    # The live cameras, for the dashboard to build one feed pane per camera.
+                    self._json({"cameras": cameras_meta, "primary": primary})
                 elif path == "/api/naming":
                     self._json(_naming_status())
                 elif path == "/api/live/now":
-                    self._json(_live_now(cfg))
+                    self._json(_live_now(cfg, self._src()))
                 elif path == "/api/crops":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.crops_page(
@@ -427,13 +456,13 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_clips(cfg, (q.get("individual") or [""])[0]))
                 elif path == "/snapshot.jpg":
-                    frame, _ = frame_buffer.get()
+                    frame, _ = frame_buffers[self._src()].get()
                     if frame is None:
                         self._send(503, "text/plain", b"no frame yet")
                     else:
                         self._send(200, "image/jpeg", frame, {"Cache-Control": "no-store"})
                 elif path == "/stream.mjpg":
-                    self._stream()
+                    self._stream(frame_buffers[self._src()])
                 elif path.startswith("/media/"):
                     self._media(path[len("/media/"):])
                 else:
@@ -468,7 +497,7 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                 data = {}
             try:
                 if path == "/api/camera":
-                    control_bridge.request(_clean_settings(data))
+                    control_bridges[self._src()].request(_clean_settings(data))
                     self._json({"ok": True})
                 elif path == "/api/individual":
                     self._individual_action(data)
@@ -556,11 +585,15 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             if not isinstance(names, list) or not any(str(n).strip() for n in names):
                 self._json({"error": "need at least one name"}, code=400)
                 return
-            visit = stats.current_live_visit(cfg)
+            # Which camera the user is naming, from the POST body (the Live tab sends the pane it's
+            # watching). Falls back to the primary camera for an unknown/absent value.
+            source = data.get("source")
+            source = source if source in frame_buffers else primary
+            visit = stats.current_live_visit(cfg, source)
             conn = db.connect(cfg.db_path)
             try:
                 res = db.record_live_sighting(
-                    conn, source=cfg.source, names=names,
+                    conn, source=source, names=names,
                     span_start=visit.get("start"), span_end=visit.get("end"),
                     note=data.get("note"))
                 if res.get("error"):
@@ -632,8 +665,8 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
             finally:
                 conn.close()
 
-        def _stream(self):
-            if not _stream_slots.acquire(blocking=False):
+        def _stream(self, frame_buffer):
+            if not stream_slots.acquire(blocking=False):
                 self._send(503, "text/plain", b"too many active streams; try again shortly")
                 return
             try:
@@ -651,7 +684,7 @@ def make_server(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBri
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
             finally:
-                _stream_slots.release()
+                stream_slots.release()
 
         def _media(self, rel):
             target = (config.ROOT / urllib.parse.unquote(rel)).resolve()
@@ -896,11 +929,14 @@ def _reid_clips(cfg, individual: str) -> dict:
         conn.close()
 
 
-def _live_now(cfg) -> dict:
-    """Powers the Live tab's "who's here now?" control: the current visit span, the named cast to
-    pick from (human-confirmed individuals, so you tag a known animal in one tap), and a short log
-    of recent live sightings so a just-logged note visibly lands."""
-    visit = stats.current_live_visit(cfg)
+def _live_now(cfg, source: str | None = None) -> dict:
+    """Powers the Live tab's "who's here now?" control for one camera `source`: the current visit
+    span ON THAT SOURCE, the named cast to pick from (human-confirmed individuals, so you tag a
+    known animal in one tap), and a short log of recent live sightings so a just-logged note
+    visibly lands. The cast/recent log is shared across cameras (you name the same animals
+    everywhere); only the visit span is per-source."""
+    source = source or cfg.source
+    visit = stats.current_live_visit(cfg, source)
     cast, recent = [], []
     conn = db.connect_readonly(cfg.db_path)
     if conn is not None:
@@ -912,7 +948,7 @@ def _live_now(cfg) -> dict:
             recent = db.recent_live_sightings(conn, limit=8)
         finally:
             conn.close()
-    return {"visit": visit, "cast": cast, "recent": recent, "source": cfg.source}
+    return {"visit": visit, "cast": cast, "recent": recent, "source": source}
 
 
 def _candidate_labels(cfg) -> list:
@@ -932,8 +968,8 @@ def _candidate_labels(cfg) -> list:
     return sorted(labels)
 
 
-def start(cfg, frame_buffer: FrameBuffer, control_bridge: CameraControlBridge):
-    server = make_server(cfg, frame_buffer, control_bridge)
+def start(cfg, frame_buffers: dict, control_bridges: dict):
+    server = make_server(cfg, frame_buffers, control_bridges)
     threading.Thread(target=server.serve_forever, name="webdash", daemon=True).start()
     return server
 

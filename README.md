@@ -174,7 +174,8 @@ All defaults live in `config.py`; these override them per-run:
 
 | Flag | Meaning |
 |------|---------|
-| `--camera-index N` | Which webcam (default 0). |
+| `--camera-index N` | Which webcam (default 0). Single-camera mode; for several at once see [Multiple cameras](#multiple-cameras-usb--networked). |
+| `--source NAME` | DB `source` label for this camera's rows (single-camera mode; default `glass_door_cam`). |
 | `--width W --height H` | Requested capture resolution. |
 | `--model-version V` | `MDV6-yolov10-c` (default, fast) · `MDV6-yolov9-c` · `MDV6-rtdetr-c` · `MDV6-yolov10-e` / `MDV6-yolov9-e` (heavier, more accurate). |
 | `--device D` | `auto` (default; GPU if usable, else CPU) · `cuda` (require an NVIDIA GPU, fail loud) · `cpu` (force CPU, slower). |
@@ -191,6 +192,53 @@ All defaults live in `config.py`; these override them per-run:
 | `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
 | `--port N` / `--host H` | Dashboard port (default 8000) / bind host (default `127.0.0.1`; `0.0.0.0` = LAN). |
+
+### Multiple cameras (USB + networked)
+
+The glass-door webcam is the primary rig, but you can watch **several cameras at once** — a USB
+webcam *plus* networked cameras around the yard. They run on one process (one capture thread per
+camera, all sharing the single MegaDetector and the one naming helper), and the dashboard's **Live
+Observation** tab shows a **grid of feeds**. Each camera writes its own `source`, so the whole
+downstream — species ID, re-ID, behaviour, visits, the calendar — keeps the cameras separate
+automatically (the schema was multi-source from day one).
+
+List the cameras in `config_local.py` (copy `config_local.example.py`):
+
+```python
+from config import CameraSpec
+def apply(cfg):
+    cfg.latitude, cfg.longitude = 47.6, -122.3
+    cfg.cameras = [
+        CameraSpec("glass_door_cam", 0, name="Glass door"),                 # USB webcam, index 0
+        CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
+                   name="Yard (night IR)"),                                  # RTSP/PoE IP camera
+        CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
+                   name="Feeder (ESP32)", frame_width=640, frame_height=480, motion_min_area=300),
+    ]
+```
+
+`src` is anything OpenCV's `VideoCapture` accepts: an **int** webcam index, or a **URL** — `rtsp://…`
+for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Per-camera fields
+(resolution, `motion_min_area`, day/night profile, `record_clips`) default to the global config;
+only override what differs. Each camera needs a **unique `source`**.
+
+- **Networked cameras** are opened through OpenCV's FFMPEG backend with a 1-frame buffer (so the
+  stream can't lag behind the detector), forced to **TCP** transport, and reconnected with
+  **indefinite backoff** (a network blip is transient — unlike a USB unplug, which gives up after
+  a few tries). Use a camera's **sub-stream** (lower resolution) for the motion gate to keep
+  decode cheap. In the dashboard, click a pane to make the **Instrument Panel** and **Who's
+  visiting now?** act on that camera; a networked camera's exposure/focus are set on the camera
+  itself, so its panel shows a note instead of sliders.
+- **What to buy (for a nocturnal yard).** The targets here are mostly night animals, and that's
+  where camera choice matters most. A **PoE IR camera** (e.g. Reolink RLC-510A, ~$60 — clean RTSP,
+  IR night vision, one cable for power + data) is the night workhorse. An **ESP32-CAM** (ESP32-S3
+  with PSRAM is steadier) is a cheap, fun **daytime** angle — its sensor is weak in the dark.
+  Two notes from experience: IR night vision is **monochrome**, which costs the colour cues your
+  species labels and re-ID rely on (a *colour-at-night* camera over a lit feeding spot keeps them);
+  and mount any IR illuminator **off-axis** from the lens or eyeshine blows out the eyes.
+
+Clips from each camera are written under `clips/<source>/<date>/`. Single-camera mode is just the
+N=1 case — if you don't set `cfg.cameras`, nothing changes.
 
 ### Checking what it's caught
 

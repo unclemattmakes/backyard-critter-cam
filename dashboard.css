@@ -70,6 +70,17 @@
   .plate img{display:block; width:100%; height:auto;}
   .plate .cap{display:flex; justify-content:space-between; padding:10px 4px 2px; color:var(--dim);}
 
+  /* Live grid: one pane per camera (loadCameras builds them). Auto-fit so 2-4 cameras tile
+     responsively; .single collapses to one full-width pane identical to the old single feed. The
+     .plate .frame / .plate img / .feed-msg / .offline rules already apply inside each pane. */
+  .live-grid{display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));}
+  .live-grid.single{grid-template-columns:1fr;}
+  .live-pane{margin:0; cursor:pointer; border:1px solid transparent; border-radius:3px;
+    transition:border-color .2s; padding:2px;}
+  .live-pane.sel{border-color:var(--gilt);}             /* the camera the controls + who's-here act on */
+  .live-grid.single .live-pane{cursor:default; border-color:transparent; padding:0;}
+  .live-pane .cap{padding:8px 2px 0;}
+
   .panel.instr{padding:16px 16px 18px;}
   .instr h3{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500; font-size:17px;}
   .instr .hint{color:var(--faint); font-style:italic; font-size:13px; margin:0 0 14px;}

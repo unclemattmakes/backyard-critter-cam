@@ -122,7 +122,7 @@ function buildControls(){
   });
 }
 let postTimer={}, touchedAt={};   // touchedAt[key] = Date.now() of the user's last interaction with that control
-function postCamera(obj){ fetch('/api/camera',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
+function postCamera(obj){ fetch('/api/camera?source='+encodeURIComponent(LIVE.sel||''),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}); }
 function sendControl(key,v){
   let p;
   if(key==='exposure')p={exposure:v};
@@ -137,10 +137,68 @@ function sendAuto(autoKey,on,slider){
   else if(autoKey==='autofocus')postCamera(on?{AUTOFOCUS:1}:{AUTOFOCUS:0,FOCUS:parseFloat(slider.value)});
   else if(autoKey==='auto_wb')postCamera(on?{AUTO_WB:1}:{AUTO_WB:0,WB_TEMPERATURE:parseFloat(slider.value)});
 }
-async function refreshCamera(){
-  let v; try{ v=await fetch('/api/camera').then(r=>r.json()); }catch(e){ return; }
+/* The live cameras. LIVE.sel is the camera the controls + "who's here" act on (click a pane to
+   change it); LIVE.primary is the main feed the masthead period/coords come from. A single-camera
+   rig has one pane and behaves exactly as before. */
+let LIVE={ cams:[], sel:null, primary:null };
+async function loadCameras(){
+  let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); }catch(e){ return; }
+  const cams=d.cameras||[];
+  if(!cams.length) return;
+  LIVE.cams=cams; LIVE.primary=d.primary||cams[0].source;
+  if(!LIVE.sel || !cams.find(c=>c.source===LIVE.sel)) LIVE.sel=LIVE.primary;
+  const grid=$('#live-grid'); if(!grid) return;
+  grid.classList.toggle('single', cams.length<=1);
+  grid.innerHTML=cams.map(c=>`
+    <figure class="live-pane${c.source===LIVE.sel?' sel':''}" data-source="${esc(c.source)}" onclick="selectCamera(${jarg(c.source)})">
+      <div class="frame"><i></i>
+        <img src="/stream.mjpg?source=${encodeURIComponent(c.source)}" alt="live feed" onerror="paneFeed(${jarg(c.source)},false)">
+        <div class="feed-msg"><b>Camera feed unavailable</b><span>This camera may be warming up, or isn&rsquo;t running.</span></div>
+      </div>
+      <figcaption class="cap">
+        <span class="lbl">${esc(c.name||c.source)}${c.network?' · net':''}${c.primary&&cams.length>1?' · main':''}</span>
+        <button class="gear" type="button" onclick="event.stopPropagation();openSettings(${jarg(c.source)})" title="Camera settings">&#9881;</button>
+      </figcaption>
+    </figure>`).join('');
+  checkFeeds();
+}
+function paneFor(source){ return [...document.querySelectorAll('.live-pane')].find(p=>p.dataset.source===source); }
+function paneFeed(source,up){ const p=paneFor(source); if(p){ const f=p.querySelector('.frame'); if(f) f.classList.toggle('offline',!up); } }
+async function checkFeeds(){
+  // An MJPEG <img> goes black (not "errored") when frames merely stall, so poll /snapshot.jpg per
+  // camera -- it 503s whenever that camera's capture thread has no current frame.
+  for(const c of LIVE.cams){
+    try{ const r=await fetch('/snapshot.jpg?source='+encodeURIComponent(c.source),{cache:'no-store'}); paneFeed(c.source,r.ok); }
+    catch(e){ paneFeed(c.source,false); }
+  }
+}
+function selectCamera(source){
+  if(LIVE.sel===source) return;
+  LIVE.sel=source; touchedAt={};   // a fresh camera's read-back shouldn't be suppressed by the last one's edits
+  document.querySelectorAll('.live-pane').forEach(p=>p.classList.toggle('sel',p.dataset.source===source));
+  refreshWhoshere();               // re-scope "who's here" to the newly selected camera
+  if(!$('#settings').hidden) refreshControls();
+}
+function camName(source){ const c=(LIVE.cams||[]).find(x=>x.source===source); return c?(c.name||c.source):source; }
+
+/* The masthead period/coords come from the PRIMARY camera (period is global -- one sun). */
+async function refreshHeader(){
+  const src=LIVE.primary; if(!src) return;
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
   if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
   if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+}
+
+/* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no
+   settable controls, so we show a note instead of sliders. Only refreshed while the modal is open. */
+async function refreshControls(){
+  const src=LIVE.sel; if(!src) return;
+  $('#instr-cam').textContent = (LIVE.cams.length>1?'· '+camName(src):'');
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
+  const net=!!v.network;
+  $('#instr-net').hidden=!net;
+  $('#controls').style.display=net?'none':'';
+  if(net) return;
   CONTROLS.forEach(c=>{
     const el=$(`.ctrl[data-k="${c.key}"]`); if(!el)return;
     const sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]'), au=el.querySelector('[data-auto]');
@@ -203,9 +261,10 @@ async function refreshLive(){
    the names it recognises. State: WH_SEL = the names currently picked. */
 let WH_CAST=[], WH_SEL=new Set(), WH_BUSY=false, WH_CHIPSIG='';
 async function refreshWhoshere(){
-  let d; try{ d=await fetch('/api/live/now').then(r=>r.json()); }catch(e){ return; }
+  let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); }catch(e){ return; }
   const sec=$('#whoshere'); if(!sec) return;
   sec.hidden=false;
+  const wc=$('#wh-cam'); if(wc) wc.textContent=((LIVE.cams||[]).length>1?' · '+camName(LIVE.sel):'');
   WH_CAST=d.cast||[];
   const v=d.visit||{};
   $('#wh-span').textContent = v.count
@@ -242,7 +301,7 @@ async function whLog(){
   const names=[...WH_SEL];
   try{
     const r=await fetch('/api/live/sighting',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({names})}).then(r=>r.json());
+      body:JSON.stringify({names, source:LIVE.sel})}).then(r=>r.json());
     if(r.error){ whMsg(r.error,true); }
     else{
       const who=names.map(cap1).join(' + ');
@@ -1142,8 +1201,8 @@ function renderCalendar(){
   body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
 }
 
-/* ---------- settings popout ---------- */
-function openSettings(){ const m=$('#settings'); if(m) m.hidden=false; }
+/* ---------- settings popout (scoped to the selected camera) ---------- */
+function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); }
 function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
 
@@ -1164,11 +1223,6 @@ async function refreshNaming(){
       : n.state==='stopped' ? 'The species identifier is not running right now.'
       : 'New visitors are being named automatically.';
 }
-/* ---------- live-feed liveness: show an overlay when the camera isn't actually streaming ---------- */
-/* An MJPEG <img> goes black (not "errored") when frames merely stall, so onerror alone isn't
-   enough -- poll /snapshot.jpg, which 503s whenever the capture thread has no current frame. */
-function setFeed(up){ const f=document.getElementById('live-frame'); if(f) f.classList.toggle('offline',!up); }
-async function checkFeed(){ try{ const r=await fetch('/snapshot.jpg',{cache:'no-store'}); setFeed(r.ok); }catch(e){ setFeed(false); } }
 /* ---------- first-run orientation: shown only while the database is still empty ---------- */
 function maybeFirstRun(s){
   const el=document.getElementById('firstrun'); if(!el) return;
@@ -1186,12 +1240,13 @@ function maybeFirstRun(s){
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-refreshLive(); refreshCamera(); refreshNaming(); checkFeed(); refreshWhoshere();
+loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
 setInterval(refreshLive,6000);
-setInterval(refreshCamera,4000);
+setInterval(refreshHeader,4000);
 setInterval(refreshNaming,4000);
-setInterval(checkFeed,8000);
+setInterval(checkFeeds,8000);
 setInterval(refreshWhoshere,6000);
+setInterval(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); },2000);   // live controls while the panel's open
 /* ---------- lightbox: click any crop/frame to enlarge ---------- */
 /* Delegated so it covers every served image across all tabs (review queue, cast, species
    browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.

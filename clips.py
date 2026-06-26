@@ -102,6 +102,12 @@ class _FfmpegWriter:
 _rel = db.rel_to_root
 
 
+def _safe_source(source: str) -> str:
+    """A filesystem-safe directory name for a `source` (any non-alphanumeric char -> '_'), so a
+    source label can name a clips subdir. Mirrors import_trailcam.ledger_path's sanitising."""
+    return "".join(c if c.isalnum() else "_" for c in str(source)) or "cam"
+
+
 def prune_clips(cfg: config.Config, conn) -> int:
     """Keep clips/ under cfg.clips_max_gb by deleting the OLDEST clips (file + DB row; any
     clip_tracks rows cascade). This is what makes always-on recording safe on a family rig --
@@ -221,9 +227,14 @@ class ClipRecorder:
     `now` is a time.monotonic() value; `saved_dets` are detector.Detection objects (only the
     classes you actually save -- so a person at the glass never starts a clip)."""
 
-    def __init__(self, cfg: config.Config, conn):
+    def __init__(self, cfg: config.Config, conn, source: str | None = None):
         self.cfg = cfg
         self.conn = conn
+        # The DB 'source' this recorder tags its clips with. Defaults to cfg.source for the
+        # single-camera rig; a multi-camera rig passes each camera's own source so two cameras
+        # never share a clip row -- and writes each camera's clips to its own clips/<source>/<date>/
+        # subdir, so two cameras firing in the same millisecond can't collide on a filename.
+        self.source = source or cfg.source
         self.scale = min(1.0, max(0.05, cfg.clip_scale))
         self.pre_roll = max(0.0, cfg.clip_pre_roll_s)
         self.post_roll = max(0.0, cfg.clip_post_roll_s)
@@ -331,7 +342,11 @@ class ClipRecorder:
         self.fps = self._measure_fps()
         wall = datetime.now().astimezone()
         self.started_iso = wall.isoformat()
-        day_dir = self.cfg.clips_dir / wall.strftime("%Y-%m-%d")
+        # Per-source subdir so a multi-camera rig keeps each camera's clips apart (and a same-
+        # millisecond filename on two cameras can't collide). Single-camera rigs that pass no
+        # source still get clips/<source>/<date>/ -- harmless, and clipmotion/web rglob clips_dir
+        # so older flat clips/<date>/ clips are still found and served.
+        day_dir = self.cfg.clips_dir / _safe_source(self.source) / wall.strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         stamp = wall.strftime("%Y-%m-%dT%H-%M-%S-") + f"{wall.microsecond // 1000:03d}"
         self.clip_path = day_dir / f"{stamp}.mp4"
@@ -398,7 +413,7 @@ class ClipRecorder:
             ended = datetime.now().astimezone().isoformat()
             w, h = self.size if self.size else (None, None)
             try:
-                db.insert_clip(self.conn, source=self.cfg.source, clip_path=rel,
+                db.insert_clip(self.conn, source=self.source, clip_path=rel,
                                started_at=self.started_iso, ended_at=ended, fps=self.fps,
                                width=w, height=h, frame_count=self.frame_count,
                                detection_count=self.detection_count, max_confidence=self.max_conf)
