@@ -785,17 +785,31 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 return 0
 
         queue = []
+        all_clips = stats.load_clips(conn)   # once; overlap-match each visit's footage in memory
         rows = conn.execute(
-            """SELECT id, started_at, ended_at, detection_count, representative_detection_id
+            """SELECT id, source, started_at, ended_at, detection_count, representative_detection_id
                FROM visits WHERE species = ? ORDER BY started_at DESC LIMIT ?""",
             (species, limit)).fetchall()
         for v in rows:
             s = matcher.suggest(v["id"])
+            # Evidence for the human doing the naming: the clips that rolled during this visit
+            # (busiest first, click to play) + a strip of its sharpest crops for extra angles.
+            vclips = [stats._clip_out(c) for c in stats.clips_overlapping(
+                all_clips, v["source"],
+                db.parse_local(v["started_at"]), db.parse_local(v["ended_at"]))]
+            rep = _rep_crop(v["representative_detection_id"])
+            vcrops = [r["crop_path"] for r in conn.execute(
+                "SELECT crop_path FROM detections WHERE source = ? AND species = ? "
+                "AND timestamp >= ? AND timestamp <= ? AND crop_path IS NOT NULL "
+                "ORDER BY crop_quality DESC LIMIT 7",
+                (v["source"], species, v["started_at"], v["ended_at"])).fetchall()]
+            vcrops = [c for c in vcrops if c != rep][:6]   # "other" crops -> drop the hero thumb
             queue.append({
                 "visit_id": v["id"], "started_at": v["started_at"],
                 "dwell_s": _dwell(v["started_at"], v["ended_at"]),
                 "n_crops": v["detection_count"],
-                "rep_crop": _rep_crop(v["representative_detection_id"]),
+                "rep_crop": rep,
+                "clips": vclips, "crops": vcrops,
                 "confirmed_as": s["confirmed_as"], "candidates": s["candidates"],
                 "clip_candidates": s["clip_candidates"],
                 "novel": s["novel"], "multi": s["multi"],

@@ -792,6 +792,10 @@ async function loadIndividuals(){
 let REID_BOOT=[];
 function reidWhen(ts){ return ts? ts.slice(5,16).replace('T',' ') : '?'; }
 function reidInput(id,ph){ return `<input id="${id}" placeholder="${ph}" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit" onkeydown="if(event.key==='Enter')this.nextElementSibling.click()">`; }
+/* Clips that rolled during each queued visit, stashed at render time so a card's "▶ N clips"
+   button can replay them in the lightbox without re-fetching. Reset each time the queue renders. */
+let REID_VISIT_CLIPS={};
+function reidPlayClips(vid){ const c=REID_VISIT_CLIPS[vid]||[]; if(c.length) playClips(c,0,`visit #${vid}`); }
 function reidCard(v){
   const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
   const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
@@ -829,6 +833,13 @@ function reidCard(v){
     <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
   const ub=v.multi?`<div style="margin-top:8px"><button class="gear" onclick="toggleUnblend(${v.visit_id})" title="separate the two animals using the clips, then name each">⚖ un-blend the animals</button>
     <div id="ub-${v.visit_id}" style="display:none;margin-top:8px"></div></div>`:'';
+  // Naming evidence: a one-click "play this visit's clips" button + a strip of its sharpest crops
+  // (each enlarges via the global /media/ lightbox), so the eye has more than the one hero angle.
+  REID_VISIT_CLIPS[v.visit_id]=v.clips||[];
+  const nclip=(v.clips||[]).length;
+  const clipBtn=nclip?`<button class="gear" onclick="reidPlayClips(${v.visit_id})" title="watch the clip${nclip>1?'s':''} that rolled during this visit">▶ ${nclip} clip${nclip>1?'s':''}</button>`:'';
+  const cropTiles=(v.crops||[]).map(c=>`<img src="/media/${encodeURI(c)}" loading="lazy" title="click to enlarge" style="width:58px;height:58px;object-fit:cover;border-radius:4px;cursor:zoom-in">`).join('');
+  const strip=(nclip||cropTiles)?`<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:8px">${clipBtn}${cropTiles}</div>`:'';
   return `<div class="panel" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       ${thumb}
@@ -837,6 +848,7 @@ function reidCard(v){
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
+    ${strip}
     ${spRow}
     ${ub}
   </div>`;
@@ -971,6 +983,7 @@ function reidRefitHTML(refit){
 }
 function reidQueueHTML(q){
   if(!q||(!q.queue.length&&!q.bootstrap.length&&!q.refit)) return '';
+  REID_VISIT_CLIPS={};
   let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
   if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops aren't analysed for appearance yet — naming suggestions sharpen once the re-ID step has run (see the README's “Individual re-identification”).</p>`;
   if(q.bootstrap.length){
