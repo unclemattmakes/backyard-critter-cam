@@ -212,7 +212,9 @@ class Config:
     crops_dir: Path = ROOT / "crops"
     frames_dir: Path = ROOT / "frames"
     save_full_frame: bool = False       # Default OFF per spec; crops are ALWAYS saved.
-    crop_padding: float = 0.08          # Expand each box by this fraction before cropping.
+    crop_padding: float = 0.15          # Expand each box by this fraction before cropping (more
+                                        # breathing room around the animal). Applies to NEW captures
+                                        # only -- existing crops were already cut at the old pad.
     jpeg_quality: int = 95              # 0-100 for saved JPEGs.
 
     # ---- Identity of this capture source (V1 constant) --------------------------
