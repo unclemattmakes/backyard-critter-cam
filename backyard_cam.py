@@ -56,6 +56,42 @@ MOTION_WARMUP_FRAMES = 15
 READ_FAIL_TOLERANCE = 10
 
 
+# ---- Keep the machine awake while we watch -----------------------------------------
+# Some rigs (e.g. this Acer handheld) only support Modern Standby (S0 low-power idle), not
+# S3. Left idle, the box slides into standby within minutes -- which USB-suspends the
+# webcam. The capture loop then sees the camera "vanish", exhausts its reopen retries, and
+# exits (~30s later), so the app silently dies overnight. While a run is live we assert a
+# system-required power request so Windows won't idle-sleep underneath us. Windows-only; a
+# safe no-op everywhere else (and if the call ever fails -- it just means we don't hold the
+# box awake, never that the cam won't start).
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_system_awake() -> bool:
+    """Ask Windows to stay awake (no idle sleep / Modern Standby) until allow_system_sleep().
+    Returns True if the request was set, False on non-Windows or if the call failed."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        prev = ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        return prev != 0                            # returns the previous state, or 0 (NULL) on failure
+    except Exception:
+        return False
+
+
+def allow_system_sleep() -> None:
+    """Release the keep-awake request from keep_system_awake() (restore normal idle/sleep)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
+
+
 # ---- Camera ------------------------------------------------------------------------
 def apply_camera_settings(cap, settings: dict) -> None:
     """Apply a camera-settings dict to an open capture: 'exposure' (None = auto-expose, a
@@ -759,6 +795,14 @@ def run(cfg: config.Config) -> None:
     results: dict = {}
 
     try:
+        # Hold the system awake for the lifetime of the run so it can't idle into Modern Standby
+        # and USB-suspend the camera out from under us (the cause of the silent overnight deaths).
+        if keep_system_awake():
+            print("  power: holding the system awake (no idle-sleep) while the cam runs.")
+        elif sys.platform == "win32":
+            print("  power: WARNING -- could not hold the system awake; if the box sleeps it may "
+                  "suspend the camera and stop the app. (Also turn off USB selective suspend.)")
+
         # Build the (shared) detector first: resolves the device (a real GPU compute-check for
         # 'cuda'/'auto') and downloads the weights on first run, failing loud with device='cuda'.
         print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
@@ -838,6 +882,7 @@ def run(cfg: config.Config) -> None:
         print("\nInterrupted -- shutting down.")
     finally:
         stop_event.set()                            # tell every worker (and any reconnect wait) to stop
+        allow_system_sleep()                        # let the box idle/sleep normally again
         for t in threads:
             t.join(timeout=10)
         _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
