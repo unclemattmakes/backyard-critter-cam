@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Behind the Glass — making of a backyard critter cam</title>
+<meta name="description" content="How a webcam at a sliding glass door learns to name the raccoons in the backyard. Eight playable demos, built on real data."/>
+<link rel="stylesheet" href="makingof.css"/>
+</head>
+<body>
+
+<header class="mast">
+  <div class="top">
+    <span class="lbl">Backyard Critter Cam</span>
+    <span class="lbl">The Making-Of</span>
+  </div>
+  <h1>Behind <span class="amp">the</span> Glass</h1>
+  <div class="sub">How a webcam at a sliding door learned to name the raccoons</div>
+  <div class="live-chip"><span class="live-dot"></span> a field journal for the backyard</div>
+  <p class="dek">A USB camera points through a patio door. It watches for movement, wakes a wildlife
+  detector, and — over <b id="dek-days">18</b> nights — taught itself to recognise the regulars.
+  Here is how every piece works, with <b>eight things you can play with</b>. Everything below runs
+  on <b>real data</b> from the yard.</p>
+</header>
+
+<nav class="tabs"><div class="inner">
+  <a href="#ch00">00 · Origins</a>
+  <a href="#ch01">01 · Capture</a>
+  <a href="#ch02">02 · Glass</a>
+  <a href="#ch03">03 · Species</a>
+  <a href="#ch04">04 · Appearance</a>
+  <a href="#ch05">05 · Together</a>
+  <a href="#ch06">06 · The cast</a>
+  <a href="#ch07">07 · Motion</a>
+  <a href="#ch08">08 · Two axes</a>
+  <a href="#ch09">09 · Building it</a>
+</div></nav>
+
+<main>
+
+  <!-- 00 ORIGINS -->
+  <section class="chapter" id="ch00">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 00</div>
+      <div class="ch-title">The two classifiers in your head</div>
+      <div class="ch-keywords"><span>instinct</span><span>two axes</span><span>augment, don't replace</span></div>
+    </div>
+    <div class="prose">
+      <p>When a raccoon shows up at the glass, you do something automatic: <span class="em">"you
+      look like Notch… but you're not acting like Notch."</span> That tiny friction is the whole
+      project. You just ran <b>two</b> classifiers — one for <b>appearance</b> ("looks like X"), one
+      for <b>behaviour</b> ("but doesn't act like X") — and they disagreed.</p>
+      <p class="pull">The disagreement is the information. It's either a new individual who
+      resembles a known one, or a known one in an unusual state — and which it is, is exactly what
+      you want to know.</p>
+      <p>So the rule for the whole system: keep appearance and behaviour on <b>separate axes</b>,
+      and surface both. Never collapse them into one confident answer. The job isn't to be an
+      oracle that names every raccoon — it's to give your own instinct a <b>memory</b> and a
+      <b>second opinion</b>. Everything that follows is built to that brief, and it's honest about
+      where it falls short.</p>
+    </div>
+  </section>
+
+  <!-- 01 CAPTURE -->
+  <section class="chapter" id="ch01">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 01</div>
+      <div class="ch-title">Wake the detector</div>
+      <div class="ch-keywords"><span>MOG2 motion gate</span><span>MegaDetector v6</span><span>Ultralytics · SQLite</span></div>
+    </div>
+    <div class="prose">
+      <p>A camera left running all day can't run a GPU model on every frame — it'd melt. So the
+      first thing in the loop is the cheapest: a <b>motion gate</b> (MOG2 background subtraction)
+      that does almost nothing until something actually moves. Only then does it wake
+      <b>MegaDetector v6</b> — Microsoft's camera-trap model, run straight through Ultralytics — to
+      ask "is that an animal?" Each hit becomes a cropped image, a shot-quality score, and one row
+      in a SQLite database.</p>
+      <p>Step a single real capture through every stage below. Watch the detector stay
+      <span class="em">asleep</span> until the motion blob crosses the threshold — that's why the rig
+      can sit running next to you.</p>
+    </div>
+    <div class="demo" id="demo-pipeline">
+      <div class="demo-head"><span class="k">Interactive · scrub the pipeline</span><span class="corner">real frame</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">A real visit from <b>Stan</b>, walked stage by stage. The wide frames and
+      motion mask are pulled from the behaviour clip recorded around the visit.</div>
+    </div>
+  </section>
+
+  <!-- 02 THROUGH THE GLASS -->
+  <section class="chapter" id="ch02">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 02</div>
+      <div class="ch-title">Through the glass</div>
+      <div class="ch-keywords"><span>shot quality</span><span>sharpness × eyeshine</span><span>the cutest frame</span></div>
+    </div>
+    <div class="prose">
+      <p>The camera shoots through a sliding glass door, and most of the action is after dark.
+      Reflections and haze soften everything; a raccoon pressed to the pane with a light on it reads
+      clearly, but plenty of frames come out a little flared. There's no fixing the optics — so
+      instead every crop is <b>scored</b> for shot quality: sharpness, with a bump for the bright
+      <b>eyeshine</b> of an animal looking back at the lens.</p>
+      <p>That score is why the journal can lead each visit with its <span class="em">cutest,
+      sharpest</span> frame rather than merely its most confident one. Scrub from the softest shots
+      to the sharpest and watch the real spread.</p>
+    </div>
+    <div class="demo" id="demo-glass">
+      <div class="demo-head"><span class="k">Interactive · scrub by shot quality</span><span class="corner">real crops</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">Every crop's score comes from <b>quality.py</b> (Laplacian sharpness × a
+      night-eyeshine boost). This yard's crops span a wide range; the slider walks it.</div>
+    </div>
+  </section>
+
+  <!-- 03 SPECIES -->
+  <section class="chapter" id="ch03">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 03</div>
+      <div class="ch-title">Name the species — and the thing that isn't one</div>
+      <div class="ch-keywords"><span>BioCLIP 2</span><span>zero-shot</span><span>general-CLIP gate</span></div>
+    </div>
+    <div class="prose">
+      <p>Every crop gets a species, zero-shot, from <b>BioCLIP 2</b> — no training, just a list of
+      candidate species as text. On a real raccoon or crow it's emphatic (<span class="em">0.99,
+      1.00</span>). But BioCLIP has one blind spot that took a while to understand: it's an
+      <b>organism-only</b> model. Show it an empty deck or a plate of food and it <em>cannot</em> say
+      "not an animal" — it's forced to pick the nearest species anyway.</p>
+      <p>The fix isn't a better species list; it's a different model asking a different question. A
+      <b>general CLIP</b> runs <span class="em">first</span> and answers the one thing BioCLIP can't:
+      "is this even an animal?" Real animals score near <b>zero</b>; genuine non-animals score high.
+      The cut sits at <code>0.60</code>, in the wide empty gap between the two.</p>
+      <p>Drop crops onto the bench and drag the threshold yourself.</p>
+    </div>
+    <div class="demo" id="demo-decoy">
+      <div class="demo-head"><span class="k">Interactive · the decoy bench</span><span class="corner">real crops &amp; scores</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">The gate's verdicts are computed with the same <b>open_clip</b> model the
+      live rig uses; the species labels are real BioCLIP 2 output.</div>
+    </div>
+  </section>
+
+  <!-- 04 APPEARANCE -->
+  <section class="chapter" id="ch04">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 04</div>
+      <div class="ch-title">Same raccoon?</div>
+      <div class="ch-keywords"><span>MegaDescriptor</span><span>cosine</span><span>visit prototypes</span></div>
+    </div>
+    <div class="prose">
+      <p>Now the hard part: telling individuals apart. Each crop becomes a 1,536-number
+      <b>appearance vector</b> (MegaDescriptor, a wildlife re-ID model). Two vectors that point the
+      same way are two crops that look alike. Plotted below — a real map of raccoon crops — and the
+      first honest finding lands immediately.</p>
+      <p>Colour by <b>visit</b> and the dots clump into tight little ponds: the same raccoon, same
+      night, scores up to <span class="em">0.99</span>. Colour by <b>individual</b> and those colours
+      <em>smear across each other</em> — the same raccoon on two different nights barely beats two
+      different raccoons. Background and pose dominate. <b>Single crops can't be matched across
+      sessions.</b></p>
+      <p>So average each visit's best crops into one <b>prototype</b> and the noise washes out. The
+      same animal's nights now match at <span class="em">~0.84</span>; two different raccoons sit
+      near <span class="em">0.37</span>. Hit "collapse to prototypes" and watch it happen — then note
+      that <b>Elliot</b>, who rarely visits alone, stays stubbornly ambiguous. That's not a bug; it's
+      why a human still confirms.</p>
+    </div>
+    <div class="demo" id="demo-appearance">
+      <div class="demo-head"><span class="k">Interactive · the appearance map</span><span class="corner">PCA of real embeddings</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">Click any two dots for their true cosine similarity. Layout is a 2-D PCA
+      projection; the similarities are computed in the full 1,536-D space.</div>
+    </div>
+  </section>
+
+  <!-- 05 TWO AT ONCE -->
+  <section class="chapter" id="ch05">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 05</div>
+      <div class="ch-title">Two at once</div>
+      <div class="ch-keywords"><span>bounding boxes</span><span>IoU</span><span>the 2+ badge</span></div>
+    </div>
+    <div class="prose">
+      <p>Before you can name individuals, you have to notice when there are <b>two</b> of them. When
+      the detector returns two boxes, the question is whether they're two raccoons or one raccoon
+      boxed twice. The test is <b>intersection-over-union</b> — how much the boxes overlap. A lot of
+      overlap means the detector double-counted one animal (non-max suppression merges them); only a
+      little means two separate bodies.</p>
+      <p>Below <code>0.45</code>, the visit earns a <span class="em">"2+ raccoons"</span> badge, and
+      its blended appearance is set aside — because one name stamped on two animals poisons the
+      template. Drag the boxes and watch the verdict flip. (In practice the sparse stills miss most
+      pairs; the full-rate clips catch them — which is exactly what the next chapter leans on.)</p>
+    </div>
+    <div class="demo" id="demo-copresence">
+      <div class="demo-head"><span class="k">Interactive · the IoU toy</span><span class="corner">real frame · real cut</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">The 0.45 threshold and the IoU formula are the rig's real co-presence
+      test (<b>individuals.py</b>); the backdrop is a real night frame from a busy raccoon visit.</div>
+    </div>
+  </section>
+
+  <!-- 06 THE CAST -->
+  <section class="chapter" id="ch06">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 06</div>
+      <div class="ch-title">Name the cast — you be the re-ID</div>
+      <div class="ch-keywords"><span>suggest-confirm</span><span>co-presence</span><span>clip un-blend</span></div>
+    </div>
+    <div class="prose">
+      <p>Because appearance is only a hint, the system never names anyone on its own. It
+      <b>suggests</b>, and a human <b>confirms</b> — and every confirmation sharpens the next
+      suggestion. Play the human: here are real visits with the model's actual guess. Call it, then
+      see the truth and how you scored against the machine.</p>
+      <p>Then the finale — the trick the project is proudest of. A raccoon who only ever shows up
+      <em>with another raccoon</em> never gives you a clean solo photo to learn from. But a behaviour
+      clip tracks each animal separately, so its frames can be split apart. One real two-raccoon
+      visit un-blends into <span class="em">36 and 29</span> frames — two distinct animals out of one
+      blurry crowd — which is how a never-solo regular finally earns an identity.</p>
+    </div>
+    <div class="demo" id="demo-reidgame">
+      <div class="demo-head"><span class="k">Interactive · same, or someone new?</span><span class="corner">real suggestions</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">Suggestions are the live matcher's real output, scored leave-one-out so
+      it isn't just reading its own answer key.</div>
+    </div>
+  </section>
+
+  <!-- 07 HOW IT MOVES -->
+  <section class="chapter" id="ch07">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 07</div>
+      <div class="ch-title">How it moves</div>
+      <div class="ch-keywords"><span>motion tracklets</span><span>stride cadence</span><span>gait</span></div>
+    </div>
+    <div class="prose">
+      <p>A still says <b>who</b> and <b>when</b>; a clip says <b>how</b>. The detector runs over every
+      frame of a behaviour clip and threads the boxes into one track per animal, then reads its
+      motion — how fast, how straight, how hesitant — and the <b>stride cadence</b>: the rhythm of
+      the body bobbing up and down as it walks, pulled straight off the video with no extra sensor.</p>
+      <p>Gait is a confound-robust second opinion for identity: a limp reads the same from any angle,
+      where a single soft still does not. Pick a real walk and watch its metronome tick at the
+      cadence the rig actually measured.</p>
+    </div>
+    <div class="demo" id="demo-gait">
+      <div class="demo-head"><span class="k">Interactive · the gait metronome</span><span class="corner">real tracklets</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">Each cadence and its trust score come from <b>clipmotion.py</b>'s
+      autocorrelation of the body-bob — one real motion tracklet per chip.</div>
+    </div>
+  </section>
+
+  <!-- 08 TWO AXES -->
+  <section class="chapter" id="ch08">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 08</div>
+      <div class="ch-title">Looks like X, isn't acting like X</div>
+      <div class="ch-keywords"><span>behaviour profiles</span><span>arrival windows</span><span>the disagreement</span></div>
+    </div>
+    <div class="prose">
+      <p>Back to the beginning. Appearance is one axis; <b>behaviour</b> is the other. From the
+      visit log, each raccoon gets a profile — when they arrive, how long they stay. Raccoons here
+      run <span class="em">20:00–02:00</span>; Notch skews even later.</p>
+      <p>Plot a visit on the two axes at once. When appearance and behaviour <b>agree</b>, it's
+      quiet. When they <b>disagree</b> — looks like Notch, but arrived at 2pm — the alert fires:
+      either a look-alike, or Notch doing something unusual. Grab a visit and drag its arrival time
+      around the clock; watch the behaviour needle swing and the alarm trip. That swing is the whole
+      project, made literal.</p>
+    </div>
+    <div class="demo" id="demo-twoaxis">
+      <div class="demo-head"><span class="k">Interactive · the two-axis dial</span><span class="corner">real profiles</span></div>
+      <div class="demo-body"><div class="mount">loading…</div></div>
+      <div class="demo-cap">Behaviour windows are computed on the 24-hour circle, so a creature that
+      spans midnight gets one sensible window instead of two.</div>
+    </div>
+  </section>
+
+  <!-- 09 BUILDING IT -->
+  <section class="chapter" id="ch09">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 09</div>
+      <div class="ch-title">Building it — boring &amp; robust</div>
+      <div class="ch-keywords"><span>SQLite spine</span><span>stdlib http.server</span><span>no framework</span></div>
+    </div>
+    <div class="prose">
+      <p>None of this is one clever model. It's a lot of small, boring, robust pieces around one
+      idea: most of the value is in <b>capture and accumulation</b>, not the fancy network. One
+      SQLite database is the brain; the live dashboard is hand-written on Python's standard library
+      with no web framework; the GPU sleeps through the quiet hours.</p>
+      <div class="statline" id="statline"></div>
+      <p>The page you're reading is a frozen, camera-free export of that database — the live rig is
+      localhost-only because it shows a live feed of someone's backyard. This is the opposite: a
+      curated, public slice, with the people edited out and only the animals left in.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="statline" style="font-style:normal">
+    <span class="muted">Two cameras, one SQLite brain, four phases — capture, name the species,
+    name the individuals, learn their behaviour.</span>
+  </div>
+  <p>Built on <a href="https://github.com/microsoft/MegaDetector">MegaDetector</a>,
+  <a href="https://github.com/Imageomics/bioclip">BioCLIP 2</a>, and
+  <a href="https://huggingface.co/BVRA/MegaDescriptor-L-384">MegaDescriptor</a>.
+  Made with too many late nights and a patient raccoon named Stan.</p>
+</footer>
+
+<script src="makingof.js"></script>
+<script src="demos/pipeline.js"></script>
+<script src="demos/glass.js"></script>
+<script src="demos/decoy.js"></script>
+<script src="demos/appearance.js"></script>
+<script src="demos/copresence.js"></script>
+<script src="demos/reid_game.js"></script>
+<script src="demos/gait.js"></script>
+<script src="demos/twoaxis.js"></script>
+<script>window.MakingOf && window.MakingOf.boot();</script>
+</body>
+</html>

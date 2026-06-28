@@ -56,3 +56,12 @@ config_local.py
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ===== Making-of showcase (committed frozen export) =====
+# making-of/ is a static, shareable site whose baked demo imagery must travel
+# with the repo. Its media/crops/ and media/frames/ subdirs would otherwise be
+# swallowed by the global crops/ and frames/ ignores above -- re-include them.
+!making-of/media/crops/
+!making-of/media/crops/**
+!making-of/media/frames/
+!making-of/media/frames/**
