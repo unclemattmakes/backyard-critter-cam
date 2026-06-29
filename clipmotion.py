@@ -37,7 +37,7 @@ import json
 import sqlite3
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 
 import numpy as np
@@ -422,6 +422,70 @@ def report(conn, species: str = "raccoon") -> int:
     return 0
 
 
+def _is_placeholder(iid: str) -> bool:
+    """True for a reid auto-cluster id like 'raccoon_c01' (not a human-confirmed name)."""
+    return bool(iid) and "_c" in iid and iid.rsplit("_c", 1)[-1].isdigit()
+
+
+def _species_with_named_visits(conn) -> list:
+    """Species that have at least one visit assigned to a confirmed (non-placeholder) individual --
+    the species worth linking tracks for (raccoon today; cats/others as the cast grows)."""
+    rows = conn.execute(
+        "SELECT DISTINCT species, individual_id FROM visits WHERE individual_id IS NOT NULL").fetchall()
+    return sorted({r["species"] for r in rows if not _is_placeholder(r["individual_id"])})
+
+
+def link_tracks_to_individuals(conn, species: str = "raccoon", *,
+                               sustained: int = SUSTAINED_HITS, dry_run: bool = False) -> dict:
+    """Backfill clip_tracks.individual_id for the UNAMBIGUOUS solo clips: a clip whose SINGLE
+    sustained tracklet overlaps (in time) a visit assigned to a confirmed, NAMED individual gets
+    that name written to the tracklet (individual_source 'overlap'). This turns the dark motion
+    fingerprints into per-individual behaviour data without guessing -- pair clips (2+ sustained
+    tracks) and placeholder/unnamed visits are deliberately LEFT for the manual un-blend queue,
+    and a human un-blend label is never overwritten. Idempotent + resumable. Returns a summary."""
+    rows = tracks_with_visits(conn, species)         # each track + its best-overlap visit's individual
+    by_clip = defaultdict(list)
+    for r in rows:
+        by_clip[r["clip_id"]].append(r)
+    assigned, skip = 0, Counter()
+    for rs in by_clip.values():
+        sustained_tracks = [r for r in rs if (r["n_hits"] or 0) >= sustained]
+        if len(sustained_tracks) != 1:
+            skip["not_solo"] += 1                     # 0 sustained, or a pair -> leave for un-blend
+            continue
+        tr = sustained_tracks[0]
+        iid = tr["individual_id"]                     # the overlapping visit's individual
+        if not iid:
+            skip["visit_unnamed"] += 1
+            continue
+        if _is_placeholder(iid):
+            skip["visit_placeholder"] += 1            # raccoon_c01 -- not a confirmed name
+            continue
+        if tr["individual_source"] == "human":
+            skip["human_locked"] += 1                 # never clobber a manual un-blend
+            continue
+        if not dry_run:
+            db.set_clip_track_individual(conn, [tr["id"]], iid, source="overlap")
+        assigned += 1
+    return {"species": species, "assigned": assigned, "clips_seen": len(by_clip),
+            "skipped": dict(skip)}
+
+
+def link_all(conn, *, dry_run: bool = False, species: str | None = None) -> int:
+    """Run the solo-overlap backfill for every species that has named individuals (or just one)."""
+    species_list = [species] if species else (_species_with_named_visits(conn) or ["raccoon"])
+    total = 0
+    for sp in species_list:
+        res = link_tracks_to_individuals(conn, sp, dry_run=dry_run)
+        total += res["assigned"]
+        print(f"  {sp}: {'would link' if dry_run else 'linked'} {res['assigned']} solo "
+              f"tracklet(s) over {res['clips_seen']} clip(s); skipped {res['skipped']}")
+    verb = "Would link" if dry_run else "Linked"
+    print(f"{verb} {total} solo tracklet(s) to named individuals (individual_source 'overlap'); "
+          f"pair/unnamed clips left for the un-blend queue.")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: motion fingerprints from behaviour clips.")
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu", "auto"],
@@ -433,6 +497,11 @@ def main() -> int:
     p.add_argument("--show", action="store_true", help="Print stored fingerprints and exit.")
     p.add_argument("--report", action="store_true",
                    help="Motion features grouped by individual/visit + pair-clip comparison.")
+    p.add_argument("--link", action="store_true",
+                   help="Backfill clip_tracks.individual_id from solo-clip/visit overlap (no GPU). "
+                        "Run after extraction (and after naming visits) to feed the two-axis readout.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="With --link: report what would be assigned, write nothing.")
     p.add_argument("--species", default="raccoon", help="Species for --report (default raccoon).")
     p.add_argument("--visit-species", default=None, metavar="SPECIES",
                    help="Only process clips overlapping a visit of this species (e.g. raccoon) "
@@ -448,6 +517,8 @@ def main() -> int:
             return show_tracks(conn)
         if args.report:
             return report(conn, args.species)
+        if args.link:
+            return link_all(conn, dry_run=args.dry_run)
 
         model = cfg.model_version
         if args.clip is not None:

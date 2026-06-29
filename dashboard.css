@@ -439,3 +439,37 @@
     text-transform:uppercase; color:var(--gilt); background:none; border:1px solid var(--rule2);
     border-radius:3px; padding:7px 14px; cursor:pointer; }
   .firstrun .fr-x:hover{ border-color:var(--gilt); }
+
+  /* ---------- Cast Roll Call (Dispatch): the named cast with last-seen / overdue ---------- */
+  .rollcall{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:10px; }
+  .rc-card{ display:flex; align-items:center; gap:11px; padding:9px 11px; cursor:pointer;
+    background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--rule);
+    border-radius:4px; transition:border-color .15s; }
+  .rc-card:hover{ border-color:var(--gilt); }
+  .rc-card.overdue{ border-color:var(--rust); }
+  .rc-av{ flex:0 0 44px; width:44px; height:44px; border-radius:50%; background:#000 center/cover no-repeat;
+    border:1px solid var(--rule2); }
+  .rc-card.overdue .rc-av{ border-color:var(--rust); }
+  .rc-info{ min-width:0; }
+  .rc-name{ font-family:var(--serif); font-size:16px; color:var(--ink); display:flex; align-items:center;
+    gap:7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rc-flag{ font-family:var(--mono); font-size:8.5px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--rust); border:1px solid var(--rust); border-radius:3px; padding:1px 5px; }
+  .rc-sub{ margin-top:1px; }
+  .rc-since{ font-family:var(--mono); font-size:11px; color:var(--dim); margin-top:3px; }
+  .rc-card.overdue .rc-since{ color:var(--rust); }
+
+  /* ---------- Needs Review: launcher (Catalogue) + the per-crop reason tag ---------- */
+  .review-launch{ display:flex; align-items:center; gap:14px; width:100%; text-align:left;
+    margin:0 0 18px; padding:13px 16px; cursor:pointer; color:var(--ink);
+    background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--rule2);
+    border-left:3px solid var(--gilt); border-radius:4px; transition:border-color .15s; }
+  .review-launch:hover{ border-color:var(--gilt); }
+  .review-launch .rl-mark{ font-family:var(--serif); font-size:22px; color:var(--gilt); line-height:1; }
+  .review-launch .rl-text{ display:flex; flex-direction:column; gap:2px; }
+  .review-launch .rl-text b{ font-family:var(--serif); font-size:17px; font-weight:500; }
+  .review-launch .rl-sub{ font-size:13px; color:var(--dim); font-style:italic; font-family:var(--serif); }
+  .review-launch .rl-go{ margin-left:auto; color:var(--gilt); font-size:18px; }
+  .rv-tag{ position:absolute; top:0; left:0; right:0; padding:4px 7px; font-size:9px;
+    background:rgba(21,19,13,.82); color:var(--gilt); border-bottom:1px solid var(--rule);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }

@@ -296,6 +296,10 @@ def species_overview(cfg) -> dict | None:
             "SUM(CASE WHEN species_verified = 0 THEN 1 ELSE 0 END) rejected "
             "FROM detections WHERE species IS NOT NULL GROUP BY species ORDER BY n DESC"
         ).fetchall()
+        # Drop non-critter human-correction labels (chair, bricks, "not an animal", homeowner, ...)
+        # so the catalogue and the "Rarely Seen" cards stay about real animals -- same filter the
+        # period digest applies (see _NON_CRITTER). Real rarities (Douglas squirrel) are NOT here.
+        rows = [r for r in rows if (r["species"] or "").lower() not in _NON_CRITTER]
         species = []
         for r in rows:
             s = conn.execute(
@@ -345,6 +349,116 @@ def individuals_overview(cfg, thumbs: int = 6) -> dict:
         groups.sort(key=lambda g: (g["placeholder"], -g["n_crops"]))
         return {"groups": groups, "total_crops": sum(g["n_crops"] for g in groups),
                 "named": sum(1 for g in groups if not g["placeholder"])}
+    finally:
+        conn.close()
+
+
+def cast_rollcall(cfg, now=None) -> dict:
+    """The named cast with last-seen + an 'overdue' flag -- the daily "who's back / who hasn't
+    shown" roll for the Dispatch and Individuals tab. Placeholder clusters (raccoon_c01) are
+    excluded; this is the hand-named cast only. 'Overdue' = a REGULAR (seen on >=3 distinct days)
+    now gone notably longer than its own typical gap between appearances -- a one-off visitor is
+    never flagged overdue. Sorted overdue-first, then by most-recently-seen."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"cast": []}
+    try:
+        now = now or _local_now()
+        rows = conn.execute(
+            "SELECT individual_id iid, COUNT(*) n, MAX(timestamp) last_seen "
+            "FROM detections WHERE individual_id IS NOT NULL GROUP BY individual_id").fetchall()
+        cast = []
+        for r in rows:
+            iid = r["iid"]
+            if "_c" in iid and iid.rsplit("_c", 1)[-1].isdigit():
+                continue                                  # placeholder cluster -> not the named cast
+            days = [d["d"] for d in conn.execute(
+                "SELECT DISTINCT substr(timestamp, 1, 10) d FROM detections WHERE individual_id = ? "
+                "ORDER BY d", (iid,)).fetchall()]
+            last = db.parse_local(r["last_seen"])
+            days_since = (now.date() - last.date()).days if last else None
+            gaps = sorted(
+                (datetime.fromisoformat(days[i]).date() - datetime.fromisoformat(days[i - 1]).date()).days
+                for i in range(1, len(days)))
+            med_gap = gaps[len(gaps) // 2] if gaps else None
+            regular = len(days) >= 3
+            overdue = bool(regular and med_gap and days_since is not None
+                           and days_since > max(2, 2 * med_gap))
+            sp = conn.execute(
+                "SELECT species FROM detections WHERE individual_id = ? AND species IS NOT NULL "
+                "GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1", (iid,)).fetchone()
+            crop = conn.execute(
+                "SELECT crop_path FROM detections WHERE individual_id = ? "
+                "ORDER BY (species_verified = 1) DESC, crop_quality DESC LIMIT 1", (iid,)).fetchone()
+            cast.append({
+                "id": iid, "species": sp["species"] if sp else None,
+                "n_crops": r["n"], "nights": len(days),
+                "last_seen": r["last_seen"], "days_since": days_since,
+                "typical_gap_days": med_gap, "regular": regular, "overdue": overdue,
+                "crop": (crop["crop_path"].replace("\\", "/") if crop and crop["crop_path"] else None),
+            })
+        cast.sort(key=lambda c: (not c["overdue"],
+                                 c["days_since"] if c["days_since"] is not None else 1e9))
+        return {"cast": cast, "as_of": now.isoformat()}
+    finally:
+        conn.close()
+
+
+_REVIEW_SUSPECT = {"brown rat", "domestic dog"}   # real-ish but error-prone labels (per the analysis)
+# Clearly day-active species: one detected at deep night is almost certainly a nocturnal mammal
+# mislabeled. Used ONLY to prioritize the review queue -- never to relabel anything.
+_DIURNAL = {
+    "american crow", "dark-eyed junco", "spotted towhee", "european starling", "house finch",
+    "house sparrow", "northern flicker", "american robin", "band-tailed pigeon", "song sparrow",
+    "california scrub-jay", "varied thrush", "chestnut-backed chickadee", "american goldfinch",
+    "golden-crowned sparrow", "white-crowned sparrow", "bushtit", "black-capped chickadee",
+    "bewick's wren", "steller's jay", "eastern gray squirrel", "douglas squirrel",
+    "townsend's chipmunk",
+}
+
+
+def review_queue(cfg, limit: int = 150) -> dict:
+    """Prioritized 'most likely mislabeled' crops for a human verify pass -- the suspect crops the
+    analysis flagged. UNVERIFIED only (species_verified IS NULL); each crop carries a `reason` and is
+    ordered worst-first so a few minutes of ✓/✗ clears the shakiest labels. Reuses the dashboard's
+    existing per-crop review controls. Priorities (high->low): a flagged suspect species (brown rat,
+    domestic dog); the clip-filter's 'not an animal' / other non-critter labels; a clearly day-active
+    species detected at deep night (22:00-05:00); and very low detector confidence. This only RANKS
+    what to look at -- it never changes a label."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"crops": [], "total": 0, "shown": 0}
+    try:
+        rows = conn.execute(
+            "SELECT id, crop_path, species, ROUND(confidence, 3) det_conf, "
+            "ROUND(species_confidence, 3) sp_conf, species_verified, timestamp, source "
+            "FROM detections WHERE species_verified IS NULL AND species IS NOT NULL").fetchall()
+        out = []
+        for r in rows:
+            sp = (r["species"] or "").lower()
+            ts = r["timestamp"] or ""
+            hour = int(ts[11:13]) if len(ts) >= 13 and ts[11:13].isdigit() else 12
+            night = hour >= 22 or hour < 5
+            if sp in _REVIEW_SUSPECT:
+                reason, prio = f"suspect label · {r['species']}", 4
+            elif sp in _NON_CRITTER:
+                reason, prio = "flagged non-animal", 3
+            elif sp in _DIURNAL and night:
+                reason, prio = "day species, seen at night", 3
+            elif ((r["det_conf"] if r["det_conf"] is not None else 1.0) < 0.45
+                  and r["sp_conf"] is not None and r["sp_conf"] < 0.6):
+                reason, prio = "both models unsure", 2   # detector barely saw it AND BioCLIP hesitated
+            else:
+                continue
+            out.append({"id": r["id"], "crop_path": (r["crop_path"] or "").replace("\\", "/"),
+                        "species": r["species"], "confidence": r["det_conf"],
+                        "species_confidence": r["sp_conf"], "verified": r["species_verified"],
+                        "timestamp": r["timestamp"], "reason": reason, "_p": prio})
+        out.sort(key=lambda c: (-c["_p"], c["timestamp"]))   # worst first, then oldest first
+        total = len(out)
+        for c in out:
+            c.pop("_p", None)
+        return {"crops": out[:max(1, int(limit))], "total": total, "shown": min(int(limit), total)}
     finally:
         conn.close()
 

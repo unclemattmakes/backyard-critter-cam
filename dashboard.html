@@ -21,8 +21,8 @@
 </header>
 
 <nav class="tabs">
-  <button id="tab-live" class="on" onclick="show('live')">Live Observation</button>
-  <button id="tab-dispatch" onclick="show('dispatch')">The Dispatch</button>
+  <button id="tab-live" onclick="show('live')">Live Observation</button>
+  <button id="tab-dispatch" class="on" onclick="show('dispatch')">The Dispatch</button>
   <button id="tab-behavior" onclick="show('behavior')">Behaviour</button>
   <button id="tab-indiv" onclick="show('indiv')">Individuals</button>
   <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
@@ -31,7 +31,7 @@
 
 <main>
   <!-- ============ LIVE ============ -->
-  <section id="view-live" class="view on">
+  <section id="view-live" class="view">
     <div class="firstrun" id="firstrun" hidden></div>
     <div class="obs">
       <div class="panel plate">
@@ -84,6 +84,11 @@
   <section id="view-cat" class="view">
     <div id="cat-index">
       <h2 class="sec">Specimen Catalogue <span class="n" id="cat-count"></span></h2>
+      <button class="review-launch" type="button" onclick="openReview()">
+        <span class="rl-mark">✎</span>
+        <span class="rl-text"><b>Needs Review</b><span class="rl-sub">the crops most likely mislabeled — confirm or correct them</span></span>
+        <span class="rl-go">→</span>
+      </button>
       <div class="cards" id="catalogue"></div>
     </div>
     <div id="cat-sheet" style="display:none">
@@ -105,8 +110,8 @@
     <div id="explore-body"></div>
   </section>
 
-  <!-- ============ THE DISPATCH (period digest) ============ -->
-  <section id="view-dispatch" class="view">
+  <!-- ============ THE DISPATCH (period digest) — default landing tab ============ -->
+  <section id="view-dispatch" class="view on">
     <div id="dispatch-body"><p class="empty">Loading the dispatch&hellip;</p></div>
   </section>
 

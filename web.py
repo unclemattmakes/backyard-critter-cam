@@ -442,6 +442,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json(behavior.overview(cfg))
                 elif path == "/api/individuals":
                     self._json(stats.individuals_overview(cfg))
+                elif path == "/api/rollcall":
+                    self._json(stats.cast_rollcall(cfg))
+                elif path == "/api/review":
+                    self._json(stats.review_queue(cfg))
                 elif path == "/api/reid/queue":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_queue(cfg, species=(q.get("species") or [cfg.reid_species])[0],

@@ -419,7 +419,7 @@ async function openSheet(name){
   if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">No plates.</p>'; return; }
   $('#sheet-crops').innerHTML=rows.map(r=>cropTile(r,name)).join('');
 }
-function cropTile(r,name){
+function cropTile(r,name,tag){
   const v=r.verified; const cls=v===1?'v-1':v===0?'v-0':'';
   const stamp=v===1?'<span class="stamp v1">✓ confirmed</span>':v===0?'<span class="stamp v0">✗ wrong</span>':'';
   const opts=['<option value="">— correct to —</option>'].concat(
@@ -428,6 +428,7 @@ function cropTile(r,name){
   return `<div class="crop ${cls}" data-id="${r.id}">
     <img loading="lazy" src="${media(r.crop_path)}" alt="">
     ${stamp}
+    ${tag?`<div class="rv-tag lbl">${esc(tag)}</div>`:''}
     <div class="ft"><span class="c">${Math.round((r.confidence||0)*100)}%</span>
       <span class="acts">
         <button class="b up" title="confirm" onclick="act(${r.id},'verify',this)">✓</button>
@@ -436,6 +437,20 @@ function cropTile(r,name){
       </span></div>
     <select onchange="correct(${r.id},this.value)">${opts}</select>
   </div>`;
+}
+/* Needs Review: the prioritized "most likely mislabeled" crops (suspect species, junk labels,
+   day-species-at-night, both-models-unsure), pulled across all species into the same sheet and the
+   same ✓/✗/✎ controls. Opens from the Catalogue. */
+async function openReview(){
+  show('cat');
+  $('#cat-index').style.display='none'; $('#cat-sheet').style.display='block';
+  $('#sheet-name').textContent='Needs Review'; $('#sheet-latin').textContent='most likely mislabeled';
+  $('#sheet-crops').innerHTML='<p class="empty">Gathering the suspect plates…</p>';
+  let d; try{ d=await fetch('/api/review').then(r=>r.json()); }catch(e){ d={crops:[]}; }
+  const rows=d.crops||[];
+  if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">Nothing flagged for review — every label has been checked.</p>'; return; }
+  const head=`<p class="hint" style="color:var(--faint);font-style:italic">Showing ${rows.length} of ${d.total} flagged · sorted most-suspect first · ✓ confirm · ✗ wrong · ✎ correct the identification.</p>`;
+  $('#sheet-crops').innerHTML=head+rows.map(r=>cropTile(r, r.species, cap1(r.species)+' · '+r.reason)).join('');
 }
 function toggleEdit(btn){ btn.closest('.crop').classList.toggle('editing'); }
 async function act(id,action,btn){
@@ -623,9 +638,37 @@ let dispatchEdition='auto';
 function setDispatch(ed){ dispatchEdition=ed; loadDispatch(); }
 async function loadDispatch(){
   const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the dispatch…</p>';
-  let d; try{ d=await fetch('/api/digest?edition='+dispatchEdition).then(r=>r.json()); }
-  catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
-  renderDispatch(d);
+  let d, rc;
+  try{
+    [d, rc] = await Promise.all([
+      fetch('/api/digest?edition='+dispatchEdition).then(r=>r.json()),
+      fetch('/api/rollcall').then(r=>r.json()).catch(()=>({cast:[]})),
+    ]);
+  }catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
+  renderDispatch(d, rc);
+}
+/* The named cast with last-seen / overdue chips -- the daily "who's back, who hasn't shown" roll.
+   Clicking a face jumps to the Individuals tab. Empty (no named cast yet) renders nothing. */
+function rollcallSection(rc){
+  const cast=(rc&&rc.cast)||[];
+  if(!cast.length) return '';
+  const overdue=cast.filter(c=>c.overdue).length;
+  const note=overdue?`${overdue} overdue`:`${cast.length} named`;
+  const sinceText=c=> c.days_since==null ? '' :
+    c.days_since===0 ? 'seen today' : c.days_since===1 ? 'seen yesterday' : `${c.days_since} days ago`;
+  const card=c=>{
+    const av=c.crop?`style="background-image:url('${media(c.crop)}')"`:'';
+    return `<div class="rc-card${c.overdue?' overdue':''}" onclick="show('indiv')"
+        title="${esc(c.id)} — last seen ${esc((c.last_seen||'').slice(0,16).replace('T',' '))}">
+      <div class="rc-av" ${av}></div>
+      <div class="rc-info">
+        <div class="rc-name">${esc(c.id)}${c.overdue?'<span class="rc-flag">overdue</span>':''}</div>
+        <div class="rc-sub lbl">${esc(nameOf(c.species||'·'))}</div>
+        <div class="rc-since">${esc(sinceText(c))}</div>
+      </div></div>`;
+  };
+  return `<h2 class="sec">Cast Roll Call <span class="n">${note}</span></h2>
+    <div class="rollcall">${cast.map(card).join('')}</div>`;
 }
 function dispatchHeader(d){
   const ed=d.edition;
@@ -642,9 +685,10 @@ function dispatchHeader(d){
     </div>
   </div>`;
 }
-function renderDispatch(d){
+function renderDispatch(d, rc){
   const body=$('#dispatch-body');
-  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`; return; }
+  const roll=rollcallSection(rc||{});
+  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+roll+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`; return; }
   let html=dispatchHeader(d);
   const flags=[];
   (d.novel||[]).forEach(sp=>{ const s=(d.species||[]).find(x=>x.species===sp); const n=s&&s.novelty;
@@ -653,6 +697,7 @@ function renderDispatch(d){
   (d.quiet||[]).forEach(q=>{ flags.push(`<span class="flag quiet">— No ${esc(nameOf(q.species))} this ${esc(d.edition)} (usually ${Math.round(q.frac*100)}% of ${esc(d.edition)}s)</span>`); });
   if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
   if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
+  html+=roll;
   if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`; return; }
   // Highlight reel — the night's clips, played back-to-back. Poster is the sharpest still
   // (the plate); the filmstrip lets you jump straight to any moment.
@@ -1237,10 +1282,14 @@ async function refreshNaming(){
       : 'New visitors are being named automatically.';
 }
 /* ---------- first-run orientation: shown only while the database is still empty ---------- */
+let __firstRunLanded=false;   // so the empty-DB redirect to Live fires at most once per page load
 function maybeFirstRun(s){
   const el=document.getElementById('firstrun'); if(!el) return;
   const empty=!(s&&s.total_crops);
   if(empty && localStorage.getItem('cc-introDismissed')!=='1'){
+    // A brand-new, empty rig should see the welcome card (it lives in the Live view), not the
+    // empty Dispatch we land on by default. Redirect once; afterwards the user can navigate freely.
+    if(!__firstRunLanded){ __firstRunLanded=true; show('live'); }
     if(!el.dataset.filled){
       el.innerHTML='<div class="fr-card"><div class="fr-title">Welcome to your Backyard Observatory</div>'
         +'<p>The camera is watching the yard right now &mdash; there&rsquo;s nothing else to start. As real animals visit, this log fills in by itself: their photographs, the species name, and over days, who comes and when.</p>'
@@ -1254,6 +1303,7 @@ function maybeFirstRun(s){
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
 loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
+loadDispatch();   // land on the daily Dispatch ("who visited"); maybeFirstRun redirects empty rigs to Live
 setInterval(refreshLive,6000);
 setInterval(refreshHeader,4000);
 setInterval(refreshNaming,4000);
