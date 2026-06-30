@@ -121,6 +121,13 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
             continue
         n_batch = len(valid)   # crops actually processed this batch (animal + non-animal)
 
+        # Run ALL the slow inference first and stash the labels in memory -- do NOT touch the DB
+        # yet. Writing here would open a transaction and hold SQLite's WAL write lock across the
+        # (CPU, multi-second-per-image) CLIP/BioCLIP passes, which locks out the live capture
+        # thread long enough to crash it ("database is locked"). We instead commit everything in
+        # one quick burst at the end, so the write lock is held for milliseconds, not minutes.
+        pending: list = []                 # (id, label, score, source) -- source None = bioclip default
+
         # Stage 0: general-CLIP non-animal gate. Rejected crops are labelled NONANIMAL_LABEL and
         # dropped from the batch, so BioCLIP only ever sees things that are plausibly animals.
         if afilter is not None:
@@ -129,7 +136,7 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
                 if is_animal:
                     kept.append((rid, pth))
                 else:
-                    db.set_species(conn, rid, NONANIMAL_LABEL, p_non, source="clip-filter")
+                    pending.append((rid, NONANIMAL_LABEL, p_non, "clip-filter"))
                     tally[NONANIMAL_LABEL] += 1
             valid = kept
 
@@ -156,9 +163,15 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
             for rid, pth in valid:
                 if pth in best:
                     label, score = best[pth]
-                    db.set_species(conn, rid, label, score)
+                    pending.append((rid, label, score, None))
                     tally[label] += 1
 
+        # Take the write lock only for this quick burst of UPDATEs, then release it with commit().
+        for rid, label, score, source in pending:
+            if source is None:
+                db.set_species(conn, rid, label, score)
+            else:
+                db.set_species(conn, rid, label, score, source=source)
         conn.commit()
         done += n_batch
         print(f"  {done}/{total} classified ...")

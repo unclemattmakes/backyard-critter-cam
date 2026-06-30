@@ -902,11 +902,19 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                         if s is None:
                             continue
                         crop_path, crop_q = s
-                        db.insert_detection(
-                            conn, timestamp=iso, source=spec.source,
-                            detection_class=det.class_name, confidence=det.confidence,
-                            bbox=det.bbox, frame_w=w, frame_h=h,
-                            crop_path=_rel(crop_path), frame_path=frame_path, crop_quality=crop_q)
+                        # The crop is already on disk, so a transient DB hiccup (classically
+                        # "database is locked" while the naming helper holds a long write) must
+                        # NOT kill the capture thread -- log it and keep watching. Same spirit as
+                        # the detector guard above; staying alive beats one detection row.
+                        try:
+                            db.insert_detection(
+                                conn, timestamp=iso, source=spec.source,
+                                detection_class=det.class_name, confidence=det.confidence,
+                                bbox=det.bbox, frame_w=w, frame_h=h,
+                                crop_path=_rel(crop_path), frame_path=frame_path, crop_quality=crop_q)
+                        except Exception as e:
+                            print(f"  {tag} [{iso}] DB write failed, kept crop {_rel(crop_path)}: {e}")
+                            continue
                         saved += 1
                         print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
 
