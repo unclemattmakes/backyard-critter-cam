@@ -15,9 +15,15 @@ echo      (Or just close that window.)  Everything stops together.
 echo   ===============================================================
 echo.
 echo   You can leave this little log window alone -- it closes by itself
-echo   when you stop the app.
+echo   when you stop the app normally. If something goes wrong it STAYS
+echo   open with an error so you (or Claude) can read what happened.
 echo.
-start "Backyard Critter Cam - log (you can ignore or minimize this)" ".venv\Scripts\python.exe" backyard_cam.py --serve
+REM Run python INSIDE a cmd /k so the log window stays open on an abnormal exit (nonzero exit
+REM code = a crash or a clean-but-unexpected self-exit), instead of vanishing without a trace --
+REM that silent disappearance is exactly what hid the overnight deaths. On a normal stop ('q' /
+REM closing the video window) python exits 0 and we close the window ourselves.  start /min so it
+REM doesn't steal focus from the video window + browser; the full log is also in logs\.
+start "Backyard Critter Cam - log (you can ignore or minimize this)" /min cmd /k ".venv\Scripts\python.exe backyard_cam.py --serve & if errorlevel 1 (echo. & echo   *** The app exited abnormally -- the error is above and in logs\backyard_cam.log. & echo   *** This window is kept open on purpose; close it when you are done reading. & echo.) else (exit)"
 
 REM Wait until the dashboard is actually answering (poll the port) rather than guessing a fixed
 REM delay -- the very first run downloads the detector model and can take a while, and we never

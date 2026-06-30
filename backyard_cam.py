@@ -14,6 +14,7 @@ Run `python backyard_cam.py --list-cameras` to find your webcam's index.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import sqlite3
@@ -23,6 +24,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import cv2
@@ -38,6 +40,113 @@ import visits
 import web
 from config import CONFIG
 from detector import CudaUnavailableError, Detection, Detector
+
+# ---- File logging (so the next post-mortem isn't blind) ----------------------------
+# The overnight deaths left no trace: the start-ed console window vanished with the process,
+# so there was nothing to read the morning after. We now TEE every line of stdout/stderr to a
+# rotating, line-timestamped log file as well as the console -- the live window UX is
+# unchanged (everything still prints there), but a death now leaves a dated breadcrumb trail.
+# Crash-safe: each line is flushed immediately, so even a hard kill keeps what was printed.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / "backyard_cam.log"
+
+
+class _Tee:
+    """A stdout/stderr stand-in that writes to the real stream AND a logging handler, stamping
+    each line with a timestamp in the file copy. Mirrors the file object API just enough for
+    print() and tracebacks (write/flush/isatty/fileno + the encoding attr libraries probe).
+
+    The file sink is a safety net, never load-bearing: if the console can't encode a line
+    (cp1252 console + a non-cp1252 species label) we degrade instead of dropping it, and if the
+    log handler itself starts failing (e.g. disk full) we disable it so logging.handleError
+    can't recurse back through this tee and crash the capture app."""
+
+    def __init__(self, real_stream, file_logger):
+        self._real = real_stream
+        self._log = file_logger
+        self._buf = ""                              # accumulate until a newline -> one log record
+
+    def write(self, text: str) -> int:
+        # Console first, unchanged (UX preserved). On a cp1252 console a non-cp1252 char raises
+        # UnicodeEncodeError -- don't let the live line silently vanish; re-encode with a visible
+        # escape so the window still shows something (the file copy keeps the real text).
+        try:
+            n = self._real.write(text)
+            self._real.flush()
+        except UnicodeEncodeError:
+            try:
+                enc = getattr(self._real, "encoding", "utf-8") or "utf-8"
+                self._real.buffer.write(text.encode(enc, "backslashreplace"))
+                self._real.flush()
+            except Exception:
+                pass
+            n = len(text)
+        except Exception:
+            n = len(text)
+        # Buffer and split on newlines so each console line becomes one timestamped file line.
+        self._buf += text
+        try:
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._log.info(line)                # the handler timestamps + flushes per line
+        except Exception:
+            # The file sink failed mid-run (e.g. disk full). Stop feeding it so the failing
+            # handler can't re-enter this tee via stderr and recurse the app to death; the
+            # console (the real UX) stays alive.
+            self._log = _NullLog()
+        return n
+
+    def flush(self) -> None:
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    # Pass-throughs so anything that introspects the stream (cv2, subprocess, faulthandler,
+    # isatty checks) still sees a real terminal underneath rather than choking on a bare object.
+    def isatty(self) -> bool:
+        return getattr(self._real, "isatty", lambda: False)()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._real, "encoding", "utf-8")
+
+
+class _NullLog:
+    """A do-nothing stand-in we swap in if the real file sink starts failing, so the tee keeps
+    forwarding to the console but never re-enters a broken logging handler."""
+    def info(self, *args, **kwargs) -> None:
+        pass
+
+
+def install_file_logging() -> Path | None:
+    """Tee stdout + stderr to a rotating, line-timestamped file under logs/. Call once, first
+    thing in main(). Returns the log path, or None if it couldn't be set up (which is itself
+    printed -- never silent). Idempotent-safe: re-wrapping is harmless but we only call it once."""
+    try:
+        # Don't let a failing handler raise through logging itself -- our tee already isolates the
+        # sink, and we never want a log error to surface as an app crash.
+        logging.raiseExceptions = False
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # 5 files x 2 MB ~ a couple of weeks of this rig's chatter; old ones roll off automatically.
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s",
+                                               datefmt="%Y-%m-%dT%H:%M:%S"))
+        file_logger = logging.getLogger("backyard_cam.file")
+        file_logger.setLevel(logging.INFO)
+        file_logger.propagate = False               # our own sink; don't touch the root logger
+        file_logger.handlers = [handler]
+        sys.stdout = _Tee(sys.stdout, file_logger)
+        sys.stderr = _Tee(sys.stderr, file_logger)
+        return LOG_FILE
+    except Exception as e:
+        # Logging is a safety net, never a hard dependency -- if it can't open, say so and run on.
+        print(f"  log: WARNING -- could not open the log file ({e}); running without a file log.")
+        return None
+
 
 # ---- Drawing constants -------------------------------------------------------------
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -59,35 +168,138 @@ READ_FAIL_TOLERANCE = 10
 # ---- Keep the machine awake while we watch -----------------------------------------
 # Some rigs (e.g. this Acer handheld) only support Modern Standby (S0 low-power idle), not
 # S3. Left idle, the box slides into standby within minutes -- which USB-suspends the
-# webcam. The capture loop then sees the camera "vanish", exhausts its reopen retries, and
-# exits (~30s later), so the app silently dies overnight. While a run is live we assert a
-# system-required power request so Windows won't idle-sleep underneath us. Windows-only; a
-# safe no-op everywhere else (and if the call ever fails -- it just means we don't hold the
-# box awake, never that the cam won't start).
+# webcam. The capture loop then sees the camera "vanish", and the app silently dies
+# overnight. While a run is live we hold a power request so Windows won't idle-sleep
+# underneath us.
+#
+# We learned the hard way that SetThreadExecutionState(ES_SYSTEM_REQUIRED) is NOT
+# Modern-Standby-aware: the box still slid into S0 standby (Kernel-Power 506) WHILE we were
+# actively capturing. The Modern-Standby-aware mechanism is the Power Request API
+# (PowerCreateRequest / PowerSetRequest) with PowerRequestExecutionRequired -- that's the
+# request type that actually keeps an S0 box out of the deep DRIPS sub-states that suspend
+# USB. So we hold that as the primary, and keep SetThreadExecutionState as a
+# belt-and-suspenders secondary (harmless, and helps on classic-S3 machines).
+#
+# Windows-only; a clean no-op everywhere else. CRITICAL: unlike the old version, a failure
+# here is now LOGGED loudly -- a silent failure is exactly what hid the overnight deaths.
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 
+# POWER_REQUEST_TYPE enum (winnt.h): the value we want is PowerRequestExecutionRequired.
+_PowerRequestSystemRequired = 1
+_PowerRequestExecutionRequired = 3
+# REASON_CONTEXT.Flags: a plain human-readable reason string (vs. a module+resource id).
+_POWER_REQUEST_CONTEXT_SIMPLE_STRING = 0x1
+
+# The live power-request handle, held for the lifetime of a run. Two requests are set on it
+# (Execution + System), so allow_system_sleep() clears both before closing it.
+_power_request_handle = None
+
 
 def keep_system_awake() -> bool:
-    """Ask Windows to stay awake (no idle sleep / Modern Standby) until allow_system_sleep().
-    Returns True if the request was set, False on non-Windows or if the call failed."""
+    """Hold a Modern-Standby-aware power request so Windows won't idle-sleep (S0/S3) until
+    allow_system_sleep(). Stores the request handle in module state so the release can clear
+    it. Returns True if at least the Execution request was set; False on non-Windows or if
+    the call failed (and logs WHY -- a silent failure is what hid the overnight deaths)."""
+    global _power_request_handle
     if sys.platform != "win32":
         return False
     try:
         import ctypes
-        prev = ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
-        return prev != 0                            # returns the previous state, or 0 (NULL) on failure
-    except Exception:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+
+        # REASON_CONTEXT for the simple-string case: Version (ULONG, 0), Flags (DWORD), and a
+        # union whose simple-string arm is an LPWSTR reason. We only ever use the string arm,
+        # so model the struct with just that member (the detailed-info arm is larger, but we
+        # never set Flags to use it, so Windows never reads past our LPWSTR).
+        class _REASON_CONTEXT(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.ULONG),
+                ("Flags", wintypes.DWORD),
+                ("SimpleReasonString", wintypes.LPWSTR),
+            ]
+
+        # CRITICAL: PowerCreateRequest returns a HANDLE. Without restype=HANDLE ctypes assumes
+        # c_int and truncates the pointer to 32 bits on 64-bit Python -- the handle then looks
+        # valid but PowerSetRequest/CloseHandle silently operate on garbage. Pin it explicitly.
+        kernel32.PowerCreateRequest.restype = wintypes.HANDLE
+        kernel32.PowerCreateRequest.argtypes = [ctypes.POINTER(_REASON_CONTEXT)]
+        kernel32.PowerSetRequest.restype = wintypes.BOOL
+        kernel32.PowerSetRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        # CloseHandle releases the request on the failure path below; pin it too so a large
+        # handle value can't raise OverflowError against ctypes' default c_int argument.
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        ctx = _REASON_CONTEXT(
+            Version=0,
+            Flags=_POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            SimpleReasonString="Backyard Critter Cam is capturing (keep the USB camera awake).",
+        )
+        handle = kernel32.PowerCreateRequest(ctypes.byref(ctx))
+        # INVALID_HANDLE_VALUE (-1) or NULL means the create failed -- read GetLastError() live
+        # (windll isn't use_last_error=True, so call the API directly rather than ctypes' cache).
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            err = kernel32.GetLastError()
+            print(f"  power: WARNING -- PowerCreateRequest failed (err {err}); cannot hold a "
+                  "power request. The box may idle into Modern Standby and suspend the camera.")
+            # Fall through to the SetThreadExecutionState belt-and-suspenders below anyway.
+            handle = None
+
+        ok_exec = False
+        if handle is not None:
+            # PowerRequestExecutionRequired is the Modern-Standby-aware one (keeps an S0 box out
+            # of the deep DRIPS states that USB-suspend the cam); PowerRequestSystemRequired
+            # covers classic S3 idle-sleep. Set both on the one handle.
+            ok_exec = bool(kernel32.PowerSetRequest(handle, _PowerRequestExecutionRequired))
+            ok_sys = bool(kernel32.PowerSetRequest(handle, _PowerRequestSystemRequired))
+            if not ok_exec:
+                err = kernel32.GetLastError()
+                print(f"  power: WARNING -- PowerSetRequest(Execution) failed (err {err}); the "
+                      "Modern-Standby keep-awake is NOT in effect. The cam may suspend overnight.")
+            elif not ok_sys:
+                # Execution is the one that matters for this rig; note the S3 miss but don't alarm.
+                print("  power: note -- the system-required (S3) request didn't set, but the "
+                      "Modern-Standby (execution) request is holding.")
+            _power_request_handle = handle if ok_exec else None
+            if not ok_exec:
+                kernel32.CloseHandle(handle)        # nothing to hold; don't leak the handle
+
+        # Belt-and-suspenders: also assert the legacy execution-state flag. It alone did NOT hold
+        # this Modern-Standby box (that's the whole bug), but it's free and helps on S3 machines.
+        try:
+            kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        except Exception:
+            pass
+
+        return ok_exec
+    except Exception as e:
+        print(f"  power: WARNING -- could not set a power request ({e}); if the box sleeps it "
+              "may suspend the camera and stop the app.")
         return False
 
 
 def allow_system_sleep() -> None:
-    """Release the keep-awake request from keep_system_awake() (restore normal idle/sleep)."""
+    """Release the keep-awake request from keep_system_awake() (restore normal idle/sleep):
+    clear both power requests, close the handle, and drop the legacy execution-state flag."""
+    global _power_request_handle
     if sys.platform != "win32":
         return
     try:
         import ctypes
-        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        handle = _power_request_handle
+        _power_request_handle = None
+        if handle is not None:
+            kernel32.PowerClearRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.PowerClearRequest(handle, _PowerRequestExecutionRequired)
+            kernel32.PowerClearRequest(handle, _PowerRequestSystemRequired)
+            kernel32.CloseHandle(handle)
+        kernel32.SetThreadExecutionState(_ES_CONTINUOUS)   # drop the belt-and-suspenders flag
     except Exception:
         pass
 
@@ -238,12 +450,17 @@ def open_camera(cfg: config.Config) -> cv2.VideoCapture | None:
 
 def reconnect_capture(spec: config.CameraSpec, cfg: config.Config,
                       stop_event: threading.Event) -> cv2.VideoCapture | None:
-    """Re-open a camera after a read failure. A NETWORK camera (the AP, switch, or camera itself
-    rebooted) gets indefinite exponential backoff -- it will come back, so never give up. A LOCAL
-    camera (a USB unplug) retries cfg.reopen_max_retries times then gives up (the device is gone).
-    Honours stop_event so a shutdown isn't blocked waiting on a dead network cam, and uses
-    stop_event.wait() (not sleep) so the wait ends the instant we're told to stop. Returns a
-    working capture, or None if it gave up / we're shutting down."""
+    """Re-open a camera after a read failure. NEITHER kind ever gives up: it keeps retrying
+    until the camera comes back or we're told to stop. A NETWORK camera (the AP, switch, or
+    camera itself rebooted) comes back; a LOCAL USB camera does too -- and crucially, on this
+    Modern-Standby rig a USB "unplug" is usually the box idle-suspending the cam overnight, so
+    when it wakes the device re-enumerates and we recover. The OLD behaviour (local cams gave up
+    after cfg.reopen_max_retries) is exactly what killed the app overnight; we don't do that any
+    more. Both kinds get a fast initial burst (cfg.reopen_max_retries attempts at
+    cfg.reopen_delay_s, for brief USB hiccups) then slow exponential backoff, capped, FOREVER.
+    Honours stop_event throughout -- it uses stop_event.wait() (not sleep) so Ctrl+C / 'q' / the
+    finally-join end the wait instantly and never hang. Returns a working capture, or None only
+    when we're shutting down."""
     tag = f"[{spec.source}]"
     print(f"{tag} read failed -- reconnecting ...")
     attempt, delay = 0, cfg.reopen_delay_s
@@ -256,16 +473,16 @@ def reconnect_capture(spec: config.CameraSpec, cfg: config.Config,
                 print(f"{tag} reconnected on attempt {attempt}.")
                 return cap
             cap.release()
-        if spec.is_network:
-            print(f"{tag} reconnect attempt {attempt} failed; retrying in {delay:.0f}s.")
+        # Fast burst first (brief USB hiccup / network blip), then back off so we're not hammering
+        # a device that's genuinely away (e.g. the box is in standby) -- but keep trying forever.
+        if attempt < cfg.reopen_max_retries:
+            print(f"{tag} reopen attempt {attempt} failed; retrying in {cfg.reopen_delay_s:.0f}s.")
+            stop_event.wait(cfg.reopen_delay_s)
+        else:
+            print(f"{tag} reopen attempt {attempt} failed; the device looks away -- backing off, "
+                  f"retrying in {delay:.0f}s (will keep trying until it returns).")
             stop_event.wait(delay)
             delay = min(30.0, delay * 2)        # exponential backoff, capped at 30 s
-        else:
-            print(f"{tag} reopen attempt {attempt}/{cfg.reopen_max_retries} failed.")
-            if attempt >= cfg.reopen_max_retries:
-                print(f"{tag} giving up after exhausting reopen retries.")
-                return None
-            stop_event.wait(cfg.reopen_delay_s)
     return None
 
 
@@ -559,14 +776,16 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     saved = 0
     try:
         cap = open_capture(spec, cfg)
-        if cap is None and spec.is_network:
-            cap = reconnect_capture(spec, cfg, stop_event)   # an IP cam may still be booting -- wait
         if cap is None:
-            msg = f"{tag} could not open camera src={spec.src!r}; this camera will not run."
-            if not spec.is_url:
-                msg += "  (try `python backyard_cam.py --list-cameras` to find the right index)"
-            print(msg)
-            return
+            # Couldn't open on the first try -- but don't bail. An IP cam may still be booting, and
+            # a local USB cam may be mid-suspend (the box was in Modern Standby when we launched).
+            # reconnect_capture retries forever (honouring stop_event), so we recover once it wakes.
+            print(f"{tag} could not open camera src={spec.src!r} yet -- will keep trying to connect."
+                  + ("" if spec.is_url else "  (if it never opens, `python backyard_cam.py "
+                     "--list-cameras` finds the right index)"))
+            cap = reconnect_capture(spec, cfg, stop_event)
+        if cap is None:
+            return                                  # only reached when we're shutting down
         print(f"{tag} open ({spec.src!r}).")
 
         recorder = clips.ClipRecorder(cfg, conn, source=spec.source) if record else None
@@ -606,7 +825,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     cap = reconnect_capture(spec, cfg, stop_event)
                     read_fails = 0
                     if cap is None:
-                        break                       # gave up (local) or shutting down
+                        break                       # only None when we're shutting down
                     active_period = None            # re-apply the profile after a reconnect
                     last_profile_check = 0.0
                 continue
@@ -997,6 +1216,10 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
 
 
 def main() -> int:
+    # Start the file log before anything else so the whole run (including a crash) is captured.
+    log_path = install_file_logging()
+    if log_path is not None:
+        print(f"  log: writing this session to {log_path}")
     cfg, args = parse_args()
     if args.list_cameras:
         list_cameras(cfg)
@@ -1011,6 +1234,13 @@ def main() -> int:
         return 2
     except RuntimeError as e:
         print(f"\n[ERROR] {e}")
+        return 1
+    except Exception:
+        # Anything that would otherwise vanish with the window: log the full traceback to the file
+        # (via the tee'd stderr) AND surface a nonzero exit so the .bat keeps the window open.
+        import traceback
+        print("\n[FATAL] uncaught exception -- the run is ending. Traceback:")
+        traceback.print_exc()
         return 1
     return 0
 
