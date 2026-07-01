@@ -26,6 +26,8 @@ clips_web/
 clip_crops/
 # rotating run log (backyard_cam.py tees stdout/stderr here for post-mortems; regenerated)
 logs/
+# eval.py evaluation artifacts (timestamped JSON runs; regenerated on demand, comparable on disk)
+reports/
 
 # ===== Model weights (auto-download from Zenodo on first run) =====
 weights/
