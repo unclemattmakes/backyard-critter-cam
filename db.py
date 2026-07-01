@@ -485,6 +485,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Every label written before this column existed was a reid.py placeholder cluster.
         conn.execute("UPDATE detections SET individual_source = 'cluster' "
                      "WHERE individual_id IS NOT NULL")
+    if "model_species" not in cols:
+        # The model's ORIGINAL auto-prediction, preserved so a later human CORRECTION -- which
+        # overwrites species and forces species_confidence=1.0 -- doesn't destroy what the
+        # classifier actually said. Without this, a corrected crop can never grade the model, which
+        # was eval.py's single biggest data gap (only the confirmed/rejected slice was gradable).
+        # set_species snapshots it at classify time; correct_species / apply_visit_label preserve it.
+        conn.execute("ALTER TABLE detections ADD COLUMN model_species TEXT")
+        conn.execute("ALTER TABLE detections ADD COLUMN model_species_confidence REAL")
+        conn.execute("ALTER TABLE detections ADD COLUMN model_species_source TEXT")
+        # Backfill from every row whose species is STILL the model's (never human-overwritten):
+        # snapshot its prediction now so a future correction keeps it. Rows a human already corrected
+        # had their prediction destroyed in place and are unrecoverable -- left NULL, honestly.
+        conn.execute(
+            "UPDATE detections SET model_species = species, "
+            "model_species_confidence = species_confidence, "
+            "model_species_source = species_source "
+            "WHERE species IS NOT NULL AND (species_source IS NULL OR species_source != 'human')")
     # clip_tracks grew multi-animal + gait columns (2026-06-11, phase 4 part 2).
     ct_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_tracks)")}
     if "track_idx" not in ct_cols:
@@ -509,11 +526,17 @@ def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
     """Phase 2: write an auto-classified species + score onto a detection. `source` records WHICH
     automatic stage decided it -- 'bioclip' (the species namer) or 'clip-filter' (the general-CLIP
     non-animal gate in clipfilter.py). Human corrections go through correct_species (source
-    'human', verified) and are never overwritten by either stage."""
+    'human', verified) and are never overwritten by either stage.
+
+    Also snapshots the model's call into model_species/_confidence/_source -- the classifier's word
+    on this crop, kept intact so a later human correction can still be graded against what the model
+    predicted (eval.py). classify.py skips already-verified crops, so this never clobbers a human
+    label."""
     conn.execute(
-        "UPDATE detections SET species = ?, species_confidence = ?, species_source = ? "
+        "UPDATE detections SET species = ?, species_confidence = ?, species_source = ?, "
+        "model_species = ?, model_species_confidence = ?, model_species_source = ? "
         "WHERE id = ?",
-        (species, float(confidence), source, int(detection_id)),
+        (species, float(confidence), source, species, float(confidence), source, int(detection_id)),
     )
 
 
@@ -525,9 +548,17 @@ def set_species_verified(conn: sqlite3.Connection, detection_id: int, verified) 
 
 
 def correct_species(conn: sqlite3.Connection, detection_id: int, species: str) -> None:
-    """Dashboard correction: set a human-chosen species (confirmed, full confidence, source=human)."""
+    """Dashboard correction: set a human-chosen species (confirmed, full confidence, source=human).
+
+    Preserves the model's prediction into model_species first (COALESCE, so an already-snapshotted
+    value from set_species is kept, not clobbered by an intermediate correction), so the model can
+    still be graded on this crop even though its live species is now the human's answer."""
     conn.execute(
-        "UPDATE detections SET species = ?, species_confidence = 1.0, species_verified = 1, "
+        "UPDATE detections SET "
+        "model_species = COALESCE(model_species, species), "
+        "model_species_confidence = COALESCE(model_species_confidence, species_confidence), "
+        "model_species_source = COALESCE(model_species_source, species_source), "
+        "species = ?, species_confidence = 1.0, species_verified = 1, "
         "species_source = 'human' WHERE id = ?",
         (species, int(detection_id)),
     )
@@ -721,8 +752,16 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
         return {"detections": 0}
 
     if species:
+        # Preserve each crop's model prediction before overwriting (COALESCE keeps an existing
+        # snapshot), the whole-visit twin of correct_species -- so a bulk visit correction stays
+        # gradable against what the classifier said. The COALESCE reads the row's own columns, so
+        # no extra bound params: species for SET, `params` for the WHERE, unchanged.
         conn.execute(
-            f"UPDATE detections SET species = ?, species_confidence = 1.0, species_verified = 1, "
+            f"UPDATE detections SET "
+            f"model_species = COALESCE(model_species, species), "
+            f"model_species_confidence = COALESCE(model_species_confidence, species_confidence), "
+            f"model_species_source = COALESCE(model_species_source, species_source), "
+            f"species = ?, species_confidence = 1.0, species_verified = 1, "
             f"species_source = 'human' WHERE {where}", [species] + params)
     elif verify:
         conn.execute(f"UPDATE detections SET species_verified = 1 WHERE {where}", params)

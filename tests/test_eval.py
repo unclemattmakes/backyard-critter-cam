@@ -130,6 +130,32 @@ def test_eval_species_separates_intact_from_overwritten(conn):
     assert tr["conf_lt_0.5"]["accuracy"] == pytest.approx(0.0)
 
 
+def test_eval_species_grades_recovered_corrections(conn):
+    # A confirmed raccoon (intact) + a correction where the model said 'American crow' but a human
+    # relabelled it 'raccoon'. The model_species fix preserves the crow prediction, so it must now
+    # grade as a crow->raccoon MISS (a real confusion row), not the ungradable lost sentinel.
+    cfg = config.Config()
+    _det(conn, species="raccoon", conf=0.95, verified=1, source_stage="bioclip", minutes=0)
+    did = db.insert_detection(
+        conn, timestamp=_ts(1), source=db.SOURCE_GLASS_DOOR_CAM, detection_class="animal",
+        confidence=0.9, bbox=(0, 0, 10, 10), frame_w=100, frame_h=100, crop_path="crops/rec.jpg")
+    db.set_species(conn, did, "American crow", 0.4, "bioclip")   # the model's call, snapshotted
+    conn.commit()
+    db.correct_species(conn, did, "raccoon")                     # human overrides -> prediction kept
+
+    s = evalmod.eval_species(conn, cfg)
+    gt = s["ground_truth"]
+    assert gt["correction_recovered"] == 1
+    assert gt["prediction_overwritten_by_correction"] == 0       # nothing lost -- it was preserved
+    assert s["graded_rows"] == 2                                 # confirmed raccoon + recovered crow
+    per = s["precision_recall_f1"]["per_label"]
+    # crow PREDICTION with raccoon TRUTH: a false positive for crow, a false negative for raccoon
+    # recall -- both only measurable because the correction preserved the model's prediction.
+    assert per["American crow"]["fp"] == 1
+    assert per["raccoon"]["fn"] == 1
+    assert per["raccoon"]["support"] == 2
+
+
 def test_eval_species_empty_is_safe(conn):
     s = evalmod.eval_species(conn, config.Config())
     assert s["graded_rows"] == 0 and s["ground_truth"]["verified_rows_total"] == 0

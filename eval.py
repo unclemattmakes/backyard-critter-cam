@@ -16,13 +16,15 @@ It runs two evaluations, both pure offline numpy (no cloud, no LLM, no GPU, no m
      and a calibration curve that directly tests the 0.8/0.5 confidence folklore. Stratified by
      predicted species, by day/night, and by source (glass door vs trail cam).
 
-     IMPORTANT DATA LIMITATION, surfaced by this harness: when a human CORRECTS a species in the
-     dashboard, db.correct_species / apply_visit_label OVERWRITE detections.species with the human
-     answer and set species_confidence = 1.0 -- so the model's original prediction is GONE. Only
-     rows the human CONFIRMED (species_source still 'bioclip'/'clip-filter') or REJECTED
-     (species_verified = 0) still carry the model's own prediction. The classifier eval can
-     therefore only score that "prediction-intact" slice; the (much larger) corrected slice is
-     counted and reported but cannot feed a confusion matrix. That gap is itself a finding.
+     CORRECTION HANDLING (a limitation this harness surfaced, since fixed at the source): a human
+     CORRECTION overwrites detections.species and forces confidence=1.0. db.correct_species /
+     apply_visit_label now PRESERVE the model's prediction into detections.model_species first, so a
+     corrected crop stays gradable -- the model's call and the human's true label are both known
+     (category 'corrected_recovered'), which is what finally lets recall for a corrected-away class
+     like crow be measured. The classifier eval scores confirmed + rejected + recovered rows; only
+     LEGACY corrections made before the preservation fix have an unrecoverable prediction (counted as
+     prediction_overwritten_by_correction). That original gap -- and how much of the review corpus it
+     stranded -- is itself a finding the report still surfaces.
 
   2. RE-ID eval -- reproduce the cross-session individual-ID result as a MEASURED number. Using
      the exact visit-prototype logic the live loop uses (individuals.VisitMatcher / prototype /
@@ -108,6 +110,13 @@ def open_readonly(db_path):
     return conn
 
 
+def _table_columns(conn, table: str) -> set:
+    """Column names of `table` -- lets the harness stay robust to an un-migrated DB (one opened
+    read-only before the model_species columns were added), degrading to legacy behaviour instead
+    of raising 'no such column'."""
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def git_commit() -> str | None:
     """Best-effort short git hash of the working tree, so each artifact is pinned to the code that
     produced it (a run is only comparable to another if you know what changed between them)."""
@@ -152,25 +161,60 @@ def _daynight_fn(cfg):
 # ===========================================================================
 
 def _fetch_verified_rows(conn):
-    """Every human-reviewed detection (species_verified IS NOT NULL), with the model's prediction
-    intact-ness worked out. Returns a list of dicts: id, source, timestamp, pred (model's species),
-    pred_conf, verified (1/0), source_stage (bioclip/clip-filter/human/None), prediction_intact."""
+    """Every human-reviewed detection (species_verified IS NOT NULL), each resolved to what the
+    MODEL predicted vs the true label so even corrected rows can be graded. One of four categories:
+
+      * 'confirmed'  -- species_source != 'human', verified=1: the model's label survived and was
+                        right (true label = that species).
+      * 'rejected'   -- species_source != 'human', verified=0: the model's label survived and was
+                        wrong; the real class is unknown, so the true label is the MISPREDICTED
+                        sentinel.
+      * 'corrected_recovered' -- species_source == 'human' but model_species was preserved (a
+                        post-fix correction): the model's original prediction AND the human's true
+                        label are both known -> a real confusion-matrix row (this is what makes a
+                        corrected-away class like crow measurable).
+      * 'corrected_lost' -- species_source == 'human' with no preserved model_species (a legacy
+                        correction made before the fix): ungradable, counted only.
+
+    Each dict carries resolved pred / pred_conf / true / correct / gradable / category, plus the raw
+    source & timestamp the stratification needs. Robust to an un-migrated DB (no model_species
+    columns): those rows fall back to the intact-only behaviour."""
+    has_model = "model_species" in _table_columns(conn, "detections")
+    extra = ", model_species, model_species_confidence" if has_model else ""
     rows = conn.execute(
-        """SELECT id, source, timestamp, species, species_confidence, species_verified,
-                  species_source
-           FROM detections
-           WHERE species_verified IS NOT NULL"""
+        f"""SELECT id, source, timestamp, species, species_confidence, species_verified,
+                   species_source{extra}
+            FROM detections WHERE species_verified IS NOT NULL"""
     ).fetchall()
     out = []
     for r in rows:
         stage = r["species_source"]
-        # A human correction overwrites species + sets confidence 1.0, destroying the model's own
-        # prediction. Everything else (bioclip / clip-filter / legacy NULL) still carries it.
-        intact = stage != "human"
+        mpred = r["model_species"] if has_model else None
+        mconf = r["model_species_confidence"] if has_model else None
+        if stage != "human":
+            # Prediction intact: the live species IS the model's own call.
+            pred, pred_conf = r["species"], r["species_confidence"]
+            true = r["species"] if r["species_verified"] == 1 else MISPREDICTED
+            correct = 1 if r["species_verified"] == 1 else 0
+            gradable = pred is not None and pred_conf is not None
+            category = "confirmed" if r["species_verified"] == 1 else "rejected"
+        elif mpred is not None:
+            # Human correction with the model's prediction preserved -> fully gradable, and the true
+            # label is the human's answer (a REAL class, not the sentinel).
+            pred, pred_conf = mpred, mconf
+            true = r["species"]
+            correct = 1 if mpred == r["species"] else 0
+            gradable = pred_conf is not None
+            category = "corrected_recovered"
+        else:
+            # Legacy correction: the prediction was overwritten in place and is unrecoverable.
+            pred = pred_conf = true = correct = None
+            gradable = False
+            category = "corrected_lost"
         out.append({
-            "id": r["id"], "source": r["source"], "timestamp": r["timestamp"],
-            "pred": r["species"], "pred_conf": r["species_confidence"],
-            "verified": r["species_verified"], "stage": stage, "intact": intact,
+            "id": r["id"], "source": r["source"], "timestamp": r["timestamp"], "stage": stage,
+            "pred": pred, "pred_conf": pred_conf, "true": true, "correct": correct,
+            "gradable": gradable, "category": category, "verified": r["species_verified"],
         })
     return out
 
@@ -181,24 +225,29 @@ def eval_species(conn, cfg) -> dict:
     dn_fn, dn_method = _daynight_fn(cfg)
     all_rows = _fetch_verified_rows(conn)
 
-    intact = [r for r in all_rows if r["intact"]]
-    corrected = [r for r in all_rows if not r["intact"]]
+    graded = [r for r in all_rows if r["gradable"]]
+    by_cat = Counter(r["category"] for r in all_rows)
 
-    # Assemble the arrays the metric helpers grade. For the confusion matrix / precision we need a
-    # concrete true label; a confirmed row's truth is its (unchanged) species, a rejected row's is
-    # the MISPREDICTED sentinel (model wrong, real class overwritten -> unknown).
+    # Each gradable row already carries its resolved (pred, true, correct): confirmed -> pred==true;
+    # rejected -> MISPREDICTED sentinel truth (model wrong, real class unknown); corrected_recovered
+    # -> the model's prediction vs the human's real corrected class.
     y_pred, y_true, conf, correct = [], [], [], []
-    for r in intact:
+    for r in graded:
         if r["pred"] is None or r["pred_conf"] is None:
             continue
         y_pred.append(r["pred"])
-        y_true.append(r["pred"] if r["verified"] == 1 else MISPREDICTED)
+        y_true.append(r["true"])
         conf.append(float(r["pred_conf"]))
-        correct.append(1 if r["verified"] == 1 else 0)
+        correct.append(int(r["correct"]))
 
-    pred_species = sorted({p for p in y_pred}, key=em._sort_key)
-    labels = pred_species + [MISPREDICTED]
-    prf = em.precision_recall_f1(y_true, y_pred, labels=pred_species)
+    # Labels span both what the model PREDICTED and the real classes recovered from corrections -- a
+    # crow the model called that a human relabelled 'raccoon' contributes a raccoon TRUE row the
+    # model never predicted, and only a union label set makes that missed class's recall measurable.
+    pred_species = sorted(set(y_pred), key=em._sort_key)
+    true_species = sorted({t for t in y_true if t != MISPREDICTED}, key=em._sort_key)
+    class_labels = sorted(set(pred_species) | set(true_species), key=em._sort_key)
+    labels = class_labels + [MISPREDICTED]
+    prf = em.precision_recall_f1(y_true, y_pred, labels=class_labels)
     cm = em.confusion_matrix(y_true, y_pred, labels=labels)
     calib = em.reliability_curve(conf, correct, n_bins=10)
 
@@ -207,13 +256,13 @@ def eval_species(conn, cfg) -> dict:
     # it enters the mean as a 0.0 that swamps the classes that actually matter (raccoon, opossum).
     # Report a second macro restricted to labels the truth actually contains -- the honest per-class
     # read for a corpus this skewed. `prf['macro']` (all labels) stays in the artifact for parity.
-    present = [l for l in pred_species if prf["per_label"][l]["support"] > 0]
+    present = [l for l in class_labels if prf["per_label"][l]["support"] > 0]
     prf["macro_present_classes"] = {
         k: (float(np.mean([prf["per_label"][l][k] for l in present])) if present else 0.0)
         for k in ("precision", "recall", "f1")}
     prf["present_classes"] = present
 
-    # ---- Stratification (all over the prediction-intact rows) ----
+    # ---- Stratification (over the gradable rows: intact + recovered corrections) ----
     def _reliability_for(subset):
         c = [x[0] for x in subset]
         k = [x[1] for x in subset]
@@ -222,8 +271,8 @@ def eval_species(conn, cfg) -> dict:
         return {"n": len(subset), "accuracy": acc,
                 "ece": rc["ece"] if rc else None, "reliability": rc}
 
-    triples = [(float(r["pred_conf"]), 1 if r["verified"] == 1 else 0, r)
-               for r in intact if r["pred_conf"] is not None]
+    triples = [(float(r["pred_conf"]), int(r["correct"]), r)
+               for r in graded if r["pred_conf"] is not None]
 
     by_species = {}
     for sp in pred_species:
@@ -238,7 +287,7 @@ def eval_species(conn, cfg) -> dict:
         by_daynight[period] = _reliability_for(sub)
 
     by_source = {}
-    for src in sorted({r["source"] for r in intact}):
+    for src in sorted({r["source"] for r in graded}):
         sub = [(c, k) for c, k, r in triples if r["source"] == src]
         by_source[src] = _reliability_for(sub)
 
@@ -256,13 +305,16 @@ def eval_species(conn, cfg) -> dict:
     return {
         "ground_truth": {
             "verified_rows_total": len(all_rows),
-            "prediction_intact": len(intact),   # confirmed or rejected: model's own label survives
-            "prediction_overwritten_by_correction": len(corrected),  # NOT gradable (finding!)
-            "confirmed_correct": sum(1 for r in intact if r["verified"] == 1),
-            "rejected_wrong": sum(1 for r in intact if r["verified"] == 0),
-            "note": ("Human corrections overwrite detections.species and force confidence=1.0, so "
-                     "the model's original prediction is unrecoverable for those rows; only the "
-                     "prediction-intact slice can be scored."),
+            "prediction_intact": by_cat["confirmed"] + by_cat["rejected"],  # model's own label survived
+            "correction_recovered": by_cat["corrected_recovered"],  # gradable again (the model_species fix)
+            "prediction_overwritten_by_correction": by_cat["corrected_lost"],  # legacy, unrecoverable
+            "confirmed_correct": by_cat["confirmed"],
+            "rejected_wrong": by_cat["rejected"],
+            "note": ("A human correction overwrites detections.species and forces confidence=1.0. "
+                     "Since the model_species fix, correct_species/apply_visit_label PRESERVE the "
+                     "model's prediction first, so corrected crops grade again (correction_recovered) "
+                     "against the human's real label. Only legacy corrections predating the fix "
+                     "(prediction_overwritten_by_correction) stay unrecoverable."),
         },
         "daynight_method": dn_method,
         "graded_rows": len(y_pred),
@@ -533,15 +585,17 @@ def _print_species(s: dict) -> None:
     print(f"  human-reviewed rows:        {gt['verified_rows_total']:>6}")
     print(f"  prediction intact (gradable):{gt['prediction_intact']:>5}   "
           f"(confirmed {gt['confirmed_correct']}, rejected {gt['rejected_wrong']})")
+    print(f"  correction recovered:        {gt['correction_recovered']:>5}   "
+          f"<- model prediction preserved, graded vs the human's true label")
     print(f"  overwritten by a correction: {gt['prediction_overwritten_by_correction']:>5}   "
-          f"<- model's own prediction lost, NOT gradable")
+          f"<- legacy (pre-fix): model's own prediction lost, NOT gradable")
     if not s["graded_rows"]:
         print("  -> nothing gradable. (Confirm some auto-labels in the dashboard to build truth.)")
         return
 
     prf = s["precision_recall_f1"]
-    print(f"\n  Per predicted species (prediction-intact rows; precision is the honest number --")
-    print(f"  recall/F1 are limited because mispredictions were overwritten):")
+    print(f"\n  Per graded species (recovered corrections now contribute real true labels, so recall")
+    print(f"  is measurable; legacy pre-fix corrections still cap how complete it is):")
     print(f"    {'species':22} {'prec':>6} {'rec':>6} {'F1':>6} {'support':>8}")
     per = prf["per_label"]
     for sp in sorted(per, key=lambda k: -per[k]["support"]):
