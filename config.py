@@ -217,6 +217,14 @@ class Config:
                                         # only -- existing crops were already cut at the old pad.
     jpeg_quality: int = 95              # 0-100 for saved JPEGs.
 
+    # ---- Content backups (backup.py) ---------------------------------------------
+    # Where backup.py archives everything the rig GENERATES: per-day zips of clips/ and crops/
+    # (clips especially -- clips_max_gb prunes the live folder, the backup outlives it), plus
+    # integrity-checked db snapshots. Machine-specific, so set it in config_local.py -- point it
+    # at a folder your cloud client syncs (Google Drive / Dropbox / OneDrive) and the upload
+    # takes care of itself. None = backup.py refuses to run until told where (or --dest).
+    backup_dest: Path | None = None
+
     # ---- Identity of this capture source (V1 constant) --------------------------
     # Written verbatim into detections.source. Future sources: 'trail_cam_sd', etc.
     source: str = "glass_door_cam"
