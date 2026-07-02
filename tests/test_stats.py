@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 
+import pytest
+
 import config
 import db
 import stats
@@ -172,3 +174,146 @@ def test_current_live_visit_stops_at_the_gap(conn, db_path):
     conn.commit()
     v = stats.current_live_visit(_cfg(db_path))
     assert v["count"] == 2 and v["active"] is True
+
+
+# ---- compute_stats.by_day: per-day tallies across distinct days (guards the single-pass refactor) --
+def test_compute_stats_by_day_across_days(conn, db_path):
+    """by_day is built in one pass keyed by timestamp[:10]. Insert crops dated on three distinct days
+    and assert the per-day crop counts + ascending day ordering (the refactor kept both correct)."""
+    days = {"2026-06-10": 2, "2026-06-11": 3, "2026-06-12": 1}
+    for day, n in days.items():
+        for i in range(n):
+            db.insert_detection(conn, timestamp=f"{day}T21:0{i}:00-07:00", source="glass_door_cam",
+                                detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                                frame_w=100, frame_h=100, crop_path="crops/x.jpg",
+                                species="raccoon", crop_quality=1.0)
+    conn.commit()
+    s = stats.compute_stats(_cfg(db_path))
+    by_day = s["by_day"]
+    assert [d["day"] for d in by_day] == ["2026-06-10", "2026-06-11", "2026-06-12"]   # ascending
+    assert {d["day"]: d["crops"] for d in by_day} == days
+    assert s["total_crops"] == sum(days.values())
+
+
+# ---- MOTION surfacing: visit_motion / individual_motion (phase-4 clip_tracks read-out) ------------
+# clip_tracks carry NO individual_id via insert_clip_tracks (it's stamped later by
+# set_clip_track_individual); the _track helper writes it directly so individual_motion has rows.
+# NOTE: insert_clip_tracks REPLACES every (clip, model) row, so each _track call gets its OWN clip --
+# that keeps tracks from clobbering each other and matches the real one-clip-one-track fixtures.
+_CLIP_N = [0]
+
+
+def _motion_clip(conn, *, source=db.SOURCE_GLASS_DOOR_CAM, started_at, ended_at):
+    _CLIP_N[0] += 1
+    return db.insert_clip(conn, source=source, clip_path=f"clips/x{_CLIP_N[0]}.mp4",
+                          started_at=started_at, ended_at=ended_at, fps=10.0, width=1280, height=720,
+                          frame_count=300, detection_count=12, max_confidence=0.9)
+
+
+def _track(conn, clip_id, *, avg_speed=None, peak_speed=None, straightness=None,
+           moving_frac=None, area_trend=None, individual_id=None, n_hits=9):
+    """Insert one tracklet on a clip, optionally stamping individual_id directly (as the un-blend
+    action would). Returns the new clip_tracks.id. One track per clip_id (insert replaces rows)."""
+    db.insert_clip_tracks(conn, clip_id=clip_id, model="m", n_samples=300, tracklets=[
+        {"track_json": "[[0,0.5,0.5,0.1,0.1,0.9]]", "n_hits": n_hits,
+         "features": {"avg_speed": avg_speed, "peak_speed": peak_speed, "straightness": straightness,
+                      "moving_frac": moving_frac, "area_trend": area_trend}}])
+    tid = conn.execute("SELECT id FROM clip_tracks WHERE clip_id=? ORDER BY id DESC LIMIT 1",
+                       (clip_id,)).fetchone()["id"]
+    if individual_id is not None:
+        conn.execute("UPDATE clip_tracks SET individual_id=? WHERE id=?", (individual_id, tid))
+        conn.commit()
+    return tid
+
+
+def _linked_track(conn, individual_id, **feats):
+    """A tracklet stamped to an individual, on its own throwaway clip (time window irrelevant --
+    individual_motion queries by individual_id only)."""
+    cid = _motion_clip(conn, started_at="2026-06-10T21:00:00-07:00",
+                       ended_at="2026-06-10T21:00:30-07:00")
+    return _track(conn, cid, individual_id=individual_id, **feats)
+
+
+def _visit(conn, *, source=db.SOURCE_GLASS_DOOR_CAM, started_at, ended_at):
+    vid = db.insert_visit(conn, source=source, species="raccoon", individual_id=None,
+                          started_at=started_at, ended_at=ended_at, detection_count=3,
+                          max_confidence=0.9, representative_detection_id=None)
+    conn.commit()
+    return vid
+
+
+# -- visit_motion -----------------------------------------------------------------------------------
+def test_visit_motion_empty_db(conn, db_path):
+    assert stats.visit_motion(_cfg(db_path), 999) == {
+        "tracks": 0, "avg_speed": None, "peak_speed": None, "straightness": None,
+        "moving_frac": None, "area_trend": None, "approach": "steady"}
+
+
+def test_visit_motion_overlapping_track_is_approach(conn, db_path):
+    vid = _visit(conn, started_at="2026-06-10T21:00:00-07:00", ended_at="2026-06-10T21:05:00-07:00")
+    cid = _motion_clip(conn, started_at="2026-06-10T21:01:00-07:00",
+                       ended_at="2026-06-10T21:01:30-07:00")           # clip window inside the visit
+    _track(conn, cid, avg_speed=0.12, peak_speed=0.30, straightness=0.9,
+           moving_frac=0.8, area_trend=1.4)                            # area_trend > 1.15 -> approach
+    m = stats.visit_motion(_cfg(db_path), vid)
+    assert m["tracks"] == 1
+    assert m["approach"] == "approach"
+    assert m["avg_speed"] == pytest.approx(0.12, abs=1e-3)             # reflects the single track
+    assert m["peak_speed"] == pytest.approx(0.30, abs=1e-3)
+    assert m["area_trend"] == pytest.approx(1.4, abs=1e-3)
+    for k in ("straightness", "moving_frac"):
+        assert m[k] is not None
+
+
+def test_visit_motion_ignores_non_overlapping_clip(conn, db_path):
+    """A clip on the SAME source but a time window OUTSIDE the visit must not be counted -- proves
+    the time-overlap filter (a source-only match would wrongly fold it in)."""
+    vid = _visit(conn, started_at="2026-06-10T21:00:00-07:00", ended_at="2026-06-10T21:05:00-07:00")
+    cid = _motion_clip(conn, started_at="2026-06-10T22:00:00-07:00",     # an hour later, no overlap
+                       ended_at="2026-06-10T22:00:30-07:00")
+    _track(conn, cid, avg_speed=0.5, area_trend=1.4)
+    assert stats.visit_motion(_cfg(db_path), vid)["tracks"] == 0
+
+
+def test_visit_motion_ignores_other_source(conn, db_path):
+    """An overlapping clip on a DIFFERENT source is not this visit's -- filtered by source."""
+    vid = _visit(conn, source=db.SOURCE_GLASS_DOOR_CAM,
+                 started_at="2026-06-10T21:00:00-07:00", ended_at="2026-06-10T21:05:00-07:00")
+    cid = _motion_clip(conn, source="trail_cam", started_at="2026-06-10T21:01:00-07:00",
+                       ended_at="2026-06-10T21:01:30-07:00")             # overlaps in time, wrong src
+    _track(conn, cid, avg_speed=0.5, area_trend=1.4)
+    assert stats.visit_motion(_cfg(db_path), vid)["tracks"] == 0
+
+
+# -- individual_motion ------------------------------------------------------------------------------
+def test_individual_motion_no_linked_tracks(conn, db_path):
+    assert stats.individual_motion(_cfg(db_path), "Notch") == {
+        "tracks": 0, "avg_speed_mean": None, "avg_speed_median": None, "straightness": None,
+        "moving_frac": None, "approach": 0, "retreat": 0, "steady": 0}
+
+
+def test_individual_motion_counts_by_area_trend(conn, db_path):
+    """Several tracklets stamped to one individual, mixed area_trend -> per-track approach/retreat/
+    steady counts, plus a sane mean/median avg_speed."""
+    _linked_track(conn, "Notch", avg_speed=0.10, straightness=0.9, moving_frac=0.8,
+                  area_trend=1.40)                                        # approach
+    _linked_track(conn, "Notch", avg_speed=0.20, area_trend=0.50)        # retreat
+    _linked_track(conn, "Notch", avg_speed=0.30, area_trend=1.00)        # steady
+    _linked_track(conn, "Notch", avg_speed=0.40, area_trend=1.05)        # steady
+    m = stats.individual_motion(_cfg(db_path), "Notch")
+    assert m["tracks"] == 4
+    assert (m["approach"], m["retreat"], m["steady"]) == (1, 1, 2)
+    assert m["approach"] + m["retreat"] + m["steady"] == m["tracks"]     # all have area data here
+    assert m["avg_speed_mean"] == pytest.approx((0.10 + 0.20 + 0.30 + 0.40) / 4, abs=1e-3)
+    assert m["avg_speed_median"] == pytest.approx(0.30, abs=1e-3)        # mid-element of sorted speeds
+    assert m["straightness"] is not None and m["moving_frac"] is not None
+
+
+def test_individual_motion_null_area_trend_counts_in_tracks_only(conn, db_path):
+    """A track with NULL area_trend is counted in `tracks` but in NONE of approach/retreat/steady."""
+    _linked_track(conn, "Stan", avg_speed=0.10, area_trend=1.40)        # approach
+    _linked_track(conn, "Stan", avg_speed=0.20, area_trend=None)        # no direction
+    m = stats.individual_motion(_cfg(db_path), "Stan")
+    assert m["tracks"] == 2
+    assert (m["approach"], m["retreat"], m["steady"]) == (1, 0, 0)
+    assert m["approach"] + m["retreat"] + m["steady"] == 1              # the NULL one counts to none
