@@ -72,7 +72,7 @@ def species_fit(visit, prof):
     dwell_ok = 0.15 <= ratio <= 8 or dwell < 5
     notes.append(f"dwell {dwell:.0f}s [{prof['label']} median {med:.0f}s] "
                  f"{'OK' if dwell_ok else f'{ratio:.1f}x'}")
-    verdict = "FITS" if arrival_ok else "DISAGREES"   # timing is the strong species signal
+    verdict = "FITS" if (arrival_ok and dwell_ok) else "DISAGREES"  # arrival-hour AND dwell both inform the fit
     return verdict, notes
 
 

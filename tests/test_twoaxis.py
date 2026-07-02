@@ -104,12 +104,15 @@ def test_species_fit_wrapping_window_accepts_after_midnight():
     assert verdict == "FITS"
 
 
-def test_species_fit_verdict_driven_by_arrival_not_dwell():
-    """Timing is the strong species signal: an in-window arrival FITS even with an odd dwell."""
+def test_species_fit_disagrees_on_abnormal_dwell_despite_ok_arrival():
+    """Both axes inform the verdict now: an in-window arrival with a wildly off dwell DISAGREES.
+    A raccoon that shows up at a normal hour but lingers 30x too long (or bolts) isn't a clean
+    fit, so dwell is no longer thrown away in favour of arrival alone."""
     prof = _prof(dwell_median_s=60)
-    # 30-minute dwell (1800s) is 30x the median, but arrival at 21h is in-window -> still FITS.
+    # 30-minute dwell (1800s) is 30x the median; arrival at 21h is in-window, but dwell flips it.
     visit = _visit("2026-06-07T21:00:00-07:00", "2026-06-07T21:30:00-07:00")
     verdict, notes = twoaxis.species_fit(visit, prof)
-    assert verdict == "FITS"
-    # the dwell note still reports the ratio (not OK), even though it doesn't flip the verdict.
+    assert verdict == "DISAGREES"
+    # arrival is still noted OK -- the read-out shows it was dwell, not arrival, that disagreed.
+    assert any("arrived" in n and "OK" in n for n in notes)
     assert any("dwell" in n for n in notes)
