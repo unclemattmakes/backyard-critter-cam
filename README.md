@@ -346,6 +346,15 @@ retraining. It's resumable and re-runnable; by default only crops without a spec
   overwritten by a re-run — and they feed the per-individual behaviour profiles. Non-critter
   corrections ("cat food", "blur", …) live on a denylist so they vanish from the stats and the
   digest, exactly like `not an animal`.
+- **How far to trust a label — and the day/night catch.** A read-only eval harness (`eval.py`)
+  grades the auto labels against your confirmed/corrected verdicts and writes a timestamped JSON
+  to `reports/` (gitignored). Its headline finding: species labels at **`species_confidence` ≥ 0.8
+  are ~94% accurate overall — but that trust does not survive the dark.** By day the high-confidence
+  slice is nearly perfect; **at night it drops to ~63%**, because through-glass IR is monochrome and
+  soft, so a confident night label is *far* likelier to be wrong than a confident day one. Read
+  night labels with more suspicion, and re-run `eval.py` after you change the label list or a
+  threshold to see the numbers move. (The grading only works because `model_species` snapshots the
+  model's original call, so your corrections *teach* the eval instead of erasing the thing it scores.)
 
 ---
 
@@ -589,6 +598,9 @@ read off a window-side clock, but globally unambiguous and sortable.
 | `species_confidence` | Phase 2 classifier score 0–1 for `species`. |
 | `species_verified` | Human review in the dashboard: NULL = unreviewed, 1 = confirmed, 0 = wrong. |
 | `species_source` | `bioclip` / `clip-filter` (auto) or `human` (corrected in the dashboard). |
+| `model_species` | The classifier's **original** prediction, snapshotted at classify time so a later human correction to `species` no longer destroys what the model actually said. |
+| `model_species_confidence` | The model's own score for `model_species` (unlike `species_confidence`, a human correction doesn't force this to 1.0). |
+| `model_species_source` | Which model made that call (`bioclip` / `clip-filter`). Read by `eval.py` to grade the classifier against human verdicts. |
 | `individual_id` | Phase 3 (re-ID): set when you confirm a visit or hand-label a cluster. NULL until then. |
 | `individual_source` | How `individual_id` was set (e.g. `human`, `refit`). |
 | `visit_id` | Phase 4: which `visits` row this crop belongs to (stamped by `visits.py`). |
@@ -716,4 +728,13 @@ The rig runs MegaDetector v6 through [Ultralytics](https://github.com/ultralytic
 - **No detections though motion shows:** lower `--min-confidence`, or check lighting; the red
   dot (top-right of the preview) confirms the motion gate is firing.
 - **Too many / too few motion triggers:** tune `--motion-min-area` (lower = more sensitive).
+- **App dies overnight / camera "vanishes" while idle:** a running rig **deliberately keeps the
+  machine awake** — on Windows `backyard_cam.py` holds a **Power Request**
+  (`PowerRequestExecutionRequired`, which is *Modern-Standby-aware*) plus the legacy
+  `SetThreadExecutionState` as a belt-and-suspenders, so the box can't idle into standby and
+  **USB-suspend the webcam** underneath the capture loop (a `Kernel-Power` standby event mid-run
+  was the old overnight-death cause; the legacy flag alone did **not** hold a Modern-Standby box).
+  It's Windows-only and a clean no-op elsewhere; a failure to set the request is now **logged
+  loudly** at startup (`power: WARNING …`) rather than failing silently. If the machine still
+  sleeps, check that no power policy is force-sleeping it and read that startup log line.
 ```
