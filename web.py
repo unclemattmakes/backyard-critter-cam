@@ -444,6 +444,17 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json(stats.individuals_overview(cfg))
                 elif path == "/api/rollcall":
                     self._json(stats.cast_rollcall(cfg))
+                elif path == "/api/visit/motion":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    try:                        # a bad/missing visit_id => empty shape, not a 500
+                        vid = int((q.get("visit_id") or [""])[0])
+                    except (TypeError, ValueError):
+                        self._send(400, "text/plain", b"bad visit_id")
+                    else:
+                        self._json(stats.visit_motion(cfg, vid))
+                elif path == "/api/individual/motion":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(stats.individual_motion(cfg, (q.get("individual") or [""])[0]))
                 elif path == "/api/review":
                     self._json(stats.review_queue(cfg))
                 elif path == "/api/reid/queue":

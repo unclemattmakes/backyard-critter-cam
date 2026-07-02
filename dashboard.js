@@ -18,6 +18,41 @@ const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','
 const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
 const fmtDur=s=>{ s=Math.round(s||0); return s>=60?`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`:`${s}s`; };
 
+/* ---------- live-connection indicator ----------
+   The recurring live polls (stats, live/now, cameras, header, naming) shouldn't shout on every
+   transient blip. Instead they call connFail() on a failed fetch and connOK() on a good one; a
+   single subtle "reconnecting…" pill appears in the masthead after a failure and self-clears on the
+   next success. Reference-counted across the several pollers so one recovering doesn't hide a pill
+   another still needs. Created lazily (dashboard.html isn't ours to edit). */
+let __connDown=0;
+function __connPill(){
+  let el=document.getElementById('connpill');
+  if(!el){
+    const top=document.querySelector('.mast .top');
+    if(!top) return null;
+    el=document.createElement('span');
+    el.id='connpill'; el.className='conn-pill'; el.hidden=true;
+    el.innerHTML='<span class="cp-dot"></span>reconnecting…';
+    el.title='The live feed of stats briefly stopped responding. Retrying automatically — nothing to do.';
+    top.appendChild(el);
+  }
+  return el;
+}
+function connFail(){ __connDown++; const el=__connPill(); if(el) el.hidden=false; }
+function connOK(){ if(__connDown===0) return; __connDown=0; const el=document.getElementById('connpill'); if(el) el.hidden=true; }
+
+/* Fire-and-forget POST feedback: dim+disable the just-clicked button while its request is in
+   flight, restore it after. Pass a DOM node, or nothing to grab the current inline-handler's
+   target. Returns a restore() to call in a finally. No-op if there's no button to mark. */
+function busyBtn(btn){
+  const el=btn||(typeof event!=='undefined'&&event?(event.currentTarget||event.target):null);
+  if(!el||el.tagName!=='BUTTON') return ()=>{};
+  const wasDisabled=el.disabled, prevOp=el.style.opacity;
+  el.disabled=true; el.style.opacity='.45'; el.style.cursor='progress';
+  let done=false;
+  return ()=>{ if(done) return; done=true; el.disabled=wasDisabled; el.style.opacity=prevOp; el.style.cursor=''; };
+}
+
 /* ---------- clip player (lightbox; plays one clip or a whole reel as a playlist) ----------
    Everywhere a thumbnail has clip(s) behind it, clicking plays them here. A reel auto-advances
    (the <video> 'ended' event steps to the next), with a filmstrip + ‹ › + arrow keys to scrub. */
@@ -142,7 +177,7 @@ function sendAuto(autoKey,on,slider){
    rig has one pane and behaves exactly as before. */
 let LIVE={ cams:[], sel:null, primary:null };
 async function loadCameras(){
-  let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); }catch(e){ return; }
+  let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const cams=d.cameras||[];
   if(!cams.length) return;
   LIVE.cams=cams; LIVE.primary=d.primary||cams[0].source;
@@ -184,7 +219,7 @@ function camName(source){ const c=(LIVE.cams||[]).find(x=>x.source===source); re
 /* The masthead period/coords come from the PRIMARY camera (period is global -- one sun). */
 async function refreshHeader(){
   const src=LIVE.primary; if(!src) return;
-  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
   if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
 }
@@ -194,7 +229,7 @@ async function refreshHeader(){
 async function refreshControls(){
   const src=LIVE.sel; if(!src) return;
   $('#instr-cam').textContent = (LIVE.cams.length>1?'· '+camName(src):'');
-  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); }catch(e){ return; }
+  let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const net=!!v.network;
   $('#instr-net').hidden=!net;
   $('#controls').style.display=net?'none':'';
@@ -229,7 +264,7 @@ async function refreshControls(){
 
 /* ---------- live stats + species ---------- */
 async function refreshLive(){
-  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ return; }
+  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   maybeFirstRun(s);
   if(s.period){ $('#period').textContent=s.period; }
   if(s.span){ $('#span').textContent=`${s.span.start.slice(0,10)} → ${s.span.end.slice(0,10)}`; }
@@ -246,7 +281,7 @@ async function refreshLive(){
   // Feature the most recent IDENTIFIED visitor; fall back to the newest detection if none are classified yet.
   renderLatest((s.latest||[]).find(x=>x.species) || (s.latest||[])[0]);
 
-  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const sp=(o.species||[]);
   window.__species=sp;
   const top=sp.slice(0,3), rare=sp.slice().reverse().filter(x=>!top.includes(x)).slice(0,3);
@@ -261,7 +296,7 @@ async function refreshLive(){
    the names it recognises. State: WH_SEL = the names currently picked. */
 let WH_CAST=[], WH_SEL=new Set(), WH_BUSY=false, WH_CHIPSIG='';
 async function refreshWhoshere(){
-  let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); }catch(e){ return; }
+  let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const sec=$('#whoshere'); if(!sec) return;
   sec.hidden=false;
   const wc=$('#wh-cam'); if(wc) wc.textContent=((LIVE.cams||[]).length>1?' · '+camName(LIVE.sel):'');
@@ -403,7 +438,7 @@ function bindCards(){ document.querySelectorAll('.card[data-sp]').forEach(c=>c.o
 
 /* ---------- catalogue + species sheet ---------- */
 async function loadCatalogue(){
-  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ return; }
+  let o; try{ o=await fetch('/api/species').then(r=>r.json()); }catch(e){ $('#catalogue').innerHTML='<p class="empty">Could not load the catalogue.</p>'; return; }
   const sp=o.species||[]; window.__species=sp;
   $('#cat-count').textContent=`${sp.length} species · ${(o.total||0).toLocaleString()} observations`;
   $('#catalogue').innerHTML=sp.map((x,i)=>card(x,i+1)).join('')||'<p class="empty">Catalogue is empty.</p>';
@@ -454,7 +489,10 @@ async function openReview(){
 }
 function toggleEdit(btn){ btn.closest('.crop').classList.toggle('editing'); }
 async function act(id,action,btn){
-  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+  const restore=busyBtn(btn);
+  try{ await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})}); connOK(); }
+  catch(e){ connFail(); restore(); return; }   // leave the crop untouched; the subtle pill flags the blip
+  restore();
   const crop=btn.closest('.crop');
   crop.classList.remove('v-1','v-0'); crop.querySelectorAll('.stamp').forEach(s=>s.remove());
   if(action==='verify'){ crop.classList.add('v-1'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v1">✓ confirmed</span>'); }
@@ -463,9 +501,12 @@ async function act(id,action,btn){
 async function correct(id,species){
   if(species==='__other__'){ species=(prompt('New label for this crop (e.g. cat food):')||'').trim(); }
   if(!species)return;
-  await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})});
+  const sel=(typeof event!=='undefined'&&event)?(event.currentTarget||event.target):null;   // the <select> that changed
+  if(sel){ sel.disabled=true; sel.style.opacity='.45'; }
+  try{ await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})}); connOK(); }
+  catch(e){ connFail(); if(sel){ sel.disabled=false; sel.style.opacity=''; } return; }
   const crop=document.querySelector(`.crop[data-id="${id}"]`);
-  crop.style.transition='opacity .4s'; crop.style.opacity='.25';
+  if(crop){ crop.style.transition='opacity .4s'; crop.style.opacity='.25'; }
 }
 function closeSheet(){ $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
 
@@ -502,7 +543,7 @@ async function loadMoreObs(){
   const qs=new URLSearchParams();
   ['day','species','start','end'].forEach(k=>{ if(s[k]) qs.set(k,s[k]); });
   qs.set('offset',s.offset); qs.set('limit',60);
-  let o; try{ o=await fetch('/api/crops?'+qs).then(r=>r.json()); }catch(e){ return; }
+  let o; try{ o=await fetch('/api/crops?'+qs).then(r=>r.json()); }catch(e){ const m=$('#obs-more'); if(m) m.innerHTML='<p class="empty">Could not load observations.</p>'; return; }
   s.offset+=o.crops.length;
   const grid=$('#obs-grid'); if(!grid)return;
   grid.insertAdjacentHTML('beforeend', o.crops.map(obsTile).join(''));
@@ -632,6 +673,80 @@ const glyphHTML=g=>g.e?g.e:`<b class="mono-gl">${esc(g.m)}</b>`;
 const nameOf=sp=>sp==='animal'?'Unidentified':cap1(sp);
 const fmtHourJS=h=>`${(h%12)||12}${h<12?'am':'pm'}`;
 const fmtClock=iso=>{ const d=new Date(iso); return isNaN(d)?'':d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}); };
+
+/* ---------- motion strip (phase-4 clip-track signal) ----------
+   The robust signals LEAD: approach/retreat/steady + straightness-in-words + moving%. Speed is
+   bbox-SIZE-confounded and unvalidated, so it's a faint secondary figure only, never the headline.
+   Fetched lazily per shown visit (never for a whole list at once) — see fillVisitMotion. */
+const APPROACH_WORD={approach:'approaching',retreat:'moving off',steady:'holding steady'};
+// straightness is 0..1 (path directness); describe it in words rather than a bare number.
+function straightWord(s){ if(s==null) return ''; return s>=0.8?'a direct line':s>=0.55?'a fairly direct path':s>=0.3?'a meandering path':'a wandering path'; }
+// Build the one-line strip from a visit_motion payload; '' when there's nothing to show.
+function motionStrip(m){
+  if(!m||!(m.tracks>0)) return '';
+  const bits=[];
+  const app=APPROACH_WORD[m.approach]; if(app) bits.push(`<b>${app}</b>`);
+  const sw=straightWord(m.straightness); if(sw) bits.push(sw);
+  if(m.moving_frac!=null) bits.push(`moving ${Math.round(m.moving_frac*100)}%`);
+  // Speed: a hushed, size-confounded aside — omitted unless we have nothing more robust to say.
+  const spd=(m.avg_speed!=null && !bits.length)?`<span class="ms-spd" title="uncalibrated; bbox-size-confounded — not an absolute speed">~${(+m.avg_speed).toFixed(2)} px/f</span>`:'';
+  if(!bits.length && !spd) return '';
+  const track=`${m.tracks} track${m.tracks===1?'':'s'}`;
+  return `<div class="motion-strip" title="from ${track} of clip motion in this visit — direction &amp; path are the trustworthy signals; speed is uncalibrated">`
+    +`<span class="ms-paw">🐾</span><span class="ms-txt">${bits.join(' · ')}${spd?' · '+spd:''}</span></div>`;
+}
+// Lazily fetch a single visit's motion into a placeholder <div data-vm="ID">; drops the box when
+// there's nothing (tracks==0) so we never render an empty strip. Guarded so a fetch blip is silent.
+async function fillVisitMotion(vid, box){
+  if(!box || vid==null) return;
+  let m; try{ m=await fetch('/api/visit/motion?visit_id='+encodeURIComponent(vid)).then(r=>r.json()); }
+  catch(e){ box.remove(); return; }
+  const html=motionStrip(m);
+  if(html) box.outerHTML=html; else box.remove();
+}
+// Wire every [data-vm] placeholder under `root`, capped so a huge list can't fire N calls at once.
+const MOTION_FETCH_CAP=40;
+function wireVisitMotion(root){
+  if(!root) return;
+  const boxes=[...root.querySelectorAll('[data-vm]')];
+  if(boxes.length>MOTION_FETCH_CAP){
+    console.log(`[motion] capping lazy visit-motion fetches at ${MOTION_FETCH_CAP} of ${boxes.length} shown`);
+    boxes.slice(MOTION_FETCH_CAP).forEach(b=>b.remove());   // leave the rest strip-less rather than storm the server
+  }
+  boxes.slice(0,MOTION_FETCH_CAP).forEach(b=>fillVisitMotion(b.dataset.vm, b));
+}
+// Per-individual motion FINGERPRINT (aggregate across a named individual's clip-tracks). Same
+// priority order as the visit strip: direction tendency + straightness-in-words lead; the clip
+// count is context; speed is omitted (aggregate size-confound is worse). '' when tracks==0.
+function individualFP(m){
+  if(!m||!(m.tracks>0)) return '';
+  const bits=[];
+  const dirs=[['approach',m.approach,'approaches'],['retreat',m.retreat,'retreats'],['steady',m.steady,'holds steady']]
+    .filter(d=>d[1]>0).sort((a,b)=>b[1]-a[1]);
+  if(dirs.length){
+    const top=dirs[0];
+    bits.push(`usually ${top[2]} <span class="fp-n">(${top[1]})</span>`
+      +dirs.slice(1).map(d=>` · ${d[2]} <span class="fp-n">(${d[1]})</span>`).join(''));
+  }
+  const sw=straightWord(m.straightness); if(sw) bits.push(sw.replace(/^a /,''));   // "direct line" reads better bare here
+  if(m.moving_frac!=null) bits.push(`moving ${Math.round(m.moving_frac*100)}%`);
+  if(!bits.length) return '';
+  bits.push(`${m.tracks} clip${m.tracks===1?'':'s'} of motion`);
+  return `<span class="fp-paw">🐾</span>${bits.join(' · ')}`;
+}
+// Lazily fill an individual's fingerprint into a placeholder <span data-im="NAME">; drop if empty.
+async function fillIndivMotion(name, box){
+  if(!box || !name) return;
+  let m; try{ m=await fetch('/api/individual/motion?individual='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ box.remove(); return; }
+  const html=individualFP(m);
+  if(html) box.innerHTML=html; else box.remove();
+}
+function wireIndivMotion(root){
+  if(!root) return;
+  // The named cast is small (placeholders are excluded at render), so no cap is needed here.
+  root.querySelectorAll('[data-im]').forEach(b=>fillIndivMotion(b.dataset.im, b));
+}
 
 /* ---------- The Dispatch (period digest) ---------- */
 let dispatchEdition='auto';
@@ -894,6 +1009,7 @@ function reidCard(v){
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
     ${strip}
+    <div data-vm="${esc(v.visit_id)}"></div>
     ${spRow}
     ${ub}
   </div>`;
@@ -951,21 +1067,23 @@ function reidUnblendGroup(vid,g,i){
 }
 function reidUnblendConfirm(vid,i,name){
   const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  const restore=busyBtn();   // the clicked ✓/★/＋ suggestion button
   fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json()).then(r=>{
-      if(r.error){ alert(r.error); return; } renderUnblend(vid);
-    }).catch(e=>alert('Could not save: '+e));
+      if(r.error){ restore(); alert(r.error); return; } renderUnblend(vid);
+    }).catch(e=>{ restore(); connFail(); });
 }
 async function reidUnblendLabel(vid,i){
+  const restore=busyBtn();   // the clicked "Name" button (grab before await)
   const inp=document.getElementById('ubn-'+vid+'-'+i); const name=(inp&&inp.value||'').trim();
-  if(!name){ if(inp) inp.focus(); return; }
-  const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
+  if(!name){ restore(); if(inp) inp.focus(); return; }
+  const g=(REID_UNBLEND[vid]||[])[i]; if(!g){ restore(); return; }
   try{
     const r=await fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json());
-    if(r.error){ alert(r.error); return; }
+    if(r.error){ restore(); alert(r.error); return; }
     renderUnblend(vid);
-  }catch(e){ alert('Could not save: '+e); }
+  }catch(e){ restore(); connFail(); }
 }
 function reidBootCard(g,i){
   const span=`${reidWhen(g.started[0])} → ${reidWhen(g.started[g.started.length-1])}`;
@@ -1053,12 +1171,14 @@ function speciesSelect(id, current){
   return `<select id="${id}" style="padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit;font:inherit;max-width:150px">${opts}</select>`;
 }
 async function postVisitLabel(target, body, after){
+  const restore=busyBtn();   // dim the clicked confirm/correct/Name button while it saves
   try{
     const r=await fetch('/api/visit/label',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(Object.assign({}, target, body))}).then(r=>r.json());
-    if(r.error){ alert(r.error); return; }
+    if(r.error){ restore(); alert(r.error); return; }
+    restore();
     if(after) after(r);
-  }catch(e){ alert('Could not save: '+e); }
+  }catch(e){ restore(); connFail(); }
 }
 function visitSpeciesCorrect(target, selectId, after){
   const sel=document.getElementById(selectId); if(!sel) return;
@@ -1089,18 +1209,19 @@ async function reidNameNovel(i){
   reidConfirmMany(g.visits,name);
 }
 async function reidConfirm(vid,name,clear){
-  if(clear&&!confirm('Unconfirm this visit?')) return;
+  const restore=busyBtn();   // the clicked ✓/Name/Clear button — grab it before any await/confirm
+  if(clear&&!confirm('Unconfirm this visit?')){ restore(); return; }
   if(!clear&&!name){
     const inp=document.getElementById('rq-'+vid);
     name=(inp&&inp.value||'').trim();
-    if(!name){ if(inp) inp.focus(); return; }
+    if(!name){ restore(); if(inp) inp.focus(); return; }
   }
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({visit_id:vid,name:clear?null:name})}).then(r=>r.json());
-    if(r.error){ alert(r.error); return; }
-    loadIndividuals();
-  }catch(e){ alert('Could not save: '+e); }
+    if(r.error){ restore(); alert(r.error); return; }
+    loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
+  }catch(e){ restore(); connFail(); }
 }
 async function reidNameGroup(i){
   const inp=document.getElementById('rg-'+i);
@@ -1132,7 +1253,8 @@ function indivRow(g){
   return `<div class="panel" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
-        <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div></div>
+        <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div>
+        ${g.placeholder?'':`<div class="motion-fp" data-im="${esc(g.id)}"></div>`}</div>
       <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
@@ -1176,7 +1298,7 @@ function renderIndividuals(d,q){
   const queueHTML=reidQueueHTML(q);
   const groups=(d&&d.groups)||[];
   if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals to name yet. As more animals visit, look-alike groups will appear here for you to name — this is the slowest part, since it needs a good number of clear photos first.</p>'; return; }
-  if(!groups.length){ body.innerHTML=queueHTML; return; }
+  if(!groups.length){ body.innerHTML=queueHTML; wireVisitMotion(body); return; }
   const named=groups.filter(g=>!g.placeholder), prop=groups.filter(g=>g.placeholder);
   let html=queueHTML;
   if(named.length){
@@ -1189,6 +1311,8 @@ function renderIndividuals(d,q){
   html+=`<div style="display:flex;flex-direction:column;gap:8px">${prop.slice(0,30).map(indivRow).join('')}</div>`;
   if(prop.length>30) html+=`<p class="empty">…and ${prop.length-30} smaller groups (name the big ones first).</p>`;
   body.innerHTML=html;
+  wireVisitMotion(body);   // lazily fill the per-visit motion strips on the "Who Is This?" cards
+  wireIndivMotion(body);   // and the per-individual motion fingerprint on the Cast rows
 }
 async function nameIndiv(from){
   const inp=document.getElementById('nm-'+from);
@@ -1201,12 +1325,13 @@ async function clearIndiv(from){
   await postIndiv(from,null);
 }
 async function postIndiv(from,to){
+  const restore=busyBtn();   // dim the clicked Rename/Clear button while it saves
   try{
     const r=await fetch('/api/individual',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({from,to})}).then(r=>r.json());
-    if(r.error){ alert(r.error); return; }
-    loadIndividuals();
-  }catch(e){ alert('Could not save: '+e); }
+    if(r.error){ restore(); alert(r.error); return; }
+    loadIndividuals();   // re-renders; button removed
+  }catch(e){ restore(); connFail(); }
 }
 
 async function loadCalendar(){
@@ -1267,7 +1392,7 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); }
 /* ---------- boot ---------- */
 buildControls();
 async function refreshNaming(){
-  let n; try{ n=await fetch('/api/naming').then(r=>r.json()); }catch(e){ return; }
+  let n; try{ n=await fetch('/api/naming').then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const el=document.getElementById('naming'); if(!el) return;
   const map={ loading:['#d9a23b','Identifier: warming up…'],
               ready:['#5b8c5a','Identifier: on'],

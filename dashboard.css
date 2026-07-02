@@ -473,3 +473,25 @@
   .rv-tag{ position:absolute; top:0; left:0; right:0; padding:4px 7px; font-size:9px;
     background:rgba(21,19,13,.82); color:var(--gilt); border-bottom:1px solid var(--rule);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* ---------- motion strip / fingerprint (phase-4 clip-track read-out) ----------
+     A quiet field-note line: the direction & path signals are trustworthy, speed is not, so the
+     strip stays understated — sage rule, small serif, no loud colour. */
+  .motion-strip{ display:flex; align-items:center; gap:7px; margin-top:8px; padding:4px 0 4px 10px;
+    border-left:2px solid var(--sage); font-family:var(--serif); font-style:italic; font-size:13px; color:var(--dim); }
+  .motion-strip .ms-paw{ font-style:normal; font-size:12px; opacity:.8; }
+  .motion-strip .ms-txt b{ font-style:normal; font-weight:600; color:var(--ink); }
+  .motion-strip .ms-spd{ font-family:var(--mono); font-style:normal; font-size:10.5px; color:var(--faint); }
+  /* Per-individual fingerprint: one mono line under the cast name (matches the .lbl sub-line above it). */
+  .motion-fp{ margin-top:3px; font-family:var(--mono); font-size:10px; letter-spacing:.04em; color:var(--faint); }
+  .motion-fp .fp-paw{ margin-right:5px; opacity:.75; }
+  .motion-fp .fp-n{ color:var(--sage); }
+
+  /* ---------- live-reconnect pill (subtle, self-clearing) ----------
+     Appears in the masthead top bar after a failed live poll; hidden again on the next success. */
+  .conn-pill{ display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:9.5px;
+    letter-spacing:.14em; text-transform:uppercase; color:var(--rust); border:1px solid var(--rule2);
+    border-radius:3px; padding:2px 7px; background:rgba(192,95,62,.08); }
+  .conn-pill[hidden]{ display:none; }
+  .conn-pill .cp-dot{ width:6px; height:6px; border-radius:50%; background:var(--rust);
+    animation:pulse 2s infinite; }
