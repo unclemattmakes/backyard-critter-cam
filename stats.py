@@ -178,19 +178,23 @@ def compute_stats(cfg) -> dict | None:
         def day(ts): return ts[:10]
         def web(p):  return p.replace("\\", "/") if p else None
 
-        days_set = sorted({day(r["timestamp"]) for r in rows}) if rows else []
         src_crops = Counter(r["source"] for r in rows)
         src_visits = Counter(v["source"] for v in visits)
         cls_crops = Counter((r["species"] or r["detection_class"]) for r in rows)
         visits_by_day = Counter(v["start"].strftime("%Y-%m-%d") for v in visits)
         hour_counts = Counter(v["start"].hour for v in visits)
 
-        by_day = []
-        for d in days_set:
-            drows = [r for r in rows if day(r["timestamp"]) == d]
-            cls = Counter((r["species"] or r["detection_class"]) for r in drows)
-            by_day.append({"day": d, "crops": len(drows),
-                           "visits": visits_by_day.get(d, 0), "classes": dict(cls.most_common())})
+        # Per-day tallies in ONE pass, not the old O(rows*days) re-scan of `rows` inside the day
+        # loop: accumulate a crop Counter and a class Counter keyed by day, then just read them out.
+        day_crops = Counter()
+        day_classes = defaultdict(Counter)
+        for r in rows:
+            d = day(r["timestamp"])
+            day_crops[d] += 1
+            day_classes[d][r["species"] or r["detection_class"]] += 1
+        by_day = [{"day": d, "crops": day_crops[d], "visits": visits_by_day.get(d, 0),
+                   "classes": dict(day_classes[d].most_common())}
+                  for d in sorted(day_crops)]
 
         latest = [{
             "timestamp": r["timestamp"],
@@ -400,6 +404,125 @@ def cast_rollcall(cfg, now=None) -> dict:
         cast.sort(key=lambda c: (not c["overdue"],
                                  c["days_since"] if c["days_since"] is not None else 1e9))
         return {"cast": cast, "as_of": now.isoformat()}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# MOTION surfacing -- phase-4 clip_tracks (clipmotion.py) read out for the dashboard. A tracklet is
+# one animal's box-centre trajectory through a clip: how fast, how straight, how hesitant, and --
+# via area_trend (end/start box-area ratio) -- whether it approached the camera or backed away.
+# These surface that behaviour signal per VISIT and per named INDIVIDUAL; both are read-only.
+# CAVEAT: speed/area are in normalized (fraction-of-frame) units, so they're bbox-SIZE-confounded --
+# a nearer or larger animal reads "faster" for the same real motion. Treat as descriptive, not
+# authoritative (matches the documented re-ID caveat -- motion is unvalidated as an ID/metric).
+# ---------------------------------------------------------------------------
+
+def _approach_label(mean_area_trend) -> str:
+    """area_trend is end/start box-area: >1.15 the animal grew in frame (approached), <0.85 it
+    shrank (retreated), else steady. None (no area data) reads as 'steady'."""
+    if mean_area_trend is None:
+        return "steady"
+    if mean_area_trend > 1.15:
+        return "approach"
+    if mean_area_trend < 0.85:
+        return "retreat"
+    return "steady"
+
+
+def visit_motion(cfg, visit_id) -> dict:
+    """Motion summary for one visit: the clip_tracks whose parent clip overlaps the visit's
+    [started_at, ended_at] window on the SAME source (no FK -- matched by time, like the rest of
+    stats.py). Returns a small JSON-able dict -- {tracks, avg_speed, peak_speed, straightness,
+    moving_frac, area_trend, approach} -- or {"tracks": 0, ...} when the visit has no overlapping
+    tracks (or the visit / clips don't exist). Speeds are bbox-size-confounded (see module note)."""
+    empty = {"tracks": 0, "avg_speed": None, "peak_speed": None, "straightness": None,
+             "moving_frac": None, "area_trend": None, "approach": "steady"}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return empty
+    try:
+        v = conn.execute(
+            "SELECT source, started_at, ended_at FROM visits WHERE id = ?", (visit_id,)).fetchone()
+        if v is None:
+            return empty
+        start, end = _parse(v["started_at"]), _parse(v["ended_at"])
+        if start is None or end is None:
+            return empty
+        # Join tracks to their clip, keep those on this source whose clip window overlaps the visit.
+        rows = conn.execute(
+            "SELECT t.avg_speed, t.peak_speed, t.straightness, t.moving_frac, t.area_trend, "
+            "c.started_at, c.ended_at FROM clip_tracks t JOIN clips c ON c.id = t.clip_id "
+            "WHERE c.source = ?", (v["source"],)).fetchall()
+        tracks = []
+        for r in rows:
+            csdt = _parse(r["started_at"])
+            cedt = _parse(r["ended_at"]) if r["ended_at"] else csdt
+            if csdt is not None and csdt <= end and (cedt or csdt) >= start:
+                tracks.append(r)
+        if not tracks:
+            return empty
+
+        def _mean(col):
+            vals = [r[col] for r in tracks if r[col] is not None]
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        peaks = [r["peak_speed"] for r in tracks if r["peak_speed"] is not None]
+        area = _mean("area_trend")
+        return {
+            "tracks": len(tracks),
+            "avg_speed": _mean("avg_speed"),
+            "peak_speed": round(max(peaks), 4) if peaks else None,
+            "straightness": _mean("straightness"),
+            "moving_frac": _mean("moving_frac"),
+            "area_trend": area,
+            "approach": _approach_label(area),
+        }
+    finally:
+        conn.close()
+
+
+def individual_motion(cfg, individual_id) -> dict:
+    """Aggregate motion fingerprint for one named individual (e.g. 'Notch', 'Stan') from every
+    clip_track linked to it (clip_tracks.individual_id = ?). Returns a JSON-able dict: track count,
+    mean/median avg_speed, mean straightness, mean moving_frac, and approach/retreat/steady counts.
+    NOTE: per-individual speed is bbox-SIZE-confounded and UNVALIDATED (a nearer animal reads faster);
+    this is a descriptive fingerprint, not an authoritative metric -- do not present it as ground
+    truth. {"tracks": 0, ...} when the individual has no linked tracks."""
+    empty = {"tracks": 0, "avg_speed_mean": None, "avg_speed_median": None, "straightness": None,
+             "moving_frac": None, "approach": 0, "retreat": 0, "steady": 0}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return empty
+    try:
+        rows = conn.execute(
+            "SELECT avg_speed, straightness, moving_frac, area_trend FROM clip_tracks "
+            "WHERE individual_id = ?", (individual_id,)).fetchall()
+        if not rows:
+            return empty
+
+        def _mean(col):
+            vals = [r[col] for r in rows if r[col] is not None]
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        speeds = sorted(r["avg_speed"] for r in rows if r["avg_speed"] is not None)
+        median = round(speeds[len(speeds) // 2], 4) if speeds else None   # simple mid-element median
+        approach = retreat = steady = 0
+        for r in rows:
+            lab = _approach_label(r["area_trend"])   # per-track, so counts sum to tracks-with-area
+            if r["area_trend"] is None:
+                continue                             # no area data -> not counted as any direction
+            approach += lab == "approach"
+            retreat += lab == "retreat"
+            steady += lab == "steady"
+        return {
+            "tracks": len(rows),
+            "avg_speed_mean": _mean("avg_speed"),
+            "avg_speed_median": median,
+            "straightness": _mean("straightness"),
+            "moving_frac": _mean("moving_frac"),
+            "approach": approach, "retreat": retreat, "steady": steady,
+        }
     finally:
         conn.close()
 
