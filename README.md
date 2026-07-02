@@ -406,7 +406,10 @@ becomes a new template, so **suggestions sharpen as you confirm**. No training; 
 accumulating verified prototypes. Visits with two raccoons present at once get a "2+ raccoons"
 badge — detected from simultaneous separated boxes in the stills *and* from clips holding two
 sustained motion tracks (`clipmotion.py`), which catch pairs the sparse stills miss (co-arrival
-is behaviour signal; their blended prototype never teaches).
+is behaviour signal; their blended prototype never teaches). The *"possibly someone new"* cut
+(`reid_novel_threshold`) is set to the similarity `eval.py` measured as best-separating
+same-from-different across *all* your confirmed visits — currently **0.31**, not the eyeballed 0.55
+it began with — so re-run `python eval.py --reid` as the cast grows and it reports the new optimum.
 
 The **dashboard's Individuals tab** is the intended surface: a "Who is this?" review queue
 with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
@@ -477,7 +480,10 @@ archives each day before the pruner reaches it — see [Backups](#backups).)
   to trust it. The raw track is stored as JSON (`clip_tracks` table) so richer gait work (limp
   asymmetry) can re-derive later without re-running the detector. Batch + resumable:
   `python clipmotion.py` after clips accumulate; `--show` reads tracks back; `--report` groups
-  motion features by individual/visit and prints the pair-clip same-conditions comparisons.
+  motion features by individual/visit and prints the pair-clip same-conditions comparisons. Those
+  fingerprints now also reach the dashboard live — a per-visit strip and a per-individual summary —
+  through `/api/visit/motion` and `/api/individual/motion`, so the motion axis is visible without
+  the CLI.
 - One `.mp4` per visit under `clips/<camera>/<date>/`, plus a row in the **`clips`** table (time span,
   fps, size, detection count) for later behaviour queries. Crops are still saved alongside.
 - All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes, disk budget)
@@ -509,13 +515,19 @@ The second axis. Once crops are classified, a chain of small tools turns raw det
   individual's appearance centroid). The appearance axis as a number.
 - **`twoaxis.py`** — the payoff. For each visit it puts the **appearance** match *next to* the
   **behaviour** fit and flags when they **disagree** ("labelled raccoon, but arrived at 11am —
-  raccoons are nocturnal"). Catches both genuinely unusual visits and mis-classifications; gets
+  raccoons are nocturnal"). The behaviour fit weighs **both** the arrival hour **and** the dwell
+  time against the species profile, so a raccoon that shows up at a normal hour but bolts in three
+  seconds reads as *off* too. Catches both genuinely unusual visits and mis-classifications; gets
   sharper per-individual as you hand-label with `reid.py --name`.
 
 The dashboard surfaces all of this: a **Behaviour** tab (profiles, off-pattern flags,
 co-occurrence) and an **Individuals** tab where you *name the cast* — each look-alike group
 shows its best crops with a name box; naming two groups the same name merges them, and the
-per-individual axes sharpen as the cast grows.
+per-individual axes sharpen as the cast grows. The **motion** signal is visible here too: each
+visit in the *Who is this?* queue carries a one-line **motion strip** (approached or retreated,
+how direct the path, how much it moved) and each named individual a **motion fingerprint**
+aggregated across its clips. Speed stays hedged — it's in frame-fraction units, so a nearer animal
+reads faster; direction and straightness are the trustworthy parts.
 
 The visit ledger refreshes itself on rig shutdown and after trail-cam imports; `visits.py` is
 only needed manually after offline label edits.

@@ -9,6 +9,16 @@
 > *Window: 2026-06-07 → 2026-06-28, one camera. The DB is still being written, so raw
 > counts carry a small live drift — numbers below are verifier-confirmed to ±drift.*
 
+> **Status update — 2026-07-01.** The lead finding below ("the behaviour goldmine is mined, then
+> thrown on the floor") is now largely resolved. `clipmotion.py` runs nightly (Windows Scheduled
+> Task; ~all clips tracked), the solo-overlap backfill has linked `clip_tracks.individual_id`, and
+> the motion signal is **surfaced live** — `stats.visit_motion` / `individual_motion`,
+> `/api/visit/motion` & `/api/individual/motion`, and dashboard motion strips + per-individual
+> fingerprints. The two-axis verdict now folds **dwell** (not arrival hour alone), `compute_stats`
+> is single-pass on the poll, and `reid_novel_threshold` is eval-tuned to **0.31**. Several items
+> below are therefore DONE; the analysis text is kept as the original 2026-06-28 snapshot for
+> provenance.
+
 ## State of the Observatory
 
 In 22 days the glass-door cam has logged **~36,300 animal detections** (single source

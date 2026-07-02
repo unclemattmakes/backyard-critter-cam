@@ -175,8 +175,10 @@ here.** Store embeddings per the stubbed schema. Filter by confidence before clu
 
 ### Phase 4 — Behavior profiles + the disagreement alert ✅ DONE
 
-*Built: `visits.py`, `behavior.py`, and `twoaxis.py` (the two-axis readout), plus clip capture
-and `clipmotion.py` motion/gait fingerprints. Sharpens per-individual as the cast is named.*
+*Built: `visits.py`, `behavior.py`, and `twoaxis.py` (the two-axis readout — its verdict now
+weighs arrival hour AND dwell), plus clip capture and `clipmotion.py` motion/gait fingerprints,
+now surfaced per-visit and per-individual in the dashboard. Sharpens per-individual as the cast
+is named.*
 
 The differentiator nobody builds. Accumulate a per-individual profile: typical arrival
 window, co-occurrence partners, boldness at the food, dwell time. Then the payoff —
