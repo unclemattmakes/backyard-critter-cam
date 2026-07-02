@@ -305,9 +305,13 @@ class Config:
     reid_proto_top_k: int = 40          # best crops (by crop_quality) averaged into a prototype
     reid_proto_min_crops: int = 3       # fewer embedded crops than this = too thin to suggest on
     reid_suggest_min_conf: float = 0.5  # embedding gate: crops below this confidence don't vote
-    # Best-match similarity below this = "possibly someone new" (novelty flag). Between the
-    # different-raccoon ceiling (~0.45) and the same-raccoon cross-night floor (~0.7).
-    reid_novel_threshold: float = 0.55
+    # Best-match similarity below this = "possibly someone new" (novelty flag). Set to the eval
+    # optimum: eval.py measured same-vs-different individual separation at ROC-AUC 0.81 with the
+    # Youden-J best operating point at cosine 0.31 (reports/eval_*.json, reid.separation.
+    # best_threshold). The old 0.55 was over-conservative -- it wrongly flagged ~7 of 61 correctly-
+    # matched raccoon visits as "possibly someone new". Since suggest-confirm still has a human
+    # approve every match, the looser cut mostly just recovers true returnees.
+    reid_novel_threshold: float = 0.31
     # >= this many frames with two separated raccoon boxes = a multi-animal visit: it gets a
     # "2+ raccoons" badge and its (blended) prototype never becomes a suggestion template.
     reid_co_presence_min: int = 3
