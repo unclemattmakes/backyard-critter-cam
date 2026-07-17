@@ -25,6 +25,7 @@ from pathlib import Path
 import behavior
 import config
 import db
+import reel
 import stats
 
 DASHBOARD_FILE = config.ROOT / "dashboard.html"
@@ -381,10 +382,14 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             if not self._lan_guard():
                 return
             path = urllib.parse.urlparse(self.path).path
+            # The three UI files are read fresh from disk per request so the design iterates
+            # without a restart -- tell the BROWSER the same (no-cache = revalidate each load),
+            # or an updated dashboard keeps rendering with last week's cached css/js.
+            _fresh = {"Cache-Control": "no-cache"}
             try:
                 if path in ("/", "/index.html"):
                     if DASHBOARD_FILE.exists():
-                        self._send(200, "text/html; charset=utf-8", DASHBOARD_FILE.read_bytes())
+                        self._send(200, "text/html; charset=utf-8", DASHBOARD_FILE.read_bytes(), _fresh)
                     else:
                         self._send(500, "text/plain", b"dashboard.html missing")
                 elif path == "/dashboard.css":
@@ -392,7 +397,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     # so the design still iterates without a server restart).
                     css = config.ROOT / "dashboard.css"
                     if css.exists():
-                        self._send(200, "text/css; charset=utf-8", css.read_bytes())
+                        self._send(200, "text/css; charset=utf-8", css.read_bytes(), _fresh)
                     else:
                         self._send(404, "text/plain", b"dashboard.css missing")
                 elif path == "/dashboard.js":
@@ -400,7 +405,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     # request (no restart needed to iterate). The HTML loads it via <script src>.
                     js = config.ROOT / "dashboard.js"
                     if js.exists():
-                        self._send(200, "application/javascript; charset=utf-8", js.read_bytes())
+                        self._send(200, "application/javascript; charset=utf-8", js.read_bytes(), _fresh)
                     else:
                         self._send(404, "text/plain", b"dashboard.js missing")
                 elif path == "/api/stats":
@@ -437,7 +442,14 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json(stats.visits_page(cfg, day=(q.get("day") or [None])[0]))
                 elif path == "/api/digest":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self._json(stats.period_digest(cfg, edition=(q.get("edition") or ["auto"])[0]))
+                    self._json(stats.period_digest(cfg, edition=(q.get("edition") or ["auto"])[0],
+                                                   date=(q.get("date") or [None])[0]))
+                elif path == "/api/reel":
+                    # The condensed highlight reel for a period: ready (manifest) | building |
+                    # empty | unavailable | failed. Building happens in a background thread.
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    self._json(reel.reel_status(cfg, edition=(q.get("edition") or ["auto"])[0],
+                                                date=(q.get("date") or [None])[0]))
                 elif path == "/api/behavior":
                     self._json(behavior.overview(cfg))
                 elif path == "/api/individuals":
@@ -511,6 +523,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             except Exception:
                 data = {}
             try:
+                if path != "/api/camera":
+                    stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
                 if path == "/api/camera":
                     control_bridges[self._src()].request(_clean_settings(data))
                     self._json({"ok": True})
@@ -997,9 +1011,22 @@ def _candidate_labels(cfg) -> list:
     return sorted(labels)
 
 
+def _prewarm(cfg):
+    """Warm the Dispatch's digest cache and kick the current period's highlight-reel build a
+    little after startup, so the first person to open the page isn't the one who pays for it.
+    Delayed so the rig finishes loading its models first; failures are silently irrelevant."""
+    time.sleep(45)
+    try:
+        stats.period_digest(cfg)
+        reel.reel_status(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"[web] prewarm skipped: {e}")
+
+
 def start(cfg, frame_buffers: dict, control_bridges: dict):
     server = make_server(cfg, frame_buffers, control_bridges)
     threading.Thread(target=server.serve_forever, name="webdash", daemon=True).start()
+    threading.Thread(target=_prewarm, args=(cfg,), name="web-prewarm", daemon=True).start()
     return server
 
 

@@ -377,9 +377,11 @@
     .mast h1{ font-size:clamp(26px,8vw,40px); margin:12px 0 4px; }
     .mast .sub{ margin-bottom:12px; }
 
-    /* nav: a horizontally scrollable tab strip (no more 6-tabs-on-one-line cram) */
+    /* nav: a horizontally scrollable tab strip (no more 6-tabs-on-one-line cram).
+       NB: no negative margins — nav.tabs sits directly in the unpadded <body>, so
+       margin:-16px made the whole PAGE 32px wider than the phone (everything bled right). */
     nav.tabs{
-      margin:14px -16px 0; padding:0 16px; gap:22px;
+      margin:14px 0 0; padding:0 16px; gap:22px;
       justify-content:flex-start; flex-wrap:nowrap;
       overflow-x:auto; -webkit-overflow-scrolling:touch;
       scrollbar-width:none; border-bottom:1px solid var(--rule);
@@ -400,6 +402,18 @@
     .latest-photo{ min-height:180px; }
     .hero-info{ padding:16px 18px; }
     .entry{ grid-template-columns:54px 1fr auto; gap:10px; padding:10px 12px; }
+
+    /* visit timeline: two tight rows — [thumb | name] over [thumb | time · counts] */
+    .vl-row{ grid-template-columns:54px minmax(0,1fr) auto; gap:3px 10px;
+      grid-template-areas:"thumb main main" "thumb time right"; padding:9px 10px; }
+    .vl-thumb{ grid-area:thumb; width:54px; height:48px; }
+    .vl-main{ grid-area:main; }
+    .vl-time{ grid-area:time; flex-direction:row; gap:7px; align-items:baseline; }
+    .vl-time b{ font-size:11.5px; }
+    .vl-right{ grid-area:right; flex-direction:row; gap:10px; align-items:baseline; }
+    .vl-name{ font-size:15px; }
+    .vl-obs{ font-size:12px; }
+    .dsp-nav{ width:100%; justify-content:center; }
 
     /* calendar: drop the fixed 240px month label and shrink the 7-col grid */
     .cal-head{ gap:10px; }
@@ -458,6 +472,60 @@
   .rc-sub{ margin-top:1px; }
   .rc-since{ font-family:var(--mono); font-size:11px; color:var(--dim); margin-top:3px; }
   .rc-card.overdue .rc-since{ color:var(--rust); }
+  /* the long-gone register: one soft italic line instead of a wall of rust OVERDUE cards */
+  .rc-gone{ margin:10px 2px 0; font-style:italic; font-size:13.5px; color:var(--faint); }
+  .rc-gone span{ cursor:pointer; }
+  .rc-gone span:hover{ color:var(--dim); }
+  .rc-gone i{ font-style:normal; font-family:var(--mono); font-size:10.5px; }
+
+  /* ---------- Dispatch nav: ‹ day-to-day walking › + back-to-latest ---------- */
+  .dsp-nav{ display:flex; align-items:center; gap:8px; }
+  .dsp-arrow{ background:none; border:1px solid var(--rule2); color:var(--dim); border-radius:3px;
+    width:34px; height:30px; cursor:pointer; font-size:15px; line-height:1; transition:border-color .15s,color .15s; }
+  .dsp-arrow:hover:not(:disabled){ border-color:var(--gilt); color:var(--ink); }
+  .dsp-arrow:disabled{ opacity:.25; cursor:default; }
+  .dsp-latest{ color:var(--gilt); cursor:pointer; font-style:normal; font-family:var(--mono); font-size:11.5px; }
+  .dsp-latest:hover{ text-decoration:underline; }
+
+  /* ---------- the visit timeline ("The Visits" on the Dispatch) ---------- */
+  .vlog{ display:flex; flex-direction:column; border:1px solid var(--rule); border-radius:4px; overflow:hidden; }
+  .vl-row{ display:grid; grid-template-columns:74px 66px 1fr auto; gap:14px; align-items:center;
+    padding:11px 14px; border-bottom:1px solid var(--rule); background:var(--panel); cursor:pointer;
+    transition:background .15s; }
+  .vl-row:last-child{ border-bottom:0; }
+  .vl-row:hover{ background:var(--panel2); }
+  .vl-time{ display:flex; flex-direction:column; gap:2px; }
+  .vl-time b{ font-family:var(--mono); font-weight:400; font-size:13.5px; color:var(--ink); white-space:nowrap; }
+  .vl-time span{ font-family:var(--mono); font-size:10px; color:var(--faint); }
+  .vl-thumb{ width:66px; height:56px; border-radius:3px; background:#000 center/cover no-repeat; border:1px solid var(--rule2); }
+  .vl-main{ min-width:0; }
+  .vl-name{ font-variant:small-caps; font-size:17px; letter-spacing:.02em; line-height:1.15;
+    display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .vl-name .gx{ font-variant:normal; font-size:15px; }
+  .vl-ind{ font-variant:normal; font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--gilt); border:1px solid rgba(201,162,75,.5); border-radius:3px; padding:1.5px 6px; white-space:nowrap; }
+  .vl-main .motion-strip{ margin-top:5px; padding:2px 0 2px 10px; }
+  .vl-right{ text-align:right; display:flex; flex-direction:column; align-items:flex-end; gap:5px; }
+  .vl-obs{ font-family:var(--mono); font-size:15px; color:var(--ink); white-space:nowrap; }
+  .vl-obs small{ color:var(--faint); font-size:10px; }
+  .vl-clips{ font-family:var(--mono); font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--gilt); white-space:nowrap; }
+  .vlog-more{ margin:10px 2px 0; font-family:var(--mono); font-size:11.5px; }
+  .vlog-more span{ color:var(--gilt); cursor:pointer; }
+  .vlog-more span:hover{ text-decoration:underline; }
+
+  /* ---------- reel section extras: the links row under the hero/filmstrip ---------- */
+  .reel-links{ margin:8px 2px 0; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .reel-link{ color:var(--gilt); cursor:pointer; text-decoration:none; border-bottom:1px solid transparent; }
+  .reel-link:hover{ border-color:var(--gilt); }
+  .reel-note{ font-style:italic; color:var(--faint); }
+
+  /* ---------- explorer visit cards: curation tools tucked behind ✎ ---------- */
+  .vlabel{ margin-top:8px; }
+  .vlabel-tools{ display:none; }
+  .vlabel.open .vlabel-tools{ display:block; }
+  .vlabel-toggle{ opacity:.75; }
+  .vlabel.open .vlabel-toggle{ border-color:var(--gilt); color:var(--ink); opacity:1; }
 
   /* ---------- Needs Review: launcher (Catalogue) + the per-crop reason tag ---------- */
   .review-launch{ display:flex; align-items:center; gap:14px; width:100%; text-align:left;

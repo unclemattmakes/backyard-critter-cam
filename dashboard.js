@@ -5,7 +5,9 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 // and esc neutralises it for the double-quoted HTML attribute. Use jarg(x), never '${esc(x)}', for
 // any onclick string argument.
 const jarg=s=>esc(JSON.stringify(s==null?'':String(s)));
-const cap1=s=>s.replace(/\b\w/g,c=>c.toUpperCase());
+// Word-initial capitals only: "townsend's chipmunk" -> "Townsend's Chipmunk" (never Townsend'S),
+// "band-tailed pigeon" -> "Band-tailed Pigeon" (bird-guide style keeps the hyphenated tail lower).
+const cap1=s=>s.replace(/(^|[\s(])(\S)/g,(m,p,c)=>p+c.toUpperCase());
 const media=p=>'/media/'+encodeURI(p);
 // playful pseudo-taxonomic labels (flavour only)
 const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','eastern gray squirrel':'Sciurus carolinensis',
@@ -53,14 +55,17 @@ function busyBtn(btn){
   return ()=>{ if(done) return; done=true; el.disabled=wasDisabled; el.style.opacity=prevOp; el.style.cursor=''; };
 }
 
-/* ---------- clip player (lightbox; plays one clip or a whole reel as a playlist) ----------
-   Everywhere a thumbnail has clip(s) behind it, clicking plays them here. A reel auto-advances
-   (the <video> 'ended' event steps to the next), with a filmstrip + ‹ › + arrow keys to scrub. */
-let __clips=[], __ci=0, __reelMode=false;
+/* ---------- clip player (lightbox) ----------
+   Three shapes, one box: a single clip; a PLAYLIST of clips (auto-advances on 'ended', filmstrip
+   + ‹ › + arrow keys to scrub); or a stitched HIGHLIGHT REEL — one mp4 whose filmstrip cells are
+   CHAPTERS (seek points inside the same video) rather than separate files. */
+let __clips=[], __ci=0, __reelMode=false, __chapters=null;
 function playClips(clips,i,title){
   clips=(clips||[]).filter(c=>c&&c.clip_path);
   if(!clips.length) return;
-  __clips=clips; __ci=Math.max(0,Math.min(i||0,clips.length-1)); __reelMode=clips.length>1;
+  // Playlists play in wall-clock order regardless of how the caller ranked them.
+  if(clips.length>1) clips=clips.slice().sort((a,b)=>String(a.start||'').localeCompare(String(b.start||'')));
+  __clips=clips; __ci=Math.max(0,Math.min(i||0,clips.length-1)); __reelMode=clips.length>1; __chapters=null;
   const box=$('#clipbox'); if(!box) return;
   $('#clip-title').textContent=title||(__reelMode?`Reel · ${clips.length} clips`:'Clip');
   box.hidden=false;
@@ -71,9 +76,54 @@ function playClips(clips,i,title){
       <div class="lab">${esc(fmtClock(c.start)||'')}${c.species?' · '+esc(nameOf(c.species)):''}</div>
     </div>`).join(''):'';
   const v=$('#clip-video');
+  v.ontimeupdate=null;
   v.onended=()=>{ if(__reelMode && __ci<__clips.length-1) reelStep(1); };
   document.addEventListener('keydown',clipKeys);
   showClip();
+}
+/* The stitched highlight reel: one video, chapter filmstrip. `man` is /api/reel's manifest. */
+function playHighlightReel(man,title){
+  if(!man||!man.clip_path||!(man.segments||[]).length) return;
+  __clips=[{clip_path:man.clip_path, seconds:man.seconds}]; __ci=0; __reelMode=false; __chapters=man.segments;
+  const box=$('#clipbox'); if(!box) return;
+  $('#clip-title').textContent=title||'Highlight Reel';
+  box.hidden=false;
+  const strip=$('#clip-strip'); strip.style.display='flex';
+  strip.innerHTML=__chapters.map((s,k)=>`
+    <div class="fs" data-i="${k}" onclick="reelSeek(${k})">
+      <div class="ft" style="background-image:url('${s.thumb?media(s.thumb):''}')"><span class="dur">${fmtDur(s.seconds)}</span></div>
+      <div class="lab">${esc(fmtClock(s.start)||'')}${s.species?' · '+esc(nameOf(s.species)):''}</div>
+    </div>`).join('');
+  const v=$('#clip-video');
+  if(__chapters[0].thumb) v.poster=media(__chapters[0].thumb); else v.removeAttribute('poster');
+  v.src=media(man.clip_path);
+  v.onended=null;
+  v.ontimeupdate=()=>__reelSyncChapter();
+  const pr=v.play(); if(pr&&pr.catch) pr.catch(()=>{});
+  document.addEventListener('keydown',clipKeys);
+  __reelSyncChapter(true);
+}
+function __chapterAt(t){ let k=0; (__chapters||[]).forEach((s,i)=>{ if(t>=s.at-0.3) k=i; }); return k; }
+function __reelSyncChapter(force){
+  if(!__chapters) return;
+  const v=$('#clip-video'), k=__chapterAt(v.currentTime||0), s=__chapters[k];
+  if(!force && __ci===k) return;
+  __ci=k;
+  $('#clip-cap').innerHTML=`${s.species?`<span class="nm">${esc(nameOf(s.species))}</span>`:''}
+    ${(s.individuals||[]).map(n=>`<span class="mono" style="font-size:12px;color:var(--gilt)">${esc(cap1(n))}</span>`).join(' ')}
+    ${s.start?`<span class="mono" style="font-size:12px">${esc(fmtClock(s.start))}</span>`:''}
+    <span class="mono" style="font-size:12px;margin-left:auto;color:var(--faint)">moment ${k+1} / ${__chapters.length}</span>`;
+  const prev=$('#clip-prev'), next=$('#clip-next');
+  prev.style.display=next.style.display='flex';
+  prev.disabled=k<=0; next.disabled=k>=__chapters.length-1;
+  $('#clip-strip').querySelectorAll('.fs').forEach(el=>{
+    const on=+el.dataset.i===k; el.classList.toggle('on',on); if(on) el.scrollIntoView({inline:'center',block:'nearest'}); });
+}
+function reelSeek(i){
+  if(!__chapters||i<0||i>=__chapters.length) return;
+  const v=$('#clip-video'); v.currentTime=__chapters[i].at+0.01;
+  const pr=v.play(); if(pr&&pr.catch) pr.catch(()=>{});
+  __ci=i; __reelSyncChapter(true);
 }
 function showClip(){
   const c=__clips[__ci]; if(!c) return;
@@ -95,35 +145,52 @@ function showClip(){
   $('#clip-strip').querySelectorAll('.fs').forEach(el=>{
     const on=+el.dataset.i===__ci; el.classList.toggle('on',on); if(on) el.scrollIntoView({inline:'center',block:'nearest'}); });
 }
-function reelStep(d){ const n=__ci+d; if(n<0||n>=__clips.length) return; __ci=n; showClip(); }
+function reelStep(d){
+  if(__chapters){ reelSeek(__ci+d); return; }
+  const n=__ci+d; if(n<0||n>=__clips.length) return; __ci=n; showClip();
+}
 function reelGo(i){ if(i>=0&&i<__clips.length){ __ci=i; showClip(); } }
 function closeClipbox(){ const m=$('#clipbox'); if(!m) return; m.hidden=true;
-  const v=$('#clip-video'); v.pause(); v.onended=null; v.removeAttribute('src'); v.load();
+  const v=$('#clip-video'); v.pause(); v.onended=null; v.ontimeupdate=null; v.removeAttribute('src'); v.load();
+  __chapters=null;
   document.removeEventListener('keydown',clipKeys); }
 function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='ArrowRight') reelStep(1); else if(e.key==='ArrowLeft') reelStep(-1); }
 /* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
 const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
 
-function show(v){
+const VIEWS=['live','dispatch','behavior','indiv','calendar','cat'];
+function show(v, fromHash){
   closeSettings();
-  $('#view-live').classList.toggle('on',v==='live');
-  $('#view-dispatch').classList.toggle('on',v==='dispatch');
-  $('#view-behavior').classList.toggle('on',v==='behavior');
-  $('#view-indiv').classList.toggle('on',v==='indiv');
-  $('#view-calendar').classList.toggle('on',v==='calendar');
-  $('#view-cat').classList.toggle('on',v==='cat');
-  $('#view-explore').classList.toggle('on',v==='explore');
-  $('#tab-live').classList.toggle('on',v==='live');
-  $('#tab-dispatch').classList.toggle('on',v==='dispatch');
-  $('#tab-behavior').classList.toggle('on',v==='behavior');
-  $('#tab-indiv').classList.toggle('on',v==='indiv');
-  $('#tab-calendar').classList.toggle('on',v==='calendar');
-  $('#tab-cat').classList.toggle('on',v==='cat');
+  VIEWS.concat('explore').forEach(k=>{ const s=$('#view-'+k); if(s) s.classList.toggle('on',v===k); });
+  VIEWS.forEach(k=>{ const t=$('#tab-'+k); if(t) t.classList.toggle('on',v===k); });
+  // Deep-linkable tabs + a working Back button: the view lives in the URL hash. Programmatic
+  // hash writes echo a hashchange we must NOT re-show (it would double-load the view).
+  if(!fromHash && VIEWS.includes(v) && location.hash!=='#'+v){ __hashQuiet=v; location.hash=v; }
+  syncLiveStreams();
   if(v==='cat') loadCatalogue();
   if(v==='dispatch') loadDispatch();
   if(v==='behavior') loadBehavior();
   if(v==='indiv') loadIndividuals();
   if(v==='calendar') loadCalendar();
+  if(v==='live') refreshWhoshere();
+}
+let __hashQuiet=null;
+window.addEventListener('hashchange',()=>{
+  const v=location.hash.replace('#','');
+  if(__hashQuiet===v){ __hashQuiet=null; return; }
+  if(VIEWS.includes(v)) show(v, true);
+});
+/* The MJPEG live streams are open-ended HTTP responses -- left attached while another tab is
+   on screen they stream (and decode) forever for nobody, which on a phone is real battery and
+   LAN traffic. Attach each pane's stream only while the Live tab is visible. */
+function syncLiveStreams(){
+  const on=!!document.querySelector('#view-live.on');
+  document.querySelectorAll('.live-pane').forEach(p=>{
+    const img=p.querySelector('.frame img'); if(!img) return;
+    const want='/stream.mjpg?source='+encodeURIComponent(p.dataset.source||'');
+    if(on){ if(!img.getAttribute('src')) img.src=want; }
+    else if(img.getAttribute('src')){ img.removeAttribute('src'); }
+  });
 }
 
 /* ---------- camera controls ---------- */
@@ -187,7 +254,7 @@ async function loadCameras(){
   grid.innerHTML=cams.map(c=>`
     <figure class="live-pane${c.source===LIVE.sel?' sel':''}" data-source="${esc(c.source)}" onclick="selectCamera(${jarg(c.source)})">
       <div class="frame"><i></i>
-        <img src="/stream.mjpg?source=${encodeURIComponent(c.source)}" alt="live feed" onerror="paneFeed(${jarg(c.source)},false)">
+        <img alt="live feed" onerror="paneFeed(${jarg(c.source)},false)">
         <div class="feed-msg"><b>Camera feed unavailable</b><span>This camera may be warming up, or isn&rsquo;t running.</span></div>
       </div>
       <figcaption class="cap">
@@ -195,13 +262,16 @@ async function loadCameras(){
         <button class="gear" type="button" onclick="event.stopPropagation();openSettings(${jarg(c.source)})" title="Camera settings">&#9881;</button>
       </figcaption>
     </figure>`).join('');
+  syncLiveStreams();          // streams attach only while the Live tab is on screen
   checkFeeds();
 }
 function paneFor(source){ return [...document.querySelectorAll('.live-pane')].find(p=>p.dataset.source===source); }
 function paneFeed(source,up){ const p=paneFor(source); if(p){ const f=p.querySelector('.frame'); if(f) f.classList.toggle('offline',!up); } }
 async function checkFeeds(){
   // An MJPEG <img> goes black (not "errored") when frames merely stall, so poll /snapshot.jpg per
-  // camera -- it 503s whenever that camera's capture thread has no current frame.
+  // camera -- it 503s whenever that camera's capture thread has no current frame. Only worth
+  // asking while the Live tab is actually visible.
+  if(!document.querySelector('#view-live.on')) return;
   for(const c of LIVE.cams){
     try{ const r=await fetch('/snapshot.jpg?source='+encodeURIComponent(c.source),{cache:'no-store'}); paneFeed(c.source,r.ok); }
     catch(e){ paneFeed(c.source,false); }
@@ -296,6 +366,7 @@ async function refreshLive(){
    the names it recognises. State: WH_SEL = the names currently picked. */
 let WH_CAST=[], WH_SEL=new Set(), WH_BUSY=false, WH_CHIPSIG='';
 async function refreshWhoshere(){
+  if(!document.querySelector('#view-live.on')) return;   // the panel lives on the Live tab only
   let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const sec=$('#whoshere'); if(!sec) return;
   sec.hidden=false;
@@ -566,7 +637,9 @@ async function renderVisits(params,body){
   const qs=params.day?('?day='+encodeURIComponent(params.day)):'';
   let o; try{ o=await fetch('/api/visits'+qs).then(r=>r.json()); }catch(e){ body.innerHTML='<p class="empty">Could not load visits.</p>'; return; }
   visitsData=o.visits||[];
-  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
+  $('#explore-sub').textContent = o.window
+    ? `the latest ${(o.total||0).toLocaleString()} visits`
+    : `${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
   if(!visitsData.length){ body.innerHTML='<p class="empty">No visits.</p>'; return; }
   body.innerHTML='<div class="cards">'+visitsData.map(visitCard).join('')+'</div>';
   // A visit with clips plays its video on click (what you asked for); one without falls back to
@@ -579,19 +652,25 @@ async function renderVisits(params,body){
 function visitCard(v,i){
   const nclips=(v.clips||[]).length;
   const sp=(v.title&&v.title!=='animal')?v.title:'';
-  // The label footer stops click-propagation so using it never triggers the card's play/drill.
-  const footer=`<div class="vlabel" onclick="event.stopPropagation()" style="margin-top:8px;display:flex;flex-direction:column;gap:5px">
-      <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
-        <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
-        ${speciesSelect('vsp-'+i,sp)}
-        <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
-      <div style="display:flex;gap:5px;align-items:center">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
-      <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
+  const inds=(v.individuals||[]).map(n=>`<span class="vl-ind">${esc(cap1(n))}</span>`).join('');
+  // The curation tools (confirm/correct species, name the individual) hide behind the ✎ so the
+  // card itself stays a reading surface: who, when, how long, play. stopPropagation keeps the
+  // whole label layer from triggering the card's play/drill.
+  const footer=`<div class="vlabel" onclick="event.stopPropagation()">
+      <button class="gear vlabel-toggle" onclick="this.closest('.vlabel').classList.toggle('open')" title="confirm or correct this visit's labels">✎ label</button>
+      <div class="vlabel-tools">
+        <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:6px">
+          <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+          ${speciesSelect('vsp-'+i,sp)}
+          <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
+        <div style="display:flex;gap:5px;align-items:center;margin-top:6px">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
+        <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
+      </div>
     </div>`;
   return `<div class="card vcard" data-vi="${i}">
     <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
     <div class="body">
-      <div class="common">${esc(cap1(v.title||'animal'))}</div>
+      <div class="common">${esc(cap1(v.title||'animal'))} ${inds}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
       <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
       ${footer}
@@ -629,10 +708,14 @@ async function renderDay(params,body){
   let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ s={}; }
   const d=(s.by_day||[]).find(x=>x.day===date)||{crops:0,visits:0,classes:{}};
   $('#explore-sub').textContent=`${(d.crops||0).toLocaleString()} obs · ${d.visits||0} visits`;
+  // The night FOLLOWING day d runs dusk(d) -> dawn(d+1), so it's anchored on d+1 in the digest.
+  const nextDay=(dt=>{const x=new Date(dt+'T12:00:00'); x.setDate(x.getDate()+1); return ymdLocal(x);})(date);
   const chips=Object.entries(d.classes||{}).map(([sp,n])=>`<button class="chip" data-sp="${esc(sp)}">${esc(cap1(sp))} <i>${n}</i></button>`).join('');
   body.innerHTML=`
     <div class="day-summary">
       <button class="back" id="day-visits">${d.visits||0} visits this day &rarr;</button>
+      <button class="back" onclick="openDispatchAt(${jarg(date)},'day')" title="the day's dispatch — reel, timeline, roll">☀ day dispatch</button>
+      <button class="back" onclick="openDispatchAt(${jarg(nextDay)},'night')" title="the night that FOLLOWED this day (dusk to dawn)">☾ that night&rsquo;s dispatch</button>
       ${chips?`<div class="chips">${chips}</div>`:''}
     </div>
     <div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>`;
@@ -748,27 +831,65 @@ function wireIndivMotion(root){
   root.querySelectorAll('[data-im]').forEach(b=>fillIndivMotion(b.dataset.im, b));
 }
 
-/* ---------- The Dispatch (period digest) ---------- */
-let dispatchEdition='auto';
-function setDispatch(ed){ dispatchEdition=ed; loadDispatch(); }
+/* ---------- The Dispatch (period digest) ----------
+   The landing page, rebuilt around the two questions people actually open it with:
+   "what happened?" (the condensed highlight reel) and "who came, when?" (the visit timeline).
+   Species aggregates (the Roll), the plate, and the cast roll call follow underneath.
+   DSP.date=null shows the latest completed period; ‹ › walk earlier days via the digest's
+   prev/next anchors. The stitched reel is fetched alongside and re-polled while building. */
+let DSP={edition:'auto', date:null};
+let __dspSeq=0, __reelTimer=null;
+function setDispatch(ed){ DSP.edition=ed; loadDispatch(); }
+function dspNav(date, edition){ DSP={edition:edition||DSP.edition, date:date||null}; loadDispatch(); }
+function dspLatest(){ DSP={edition:'auto', date:null}; loadDispatch(); }
+function openDispatchAt(date, edition){ dspNav(date, edition); show('dispatch'); }
+
 async function loadDispatch(){
   const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the dispatch…</p>';
-  let d, rc;
+  clearTimeout(__reelTimer);
+  const seq=++__dspSeq;
+  const qs='edition='+encodeURIComponent(DSP.edition)+(DSP.date?'&date='+encodeURIComponent(DSP.date):'');
+  let d, rc, rl;
   try{
-    [d, rc] = await Promise.all([
-      fetch('/api/digest?edition='+dispatchEdition).then(r=>r.json()),
+    [d, rc, rl] = await Promise.all([
+      fetch('/api/digest?'+qs).then(r=>r.json()),
       fetch('/api/rollcall').then(r=>r.json()).catch(()=>({cast:[]})),
+      fetch('/api/reel?'+qs).then(r=>r.ok?r.json():null).catch(()=>null),   // older server -> no reel
     ]);
   }catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
-  renderDispatch(d, rc);
+  if(seq!==__dspSeq) return;                    // a newer navigation superseded this load
+  window.__digest=d;
+  renderDispatch(d, rc, rl);
+  if(rl && rl.status==='building') pollReel(qs, seq, 40);
 }
-/* The named cast with last-seen / overdue chips -- the daily "who's back, who hasn't shown" roll.
-   Clicking a face jumps to the Individuals tab. Empty (no named cast yet) renders nothing. */
+/* While the server stitches the condensed cut, quietly re-ask and swap the reel section in
+   place when it's ready -- never rebuilding the whole page under the reader's scroll. */
+function pollReel(qs, seq, tries){
+  clearTimeout(__reelTimer);
+  if(tries<=0 || seq!==__dspSeq) return;
+  __reelTimer=setTimeout(async()=>{
+    if(seq!==__dspSeq) return;
+    let r2=null;
+    try{ r2=await fetch('/api/reel?'+qs).then(r=>r.ok?r.json():null); }catch(e){ /* retry below */ }
+    if(seq!==__dspSeq) return;
+    if(r2 && r2.status==='ready'){
+      window.__reelMan=r2;
+      const el=document.getElementById('reel-sec');
+      if(el) el.innerHTML=reelSection(window.__digest||{}, r2);
+    } else {
+      pollReel(qs, seq, tries-1);
+    }
+  }, 5000);
+}
+/* The named cast. Faces seen in the last days lead (with their overdue flag when a regular
+   has gone quiet); long-gone individuals compress to one soft line instead of a wall of
+   rust-red OVERDUE cards. Clicking a face jumps to the Individuals tab. */
 function rollcallSection(rc){
   const cast=(rc&&rc.cast)||[];
   if(!cast.length) return '';
-  const overdue=cast.filter(c=>c.overdue).length;
-  const note=overdue?`${overdue} overdue`:`${cast.length} named`;
+  const fresh=cast.filter(c=>c.days_since!=null && c.days_since<=10)
+                  .sort((a,b)=>a.days_since-b.days_since);
+  const gone=cast.filter(c=>!(c.days_since!=null && c.days_since<=10));
   const sinceText=c=> c.days_since==null ? '' :
     c.days_since===0 ? 'seen today' : c.days_since===1 ? 'seen yesterday' : `${c.days_since} days ago`;
   const card=c=>{
@@ -782,28 +903,130 @@ function rollcallSection(rc){
         <div class="rc-since">${esc(sinceText(c))}</div>
       </div></div>`;
   };
+  const goneLine=gone.length?`<p class="rc-gone">Not seen in a while: ${gone.map(c=>
+    `<span onclick="show('indiv')" title="last seen ${esc((c.last_seen||'').slice(0,10))}">${esc(c.id)}`
+    +`${c.days_since!=null?` <i>(${c.days_since}d)</i>`:''}</span>`).join(' · ')}</p>`:'';
+  const note=fresh.length?`${fresh.length} about lately`:'nobody about lately';
   return `<h2 class="sec">Cast Roll Call <span class="n">${note}</span></h2>
-    <div class="rollcall">${cast.map(card).join('')}</div>`;
+    ${fresh.length?`<div class="rollcall">${fresh.map(card).join('')}</div>`:''}${goneLine}`;
 }
 function dispatchHeader(d){
-  const ed=d.edition;
+  const ed=d.edition||DSP.edition;
   const masthead = ed==='night' ? 'The Morning Dispatch' : ed==='day' ? 'The Evening Dispatch' : 'The Dispatch';
   const range = d.start ? `${fmtDateTime(d.start)} – ${fmtDateTime(d.end)}` : '';
+  const back = d.latest===false ? ` · <span class="dsp-latest" onclick="dspLatest()">back to the latest ↻</span>` : '';
+  const nav=(dt,dir,lab)=> dt
+    ? `<button class="dsp-arrow" onclick="dspNav(${jarg(dt)},${jarg(d.edition||'')})" title="${lab}">${dir}</button>`
+    : `<button class="dsp-arrow" disabled>${dir}</button>`;
   return `<div class="dsp-head">
     <div>
       <div class="dsp-title">${esc(masthead)}<span style="color:var(--gilt)"> · </span>${esc(d.title||'')}</div>
-      <div class="dsp-sub">${esc(range)}${d.backed_off?' · last period with activity':''}</div>
+      <div class="dsp-sub">${esc(range)}${d.backed_off?' · last period with activity':''}${back}</div>
     </div>
-    <div class="dsp-toggle">
-      <button class="${ed==='night'?'on':''}" onclick="setDispatch('night')">☾ Night</button>
-      <button class="${ed==='day'?'on':''}" onclick="setDispatch('day')">☀ Day</button>
+    <div class="dsp-nav">
+      ${nav(d.prev_date,'‹','the previous '+esc(d.edition||'period'))}
+      <div class="dsp-toggle">
+        <button class="${ed==='night'?'on':''}" onclick="setDispatch('night')">☾ Night</button>
+        <button class="${ed==='day'?'on':''}" onclick="setDispatch('day')">☀ Day</button>
+      </div>
+      ${nav(d.next_date,'›','the next '+esc(d.edition||'period'))}
     </div>
   </div>`;
 }
-function renderDispatch(d, rc){
+/* The reel section: the stitched condensed cut when it's ready (one video, chapter strip),
+   the old every-clip playlist while it builds or on a server without /api/reel. */
+function reelSection(d, rl){
+  const playlist=window.__reel||[];
+  const ready=rl&&rl.status==='ready'&&(rl.segments||[]).length;
+  if(!ready && !playlist.length) return '';
+  const ed=d.edition==='night'?'night':'day';
+  if(ready){
+    // Hero backdrop: the plate (the period's SHARPEST frame) over a chapter thumb — a tight
+    // crop blown up to hero width reads as a wall of blur.
+    const poster=(d.plate&&d.plate.crop_path)||(rl.segments.find(s=>s.thumb)||{}).thumb;
+    const chaps=rl.segments.map((s,i)=>`
+      <div class="fs" data-i="${i}" onclick="reelChap(${i})">
+        <div class="ft" style="background-image:url('${s.thumb?media(s.thumb):''}')"><span class="dur">${fmtDur(s.seconds)}</span></div>
+        <div class="lab">${esc(fmtClock(s.start))} · ${esc(nameOf(s.species||'·'))}${(s.individuals||[]).length?' · '+esc(cap1(s.individuals[0])):''}</div>
+      </div>`).join('');
+    return `<h2 class="sec">Highlight Reel <span class="n">the ${ed} in ${fmtDur(rl.seconds)}</span></h2>
+      <div class="panel reelhero" id="reelhero" onclick="reelHeroPlay()" style="background-image:url('${poster?media(poster):''}')">
+        <div class="big-play">&#9654;</div>
+        <div class="scrim">
+          <div class="rh-eyebrow lbl">Watch the ${ed}</div>
+          <div class="rh-title">The best moments, in ${fmtDur(rl.seconds)}</div>
+          <div class="rh-meta">${rl.segments.length} moments · condensed from ${rl.n_source_clips||playlist.length} clips · press play</div>
+        </div></div>
+      <div class="filmstrip" id="dsp-strip">${chaps}</div>
+      <div class="reel-links lbl">
+        ${playlist.length?`<span class="reel-link" onclick="reelPlayAll()">▷ watch every clip (${playlist.length})</span> · `:''}
+        <a class="reel-link" href="${media(rl.clip_path)}" download>⤓ save the reel</a>
+      </div>`;
+  }
+  const total=playlist.reduce((a,c)=>a+(c.seconds||0),0);
+  const poster=(d.plate&&d.plate.crop_path)||playlist[0].thumb;
+  const note = rl&&rl.status==='building'
+    ? `<div class="reel-links lbl"><span class="reel-note">✂ a condensed cut is being stitched — it will appear here in a minute or two</span></div>` : '';
+  return `<h2 class="sec">Highlight Reel <span class="n">${playlist.length} clip${playlist.length>1?'s':''} · ${fmtDur(total)}</span></h2>
+    <div class="panel reelhero" id="reelhero" onclick="reelPlayAll()" style="background-image:url('${poster?media(poster):''}')">
+      <div class="big-play">&#9654;</div>
+      <div class="scrim">
+        <div class="rh-eyebrow lbl">Watch the ${ed}</div>
+        <div class="rh-title">The visitors, in sequence</div>
+        <div class="rh-meta">${playlist.length} clips · ${fmtDur(total)} of footage · press play</div>
+      </div></div>
+    <div class="filmstrip" id="dsp-strip">${playlist.map((c,i)=>`
+      <div class="fs" data-i="${i}" onclick="reelPlayAll(${i})"><div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
+        <div class="lab">${esc(fmtClock(c.start))} · ${esc(nameOf(c.species||'·'))}</div></div>`).join('')}</div>
+    ${note}`;
+}
+function reelHeroPlay(){
+  if(window.__reelMan) playHighlightReel(window.__reelMan,'Highlight Reel — '+((window.__digest||{}).title||''));
+  else reelPlayAll();
+}
+function reelChap(i){
+  if(!window.__reelMan) return;
+  playHighlightReel(window.__reelMan,'Highlight Reel — '+((window.__digest||{}).title||''));
+  if(i>0) reelSeek(i);
+}
+function reelPlayAll(i){ playClips(window.__reel||[], i||0, 'Every clip — '+((window.__digest||{}).title||'')); }
+/* The visit timeline: the period's comings and goings in order — when, who (species + any
+   named individuals), how long, what the motion looked like, and the clips to prove it. */
+function visitLogSection(d){
+  const log=d.visit_log||[];
+  if(!log.length) return '';
+  window.__vlog=log;
+  const rows=log.map((v,i)=>{
+    const sp=(v.species||[]).map(nameOf).join(' + ')||'Unidentified';
+    const g=glyphInfo((v.species||[])[0]||'');
+    const inds=(v.individuals||[]).map(n=>`<span class="vl-ind">${esc(cap1(n))}</span>`).join('');
+    const nclips=(v.clips||[]).length;
+    const dur=v.minutes>=1.5?`${Math.round(v.minutes)} min`:'brief';
+    return `<div class="vl-row" data-vl="${i}" title="${nclips?'watch this visit':'see this visit&rsquo;s photos'}">
+      <div class="vl-time"><b>${esc(fmtClock(v.start))}</b><span>${dur}</span></div>
+      <div class="vl-thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?'<span class="play-badge sm"></span>':''}</div>
+      <div class="vl-main">
+        <div class="vl-name"><span class="gx">${glyphHTML(g)}</span> ${esc(sp)} ${inds}</div>
+        ${motionStrip(v.motion)||''}
+      </div>
+      <div class="vl-right"><span class="vl-obs">${v.count}<small> obs</small></span>${nclips?`<span class="vl-clips">▶ ${nclips} clip${nclips>1?'s':''}</span>`:''}</div>
+    </div>`;
+  }).join('');
+  const first=fmtClock(log[0].start), last=fmtClock(log[log.length-1].start);
+  return `<h2 class="sec">The Visits <span class="n">${log.length} · first ${esc(first)} · last ${esc(last)}</span></h2>
+    <div class="vlog">${rows}</div>
+    <p class="vlog-more"><span onclick="goTally('visits')">Browse the full visit archive →</span></p>`;
+}
+function vlOpen(i){
+  const v=(window.__vlog||[])[i]; if(!v) return;
+  const title=`${(v.species||[]).map(nameOf).join(' + ')||'Visit'} · ${fmtClock(v.start)}`;
+  if((v.clips||[]).length) playClips(v.clips.slice(0,16), 0, title);   // busiest 16, played in order
+  else explore('obs',{start:v.start,end:v.end},title,fmtDateTime(v.start));
+}
+function renderDispatch(d, rc, rl){
   const body=$('#dispatch-body');
   const roll=rollcallSection(rc||{});
-  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+roll+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`; return; }
+  if(!d || (d.empty && !d.start)){ body.innerHTML=dispatchHeader(d||{})+`<p class="empty">${esc((d&&d.reason)||'Nothing to report yet.')}</p>`+roll; return; }
   let html=dispatchHeader(d);
   const flags=[];
   (d.novel||[]).forEach(sp=>{ const s=(d.species||[]).find(x=>x.species===sp); const n=s&&s.novelty;
@@ -812,26 +1035,15 @@ function renderDispatch(d, rc){
   (d.quiet||[]).forEach(q=>{ flags.push(`<span class="flag quiet">— No ${esc(nameOf(q.species))} this ${esc(d.edition)} (usually ${Math.round(q.frac*100)}% of ${esc(d.edition)}s)</span>`); });
   if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
   if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
-  html+=roll;
-  if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`; return; }
-  // Highlight reel — the night's clips, played back-to-back. Poster is the sharpest still
-  // (the plate); the filmstrip lets you jump straight to any moment.
+  if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`+roll; return; }
   window.__reel=d.reel||[];
-  if(window.__reel.length){
-    const total=window.__reel.reduce((a,c)=>a+(c.seconds||0),0);
-    const poster=(d.plate&&d.plate.crop_path)||window.__reel[0].thumb;
-    html+=`<h2 class="sec">Highlight Reel <span class="n">${window.__reel.length} clip${window.__reel.length>1?'s':''} · ${fmtDur(total)}</span></h2>`;
-    html+=`<div class="panel reelhero" id="reelhero" style="background-image:url('${poster?media(poster):''}')">
-      <div class="big-play">&#9654;</div>
-      <div class="scrim">
-        <div class="rh-eyebrow lbl">Watch the ${d.edition==='night'?'night':'day'}</div>
-        <div class="rh-title">The visitors, in sequence</div>
-        <div class="rh-meta">${window.__reel.length} clips · ${fmtDur(total)} of footage · press play</div>
-      </div></div>`;
-    html+=`<div class="filmstrip" id="dsp-strip">`+window.__reel.map((c,i)=>`
-      <div class="fs" data-i="${i}"><div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
-        <div class="lab">${esc(fmtClock(c.start))} · ${esc(nameOf(c.species||'·'))}</div></div>`).join('')+`</div>`;
-  }
+  window.__reelMan=(rl&&rl.status==='ready')?rl:null;
+  html+=`<div id="reel-sec">${reelSection(d, rl)}</div>`;
+  html+=visitLogSection(d);
+  html+=roll;
+  const t=[['visits',(d.visits||0).toLocaleString()],['species',(d.species||[]).length],
+    ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
+  html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
   if(d.plate){ const p=d.plate;
     html+=`<div class="panel hero">
       <div class="hero-photo playable" style="background-image:url('${p.crop_path?media(p.crop_path):''}')">${p.clip?playBadge(1):''}</div>
@@ -842,18 +1054,12 @@ function renderDispatch(d, rc){
         <div class="hero-meta">${esc(fmtClock(p.time))}<br><span class="c">~${Math.round((p.conf||0)*100)}%</span> · sharpest frame</div>
       </div></div>`;
   }
-  const t=[['visits',(d.visits||0).toLocaleString()],['species',(d.species||[]).length],
-    ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
-  if(d.moon) t.push(['moon',d.moon.illum_pct+'%']);
-  html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
   window.__rollClips=(d.species||[]).map(s=> s.clip?{...s.clip, species:s.species}:null);
   html+=`<h2 class="sec">The Roll <span class="n">${(d.species||[]).length} species</span></h2>`;
   html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
   body.innerHTML=html;
   body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
-  // Reel: the hero plays the whole thing; each filmstrip cell jumps straight to that clip.
-  const rh=$('#reelhero'); if(rh) rh.onclick=()=>playClips(window.__reel,0,'Highlight Reel — '+(d.title||''));
-  const ds=$('#dsp-strip'); if(ds) ds.querySelectorAll('.fs').forEach(el=>el.onclick=()=>playClips(window.__reel,+el.dataset.i,'Highlight Reel — '+(d.title||'')));
+  body.querySelectorAll('[data-vl]').forEach(el=>el.onclick=()=>vlOpen(+el.dataset.vl));
   // ▶ on the plate (when a clip caught the sharpest frame) and on each roll row.
   const pp=body.querySelector('.hero-photo .play-badge'); if(pp&&d.plate&&d.plate.clip) pp.onclick=(e)=>{ e.stopPropagation(); playClips([d.plate.clip],0,nameOf(d.plate.species)); };
   body.querySelectorAll('.entry .play-badge[data-ci]').forEach(el=>el.onclick=(e)=>{ e.stopPropagation(); const c=(window.__rollClips||[])[+el.dataset.ci]; if(c) playClips([c],0,nameOf(c.species||'')); });
@@ -910,9 +1116,12 @@ function renderBehavior(d){
     <div class="tally" style="cursor:default"><div class="n">${flags.length}</div><div class="k lbl">off-pattern</div></div></div>`;
   if(flags.length){
     html+=`<h2 class="sec">Off-Pattern <span class="n">appearance vs behaviour</span></h2>`;
-    html+=`<div class="lede">`+flags.map(f=>
-      `<span class="flag quiet">⚑ ${esc(nameOf(f.species))} at ${esc((f.started_at||'').slice(11,16))} — ${esc((f.notes&&f.notes[0])||'unusual')}</span>`
-    ).join('')+`</div>`;
+    html+=`<div class="lede">`+flags.map(f=>{
+      // Lead with the note that actually DISAGREES (a dwell-flagged visit's first note can read
+      // "arrived 14h ... OK", which looked like a false alarm), and date the sighting.
+      const note=(f.notes||[]).find(n=>/UNUSUAL/.test(n))||(f.notes&&f.notes[0])||'unusual';
+      return `<span class="flag quiet">⚑ ${esc(nameOf(f.species))} · ${esc((f.started_at||'').slice(5,16).replace('T',' '))} — ${esc(note)}</span>`;
+    }).join('')+`</div>`;
   }
   html+=`<h2 class="sec">Field Notes <span class="n">${d.species.length} species</span></h2>`;
   html+=`<div style="display:flex;flex-direction:column;gap:8px">`+d.species.map(s=>{
@@ -1428,7 +1637,10 @@ function maybeFirstRun(s){
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
 loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
-loadDispatch();   // land on the daily Dispatch ("who visited"); maybeFirstRun redirects empty rigs to Live
+// Land on the view in the URL hash when there is one (deep links / refresh keep their tab);
+// else the daily Dispatch ("who visited"). maybeFirstRun still redirects empty rigs to Live.
+{ const h=location.hash.replace('#','');
+  if(VIEWS.includes(h) && h!=='dispatch') show(h, true); else loadDispatch(); }
 setInterval(refreshLive,6000);
 setInterval(refreshHeader,4000);
 setInterval(refreshNaming,4000);

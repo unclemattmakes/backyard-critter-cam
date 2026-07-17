@@ -271,9 +271,17 @@ has grown from a single live feed into **six tabs**:
   individual (a live solo confirm that feeds the [re-ID](#individual-re-identification-phase-3)
   templates), two or more record who came *together* (co-presence, without mislabelling both
   animals as one). A short *recently logged* list shows your notes landing.
-- **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day): a back-to-back
-  highlight reel of clips, the "plate of the night" hero shot, novelty & quiet flags ("first
-  raccoon in 9 days"), moon phase, and a full species roll with per-hour activity clocks.
+- **The Dispatch** — the landing page: a newspaper-style **period digest** (☾ Night / ☀ Day,
+  with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
+  reel** — the period's best moments auto-cut into one short stitched video (~1 minute for a
+  busy night, built by `reel.py` from motion tracks + shot quality, one beat per species /
+  named individual / activity burst; chapters in the player jump between moments, and there's
+  a ⤓ save link for sharing). Below it, **The Visits** — the period's comings and goings in
+  order (time, species, any named individuals, dwell, motion one-liner, ▶ its clips) — then
+  the cast roll call (recent faces as cards, the long-gone in one quiet line), novelty & quiet
+  flags ("first raccoon in 9 days"), moon phase, the "plate of the night" hero shot, and the
+  full species roll with per-hour activity clocks. The full every-clip playlist is still one
+  click away ("watch every clip").
 - **Behaviour** — per-species field notes (visits/day, median dwell, typical arrival window,
   hourly chart), **off-pattern** alerts, and **seen-together** co-occurrence pairs.
 - **Individuals** — the "name the cast" workspace (see

@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime, time, timedelta
 import math
+import time as _time
 
 import db
 
@@ -25,6 +26,15 @@ REEL_LIMIT = 24            # max clips in a dispatch "highlight reel" (busiest k
 _parse = db.parse_local
 
 
+def _ind_of(r):
+    """A row's phase-3 individual_id, or None -- tolerant of callers whose SELECT doesn't
+    include the column (sqlite3.Row raises IndexError for a missing key, dicts KeyError)."""
+    try:
+        return r["individual_id"]
+    except (IndexError, KeyError):
+        return None
+
+
 def compute_visits(rows, gap_minutes: float, rep_key=None):
     """Collapse time-ordered detection rows into visit events, per source.
 
@@ -32,7 +42,10 @@ def compute_visits(rows, gap_minutes: float, rep_key=None):
     highest-scoring crop wins. Defaults to detector confidence (the most readable crop). visits_page
     passes a portrait-aware score (confidence x how much of the frame the animal fills) so a visit's
     thumbnail leans toward a close, usable shot -- the nearest thing to "a photo of its face"
-    without a face detector -- rather than whichever frame merely scored highest."""
+    without a face detector -- rather than whichever frame merely scored highest.
+
+    Each visit also tallies `individuals` (Counter of the rows' phase-3 individual_ids) when the
+    caller's SELECT carries that column -- how "the 1am visit was Stan" reaches the dashboard."""
     rep_key = rep_key or (lambda r: r["confidence"] or 0.0)
     gap = timedelta(minutes=gap_minutes)
     by_source = defaultdict(list)
@@ -50,7 +63,8 @@ def compute_visits(rows, gap_minutes: float, rep_key=None):
                 if cur is not None:
                     visits.append(cur)
                 cur = {"source": source, "start": dt, "end": dt, "count": 0, "max_conf": 0.0,
-                       "rep_score": None, "classes": Counter(), "rep_crop": None}
+                       "rep_score": None, "classes": Counter(), "rep_crop": None,
+                       "individuals": Counter()}
             conf = r["confidence"] or 0.0
             score = rep_key(r)
             cur["end"] = dt
@@ -60,9 +74,24 @@ def compute_visits(rows, gap_minutes: float, rep_key=None):
                 cur["rep_score"] = score
             cur["max_conf"] = max(cur["max_conf"], conf)
             cur["classes"][r["species"] or r["detection_class"]] += 1
+            iid = _ind_of(r)
+            if iid:
+                cur["individuals"][iid] += 1
         if cur is not None:
             visits.append(cur)
     return visits
+
+
+def _named_of(visit, min_crops=2):
+    """A visit's NAMED individuals (placeholder clusters like raccoon_c07 excluded), most-seen
+    first. >= min_crops so a single stray stamp doesn't headline a visit with the wrong name."""
+    named = []
+    for iid, n in (visit.get("individuals") or Counter()).most_common():
+        if "_c" in iid and iid.rsplit("_c", 1)[-1].isdigit():
+            continue
+        if n >= min_crops or visit.get("count", 0) <= 2:
+            named.append(iid)
+    return named
 
 
 def _shot_score(r) -> float:
@@ -633,21 +662,47 @@ def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limi
         conn.close()
 
 
-def visits_page(cfg, day=None, limit=300) -> dict:
-    """All visit events (newest first), each with a representative crop, for the explorer.
-    Optionally restricted to a single day ('YYYY-MM-DD')."""
+_VISITS_SCAN_ROWS = 15000   # newest detections scanned for the no-filter visits page (see below)
+
+
+def visits_page(cfg, day=None, limit=200) -> dict:
+    """Visit events (newest first), each with a representative crop + any named individuals, for
+    the explorer. Optionally restricted to a single day ('YYYY-MM-DD').
+
+    Perf: without a day filter this used to SELECT the ENTIRE detections table and cluster it in
+    Python on every request (~5s / half an MB at 80k rows, on the page people open daily). Nobody
+    scrolls hundreds of cards, so instead scan only the newest _VISITS_SCAN_ROWS detections --
+    enough for a few hundred visits -- and say so via `window: true` (`total` is then "the visits
+    in this window", not all-time). A day filter still scans exactly that day."""
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return {"visits": [], "total": 0}
     try:
-        clause, args = ("WHERE timestamp LIKE ?", [str(day) + "%"]) if day else ("", [])
-        rows = conn.execute(
-            f"SELECT id, source, timestamp, detection_class, species, confidence, species_confidence, "
-            f"crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
-            f"FROM detections {clause} ORDER BY timestamp", args).fetchall()
+        cols = ("id, source, timestamp, detection_class, species, confidence, species_confidence, "
+                "crop_path, crop_quality, individual_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, "
+                "frame_w, frame_h")
+        windowed = False
+        if day:
+            rows = conn.execute(
+                f"SELECT {cols} FROM detections WHERE timestamp LIKE ? ORDER BY timestamp",
+                [str(day) + "%"]).fetchall()
+        else:
+            rows = conn.execute(   # newest first via the timestamp index, then back to time order
+                f"SELECT {cols} FROM detections ORDER BY timestamp DESC LIMIT ?",
+                [_VISITS_SCAN_ROWS]).fetchall()
+            windowed = len(rows) >= _VISITS_SCAN_ROWS
+            rows = rows[::-1]
         clips = load_clips(conn)
 
         visits = compute_visits(rows, cfg.visit_gap_minutes, rep_key=_shot_score)
+        if windowed and visits:
+            # The window may open mid-visit, leaving each source's OLDEST visit a fragment
+            # (wrong start/count). Drop those rather than show a truncated visit as real.
+            oldest = {}
+            for v in visits:
+                if v["source"] not in oldest or v["start"] < oldest[v["source"]]["start"]:
+                    oldest[v["source"]] = v
+            visits = [v for v in visits if oldest[v["source"]] is not v]
         visits.sort(key=lambda v: v["start"], reverse=True)
         out = []
         for v in visits[:limit]:
@@ -657,12 +712,13 @@ def visits_page(cfg, day=None, limit=300) -> dict:
                 "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
                 "max_conf": round(v["max_conf"], 3), "title": title,
                 "classes": dict(v["classes"].most_common()),
+                "individuals": _named_of(v),
                 "rep_crop": ((v.get("rep_crop") or "").replace("\\", "/") or None),
                 # The clips that rolled during this visit (busiest first) -> click the card, watch the
                 # video. Empty for visits before clip recording was on (e.g. daytime pre-06-09).
                 "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
             })
-        return {"visits": out, "total": len(visits)}
+        return {"visits": out, "total": len(visits), "window": windowed}
     finally:
         conn.close()
 
@@ -834,24 +890,69 @@ def _title_for(label, anchor, today) -> str:
     return anchor.strftime("%a, %b ") + str(anchor.day)
 
 
-def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_days=3) -> dict:
-    """Summarize the most-recently-completed period. `edition`: 'auto' (whichever ended most
-    recently -> night in the morning, day in the evening), or force 'day'/'night'.
+def resolve_period(cfg, edition="auto", now=None, date=None):
+    """The completed sun-period a digest/reel request refers to: (start, end, label, anchor)
+    or None. `date`='YYYY-MM-DD' pins the anchor day (the Dispatch's back-in-time nav);
+    without it, the most recently completed period (of `edition`, or either for 'auto')."""
+    now = now or _local_now()
+    completed = _iter_completed(cfg, now)
+    if date:
+        try:
+            want = datetime.fromisoformat(str(date)).date()
+        except ValueError:
+            return None
+        return next((c for c in completed
+                     if c[3] == want and (edition == "auto" or c[2] == edition)), None)
+    return next((c for c in completed if edition == "auto" or c[2] == edition), None)
 
-    Returns a JSON-able dict: edition, title, start/end, totals, a per-species roll (visits,
-    rep crop, first/last, novelty, streak, typical hours + 24-bucket histogram), headline
-    `novel` species, `quiet` regulars that didn't show, `plate` of the period, first/last
-    visitor, busiest hour, and `moon` (night editions). `empty:true` when nobody showed."""
+
+# The digest re-reads the whole detections table per call; a completed period barely changes
+# (only label corrections touch it), so a short-lived cache makes tab flips and the Dispatch's
+# day-to-day nav instant. Keyed by (edition, date); skipped entirely when a caller pins `now`
+# (tests need determinism). POST label/name actions clear it via clear_digest_cache().
+_DIGEST_CACHE: dict = {}
+_DIGEST_TTL_S = 90
+
+
+def clear_digest_cache() -> None:
+    _DIGEST_CACHE.clear()
+
+
+def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4, novelty_days=3) -> dict:
+    """Summarize one completed period. `edition`: 'auto' (whichever ended most recently ->
+    night in the morning, day in the evening), or force 'day'/'night'; `date` pins the anchor
+    day for back-in-time navigation.
+
+    Returns a JSON-able dict: edition, title, start/end, prev/next nav anchors, totals, a
+    chronological `visit_log` (the who-came-and-when timeline: species mix, named individuals,
+    clips, motion), a per-species roll (visits, rep crop, first/last, novelty, streak, typical
+    hours + 24-bucket histogram), headline `novel` species, `quiet` regulars that didn't show,
+    `plate` of the period, busiest hour, and `moon` (night editions). `empty:true` when nobody
+    showed."""
+    cache_key = (str(edition), str(date) if date else None, regular_frac, novelty_days)
+    cacheable = now is None
+    if cacheable:
+        hit = _DIGEST_CACHE.get(cache_key)
+        if hit and hit[0] > _time.time():
+            return hit[1]
+
+    def done(payload):
+        if cacheable:
+            if len(_DIGEST_CACHE) >= 48:                  # bound it over a long-lived server
+                _DIGEST_CACHE.pop(next(iter(_DIGEST_CACHE)), None)
+            _DIGEST_CACHE[cache_key] = (_time.time() + _DIGEST_TTL_S, payload)
+        return payload
+
     now = now or _local_now()
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
         return {"empty": True, "edition": edition, "reason": "no database yet"}
     raw = conn.execute(
         "SELECT id, timestamp, source, detection_class, species, confidence, species_confidence, "
-        "crop_path, crop_quality, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
+        "crop_path, crop_quality, individual_id, "
+        "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
         "FROM detections ORDER BY timestamp").fetchall()
     clips = load_clips(conn)
-    conn.close()
 
     rows = []
     for r in raw:
@@ -863,7 +964,7 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
             "detection_class": r["detection_class"], "species": r["species"],
             "confidence": r["confidence"] or 0.0, "species_confidence": r["species_confidence"],
             "crop_path": r["crop_path"], "label": r["species"] or r["detection_class"],
-            "crop_quality": r["crop_quality"],
+            "crop_quality": r["crop_quality"], "individual_id": r["individual_id"],
             "bbox_x1": r["bbox_x1"], "bbox_y1": r["bbox_y1"], "bbox_x2": r["bbox_x2"],
             "bbox_y2": r["bbox_y2"], "frame_w": r["frame_w"], "frame_h": r["frame_h"],
         })
@@ -875,16 +976,18 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
         return [r for r in rows if s <= r["dt"] < e]
 
     completed = _iter_completed(cfg, now)
-    chosen = next((c for c in completed if edition == "auto" or c[2] == edition), None)
+    chosen = resolve_period(cfg, edition, now, date)
     if chosen is None:
-        return {"empty": True, "edition": edition, "reason": "no completed period yet"}
+        conn.close()
+        reason = "no completed period yet" if not date else f"no {edition} period on {date}"
+        return done({"empty": True, "edition": edition, "reason": reason})
 
     start, end, label, anchor = chosen
     pr = in_window(start, end)
     backed_off = False
-    # Nothing in the most recent period and the caller didn't force an edition? Fall back to
-    # the most recent period (either type) that has detections, so the page is never blank.
-    if not pr and edition == "auto":
+    # Nothing in the most recent period and the caller didn't force an edition or a date? Fall
+    # back to the most recent period (either type) that has detections, so the page is never blank.
+    if not pr and edition == "auto" and not date:
         for c in completed:
             cand = in_window(c[0], c[1])
             if cand:
@@ -892,24 +995,85 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
                 backed_off = True
                 break
 
+    # Back-in-time nav: the anchors one day either side of this one, bounded by the first day
+    # of data and by "is that period completed yet". The dashboard's ‹ › walk on these.
+    first_day = rows[0]["dt"].date() if rows else None
+    prev_anchor = anchor - timedelta(days=1)
+    next_anchor = anchor + timedelta(days=1)
+    prev_date = prev_anchor.isoformat() if (first_day and prev_anchor >= first_day) else None
+    next_date = (next_anchor.isoformat()
+                 if any(c[3] == next_anchor and c[2] == label for c in completed) else None)
+
     today = now.date()
     out = {
         "edition": label, "title": _title_for(label, anchor, today),
         "start": start.isoformat(), "end": end.isoformat(), "backed_off": backed_off,
+        "anchor": anchor.isoformat(), "prev_date": prev_date, "next_date": next_date,
+        "latest": not date,
         "moon": _moon(anchor - timedelta(days=1)) if label == "night" else None,
     }
     if not pr:
+        conn.close()
         out.update({"empty": True, "visits": 0, "crops": 0, "species": [],
-                    "novel": [], "quiet": []})
-        return out
+                    "novel": [], "quiet": [], "visit_log": []})
+        return done(out)
+
+    # Clip-motion tracks over the window, for the visit log's one-line motion strips. Fetched
+    # while the read-only conn is still open; bucketed per visit further down.
+    try:
+        period_tracks = conn.execute(
+            "SELECT c.source src, c.started_at sa, t.moving_frac mf, t.straightness st, "
+            "t.area_trend tr FROM clip_tracks t JOIN clips c ON c.id = t.clip_id "
+            "WHERE c.started_at >= ? AND c.started_at <= ?",
+            ((start - timedelta(minutes=5)).isoformat(), end.isoformat())).fetchall()
+    except Exception:
+        period_tracks = []                       # an older DB without clip_tracks
+    conn.close()
 
     # --- visits over the period, attributed to every species they contain ---
-    visits = compute_visits(pr, cfg.visit_gap_minutes)
+    visits = compute_visits(pr, cfg.visit_gap_minutes, rep_key=_shot_score)
     visits.sort(key=lambda v: v["start"])
     per_sp_visits = Counter()
     for v in visits:
         for sp in v["classes"]:
             per_sp_visits[sp] += 1
+
+    # --- the visit log: the period's visits in order -- the "who came, and when" timeline the
+    # Dispatch leads with. Each entry carries its species mix, any NAMED individuals (from the
+    # crops' phase-3 ids; placeholder clusters excluded), its clips, and a motion one-liner
+    # aggregated from the clip-tracks that rolled during it. ---
+    tracks_parsed = []
+    for t in period_tracks:
+        sdt = _parse(t["sa"])
+        if sdt is not None:
+            tracks_parsed.append((t["src"], sdt, t["mf"], t["st"], t["tr"]))
+
+    visit_log = []
+    for v in visits:
+        individuals = _named_of(v)
+        vtracks = [t for t in tracks_parsed
+                   if t[0] == v["source"] and v["start"] - timedelta(minutes=5) <= t[1] <= v["end"]]
+        motion = None
+        if vtracks:
+            mf = [t[2] for t in vtracks if t[2] is not None]
+            st = [t[3] for t in vtracks if t[3] is not None]
+            tr = [t[4] for t in vtracks if t[4] is not None]
+            motion = {
+                "tracks": len(vtracks),
+                "approach": _approach_label(sum(tr) / len(tr) if tr else None),
+                "straightness": round(sum(st) / len(st), 2) if st else None,
+                "moving_frac": round(sum(mf) / len(mf), 2) if mf else None,
+            }
+        visit_log.append({
+            "start": v["start"].isoformat(), "end": v["end"].isoformat(),
+            "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
+            "count": v["count"], "source": v["source"],
+            "species": [sp for sp, _n in v["classes"].most_common()],
+            "individuals": individuals,
+            "rep_crop": _web(v.get("rep_crop")),
+            "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
+            "motion": motion,
+        })
 
     # --- all-time per-species history (for novelty + activity clock) ---
     sp_all = defaultdict(list)
@@ -1011,7 +1175,7 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
 
     out.update({
         "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
-        "novel": novel, "quiet": quiet[:4], "reel": reel,
+        "novel": novel, "quiet": quiet[:4], "reel": reel, "visit_log": visit_log,
         "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
                   "conf": round(plate["species_confidence"] or plate["confidence"] or 0.0, 3),
                   "time": plate["dt"].isoformat(),
@@ -1020,4 +1184,4 @@ def period_digest(cfg, edition="auto", now=None, *, regular_frac=0.4, novelty_da
         "last_visitor": {"species": pr[-1]["label"], "time": pr[-1]["dt"].isoformat()},
         "busiest_hour": ({"hour": bh[0], "visits": bh[1]} if bh else None),
     })
-    return out
+    return done(out)
