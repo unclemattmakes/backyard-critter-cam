@@ -25,19 +25,33 @@ Same detector, same crop convention, same DB. The only real differences from the
 
 IDEMPOTENCY (re-runs must not double-import). Three layers, all boring on purpose:
   * ledger: a plain-text sidecar next to the DB (backyard.db.imported-<source>.txt) records every
-    basename imported for this `source`, one per line, appended as files land. At startup we read
-    it back into a skip-set, so a plain re-run over the same folder is a no-op -- even for images
-    that produced NO crop (a frame with no animal still gets logged, so it isn't re-detected).
-    This is the primary, always-on default; it survives whether or not a crop was saved.
-  * crop_paths: the original filename is also encoded into every crop's name, so the skip-set is
-    rebuilt from the DB's crop_paths too -- a belt-and-braces recovery if the ledger is deleted
-    (crops that exist won't be re-imported).
+    file imported for this `source`, one 'basename|capture-second' key per line (e.g.
+    'IMAG0001.JPG|2026-07-13T06-42-11'), appended as files land. At startup we read it back into
+    a skip-set, so a plain re-run over the same folder is a no-op -- even for images that produced
+    NO crop (a frame with no animal still gets logged, so it isn't re-detected). This is the
+    primary, always-on default; it survives whether or not a crop was saved.
+  * crop_paths: every crop's name leads with the capture stamp and embeds 'src-<orig-stem>', so
+    the same stem|capture-second skip keys are rebuilt from the DB's crop_paths too -- a belt-
+    and-braces recovery if the ledger is deleted (crops that exist won't be re-imported).
   * --processed-dir: after a file imports cleanly, MOVE it there, so a re-run never even sees it.
     The recommended way to run an ongoing drop folder (and what --watch leans on to drain it).
 
-  (Idempotency keys on the BASENAME, scoped to `source`. Two different folders holding a same-
-  named file is the one case the ledger/crop-path layers can't tell apart -- use --processed-dir,
-  or unique filenames, if that matters to you.)
+  (Idempotency keys on BASENAME + CAPTURE SECOND, scoped to `source` -- NOT the basename alone.
+  TC02-family cams restart numbering at IMAG0001.JPG after every in-camera card format, so a
+  later cycle's dump reuses an earlier cycle's filenames -- keyed on the name alone, the ledger
+  silently skipped those real new files (hit for real 2026-07-19: 235 of 558 would have been
+  dropped). The capture second comes from image_timestamp() -- EXIF DateTimeOriginal, which trail
+  cams stamp reliably and which survives copies and re-mounts -- so the SAME photo is recognised
+  wherever it's rescanned from, while a recycled NAME from a new cycle imports cleanly. Blind
+  spot: an EXIF-less file keys on its mtime, so re-copying such a file can re-import it;
+  --processed-dir sidesteps even that.
+
+  Ledger lines written before this fix hold the bare basename. A bare name cannot tell "same
+  file re-scanned" from "new cycle reused the name", and guessing 'skip' is exactly how real
+  photos got lost -- so legacy lines no longer skip anything by themselves. Files they recorded
+  stay covered by the crop_paths recovery (the capture stamp was always in the crop name); a
+  pre-fix file that saved no crop just costs one extra no-op detector pass if its dump is ever
+  re-scanned, and its ledger line is re-appended in the new format as it goes.)
 
 Robust by design (PLAN.md "boring and robust"): an unreadable/corrupt image is warned about and
 skipped; one bad file never aborts the batch.
@@ -89,9 +103,23 @@ def _within_pixel_budget(path: Path) -> bool:
         return True
 
 # A short marker baked into each crop's filename component so the original SD-card filename is
-# recoverable from crop_path -- that's what powers the default duplicate skip-set (see module
-# docstring). Kept filesystem-safe and unlikely to collide with a real stem.
+# recoverable from crop_path; together with the capture stamp that leads the crop name, that's
+# what powers the DB-recovery skip-set (see module docstring). Kept filesystem-safe and unlikely
+# to collide with a real stem.
 SRC_TAG = "src-"
+
+# Skip keys pair the file's NAME with its CAPTURE SECOND ('IMAG0001.JPG|2026-07-13T06-42-11').
+# The name alone is not unique across card-format cycles (a TC02 restarts at IMAG0001.JPG), and
+# the second alone is not unique within a burst -- together they are, for any sane camera.
+KEY_TS_FMT = "%Y-%m-%dT%H-%M-%S"   # capture second, colon-free; the crop stamp is this + '-<ms>'
+LEDGER_KEY_SEP = "|"               # illegal in Windows filenames, so it never collides with a name
+
+
+def skip_key(name: str, ts: str) -> str:
+    """The idempotency key for one source image: filename (or stem) + its KEY_TS_FMT capture
+    second. The ledger stores name-keyed lines; imported_keys() rebuilds stem-keyed ones (crop
+    names drop the extension) -- import_folder checks both spellings against the skip-set."""
+    return f"{name}{LEDGER_KEY_SEP}{ts}"
 
 
 def list_images(folder: Path, recursive: bool) -> list[Path]:
@@ -131,10 +159,14 @@ def image_timestamp(path: Path) -> datetime:
     return dt.astimezone()
 
 
-def imported_basenames(conn, source: str) -> set[str]:
-    """Original SD-card filenames already imported for `source`, recovered from the crop_paths in
-    the DB (each crop name embeds 'src-<stem>'). This is the default skip-set that makes a plain
-    re-run idempotent without --processed-dir. Empty set on a fresh DB."""
+def imported_keys(conn, source: str) -> set[str]:
+    """Skip keys ('<orig-stem>|<capture-second>') for everything already imported for `source`,
+    recovered from the crop_paths in the DB -- each crop name leads with the capture stamp and
+    embeds 'src-<stem>'. The belt-and-braces fallback that keeps re-runs idempotent if the ledger
+    sidecar is deleted, and what still covers files imported back when ledger lines were bare
+    basenames (the stamp was always in the crop name, even then). Only full stamp+name PAIRS are
+    recovered -- a row whose stamp doesn't parse contributes nothing, because a bare name must
+    never skip a file (see module docstring). Empty set on a fresh DB."""
     out: set[str] = set()
     for (cp,) in conn.execute(
         "SELECT crop_path FROM detections WHERE source = ?", (source,)
@@ -143,13 +175,23 @@ def imported_basenames(conn, source: str) -> set[str]:
             continue
         stem = Path(cp).name
         i = stem.find(SRC_TAG)
-        if i != -1:
-            rest = stem[i + len(SRC_TAG):]
-            # crop name = 'src-<orig-stem>_<idx>_<class>_<conf>.jpg'. save_crop appends exactly THREE
-            # underscore-fields (idx, class, conf), so strip those from the RIGHT to recover the full
-            # original stem -- a left split mangles any source name that itself contains an underscore
-            # (e.g. IMG_0042 -> 'IMG'), which then never matches the file again on a DB-recovery re-run.
-            out.add(rest.rsplit("_", 3)[0])
+        if i == -1:
+            continue
+        rest = stem[i + len(SRC_TAG):]
+        # crop name = '<capture-stamp>_src-<orig-stem>_<idx>_<class>_<conf>.jpg'. save_crop appends
+        # exactly THREE underscore-fields (idx, class, conf), so strip those from the RIGHT to
+        # recover the full original stem -- a left split mangles any source name that itself
+        # contains an underscore (e.g. IMG_0042 -> 'IMG'), which then never matches the file again
+        # on a DB-recovery re-run.
+        orig_stem = rest.rsplit("_", 3)[0]
+        # The stamp before '_src-' is KEY_TS_FMT plus a '-<ms>' field (see ingest_file). Drop the
+        # milliseconds to get key granularity, and validate: garbage in, no key out.
+        ts = stem[:i].rstrip("_").rsplit("-", 1)[0]
+        try:
+            datetime.strptime(ts, KEY_TS_FMT)
+        except ValueError:
+            continue
+        out.add(skip_key(orig_stem, ts))
     return out
 
 
@@ -161,25 +203,31 @@ def ledger_path(db_path: Path, source: str) -> Path:
 
 
 def read_ledger(db_path: Path, source: str) -> set[str]:
-    """Basenames already imported for `source`, per the sidecar ledger. The always-on default
-    skip-set; survives even for frames that produced no crop. Empty set if the ledger is absent."""
+    """Skip keys ('<basename>|<capture-second>') already recorded for `source`, per the sidecar
+    ledger. The always-on default skip-set; survives even for frames that produced no crop. Empty
+    set if the ledger is absent. Pre-fix lines holding a bare basename (no '|') are read but
+    IGNORED: a name alone can't tell a re-scan from a new cycle reusing the name, and skipping on
+    it loses real photos -- files those lines recorded stay covered by imported_keys() (see module
+    docstring)."""
     p = ledger_path(db_path, source)
     if not p.exists():
         return set()
     try:
-        return {ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()}
+        lines = p.read_text(encoding="utf-8").splitlines()
     except Exception:
         return set()
+    return {ln.strip() for ln in lines if LEDGER_KEY_SEP in ln}
 
 
-def append_ledger(db_path: Path, source: str, basename: str) -> None:
-    """Record one imported basename in the sidecar ledger (append + flush, so a crash mid-batch
-    still leaves earlier files marked). Best-effort: a write failure never fails the import."""
+def append_ledger(db_path: Path, source: str, key: str) -> None:
+    """Record one imported file's skip key in the sidecar ledger (append + flush, so a crash
+    mid-batch still leaves earlier files marked). Best-effort: a write failure never fails the
+    import."""
     try:
         with open(ledger_path(db_path, source), "a", encoding="utf-8") as f:
-            f.write(basename + "\n")
+            f.write(key + "\n")
     except Exception as e:
-        print(f"  [warn] could not update import ledger for {basename}: {e}")
+        print(f"  [warn] could not update import ledger for {key}: {e}")
 
 
 def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
@@ -215,7 +263,9 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
     day = dt.strftime("%Y-%m-%d")
     # Filename stamp matches the live rig (timestamp_index_class_conf), with the source image's
     # stem spliced in as 'src-<stem>' so the import is traceable AND the default skip-set works.
-    base_stamp = dt.strftime("%Y-%m-%dT%H-%M-%S-") + f"{dt.microsecond // 1000:03d}"
+    # It leads with the capture second in KEY_TS_FMT (plus milliseconds) precisely so
+    # imported_keys() can parse the skip key back out of the crop name -- keep them in lockstep.
+    base_stamp = dt.strftime(KEY_TS_FMT) + f"-{dt.microsecond // 1000:03d}"
     stamp = f"{base_stamp}_{SRC_TAG}{path.stem}"
     h, w = frame.shape[:2]
 
@@ -276,10 +326,10 @@ def refresh_visits(conn, cfg: config.Config) -> None:
 def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
                   source: str, recursive: bool, processed_dir: Path | None,
                   skip: set[str]) -> tuple[int, int, int]:
-    """Import every image in `folder` once. `skip` is the set of original basenames already
-    imported (default idempotency); files moved to --processed-dir won't reappear anyway. Updates
-    `skip` in place as it goes so a single pass never imports the same name twice. Returns
-    (files_imported, crops_saved, files_skipped)."""
+    """Import every image in `folder` once. `skip` is the set of skip keys (basename|capture-
+    second) already imported (default idempotency); files moved to --processed-dir won't reappear
+    anyway. Updates `skip` in place as it goes so a single pass never imports the same file twice.
+    Returns (files_imported, crops_saved, files_skipped)."""
     images = list_images(folder, recursive)
     if not images:
         print(f"No images ({'/'.join(sorted(IMAGE_EXTS))}) found in {folder}"
@@ -290,16 +340,26 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
           f"{' (recursive)' if recursive else ''}. Importing as source='{source}' ...")
     imported = saved_total = skipped = 0
     for path in images:
+        # The capture second is a cheap EXIF header read (no pixel decode) -- fine to do even for
+        # files we're about to skip. stat() can still race a --watch drainer moving the file out
+        # from under us; treat a vanished file like a corrupt one (warn-ish and move on).
+        try:
+            ts = image_timestamp(path).strftime(KEY_TS_FMT)
+        except OSError:
+            print(f"  skip (vanished mid-scan): {path.name}")
+            continue
         # The ledger keys on the full filename; the DB-recovery fallback keys on the stem (the
         # extension isn't stored in the crop name) -- accept either so both skip-sources match.
-        if path.name in skip or path.stem in skip:
+        if skip_key(path.name, ts) in skip or skip_key(path.stem, ts) in skip:
             skipped += 1
             continue
         n_reported, n_saved = ingest_file(path, detector, conn, cfg, source)
         if n_reported < 0:
             continue  # unreadable/corrupt -- already warned, leave it in place to inspect
-        skip.add(path.name)
-        append_ledger(cfg.db_path, source, path.name)  # mark imported (even if 0 crops) -> idempotent
+        skip.add(skip_key(path.name, ts))
+        # Mark imported (even if 0 crops) -> idempotent; also how a pre-fix bare line gets
+        # upgraded to the keyed format when its file is re-scanned.
+        append_ledger(cfg.db_path, source, skip_key(path.name, ts))
         imported += 1
         saved_total += n_saved
         if n_saved == 0:
@@ -410,8 +470,9 @@ def main() -> int:
 
     # Seed the duplicate skip-set from what's already been imported for this source (default
     # idempotency, independent of --processed-dir): the ledger (covers files that produced no crop)
-    # UNION the DB crop_paths (belt-and-braces if the ledger was deleted). See module docstring.
-    skip = read_ledger(cfg.db_path, args.source) | imported_basenames(conn, args.source)
+    # UNION the DB crop_paths (belt-and-braces if the ledger was deleted, and what covers files
+    # imported back when ledger lines were bare basenames). See module docstring.
+    skip = read_ledger(cfg.db_path, args.source) | imported_keys(conn, args.source)
     if skip:
         print(f"  {len(skip)} file(s) already imported for source='{args.source}' -- will skip them.")
 
