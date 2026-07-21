@@ -315,7 +315,9 @@ glass-door shot without restarting (a live companion to `tune.py`).
 - **Species names appear on their own:** the rig starts the naming **helper** (`classify.py
   --watch`) as a child process and stops it with the app, so the recent-visitor card fills in a
   species by itself — nothing extra to launch or close. The helper takes a minute to warm up its
-  model; the header shows **"Identifier: warming up… / on"** so you can tell it's working.
+  model; the header shows **"Identifier: warming up… / on"** so you can tell it's working. (If a
+  previous run was killed hard and left its helper behind, the next launch sweeps it up — see
+  [Troubleshooting](#troubleshooting).)
 - **Clips just play.** Clips recorded in legacy `mp4v` aren't browser-playable, so the server
   transcodes them to H.264 **on demand** into a `clips_web/` cache (with range-request seeking);
   H.264 clips are served as-is and the originals are never touched, so `clipmotion.py` still
@@ -784,4 +786,12 @@ The rig runs MegaDetector v6 through [Ultralytics](https://github.com/ultralytic
   It's Windows-only and a clean no-op elsewhere; a failure to set the request is now **logged
   loudly** at startup (`power: WARNING …`) rather than failing silently. If the machine still
   sleeps, check that no power policy is force-sleeping it and read that startup log line.
-```
+- **Killed it with Task Manager / `taskkill /F` (or it crashed)?** The species-naming helper is
+  its own process and never exits by itself, so a hard-killed rig used to leave it running
+  invisibly — and the **next** launch then ran *two* BioCLIP workers fighting over CPU and the
+  SQLite write lock. The rig now **sweeps for orphaned helpers at startup**: each helper's
+  command-line tag names the rig that spawned it, and one is reaped only when that rig is
+  *provably* gone. Two rigs sharing the DB are safe (a live rig's helper is never touched — when
+  in doubt, nothing is killed), and both process rows of a helper (the venv launcher + the real
+  interpreter) go together. You'll see `naming: reaping N stale helper process(es)…` in the
+  console/log when it fires. Windows-only, best-effort, well under a second at startup.

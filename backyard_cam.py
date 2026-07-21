@@ -17,6 +17,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -732,18 +733,99 @@ def compose_grid(frames: list):
 
 
 # ---- Naming subprocess ------------------------------------------------------------
+_NAMING_TAG_PREFIX = "backyard-naming-"     # helper --tag = this prefix + the spawning rig's pid
+_NAMING_TAG_RE = re.compile(re.escape(_NAMING_TAG_PREFIX) + r"(\d+)")
+_RIG_CMDLINE_MARKER = "backyard_cam"        # present however a rig is launched (script or -m)
+
+
+def _parse_process_rows(text: str) -> list[tuple[int, str]]:
+    """Parse 'pid<TAB>command line' lines into (pid, cmdline) pairs. Only the FIRST tab splits
+    (a command line may itself contain tabs); lines without a leading pid are dropped."""
+    rows = []
+    for line in text.splitlines():
+        pid_s, _, cmdline = line.partition("\t")
+        try:
+            rows.append((int(pid_s.strip()), cmdline.strip()))
+        except ValueError:
+            continue
+    return rows
+
+
+def _python_process_rows(timeout: float = 15) -> list[tuple[int, str]]:
+    """(pid, command line) of every live python* process, in one CIM query. Windows-only,
+    best-effort: any failure -- including a non-zero exit, whose output could be a TRUNCATED
+    table that makes a live rig look dead -- returns [] so callers do nothing at all."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
+          'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }')
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0:
+            return []
+        return _parse_process_rows(out.stdout)
+    except Exception:
+        return []
+
+
 def _naming_pids(tag: str) -> list:
     """PIDs of python processes whose command line carries our unique --tag (the live-naming
     helper and any interpreter the venv launcher re-spawned for it). Windows-only, best-effort."""
-    ps = ("Get-CimInstance Win32_Process | "
-          f"Where-Object {{ $_.Name -like 'python*' -and $_.CommandLine -like '*{tag}*' }} | "
-          "Select-Object -ExpandProperty ProcessId")
+    return [str(pid) for pid, cmd in _python_process_rows() if tag in cmd]
+
+
+def _stale_naming_pids(rows: list[tuple[int, str]], my_pid: int) -> list[int]:
+    """Which of these python processes are naming helpers whose rig is PROVABLY gone.
+
+    A helper's --tag carries the pid of the rig that spawned it. Two rigs legitimately run
+    side by side into the same DB, and Windows reuses pids, so the bar for killing is proof
+    of death, not absence of proof of life:
+      * tag pid == my_pid: stale. We sweep BEFORE spawning our own helper, so a helper
+        already wearing our pid belongs to a dead rig whose pid we happened to inherit.
+      * tag pid is not a live python process: stale (rig exited, or its pid was reused by
+        something that isn't python).
+      * tag pid is a live python whose readable command line is some OTHER script: stale
+        (pid reused by e.g. a clipmotion batch).
+      * anything else -- a live rig, or a python whose command line we can't read: KEPT.
+        A lingering stale helper wastes CPU; killing a live rig's helper stops its naming.
+    Both rows of a helper (venv shim + real interpreter) carry the tag, so both come back."""
+    cmd_by_pid = dict(rows)
+    stale = []
+    for pid, cmd in rows:
+        if "classify.py" not in cmd:
+            continue                        # not a naming helper (a rig, a batch job, a REPL...)
+        m = _NAMING_TAG_RE.search(cmd)
+        if m is None:
+            continue
+        rig_pid = int(m.group(1))
+        rig_cmd = cmd_by_pid.get(rig_pid)
+        if (rig_pid == my_pid
+                or rig_cmd is None
+                or (rig_cmd and _RIG_CMDLINE_MARKER not in rig_cmd)):
+            stale.append(pid)
+    return stale
+
+
+def _sweep_stale_naming() -> None:
+    """Reap naming helpers orphaned by a previous rig that died WITHOUT running its finally
+    block (taskkill /F, a crash, the OOM/standby deaths). classify.py never exits on its own,
+    so a leftover helper plus this run's fresh one means two BioCLIP workers fighting over CPU
+    and the SQLite write lock (the documented 'database is locked' capture failure). Windows-
+    only, best-effort and silent on failure; the query timeout is tight so a slow WMI never
+    holds up startup. MUST run before this rig spawns its own helper (see _stale_naming_pids)."""
+    if sys.platform != "win32":
+        return
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=15)
-        return [p.strip() for p in out.stdout.splitlines() if p.strip()]
+        me = os.getpid()
+        stale = [p for p in _stale_naming_pids(_python_process_rows(timeout=2), me)
+                 if p != me and p > 4]      # paranoia: never self/system pids
+        if not stale:
+            return
+        print(f"  naming: reaping {len(stale)} stale helper process(es) left by a dead rig "
+              f"(pids {', '.join(map(str, stale))}).")
+        subprocess.run(["taskkill", "/F"] + [a for p in stale for a in ("/PID", str(p))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except Exception:
-        return []
+        pass
 
 
 def _stop_naming(proc, tag: str | None = None) -> None:
@@ -1054,7 +1136,10 @@ def run(cfg: config.Config) -> None:
     frame_buffers: dict = {}
     control_bridges: dict = {}
     classify_proc = None
-    classify_tag = f"backyard-naming-{os.getpid()}"   # unique marker for a clean, total shutdown
+    classify_tag = f"{_NAMING_TAG_PREFIX}{os.getpid()}"   # unique marker for a clean, total shutdown
+    # A previous rig that died without its finally (taskkill /F, crash, OOM kill) leaves its
+    # helper running forever. Reap those leftovers now, BEFORE our own helper exists.
+    _sweep_stale_naming()
     threads: list[threading.Thread] = []
     stop_event = threading.Event()
     latest_frames: dict = {}
@@ -1111,6 +1196,10 @@ def run(cfg: config.Config) -> None:
         # ONE shared species-naming child (classify.py --watch): it names any crop lacking a species
         # regardless of source, so a single helper covers every camera (one launch, one stop). Runs
         # as a child PROCESS because BioCLIP must be built on a process's main thread (a thread deadlocks).
+        # NOTE the process list shows TWO python rows with this helper's command line: the venv's
+        # python.exe is a redirector that launches the real interpreter as its child, so every spawn
+        # is a 0-CPU shim + one worker (the rig itself appears doubled the same way). That's one
+        # helper, not two -- _naming_pids, _stop_naming and the startup sweep all reap both rows.
         if cfg.classify_live:
             try:
                 classify_proc = subprocess.Popen(
