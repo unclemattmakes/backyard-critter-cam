@@ -330,6 +330,22 @@ class Config:
     # ~0.10-0.18 for different individuals -- both separate cleanly at 0.40). Distinct from the
     # still-still novelty cut (reid_novel_threshold 0.55).
     reid_clip_match_threshold: float = 0.40
+    # AUTO-ASSIGN (the "review by exception" tier): the nightly batch (run_clipmotion.bat ->
+    # individuals.py --auto-assign) names a solo visit AUTOMATICALLY when its best match clears
+    # BOTH bars: nearest-confirmed-visit similarity >= reid_auto_threshold AND lead over the
+    # runner-up individual >= reid_auto_margin. Auto names are stamped individual_source='auto':
+    # they show on tracking surfaces (rollcall, per-individual pages) but NEVER feed the
+    # suggestion templates and never ground behaviour links (clipmotion --link is human-only) --
+    # a wrong auto name can't teach the matcher or contaminate ground truth. The dashboard queue
+    # shows each as "auto: <name>" with one-tap promote (-> human) / reject (-> never re-named).
+    # 0.0 DISABLES the pass. Don't guess values: run `python eval.py --reid` -- its auto-assign
+    # sweep recommends the max-coverage operating point with ZERO wrong names and ZERO novel-
+    # animal false-accepts on your own confirmed corpus (re-run it as the cast grows).
+    # Current values = the sweep on 2026-07-17's corpus (113 LOO probes over a 5-raccoon cast,
+    # reports/eval_20260718T030508Z.json): named 17/113 (15%) with zero errors. Deliberately
+    # conservative -- the confident head of the distribution, not the whole queue.
+    reid_auto_threshold: float = 0.76
+    reid_auto_margin: float = 0.12
 
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
     # The live rig names each new crop by species ITSELF, in a background thread, so a single

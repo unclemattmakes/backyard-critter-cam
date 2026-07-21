@@ -458,6 +458,30 @@ The same calls work from the CLI:
 .\.venv\Scripts\python.exe individuals.py --confirm 1014 Stan  # confirm one visit
 ```
 
+### Keeping it automatic (the nightly batch + auto-assign)
+
+Suggestions are only as fresh as the vectors behind them, so the nightly batch
+(`run_clipmotion.bat`) keeps the whole loop fed without you thinking about it: motion tracks for
+new clips → still embeddings (all species, down to the 0.5 suggestion gate) → clip-tracklet
+embeddings → solo-track linking → **auto-assign**. Every step is resumable, so schedule it daily
+in an activity trough (like the backup task, no admin needed):
+
+```powershell
+schtasks /Create /TN "BackyardCritterCam-MotionTracks" /SC DAILY /ST 14:00 `
+         /TR "\"$PWD\run_clipmotion.bat\"" /F
+```
+
+**Auto-assign** is the *review by exception* tier: a solo visit whose best match clears **both**
+an eval-measured similarity bar *and* a lead-over-the-runner-up margin gets named automatically,
+stamped `individual_source='auto'`. Auto names count on tracking surfaces (roll call, last-seen)
+but deliberately **never feed the suggestion templates** and never ground behaviour links — a
+wrong auto name can't teach the matcher anything. In the queue each one shows as **auto: Stan**
+with **✓ keep** (promotes it to a real, template-feeding confirmation) and **✗ not them** (clears
+it *and* pins the visit so the nightly pass won't re-name it). It ships **disabled**: run
+`python eval.py --reid` — its auto-assign sweep recommends the max-coverage bars that made **zero
+wrong calls and zero novel-animal false-accepts on your own confirmed corpus** — then set
+`reid_auto_threshold` / `reid_auto_margin` to those values and re-run the eval as the cast grows.
+
 ---
 
 ## Behaviour clips (phase 4 capture)

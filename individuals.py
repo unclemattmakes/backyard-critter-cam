@@ -31,6 +31,8 @@ first round of naming is "name these groups", not "name 1653 crops".
   python individuals.py --visit 1062         # one visit's full suggestion read-out
   python individuals.py --bootstrap          # cold-start visit-groups for first naming
   python individuals.py --confirm 1014 Stan  # CLI confirm (the dashboard is the usual way)
+  python individuals.py --auto-assign        # name the unambiguous visits (the nightly batch's
+                                             # "review by exception" pass; --dry-run to preview)
 """
 from __future__ import annotations
 
@@ -427,6 +429,8 @@ class VisitMatcher:
             self.visit_started[vid] = min(m["timestamp"] for m in members)
 
         self.confirmed = db.confirmed_visit_labels(conn, species)   # {visit_id: name}
+        self.auto = db.visit_labels_by_source(conn, "auto", species)  # nightly auto-assigned names
+        self.rejected = db.rejected_visit_ids(conn, species)  # human said "leave unnamed" -- hands off
         self._co_cache: dict = {}
         self.clip_co_presence = clip_co_presence_by_visit(conn, species)  # {visit_id: n_clips}
         # CLIP-space templates: an individual's labelled tracklets, the only way a never-solo pair
@@ -464,6 +468,7 @@ class VisitMatcher:
                "co_present_clips": self.clip_co_presence.get(visit_id, 0),
                "multi": self.is_multi(visit_id),
                "confirmed_as": self.confirmed.get(visit_id),
+               "auto_as": self.auto.get(visit_id),
                "candidates": [], "clip_candidates": [], "novel": False, "note": None}
         if visit_id not in self.protos:
             out["note"] = ("no embedded crops yet -- run: python embed.py --min-confidence 0.5"
@@ -549,7 +554,9 @@ class VisitMatcher:
         fits: dict = {}
         novel = []
         for v in self.protos:
-            if v in self.confirmed or self.is_multi(v):
+            # Auto-assigned visits are already handled (their card shows the auto chip; undo
+            # returns them here) -- listing them again as "fits" would double-surface them.
+            if v in self.confirmed or v in self.auto or self.is_multi(v):
                 continue
             ranked = rank_templates(self.protos[v], temps) if temps else []
             if ranked and ranked[0][1] >= self.cfg.reid_novel_threshold:
@@ -564,6 +571,68 @@ class VisitMatcher:
         return {"fits": fits, "novel_groups": self._cluster_visits(novel, distance),
                 "untemplated": untemplated,
                 "n_fit": sum(len(l) for l in fits.values()), "n_novel": len(novel)}
+
+    def auto_assign(self, conn, *, threshold: float = None, margin: float = None,
+                    dry_run: bool = False) -> dict:
+        """The "review by exception" tier: NAME the unambiguous solo visits automatically, so the
+        human reviews what the machine did instead of confirming everything by hand. A visit is
+        auto-named only when its best match clears BOTH bars: nearest-confirmed-visit similarity
+        >= `threshold` AND lead over the runner-up INDIVIDUAL >= `margin` (both from eval.py's
+        auto-assign sweep -- the measured zero-wrong-assignment operating point, cfg defaults).
+
+        Guardrails, each load-bearing:
+          - stamps individual_source='auto' (db.label_visit): visible on tracking surfaces, but
+            NEVER a suggestion template (confirmed_visit_labels is human-only) -- a wrong auto
+            name can't teach the matcher;
+          - solo visits only (a pair visit's blended prototype names two animals at once);
+          - skips human-confirmed, already-auto-named, and human-REJECTED visits (the reject
+            tombstone is what makes an undo stick across nightly runs);
+          - one-individual casts still need the full margin over an empty runner-up (0.0), so a
+            lone template can't vacuum up everything above the threshold.
+
+        Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped}."""
+        cfg = self.cfg
+        threshold = cfg.reid_auto_threshold if threshold is None else threshold
+        margin = cfg.reid_auto_margin if margin is None else margin
+        if not threshold or threshold <= 0:
+            return {"enabled": False, "assigned": [], "skipped": {},
+                    "note": "disabled -- set reid_auto_threshold from eval.py --reid's sweep"}
+        temps = self.templates()
+        out = {"enabled": True, "threshold": threshold, "margin": margin,
+               "assigned": [], "skipped": defaultdict(int)}
+        if not temps:
+            out["skipped"]["no_templates"] = len(self.protos)
+            out["skipped"] = dict(out["skipped"])
+            return out
+        for vid in sorted(self.protos):
+            if vid in self.confirmed:
+                out["skipped"]["confirmed"] += 1
+                continue
+            if vid in self.auto:
+                out["skipped"]["already_auto"] += 1
+                continue
+            if vid in self.rejected:
+                out["skipped"]["human_rejected"] += 1
+                continue
+            if self.is_multi(vid):
+                out["skipped"]["multi_animal"] += 1
+                continue
+            ranked = rank_templates(self.protos[vid], temps)
+            name, sim, _via = ranked[0]
+            lead = sim - (ranked[1][1] if len(ranked) > 1 else 0.0)
+            if sim < threshold:
+                out["skipped"]["below_threshold"] += 1
+                continue
+            if lead < margin:
+                out["skipped"]["ambiguous"] += 1          # near-tie between two individuals
+                continue
+            if not dry_run:
+                db.label_visit(conn, vid, name, source="auto")
+            out["assigned"].append({"visit_id": vid, "name": name,
+                                    "similarity": round(sim, 3), "margin": round(lead, 3),
+                                    "started": self.visit_started.get(vid)})
+        out["skipped"] = dict(out["skipped"])
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +672,12 @@ def main() -> int:
                    help="Cold-start: cluster unconfirmed visits into nameable groups.")
     p.add_argument("--refit", action="store_true",
                    help="Re-fit unconfirmed visits to the confirmed cast + cluster the novel residual.")
+    p.add_argument("--auto-assign", action="store_true",
+                   help="Auto-name the unambiguous solo visits (individual_source='auto'; bars from "
+                        "config reid_auto_threshold/margin, set via eval.py --reid's sweep). The "
+                        "nightly batch runs this; auto names never feed the suggestion templates.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="With --auto-assign: report what would be named, write nothing.")
     p.add_argument("--confirm", nargs=2, metavar=("VISIT_ID", "NAME"), default=None,
                    help="Confirm a visit's individual, e.g. --confirm 1014 Stan.")
     p.add_argument("--limit", type=int, default=25, help="Queue length (default 25).")
@@ -621,6 +696,25 @@ def main() -> int:
         matcher = VisitMatcher(conn, args.species)
         if args.visit is not None:
             _print_suggestion(matcher.suggest(args.visit), matcher)
+            return 0
+
+        if args.auto_assign:
+            r = matcher.auto_assign(conn, dry_run=args.dry_run)
+            if not r["enabled"]:
+                print(f"Auto-assign is DISABLED ({r['note']}).")
+                return 0
+            verb = "would name" if args.dry_run else "named"
+            print(f"Auto-assign ({args.species}, similarity >= {r['threshold']:.2f}, "
+                  f"margin >= {r['margin']:.2f}): {verb} {len(r['assigned'])} visit(s).")
+            for a in r["assigned"]:
+                print(f"  visit #{a['visit_id']:<6} {_fmt_started(a['started'])}  "
+                      f"{a['name']}  sim {a['similarity']:.2f}  lead {a['margin']:.2f}")
+            if r["skipped"]:
+                parts = ", ".join(f"{k} {v}" for k, v in sorted(r["skipped"].items()))
+                print(f"  (skipped: {parts})")
+            if not args.dry_run and r["assigned"]:
+                print("  Review them in the dashboard queue -- [keep] promotes to a confirmed "
+                      "template, [not them] clears and pins the visit against re-naming.")
             return 0
 
         if args.refit:

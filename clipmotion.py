@@ -442,8 +442,12 @@ def link_tracks_to_individuals(conn, species: str = "raccoon", *,
     that name written to the tracklet (individual_source 'overlap'). This turns the dark motion
     fingerprints into per-individual behaviour data without guessing -- pair clips (2+ sustained
     tracks) and placeholder/unnamed visits are deliberately LEFT for the manual un-blend queue,
-    and a human un-blend label is never overwritten. Idempotent + resumable. Returns a summary."""
+    and a human un-blend label is never overwritten. Only HUMAN-confirmed visit names qualify:
+    a nightly auto-assigned name (individual_source 'auto' on the visit's crops) is a prediction,
+    not ground truth, so behaviour links wait until the human promotes it. Idempotent +
+    resumable. Returns a summary."""
     rows = tracks_with_visits(conn, species)         # each track + its best-overlap visit's individual
+    human = db.confirmed_visit_labels(conn, species)  # {visit_id: name}, human-confirmed only
     by_clip = defaultdict(list)
     for r in rows:
         by_clip[r["clip_id"]].append(r)
@@ -460,6 +464,9 @@ def link_tracks_to_individuals(conn, species: str = "raccoon", *,
             continue
         if _is_placeholder(iid):
             skip["visit_placeholder"] += 1            # raccoon_c01 -- not a confirmed name
+            continue
+        if human.get(tr["visit_id"]) != iid:
+            skip["visit_not_human_confirmed"] += 1    # auto/stale name -- not behaviour ground truth
             continue
         if tr["individual_source"] == "human":
             skip["human_locked"] += 1                 # never clobber a manual un-blend

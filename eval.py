@@ -71,7 +71,7 @@ import numpy as np
 import config
 import db
 import evalmetrics as em
-from individuals import EMBED_MODEL, VisitMatcher, iou
+from individuals import EMBED_MODEL, VisitMatcher, iou, rank_templates
 
 ROOT = Path(__file__).resolve().parent
 REPORTS_DIR = ROOT / "reports"
@@ -439,6 +439,63 @@ def _identify_loo(protos: dict, labels: dict, threshold: float) -> dict:
     }
 
 
+def _auto_assign_sweep(protos: dict, labels: dict) -> dict:
+    """Sweep the (similarity threshold, runner-up margin) grid for the nightly AUTO-ASSIGN pass
+    and recommend the max-coverage operating point with ZERO mistakes on the confirmed corpus.
+
+    Mirrors production semantics exactly (individuals.VisitMatcher.auto_assign): each confirmed
+    solo visit is matched leave-one-out against every OTHER confirmed visit, nearest-VISIT per
+    individual (rank_templates, not centroids), and would be auto-named iff top similarity >=
+    threshold AND (top - runner-up individual) >= margin. Two error channels, both required to be
+    zero at the recommended point:
+      - wrong:            a known individual's visit auto-named as someone else;
+      - novel_false_accept: a probe whose TRUE individual has no other solo visit (so its identity
+        is absent from the templates -- the stand-in for a genuinely NEW animal) still passing the
+        bars. This is the "a stranger walks in and gets Stan's name" risk, measurable only this way.
+
+    CAVEAT the numbers inherit: the confirmed corpus leans toward visits a human already agreed
+    matched, so measured coverage is optimistic for the wild population; the zero-error property
+    is what the recommendation optimizes, not the coverage estimate."""
+    probes = []
+    for vid, truth in labels.items():
+        if vid not in protos:
+            continue
+        temps = [(labels[v], v, protos[v]) for v in protos if v != vid and v in labels]
+        if not temps:
+            continue
+        ranked = rank_templates(protos[vid], temps)
+        top_name, s1, _via = ranked[0]
+        s2 = ranked[1][1] if len(ranked) > 1 else 0.0
+        probes.append({"truth": truth, "top": top_name, "s1": s1, "lead": s1 - s2,
+                       "novel_probe": not any(n == truth for n, _, _ in ranked)})
+    known = [p for p in probes if not p["novel_probe"]]
+    novel = [p for p in probes if p["novel_probe"]]
+    if not known:
+        return {"note": "no scorable probes (need >= 2 confirmed solo visits)", "n_probes": 0}
+
+    thresholds = [round(t, 2) for t in np.arange(0.30, 0.92, 0.02)]
+    margins = [round(m, 2) for m in np.arange(0.00, 0.42, 0.02)]
+    zero_error = []
+    for t in thresholds:
+        for m in margins:
+            named = [p for p in known if p["s1"] >= t and p["lead"] >= m]
+            wrong = sum(1 for p in named if p["top"] != p["truth"])
+            nfa = sum(1 for p in novel if p["s1"] >= t and p["lead"] >= m)
+            if wrong == 0 and nfa == 0 and named:
+                zero_error.append({"threshold": t, "margin": m, "auto_named": len(named),
+                                   "coverage": round(len(named) / len(known), 3)})
+    # Max coverage first; among ties prefer the SAFER point (higher threshold, then margin).
+    zero_error.sort(key=lambda r: (-r["auto_named"], -r["threshold"], -r["margin"]))
+    return {
+        "n_probes": len(known),
+        "n_novel_probes": len(novel),
+        "recommended": zero_error[0] if zero_error else None,
+        "zero_error_points": zero_error[:40],
+        "note": "recommended = max coverage with 0 wrong names AND 0 novel false-accepts; "
+                "set config reid_auto_threshold/reid_auto_margin from it (re-run as the cast grows)",
+    }
+
+
 def _iou_co_presence_check(conn, species: str, matcher: VisitMatcher, iou_cut: float = 0.45) -> dict:
     """Measure the IoU < 0.45 co-presence cut. Folklore: two SEPARATE animals in one frame sit at
     low IoU, while the detector double-boxing ONE animal sits at IoU 0.5-1.0 -- so 0.45 should fall
@@ -529,6 +586,7 @@ def eval_reid(conn, cfg, species: str) -> dict:
 
     loo = _identify_loo(protos, solo, cfg.reid_novel_threshold)
     iou_check = _iou_co_presence_check(conn, species, matcher)
+    auto_sweep = _auto_assign_sweep(protos, solo)
 
     return {
         "species": species,
@@ -544,9 +602,16 @@ def eval_reid(conn, cfg, species: str) -> dict:
         "by_source": by_source,
         "identification_loo": loo,
         "iou_co_presence": iou_check,
+        "auto_assign_sweep": auto_sweep,
         "config_threshold": {
             "reid_novel_threshold": cfg.reid_novel_threshold,
             "note": "the live 'possibly someone new' cut; compare to separation.best_threshold",
+        },
+        "config_auto_assign": {
+            "reid_auto_threshold": cfg.reid_auto_threshold,
+            "reid_auto_margin": cfg.reid_auto_margin,
+            "note": "the nightly auto-name bars; compare to auto_assign_sweep.recommended "
+                    "(0.0 = the pass is disabled)",
         },
     }
 
@@ -677,6 +742,24 @@ def _print_reid(r: dict) -> None:
         print(f"    at threshold {at['threshold']:.2f}: {at['accepted_correct']} accepted-correct, "
               f"{at['correct_but_flagged_novel']} correct-but-flagged-novel, "
               f"{at['wrong_individual']} wrong")
+
+    sw = r.get("auto_assign_sweep") or {}
+    if sw.get("n_probes"):
+        print(f"\n  Auto-assign sweep (nearest-visit LOO, {sw['n_probes']} known probes + "
+              f"{sw['n_novel_probes']} novel probes):")
+        rec = sw.get("recommended")
+        if rec:
+            ca = r.get("config_auto_assign", {})
+            cur_t, cur_m = ca.get("reid_auto_threshold", 0.0), ca.get("reid_auto_margin", 0.0)
+            print(f"    recommended bars:          similarity >= {rec['threshold']:.2f}  AND  "
+                  f"runner-up margin >= {rec['margin']:.2f}")
+            print(f"    -> would auto-name {rec['auto_named']}/{sw['n_probes']} "
+                  f"({_fmt_pct(rec['coverage'])}) with 0 wrong + 0 novel false-accepts")
+            state = "DISABLED" if not cur_t else f"{cur_t:.2f} / {cur_m:.2f}"
+            print(f"    current config:            reid_auto_threshold/margin = {state}; "
+                  f"MEASURE-and-recommend only, config is not changed.")
+        else:
+            print(f"    no zero-error operating point found -- leave auto-assign disabled.")
 
     io = r["iou_co_presence"]
     if io["fraction_below_cut"] is not None:

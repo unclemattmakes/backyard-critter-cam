@@ -695,12 +695,18 @@ def rename_individual(conn: sqlite3.Connection, old: str, new: Optional[str]) ->
 
 
 def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional[str],
-                source: str = "human") -> int:
+                source: str = "human", *, reject: bool = False) -> int:
     """Confirm WHO a visit was: stamp `individual_id` onto the visit's detections that match the
     visit's dominant species (a stray mid-visit crow crop keeps its own identity), and mirror it
     onto the visits row. The visit is the labelling unit -- one solo animal per visit, so one
     confirmation labels every crop AND makes the visit a template for future suggestions.
-    `individual_id=None` clears. Returns crops stamped."""
+    `individual_id=None` clears. Returns crops stamped.
+
+    `source` records who decided: 'human' feeds the suggestion templates, 'auto' (the nightly
+    auto-assign) never does. `reject=True` (with individual_id=None) is the human's "leave this
+    unnamed" verdict: the id clears but individual_source keeps `source` ('human'), which is the
+    tombstone the auto-assign pass respects -- without it, clearing a wrong auto name would just
+    invite the next nightly run to stamp it again."""
     v = conn.execute("SELECT species FROM visits WHERE id = ?", (int(visit_id),)).fetchone()
     if v is None:
         return 0
@@ -709,7 +715,7 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     params = [int(visit_id)] + ([] if sp is None else [sp])
     cur = conn.execute(
         f"UPDATE detections SET individual_id = ?, individual_source = ? WHERE {where}",
-        [individual_id, None if individual_id is None else source] + params)
+        [individual_id, None if (individual_id is None and not reject) else source] + params)
     conn.execute("UPDATE visits SET individual_id = ? WHERE id = ?",
                  (individual_id, int(visit_id)))
     conn.commit()
@@ -808,12 +814,14 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
             "species_set": species or None, "named": None if name is _UNSET else name}
 
 
-def confirmed_visit_labels(conn: sqlite3.Connection, species: Optional[str] = None) -> dict:
-    """{visit_id: individual_id} for every visit with human-confirmed crops (the suggestion
-    templates). Read from DETECTIONS, not visits -- visits.py rebuilds from scratch, but the
-    stamped crops persist, so labels survive a rebuild. Dominant name per visit."""
-    where = "individual_source = 'human' AND individual_id IS NOT NULL AND visit_id IS NOT NULL"
-    params: list = []
+def visit_labels_by_source(conn: sqlite3.Connection, source: str,
+                           species: Optional[str] = None) -> dict:
+    """{visit_id: individual_id} for every visit whose crops carry a label of `individual_source`
+    = `source` ('human' = confirmations, 'auto' = the nightly auto-assign pass). Read from
+    DETECTIONS, not visits -- visits.py rebuilds from scratch, but the stamped crops persist, so
+    labels survive a rebuild. Dominant name per visit."""
+    where = "individual_source = ? AND individual_id IS NOT NULL AND visit_id IS NOT NULL"
+    params: list = [source]
     if species:
         where += " AND species = ?"
         params.append(species)
@@ -824,6 +832,24 @@ def confirmed_visit_labels(conn: sqlite3.Connection, species: Optional[str] = No
     for r in rows:                       # first row per visit = dominant (ordered by n DESC)
         out.setdefault(r[0], r[1])
     return out
+
+
+def confirmed_visit_labels(conn: sqlite3.Connection, species: Optional[str] = None) -> dict:
+    """{visit_id: individual_id} for every visit with human-confirmed crops (the suggestion
+    templates; auto-assigned names deliberately don't qualify)."""
+    return visit_labels_by_source(conn, "human", species)
+
+
+def rejected_visit_ids(conn: sqlite3.Connection, species: Optional[str] = None) -> set:
+    """Visit ids a human explicitly left UNNAMED (label_visit(..., None, reject=True): id NULL but
+    individual_source 'human'). The auto-assign pass skips these -- a human already looked."""
+    where = "individual_source = 'human' AND individual_id IS NULL AND visit_id IS NOT NULL"
+    params: list = []
+    if species:
+        where += " AND species = ?"
+        params.append(species)
+    return {r[0] for r in conn.execute(
+        f"SELECT DISTINCT visit_id FROM detections WHERE {where}", params)}
 
 
 _MAX_SIGHTING_NAMES = 12   # a "who's here now" log of more than a dozen named animals isn't real.

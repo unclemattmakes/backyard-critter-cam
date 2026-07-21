@@ -645,3 +645,101 @@ def test_bootstrap_groups_split_two_animals(conn, cfg):
     sets = sorted([sorted(g["visits"]) for g in groups], key=len, reverse=True)
     assert sets == [sorted([a1, a2]), [b1]]
     assert groups[0]["cohesion"] > 0.9
+
+
+# ---------------------------------------------------------------------------
+# Auto-assign: the nightly "review by exception" pass (and its db plumbing).
+# ---------------------------------------------------------------------------
+
+def test_label_visit_reject_leaves_human_tombstone(conn):
+    vid = _visit(conn, [_det(conn, minutes=0)], start_min=0)
+    db.label_visit(conn, vid, "Stan", source="auto")
+    assert db.visit_labels_by_source(conn, "auto") == {vid: "Stan"}
+    assert db.confirmed_visit_labels(conn) == {}       # an auto name is NOT a confirmation
+
+    # The human's "not them, leave unnamed": id clears, but source='human' stays as the tombstone.
+    db.label_visit(conn, vid, None, reject=True)
+    row = conn.execute("SELECT individual_id, individual_source FROM detections "
+                       "WHERE visit_id = ?", (vid,)).fetchone()
+    assert row["individual_id"] is None and row["individual_source"] == "human"
+    assert db.rejected_visit_ids(conn) == {vid}
+    assert db.visit_labels_by_source(conn, "auto") == {}
+    assert db.confirmed_visit_labels(conn) == {}       # a rejection is not a confirmation either
+
+    # A plain clear (no reject) wipes the source too -- back to fully unlabelled.
+    db.label_visit(conn, vid, None)
+    row = conn.execute("SELECT individual_id, individual_source FROM detections "
+                       "WHERE visit_id = ?", (vid,)).fetchone()
+    assert row["individual_id"] is None and row["individual_source"] is None
+    assert db.rejected_visit_ids(conn) == set()
+
+
+def test_auto_assign_names_only_the_unambiguous(conn, cfg):
+    stan_a = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    notch_a = _three_crop_visit(conn, [0, 1, 0], start_min=30)
+    db.label_visit(conn, stan_a, "Stan")
+    db.label_visit(conn, notch_a, "Notch")
+    clear = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)      # unmistakably Stan
+    # [1, 0.75, 0]: ~0.80 to Stan but ~0.60 to Notch -- above the similarity bar, but the lead
+    # (~0.20) is under the 0.25 margin: a confident-looking near-tie the pass must NOT call.
+    tie = _three_crop_visit(conn, [1, 0.75, 0], start_min=90)
+    weak = _three_crop_visit(conn, [0, 0, 1], start_min=120)         # looks like nobody
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    r = m.auto_assign(conn, threshold=0.75, margin=0.25)
+    assert r["enabled"] and [a["visit_id"] for a in r["assigned"]] == [clear]
+    assert r["assigned"][0]["name"] == "Stan"
+    assert r["skipped"]["ambiguous"] == 1                            # the tie
+    assert r["skipped"]["below_threshold"] == 1                      # the stranger
+    assert db.visit_labels_by_source(conn, "auto", "raccoon") == {clear: "Stan"}
+
+    # The auto name shows on suggest() but never becomes a template, and refit skips the visit.
+    m2 = VisitMatcher(conn, "raccoon", cfg)
+    assert m2.suggest(clear)["auto_as"] == "Stan"
+    assert m2.suggest(clear)["confirmed_as"] is None
+    assert clear not in {v for _, v, _ in m2.templates()}
+    assert all(x["visit_id"] != clear
+               for lst in m2.refit()["fits"].values() for x in lst)
+
+    # Idempotent: the next nightly run (same bars) leaves it alone.
+    r2 = m2.auto_assign(conn, threshold=0.75, margin=0.25)
+    assert r2["assigned"] == [] and r2["skipped"]["already_auto"] == 1
+
+    # Promotion: a human ✓ turns the same name into a real, template-feeding confirmation.
+    db.label_visit(conn, clear, "Stan")
+    m3 = VisitMatcher(conn, "raccoon", cfg)
+    assert clear in {v for _, v, _ in m3.templates()}
+
+
+def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
+    stan_a = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, stan_a, "Stan")
+
+    # Human already looked at this one and said "leave it": the tombstone must hold nightly.
+    vetoed = _three_crop_visit(conn, [1, 0.02, 0], start_min=60)
+    db.label_visit(conn, vetoed, None, reject=True)
+
+    # A pair visit (>= reid_co_presence_min separated-box frames) with a Stan-like blend: solo-only.
+    ids = []
+    for k in range(3):
+        a = _det(conn, minutes=200 + k, bbox=(0, 0, 10, 10))
+        b = _det(conn, minutes=200 + k, bbox=(50, 50, 60, 60))
+        _embed(conn, a, _unit(1, 0.01, 0))
+        ids += [a, b]
+    pair = _visit(conn, ids, start_min=200, end_min=203)
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    r = m.auto_assign(conn, threshold=0.8, margin=0.1)
+    assert r["assigned"] == []
+    assert r["skipped"]["human_rejected"] == 1
+    assert r["skipped"]["multi_animal"] == 1
+
+    # threshold 0.0 disables the pass entirely (the pre-eval state of a fresh install).
+    assert m.auto_assign(conn, threshold=0.0)["enabled"] is False
+
+    # Dry-run reports but writes nothing.
+    fresh = _three_crop_visit(conn, [1, 0.03, 0], start_min=300)
+    m2 = VisitMatcher(conn, "raccoon", cfg)
+    r2 = m2.auto_assign(conn, threshold=0.8, margin=0.1, dry_run=True)
+    assert [a["visit_id"] for a in r2["assigned"]] == [fresh]
+    assert db.visit_labels_by_source(conn, "auto", "raccoon") == {}

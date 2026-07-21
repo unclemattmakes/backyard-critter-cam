@@ -166,3 +166,47 @@ def test_empty_clip_gets_marker_row_and_leaves_the_queue(conn):
     assert conn.execute("SELECT n_hits FROM clip_tracks WHERE clip_id=?",
                         (cid,)).fetchone()[0] == 0
     assert db.clips_needing_tracks(conn, "m") == []   # marker row keeps it out of the batch
+
+
+# ---------------------------------------------------------------------------
+# Solo-overlap linking: behaviour links stay grounded in HUMAN-confirmed names.
+# ---------------------------------------------------------------------------
+
+def test_link_tracks_requires_human_confirmed_visit(conn):
+    from datetime import datetime, timedelta
+
+    from clipmotion import link_tracks_to_individuals
+
+    base = datetime(2026, 6, 10, 21, 0, 0, tzinfo=datetime.now().astimezone().tzinfo)
+    ts = lambda m: (base + timedelta(minutes=m)).isoformat()
+
+    d = db.insert_detection(
+        conn, timestamp=ts(1), source=db.SOURCE_GLASS_DOOR_CAM, detection_class="animal",
+        confidence=0.9, bbox=(0, 0, 10, 10), frame_w=100, frame_h=100,
+        crop_path="crops/x.jpg", species="raccoon")
+    vid = db.insert_visit(
+        conn, source=db.SOURCE_GLASS_DOOR_CAM, species="raccoon", individual_id=None,
+        started_at=ts(0), ended_at=ts(10), detection_count=1, max_confidence=0.9,
+        representative_detection_id=d)
+    db.assign_visit(conn, [d], vid)
+    cid = db.insert_clip(
+        conn, source=db.SOURCE_GLASS_DOOR_CAM, clip_path="clips/x.mp4", started_at=ts(1),
+        ended_at=ts(2), fps=10.0, width=1280, height=720, frame_count=300,
+        detection_count=10, max_confidence=0.9)
+    db.insert_clip_tracks(conn, clip_id=cid, model="m", n_samples=300,
+                          tracklets=[{"track_json": "[]", "n_hits": 40, "features": {}}])
+    conn.commit()
+
+    # An AUTO-assigned visit name is a prediction, not ground truth: no behaviour link.
+    db.label_visit(conn, vid, "Stan", source="auto")
+    r = link_tracks_to_individuals(conn, "raccoon")
+    assert r["assigned"] == 0
+    assert r["skipped"].get("visit_not_human_confirmed") == 1
+
+    # The human promotes it -> the same solo tracklet links, tagged 'overlap'.
+    db.label_visit(conn, vid, "Stan")
+    r2 = link_tracks_to_individuals(conn, "raccoon")
+    assert r2["assigned"] == 1
+    row = conn.execute("SELECT individual_id, individual_source FROM clip_tracks "
+                       "WHERE clip_id = ?", (cid,)).fetchone()
+    assert row["individual_id"] == "Stan" and row["individual_source"] == "overlap"

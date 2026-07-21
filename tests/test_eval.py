@@ -245,3 +245,35 @@ def test_eval_reid_thin_data_degrades_honestly(conn):
     r = evalmod.eval_reid(conn, cfg, "raccoon")
     assert r["confirmed_visits"]["solo_with_prototype"] == 1
     assert "note" in r["separation"]                      # one solo visit -> nothing to separate
+
+
+# ---------------------------------------------------------------------------
+# Auto-assign sweep: the zero-error operating-point recommendation.
+# ---------------------------------------------------------------------------
+
+def test_auto_assign_sweep_recommends_full_coverage_when_clean():
+    # Two well-separated individuals with two visits each, plus "Ghost" -- one visit only, so its
+    # identity is absent from the LOO templates: the stand-in for a genuinely NEW animal.
+    protos = {1: _u(1, 0, 0), 2: _u(1, 0.05, 0),
+              3: _u(0, 1, 0), 4: _u(0.05, 1, 0),
+              5: _u(0, 0, 1)}
+    labels = {1: "Stan", 2: "Stan", 3: "Notch", 4: "Notch", 5: "Ghost"}
+    sw = evalmod._auto_assign_sweep(protos, labels)
+    assert sw["n_probes"] == 4 and sw["n_novel_probes"] == 1
+    rec = sw["recommended"]
+    # Same-pairs sit ~1.0 with a huge lead; the Ghost probe's best match is ~0 (never accepted):
+    # some point must cover all four known probes with zero errors of either kind.
+    assert rec and rec["auto_named"] == 4 and rec["coverage"] == 1.0
+
+
+def test_auto_assign_sweep_confident_wrong_match_blocks_recommendation():
+    # A mislabelled/confusable corpus: "Stan"'s second visit actually points along Notch's axis,
+    # as strongly as every correct match. Any grid point that accepts the correct matches also
+    # accepts this wrong one -> there is NO zero-error operating point, and the sweep must say so
+    # rather than recommend bars that would mis-name visits nightly.
+    protos = {1: _u(1, 0, 0), 2: _u(0, 1, 0.02),
+              3: _u(0, 1, 0), 4: _u(0, 1, 0.04)}
+    labels = {1: "Stan", 2: "Stan", 3: "Notch", 4: "Notch"}
+    sw = evalmod._auto_assign_sweep(protos, labels)
+    assert sw["recommended"] is None
+    assert sw["zero_error_points"] == []

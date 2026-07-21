@@ -634,21 +634,25 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
 
         def _reid_confirm(self, data):
             """Confirm (or clear) WHO one visit was: {"visit_id": 1014, "name": "Stan"}.
-            name=""/null clears. Stamps the visit's species-matching crops (individual_source=
-            'human') and mirrors the name onto the visits row. Deliberately does NOT rebuild the
-            visits table -- a rebuild renumbers visit ids and would invalidate every other card
-            in the open review queue; labels live on detections, so the next rebuild inherits
-            them anyway."""
+            name=""/null clears; add "reject": true to clear AND leave the human's "not them"
+            tombstone (individual_source 'human' with a NULL id), which stops the nightly
+            auto-assign pass from re-naming the visit. Stamps the visit's species-matching crops
+            (individual_source='human') and mirrors the name onto the visits row. Deliberately
+            does NOT rebuild the visits table -- a rebuild renumbers visit ids and would
+            invalidate every other card in the open review queue; labels live on detections, so
+            the next rebuild inherits them anyway."""
             try:
                 vid = int(data.get("visit_id"))
             except (TypeError, ValueError):
                 self._json({"error": "missing/bad 'visit_id'"}, code=400)
                 return
             name = (data.get("name") or "").strip() or None
+            reject = bool(data.get("reject")) and name is None
             conn = db.connect(cfg.db_path)
             try:
-                n = db.label_visit(conn, vid, name)
-                self._json({"ok": True, "visit_id": vid, "name": name, "stamped": n})
+                n = db.label_visit(conn, vid, name, reject=reject)
+                self._json({"ok": True, "visit_id": vid, "name": name, "stamped": n,
+                            "rejected": reject})
             finally:
                 conn.close()
 
@@ -839,7 +843,8 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "n_crops": v["detection_count"],
                 "rep_crop": rep,
                 "clips": vclips, "crops": vcrops,
-                "confirmed_as": s["confirmed_as"], "candidates": s["candidates"],
+                "confirmed_as": s["confirmed_as"], "auto_as": s["auto_as"],
+                "candidates": s["candidates"],
                 "clip_candidates": s["clip_candidates"],
                 "novel": s["novel"], "multi": s["multi"],
                 "co_present_frames": s["co_present_frames"],
@@ -847,14 +852,18 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "n_embedded": s["n_embedded"], "note": s["note"], "species": species,
             })
 
-        # The confirmed cast, with how much template material backs each name.
+        # The confirmed cast, with how much template material backs each name -- plus how many
+        # visits the nightly pass has auto-named to it (pending the human's glance).
         cast: dict = {}
         for vid, name in matcher.confirmed.items():
-            c = cast.setdefault(name, {"name": name, "n_visits": 0, "last_seen": None})
+            c = cast.setdefault(name, {"name": name, "n_visits": 0, "n_auto": 0, "last_seen": None})
             c["n_visits"] += 1
             started = matcher.visit_started.get(vid)
             if started and (c["last_seen"] is None or started > c["last_seen"]):
                 c["last_seen"] = started
+        for vid, name in matcher.auto.items():
+            if name in cast:               # auto only ever assigns confirmed names, but be safe
+                cast[name]["n_auto"] += 1
 
         def _group_crops(visit_ids):
             if not visit_ids:

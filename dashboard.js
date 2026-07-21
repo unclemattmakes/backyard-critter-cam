@@ -1174,6 +1174,16 @@ function reidCard(v){
   if(v.confirmed_as){
     sugg=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(v.confirmed_as)} ✓</span>`;
     act=`<button class="gear" onclick="reidConfirm(${v.visit_id},null,true)" title="unconfirm this visit">Clear</button>`;
+  }else if(v.auto_as){
+    // Named by the nightly auto-assign pass (high similarity + clear margin). Review by
+    // exception: ✓ promotes it to a real confirmation (feeds templates); ✗ clears it AND pins
+    // the visit so the next nightly run leaves it alone (the reject tombstone).
+    const top=(v.candidates||[])[0];
+    const pct=(top&&top.name===v.auto_as)? ` ${Math.round(top.similarity*100)}%` : '';
+    sugg=`<span class="flag" style="background:rgba(120,200,255,.13);border-color:rgba(120,200,255,.42)" title="named automatically by the nightly pass — it cleared both the similarity and the runner-up-margin bar. Auto names never feed the matching templates until you ✓ them.">auto: <b>${esc(v.auto_as)}</b>${pct}</span>`;
+    act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(v.auto_as)})" title="yes, it's ${esc(v.auto_as)} — promote to a confirmed template">✓ keep</button>
+         <button class="gear" onclick="reidConfirm(${v.visit_id},null,true,true)" title="not ${esc(v.auto_as)} — clear the auto name; the nightly pass won't re-name this visit">✗ not them</button>
+         ${reidInput('rq-'+v.visit_id,'or who…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
   }else if((v.candidates||[]).length){
     const top=v.candidates[0];
     const rest=v.candidates.slice(1).map(c=>`${esc(c.name)} ${Math.round(c.similarity*100)}%`).join(' · ');
@@ -1364,7 +1374,7 @@ function reidQueueHTML(q){
   }
   html+=reidRefitHTML(q.refit);
   if(q.queue.length){
-    const cast=(q.cast||[]).map(c=>`<span class="flag">${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}</span>`).join(' ');
+    const cast=(q.cast||[]).map(c=>`<span class="flag"${c.n_auto?` title="${c.n_auto} recent visit${c.n_auto>1?'s':''} auto-named ${esc(c.name)} by the nightly pass — ✓/✗ them on the cards below"`:''}>${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}${c.n_auto?` <span style="opacity:.65">+${c.n_auto} auto</span>`:''}</span>`).join(' ');
     if(cast) html+=`<h2 class="sec">Visit-by-Visit <span class="n">${q.queue.length} recent</span></h2><div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
     html+=`<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`;
   }
@@ -1417,9 +1427,9 @@ async function reidNameNovel(i){
   const g=REID_REFIT&&REID_REFIT.novel_groups&&REID_REFIT.novel_groups[i]; if(!g) return;
   reidConfirmMany(g.visits,name);
 }
-async function reidConfirm(vid,name,clear){
+async function reidConfirm(vid,name,clear,reject){
   const restore=busyBtn();   // the clicked ✓/Name/Clear button — grab it before any await/confirm
-  if(clear&&!confirm('Unconfirm this visit?')){ restore(); return; }
+  if(clear&&!confirm(reject?'Clear this auto-name? The nightly pass won\'t re-name this visit.':'Unconfirm this visit?')){ restore(); return; }
   if(!clear&&!name){
     const inp=document.getElementById('rq-'+vid);
     name=(inp&&inp.value||'').trim();
@@ -1427,7 +1437,7 @@ async function reidConfirm(vid,name,clear){
   }
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({visit_id:vid,name:clear?null:name})}).then(r=>r.json());
+      body:JSON.stringify({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
     if(r.error){ restore(); alert(r.error); return; }
     loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
   }catch(e){ restore(); connFail(); }
