@@ -40,12 +40,18 @@ _ALLOWED_CONTROLS = {
 
 
 class FrameBuffer:
-    """Thread-safe holder of the latest annotated JPEG, with new-frame signalling."""
+    """Thread-safe holder of the latest annotated JPEG, with new-frame signalling.
+
+    Also tracks whether anyone is WATCHING -- live stream clients register themselves, and a
+    snapshot request flags interest for a few seconds -- so the capture thread can skip JPEG
+    encoding entirely when nobody would see the result (see config.display_max_fps)."""
 
     def __init__(self):
         self._cond = threading.Condition()
         self._frame: bytes | None = None
         self._seq = 0
+        self._clients = 0
+        self._want_until = 0.0
 
     def update(self, jpg: bytes) -> None:
         with self._cond:
@@ -62,6 +68,23 @@ class FrameBuffer:
             if self._seq == last_seq:
                 self._cond.wait(timeout)
             return self._frame, self._seq
+
+    def client_started(self) -> None:
+        with self._cond:
+            self._clients += 1
+
+    def client_stopped(self) -> None:
+        with self._cond:
+            self._clients = max(0, self._clients - 1)
+
+    def request_frame(self, horizon_s: float = 3.0) -> None:
+        """A one-shot consumer (snapshot) wants fresh frames for the next few seconds."""
+        with self._cond:
+            self._want_until = time.monotonic() + horizon_s
+
+    def watched(self) -> bool:
+        with self._cond:
+            return self._clients > 0 or time.monotonic() < self._want_until
 
 
 class CameraControlBridge:
@@ -483,7 +506,13 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_clips(cfg, (q.get("individual") or [""])[0]))
                 elif path == "/snapshot.jpg":
-                    frame, _ = frame_buffers[self._src()].get()
+                    fbuf = frame_buffers[self._src()]
+                    _, seq = fbuf.get()
+                    # Flag interest so the capture thread starts encoding, then wait for a FRESH
+                    # frame (encoding is skipped while unwatched, so the stored one may be old).
+                    # On timeout fall back to whatever is stored rather than failing the request.
+                    fbuf.request_frame()
+                    frame, _ = fbuf.wait(seq, timeout=1.5)
                     if frame is None:
                         self._send(503, "text/plain", b"no frame yet")
                     else:
@@ -702,6 +731,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             if not stream_slots.acquire(blocking=False):
                 self._send(503, "text/plain", b"too many active streams; try again shortly")
                 return
+            frame_buffer.client_started()   # capture thread encodes only while watched
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
@@ -717,6 +747,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
             finally:
+                frame_buffer.client_stopped()
                 stream_slots.release()
 
         def _media(self, rel):

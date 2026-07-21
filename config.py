@@ -105,6 +105,15 @@ class Config:
     # DirectShow is Windows-only, so this is automatically ignored off-Windows (Linux/macOS get
     # CAP_ANY and OpenCV picks the native backend) -- see capture_backend() in backyard_cam.py.
     use_dshow_backend: bool = True
+    # Pixel-format + frame-rate REQUESTS for local webcams (None = leave the driver's pick).
+    # DirectShow builds the capture mode from format+size+rate together, and with no format
+    # request it can pick an uncompressed mode at a crawl: the 2026-07-19 replacement cam serves
+    # 720p YUY2 at a flat 4 fps day AND night (measured from clip avg_frame_rate), where MJPG
+    # runs full speed. Both are polite requests -- the driver picks the nearest supported mode,
+    # an unsupported set is ignored, and a network stream ignores them entirely (the camera owns
+    # its own encoding there).
+    camera_fourcc: str | None = "MJPG"
+    camera_request_fps: float | None = 30.0
     camera_warmup_frames: int = 5   # Throwaway reads so exposure / auto-white-balance settle.
     # Manual exposure / gain. None = let the camera auto-expose (default). Set a number to
     # LOCK it -- use tune.py to find good values for the current scene. On Windows/DirectShow
@@ -171,6 +180,13 @@ class Config:
     # at 1280x720 a visiting crow is comfortably a few hundred+ px. Raise to ignore small
     # twitches (leaves, distant motion); lower to catch smaller / further critters.
     motion_min_area: int = 800
+    # Run the motion gate on a DOWNSCALED copy about this many pixels wide (the detector, crops
+    # and clips all still see the full-resolution frame). Blur + MOG2 + contours cost scales
+    # with pixel count, and at 1920x1080 a full-res gate held the whole capture loop to ~6 fps
+    # (measured 2026-07-20). Blob areas are converted BACK to full-frame pixels before the
+    # motion_min_area comparison, so that knob keeps meaning what it always meant at any
+    # capture size. None/0 = gate at full resolution (the old behaviour).
+    motion_gate_width: int | None = 640
 
     # ---- Detector (MegaDetector v6, run via Ultralytics) ------------------------
     # MegaDetector v6 (Microsoft AI for Good Lab). The official MDV6 weights are Ultralytics
@@ -232,6 +248,10 @@ class Config:
     # ---- Live preview -----------------------------------------------------------
     show_preview: bool = True           # Required feature; press 'q' in the window to quit.
     window_name: str = "Backyard Critter Cam"
+    # Native preview window size relative to the capture resolution. imshow re-uploads the
+    # whole image every UI tick, which at full 1080p is a real slice of the main thread; a
+    # half-size window is visually identical on a laptop screen and much cheaper. 1.0 = native.
+    preview_scale: float = 0.5
 
     # ---- Stats readout (`python backyard_cam.py --stats`) -----------------------
     # Two detections on the same source more than this many minutes apart count as separate
@@ -247,6 +267,13 @@ class Config:
     web_host: str = "127.0.0.1"
     web_port: int = 8000
     web_jpeg_quality: int = 80   # JPEG quality for the live stream (lighter than saved crops).
+    # Cap how often the capture thread annotates + JPEG-encodes a display frame (dashboard
+    # stream AND native preview share the cap). A 1080p encode is one of the loop's biggest
+    # per-frame costs, and above ~12 fps a monitoring view gains nothing. Frames are encoded
+    # for the dashboard ONLY while someone is actually watching (a stream client is connected
+    # or a snapshot was just requested) -- an unwatched rig spends nothing on encoding. This
+    # never throttles capture itself: detection, crops and clips run at full camera rate.
+    display_max_fps: float = 12.0
     # When the dashboard is bound to the network (web_host = "0.0.0.0", the LAN launcher), accept
     # connections ONLY from your local network -- loopback + private ranges (192.168.x, 10.x,
     # 172.16-31.x, link-local). A DIRECT request from a public internet address is refused (HTTP

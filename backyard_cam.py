@@ -423,11 +423,27 @@ def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCaptur
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep only the freshest frame (kills RTSP lag)
         except Exception:
             pass
+    def _ask_fourcc():
+        if spec.is_network or not cfg.camera_fourcc:
+            return
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cfg.camera_fourcc))
+        except Exception:
+            pass
+
+    # Ask for the compressed format BOTH before and after size/rate: each size/fps set can
+    # rebuild the DirectShow media type and silently revert the format to uncompressed YUY2.
+    # Measured on the 2026-07 glass-door cam: fourcc-then-size ends up YUY2 @ 4 fps; re-asserting
+    # MJPG after size+fps holds MJPG @ 30 fps at 1920x1080 (its only full-speed mode).
+    _ask_fourcc()
     w, h = _eff(spec, cfg, "frame_width"), _eff(spec, cfg, "frame_height")
     if w:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
     if h:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    if not spec.is_network and cfg.camera_request_fps:
+        cap.set(cv2.CAP_PROP_FPS, float(cfg.camera_request_fps))
+    _ask_fourcc()
     exposure, gain = _eff(spec, cfg, "exposure"), _eff(spec, cfg, "gain")
     if exposure is not None:   # lock manual exposure (0.25 = manual on most UVC/DSHOW cams)
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -564,10 +580,14 @@ def print_stats(cfg: config.Config) -> None:
 
 # ---- Motion gate -------------------------------------------------------------------
 class MotionGate:
-    """MOG2 background subtractor -> 'largest motion blob area' in pixels.
+    """MOG2 background subtractor -> 'largest motion blob area' in FULL-FRAME pixels.
 
     MOG2 adapts to gradual outdoor light changes; we drop its shadow pixels (marked 127)
     and de-noise with a blur + morphology so a single flickering pixel never triggers.
+    The whole chain runs on a copy downscaled to ~cfg.motion_gate_width (its cost scales
+    with pixel count -- at 1080p a full-res gate alone held the loop to ~6 fps), and blob
+    areas are scaled BACK to full-frame px^2 so motion_min_area / the HUD readout keep
+    their familiar units at any capture size.
     """
 
     def __init__(self, cfg: config.Config):
@@ -580,11 +600,18 @@ class MotionGate:
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     def update(self, frame_bgr) -> float:
-        k = self.cfg.motion_blur_ksize
         src = frame_bgr
+        area_scale = 1.0   # multiplier back to full-frame px^2
+        gw = self.cfg.motion_gate_width
+        if gw and frame_bgr.shape[1] > gw:
+            s = gw / frame_bgr.shape[1]
+            src = cv2.resize(frame_bgr, (gw, max(1, round(frame_bgr.shape[0] * s))),
+                             interpolation=cv2.INTER_AREA)
+            area_scale = 1.0 / (s * s)
+        k = self.cfg.motion_blur_ksize
         if k and k > 1:
             k = k | 1  # GaussianBlur needs an odd kernel
-            src = cv2.GaussianBlur(frame_bgr, (k, k), 0)
+            src = cv2.GaussianBlur(src, (k, k), 0)
         mask = self.bg.apply(src)
         # Keep only strong foreground (255); shadows come back as 127 and are discarded.
         _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
@@ -593,7 +620,7 @@ class MotionGate:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return 0.0
-        return max(cv2.contourArea(c) for c in contours)
+        return max(cv2.contourArea(c) for c in contours) * area_scale
 
 
 # ---- Saving ------------------------------------------------------------------------
@@ -812,6 +839,10 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         fps = 0.0
         fps_t = time.monotonic()
         last_ctrl_pub = 0.0
+        # Display work (copy + draw + JPEG encode) is capped at display_max_fps and skipped
+        # entirely when nothing consumes it -- it's presentation, not capture (see config).
+        disp_min_dt = (1.0 / cfg.display_max_fps) if cfg.display_max_fps else 0.0
+        last_disp_t = 0.0
 
         while not stop_event.is_set():
             ok, frame = cap.read()
@@ -919,14 +950,18 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                         print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
 
             # --- Annotate for the dashboard feed + the native preview grid (NO cv2 GUI here) ---
-            if fb is not None or cfg.show_preview:
+            # Presentation only, so it's rate-capped, and the dashboard side runs ONLY while a
+            # stream client / fresh snapshot request is actually watching. Capture never waits.
+            want_stream = fb is not None and fb.watched()
+            if (want_stream or cfg.show_preview) and (now - last_disp_t) >= disp_min_dt:
+                last_disp_t = now
                 disp = frame.copy()
                 show = last_dets if (now - last_dets_t) <= cfg.box_display_ttl_s else []
                 draw_detections(disp, show)
                 draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion, saved=saved,
                          source=spec.display_name, model=cfg.model_version, period=active_period,
                          recording=recorder is not None and recorder.recording)
-                if fb is not None:
+                if want_stream:
                     ok_enc, buf = cv2.imencode(".jpg", disp,
                                                [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
                     if ok_enc:
@@ -967,6 +1002,11 @@ def _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads):
             frames = [latest_frames.get(s) for s in sources]
         grid = compose_grid(frames)
         if grid is not None:
+            ps = cfg.preview_scale
+            if ps and ps != 1.0:   # shrink BEFORE imshow -- HighGUI re-uploads every tick
+                grid = cv2.resize(grid, (max(1, int(grid.shape[1] * ps)),
+                                         max(1, int(grid.shape[0] * ps))),
+                                  interpolation=cv2.INTER_AREA)
             cv2.imshow(cfg.window_name, grid)
         if (cv2.waitKey(30) & 0xFF) == ord("q"):
             print("\n'q' pressed -- shutting down.")
@@ -1099,7 +1139,9 @@ def run(cfg: config.Config) -> None:
         if cfg.show_preview:
             # The MAIN thread owns the cv2 window (GUI calls must be single-threaded).
             cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-            cv2.resizeWindow(cfg.window_name, cfg.frame_width, cfg.frame_height)
+            ps = cfg.preview_scale or 1.0
+            cv2.resizeWindow(cfg.window_name,
+                             max(1, int(cfg.frame_width * ps)), max(1, int(cfg.frame_height * ps)))
             _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads)
         else:
             # Headless: idle until Ctrl+C or every camera thread has exited.
