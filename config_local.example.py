@@ -47,6 +47,13 @@ def apply(cfg):
     # cfg.species_labels = ["raccoon", "red fox", "white-tailed deer", "American crow", "blue jay"]
     # cfg.reid_species = "raccoon"   # the species the dashboard's Individuals tab works on
 
+    # A STATIC spot the detector keeps misreading as an animal (a hard shadow, a dark opening)?
+    # List it per camera: a detection boxed ~exactly there is dropped before saving or
+    # clip-triggering, while a real animal walking through the spot has a much bigger box and is
+    # kept. Boxes are (x1, y1, x2, y2) in full-resolution frame pixels -- read them off the
+    # repeated rows in the DB, or the preview. Full story at `ignore_zones` in config.py.
+    # cfg.ignore_zones = {"glass_door_cam": [(1127, 595, 1234, 701)]}
+
     # Where backup.py archives the rig's generated content (clips/crops/db). Point it at a
     # folder your cloud client syncs (Google Drive, Dropbox, OneDrive) so uploads are automatic;
     # schedule `python backup.py` weekly. Clips especially want this: the live clips/ folder is

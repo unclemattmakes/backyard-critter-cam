@@ -137,3 +137,48 @@ def test_sweep_swallows_taskkill_failure(monkeypatch):
                         lambda timeout=15: _helper(11, 12, 999))
     monkeypatch.setattr(backyard_cam.subprocess, "run", boom)
     backyard_cam._sweep_stale_naming()   # must not raise: best-effort, silent on failure
+
+
+# ---- Ignore zones: the static-false-fire filter -------------------------------------
+# Real numbers from the 2026-07-20 dusk: the retaining-wall opening fired "animal" at
+# (1141,608)-(1220,687) on every detector run, while the actual raccoon walked past with
+# far bigger, drifting boxes. The zone below is that box padded ~12 px (see config_local).
+
+ZONE = (1127, 595, 1234, 701)
+
+
+class _Det:
+    def __init__(self, bbox):
+        self.bbox = bbox
+
+
+def test_box_iou_identical_and_disjoint():
+    assert backyard_cam.box_iou(ZONE, ZONE) == 1.0
+    assert backyard_cam.box_iou((0, 0, 10, 10), (20, 20, 30, 30)) == 0.0
+    assert backyard_cam.box_iou((0, 0, 0, 0), (0, 0, 10, 10)) == 0.0   # degenerate box
+
+
+def test_wall_opening_false_fire_is_dropped():
+    hole = _Det((1141.0, 608.0, 1220.0, 687.0))        # the measured false-fire box
+    kept, dropped = backyard_cam.drop_ignored([hole], [ZONE], 0.45)
+    assert kept == [] and dropped == [hole]
+
+
+def test_animal_walking_through_the_zone_is_kept():
+    # A raccoon-sized box OVERLAPPING the zone: IoU with the zone stays tiny -> kept.
+    raccoon = _Det((950.0, 500.0, 1350.0, 800.0))
+    kept, dropped = backyard_cam.drop_ignored([raccoon], [ZONE], 0.45)
+    assert kept == [raccoon] and dropped == []
+
+
+def test_mixed_detections_split_correctly():
+    hole = _Det((1140.0, 609.0, 1222.0, 689.0))
+    bird = _Det((300.0, 300.0, 420.0, 400.0))          # elsewhere in frame entirely
+    kept, dropped = backyard_cam.drop_ignored([hole, bird], [ZONE], 0.45)
+    assert kept == [bird] and dropped == [hole]
+
+
+def test_no_zones_is_a_no_op():
+    d = _Det((1141.0, 608.0, 1220.0, 687.0))
+    kept, dropped = backyard_cam.drop_ignored([d], [], 0.45)
+    assert kept == [d] and dropped == []

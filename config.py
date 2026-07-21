@@ -222,6 +222,21 @@ class Config:
     detector_min_interval_s: float = 1.0
     # How long the last drawn boxes persist on the preview between detector runs (seconds).
     box_display_ttl_s: float = 1.0
+    # Ignore zones: persistent STATIC false-fire spots, per camera source. A scene can hold a
+    # patch the detector reliably misreads as an animal -- on this rig, a dark opening in the
+    # retaining wall scored "animal" 0.25-0.7 on every run for a whole dusk (2026-07-20: 170+
+    # junk rows, later force-named as birds by the species step). The motion gate is no defense:
+    # it only decides WHEN the detector runs, and anything else moving (a real visitor, dusk
+    # light-fade) makes the stateless full-frame detector re-report the patch. List such spots
+    # here -- {source: [(x1, y1, x2, y2), ...]} in FULL-RES frame pixels -- and any detection
+    # whose box mostly overlaps one (IoU >= ignore_zone_iou) is dropped before drawing, saving,
+    # and clip-triggering. The IoU gate keeps it surgical: a real animal passing THROUGH a zone
+    # has a much bigger box (IoU stays tiny) and is kept; only a zone-sized box sitting ON the
+    # zone is dropped. Zones are framing-specific: set them in config_local.py and re-measure
+    # after physically moving a camera (zones are drawn as faint gray boxes on the preview so a
+    # stale one is visible). None/{} = no zones.
+    ignore_zones: dict | None = None
+    ignore_zone_iou: float = 0.45
 
     # ---- Output (crops mandatory, full frame optional) --------------------------
     db_path: Path = ROOT / "backyard.db"

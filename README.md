@@ -782,6 +782,15 @@ The rig runs MegaDetector v6 through [Ultralytics](https://github.com/ultralytic
 - **No detections though motion shows:** lower `--min-confidence`, or check lighting; the red
   dot (top-right of the preview) confirms the motion gate is firing.
 - **Too many / too few motion triggers:** tune `--motion-min-area` (lower = more sensitive).
+- **The detector keeps boxing the same static spot** (a hard shadow, a dark opening in a wall,
+  a knot in the fence — saved over and over, then force-named as some improbable species): that
+  patch simply *looks* like an animal to MegaDetector, and the motion gate is no defense — it
+  only decides *when* the detector runs, and anything else moving (a real visitor, dusk light
+  fading) makes the stateless full-frame detector re-report the patch. List the spot in
+  `ignore_zones` (config_local.py; see config.py for the shape): a detection whose box mostly
+  *is* the zone is dropped before drawing, saving, or clip-triggering, while a real animal
+  passing through carries a much bigger box and is kept. Zones show as faint gray "ignored"
+  outlines on the preview so a stale one is visible.
 - **App dies overnight / camera "vanishes" while idle:** a running rig **deliberately keeps the
   machine awake** — on Windows `backyard_cam.py` holds a **Power Request**
   (`PowerRequestExecutionRequired`, which is *Modern-Standby-aware*) plus the legacy

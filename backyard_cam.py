@@ -624,6 +624,36 @@ class MotionGate:
         return max(cv2.contourArea(c) for c in contours) * area_scale
 
 
+# ---- Ignore zones (static false-fire spots) -----------------------------------------
+def box_iou(a, b) -> float:
+    """IoU of two (x1, y1, x2, y2) boxes; 0.0 for disjoint or degenerate boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = min(ax2, bx2) - max(ax1, bx1)
+    ih = min(ay2, by2) - max(ay1, by1)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def drop_ignored(dets, zones, min_iou: float):
+    """Split detections into (kept, dropped) against cfg.ignore_zones for this camera.
+
+    A detection is dropped only when its box mostly IS a zone (IoU >= min_iou) -- the
+    static-false-fire signature. The IoU gate keeps this surgical: a real animal walking
+    THROUGH a zone carries a much bigger box, so its IoU with the zone stays tiny and it is
+    kept (measured on the wall-opening zone: the false-fire scores ~0.55, a raccoon-sized
+    box over the same spot ~0.09)."""
+    if not zones:
+        return list(dets), []
+    kept, dropped = [], []
+    for d in dets:
+        (dropped if any(box_iou(d.bbox, z) >= min_iou for z in zones) else kept).append(d)
+    return kept, dropped
+
+
 # ---- Saving ------------------------------------------------------------------------
 # Project-root-relative stored path. Aliased to the shared db helper (kept importable under this
 # name because import_trailcam does `from backyard_cam import _rel`).
@@ -878,11 +908,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     eff_profiles = _eff(spec, cfg, "camera_profiles") or {}
     record = _eff(spec, cfg, "record_clips")
     clip_trigger = cfg.clip_classes or cfg.save_classes
+    # Static false-fire spots for THIS camera (config.ignore_zones): a detection boxed ~on one
+    # is dropped before drawing, saving, and clip-triggering. Framing-specific by design.
+    ignore_zones = list((cfg.ignore_zones or {}).get(spec.source) or ())
 
     conn = db.connect(cfg.db_path)
     cap = None
     recorder = None
-    saved = 0
+    saved = ignored = 0
     try:
         cap = open_capture(spec, cfg)
         if cap is None:
@@ -994,6 +1027,9 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 except Exception as e:  # never let one bad frame kill the loop
                     print(f"{tag} detector error on a frame (skipping): {e}")
                     dets = []
+                if dets and ignore_zones:
+                    dets, zoned_out = drop_ignored(dets, ignore_zones, cfg.ignore_zone_iou)
+                    ignored += len(zoned_out)
                 if dets:
                     last_dets, last_dets_t = dets, now
                     saved_dets = [d for d in dets if d.class_name in cfg.save_classes]
@@ -1038,6 +1074,11 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             if (want_stream or cfg.show_preview) and (now - last_disp_t) >= disp_min_dt:
                 last_disp_t = now
                 disp = frame.copy()
+                for zx1, zy1, zx2, zy2 in ignore_zones:   # faint outline: "the rig ignores this spot"
+                    cv2.rectangle(disp, (int(zx1), int(zy1)), (int(zx2), int(zy2)),
+                                  (120, 120, 120), 1)
+                    cv2.putText(disp, "ignored", (int(zx1) + 4, int(zy1) + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
                 show = last_dets if (now - last_dets_t) <= cfg.box_display_ttl_s else []
                 draw_detections(disp, show)
                 draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion, saved=saved,
@@ -1068,7 +1109,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             conn.close()
         except Exception:
             pass
-        results[spec.source] = {"saved": saved,
+        results[spec.source] = {"saved": saved, "ignored": ignored,
                                 "clips": recorder.clips_saved if recorder is not None else 0}
 
 
@@ -1258,8 +1299,11 @@ def run(cfg: config.Config) -> None:
         conn.close()
         total_saved = sum(r.get("saved", 0) for r in results.values())
         total_clips = sum(r.get("clips", 0) for r in results.values())
+        total_ignored = sum(r.get("ignored", 0) for r in results.values())
         clips_note = f"  Recorded {total_clips} clip(s)." if total_clips else ""
-        print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}.{clips_note}")
+        zone_note = (f"  Dropped {total_ignored} ignore-zone false-fire(s)." if total_ignored else "")
+        print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}."
+              f"{clips_note}{zone_note}")
 
 
 # ---- CLI ---------------------------------------------------------------------------
