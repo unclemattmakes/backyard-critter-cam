@@ -128,12 +128,16 @@ def _shot_score(r) -> float:
 # ---------------------------------------------------------------------------
 
 def load_clips(conn) -> list:
-    """Every clip, parsed once for in-memory time-overlap matching. Each entry carries the parsed
-    span (sdt/edt) plus the URL-friendly fields the dashboard needs. [] if there are no clips."""
+    """Every PLAYABLE clip, parsed once for in-memory time-overlap matching. Each entry carries
+    the parsed span (sdt/edt) plus the URL-friendly fields the dashboard needs. Soft-pruned clips
+    (video deleted for the disk budget, row kept for its derived tracks/embeddings) are excluded
+    -- this feeds watch/play surfaces, and a play button on a missing file is a broken promise.
+    [] if there are no clips."""
     try:
         rows = conn.execute(
             "SELECT source, clip_path, started_at, ended_at, fps, width, height, "
-            "frame_count, detection_count, max_confidence FROM clips ORDER BY started_at"
+            "frame_count, detection_count, max_confidence FROM clips "
+            "WHERE pruned_at IS NULL ORDER BY started_at"
         ).fetchall()
     except Exception:
         return []          # an old DB without the clips table -> just no clips to link

@@ -136,7 +136,13 @@ CREATE TABLE IF NOT EXISTS clips (
     height          INTEGER,
     frame_count     INTEGER,            -- frames written (pre-roll + live + post-roll).
     detection_count INTEGER,            -- detector hits during the clip (rough "how busy").
-    max_confidence  REAL                -- best detector score in the clip (a usability proxy).
+    max_confidence  REAL,               -- best detector score in the clip (a usability proxy).
+    pruned_at       TEXT                -- set when the rolling-window pruner deleted the FILE.
+                                        -- The row (and its clip_tracks / clip_track_embeddings /
+                                        -- individual links) outlives the video: derived re-ID and
+                                        -- behaviour data must not reset every disk-budget cycle.
+                                        -- backup.py archives the file itself before pruning
+                                        -- reaches it, when scheduled. NULL = playable on disk.
 );
 CREATE INDEX IF NOT EXISTS idx_clips_started ON clips(started_at);
 CREATE INDEX IF NOT EXISTS idx_clips_source  ON clips(source);
@@ -367,10 +373,12 @@ def insert_clip_tracks(conn: sqlite3.Connection, *, clip_id: int, model: str, n_
 
 
 def clips_needing_tracks(conn: sqlite3.Connection, model: str):
-    """Clips that don't yet have a motion track for `model` (resumable batch processing)."""
+    """Clips that don't yet have a motion track for `model` (resumable batch processing).
+    Pruned clips are excluded -- their video is gone, so there is nothing to extract from."""
     return conn.execute(
         """SELECT c.id, c.clip_path, c.fps FROM clips c
-           WHERE NOT EXISTS (SELECT 1 FROM clip_tracks t WHERE t.clip_id = c.id AND t.model = ?)
+           WHERE c.pruned_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM clip_tracks t WHERE t.clip_id = c.id AND t.model = ?)
            ORDER BY c.id""", (model,)
     ).fetchall()
 
@@ -404,12 +412,15 @@ def set_clip_track_individual(conn: sqlite3.Connection, track_ids: Sequence[int]
 def clip_tracks_needing_embedding(conn: sqlite3.Connection, model: str, min_hits: int):
     """Sustained tracklets (>= min_hits boxes) that have a stored track but no appearance vector
     for `model` yet -- the resumable work-list for clipembed.py. Joins the clip path + fps so the
-    embedder can re-open the video and seek to the tracklet's frames."""
+    embedder can re-open the video and seek to the tracklet's frames. Pruned clips are excluded
+    (no video to seek into) -- which is also why the nightly batch embeds BEFORE pruning ages a
+    clip out: vectors extracted in time survive the prune (load_clip_track_embeddings keeps
+    returning them)."""
     return conn.execute(
         """SELECT t.id AS track_id, t.clip_id, t.track_idx, t.track, t.n_hits,
                   c.clip_path, c.fps
            FROM clip_tracks t JOIN clips c ON c.id = t.clip_id
-           WHERE t.n_hits >= ? AND t.track IS NOT NULL
+           WHERE c.pruned_at IS NULL AND t.n_hits >= ? AND t.track IS NOT NULL
              AND NOT EXISTS (SELECT 1 FROM clip_track_embeddings e
                              WHERE e.track_id = t.id AND e.model = ?)
            ORDER BY t.clip_id, t.track_idx""",
@@ -502,6 +513,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "model_species_confidence = species_confidence, "
             "model_species_source = species_source "
             "WHERE species IS NOT NULL AND (species_source IS NULL OR species_source != 'human')")
+    # Soft prune (2026-07-17): the rolling-window pruner marks pruned_at instead of deleting the
+    # clips row, so clip_tracks / clip_track_embeddings / individual links survive the disk budget
+    # (June 2026's 550 tracklet vectors + all Notch/Elliot track links were cascade-lost this way).
+    clip_cols = {r[1] for r in conn.execute("PRAGMA table_info(clips)")}
+    if clip_cols and "pruned_at" not in clip_cols:
+        conn.execute("ALTER TABLE clips ADD COLUMN pruned_at TEXT")
     # clip_tracks grew multi-animal + gait columns (2026-06-11, phase 4 part 2).
     ct_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_tracks)")}
     if "track_idx" not in ct_cols:

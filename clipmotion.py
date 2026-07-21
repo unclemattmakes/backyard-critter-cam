@@ -525,7 +525,9 @@ def main() -> int:
             rows = conn.execute("SELECT id, clip_path, fps FROM clips WHERE id = ?",
                                 (args.clip,)).fetchall()
         elif args.redo:
-            rows = conn.execute("SELECT id, clip_path, fps FROM clips ORDER BY id").fetchall()
+            # Soft-pruned clips have no video left to re-extract from; their existing tracks stay.
+            rows = conn.execute("SELECT id, clip_path, fps FROM clips "
+                                "WHERE pruned_at IS NULL ORDER BY id").fetchall()
         else:
             rows = db.clips_needing_tracks(conn, model)
         if args.visit_species:

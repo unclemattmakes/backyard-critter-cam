@@ -91,7 +91,8 @@ def plan_reel(cfg, edition="auto", date=None, now=None) -> dict | None:
         pad = timedelta(minutes=10)
         clips = conn.execute(
             "SELECT id, source, clip_path, started_at, ended_at, fps, frame_count "
-            "FROM clips WHERE started_at >= ? AND started_at <= ? ORDER BY started_at",
+            "FROM clips WHERE started_at >= ? AND started_at <= ? AND pruned_at IS NULL "
+            "ORDER BY started_at",
             ((start - pad).isoformat(), end.isoformat())).fetchall()
         dets = conn.execute(
             "SELECT timestamp, source, detection_class, species, confidence, species_confidence, "

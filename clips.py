@@ -109,9 +109,17 @@ def _safe_source(source: str) -> str:
 
 
 def prune_clips(cfg: config.Config, conn) -> int:
-    """Keep clips/ under cfg.clips_max_gb by deleting the OLDEST clips (file + DB row; any
-    clip_tracks rows cascade). This is what makes always-on recording safe on a family rig --
-    the folder is a rolling window, never an unbounded grower. Returns clips removed.
+    """Keep clips/ under cfg.clips_max_gb by deleting the OLDEST clip FILES. This is what makes
+    always-on recording safe on a family rig -- the folder is a rolling window, never an
+    unbounded grower. Returns clips removed.
+
+    SOFT prune: only the video file is deleted; the clips ROW stays, stamped `pruned_at`. The
+    row's children -- clip_tracks, clip_track_embeddings, and their individual_id links -- are
+    exactly the derived re-ID/behaviour data the nightly batch mined from the clip, and deleting
+    the row used to CASCADE them away (June 2026: 550 tracklet vectors + every Notch/Elliot track
+    link silently lost when the month aged out). The video is expendable -- and usually archived
+    by backup.py before pruning reaches it anyway; what it taught us is not. Playback surfaces
+    filter on `pruned_at IS NULL`; the analytical joins keep using the full table.
     Best-effort: a locked/missing file is skipped, never fatal. 0/None budget = no cap."""
     budget = (cfg.clips_max_gb or 0) * (1024 ** 3)
     if budget <= 0 or not cfg.clips_dir.exists():
@@ -143,10 +151,11 @@ def prune_clips(cfg: config.Config, conn) -> int:
         except (OSError, ValueError):
             pass
         try:
-            conn.execute("DELETE FROM clips WHERE clip_path = ?", (_rel(p),))
+            conn.execute("UPDATE clips SET pruned_at = ? WHERE clip_path = ?",
+                         (db.now_local_iso(), _rel(p)))
             conn.commit()
         except Exception:
-            pass                               # orphan row is harmless; next prune retries
+            pass                               # unstamped row is harmless; next prune retries
     if removed:
         print(f"[clips] pruned {removed} oldest clip(s) to stay under "
               f"{cfg.clips_max_gb:g} GB (rolling window).")

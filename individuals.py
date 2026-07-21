@@ -322,8 +322,12 @@ def clips_for_individual(conn, individual_id: str, species: str = "raccoon", lim
         return []
     multi = clip_co_presence_by_visit(conn, species)
     multi_min = cfg.reid_clip_co_presence_min_clips if cfg is not None else 2
+    # Playback surface: soft-pruned clips (video gone, row kept for its derived data) are
+    # excluded here, while clip_co_presence_by_visit above deliberately keeps them -- the
+    # co-presence SIGNAL outlives the footage.
     clips = conn.execute(
-        "SELECT id, source, clip_path, started_at, ended_at, frame_count, fps FROM clips").fetchall()
+        "SELECT id, source, clip_path, started_at, ended_at, frame_count, fps FROM clips "
+        "WHERE pruned_at IS NULL").fetchall()
     out = []
     for c in clips:
         for v in vrows:

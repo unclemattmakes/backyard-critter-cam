@@ -467,8 +467,11 @@ dwell, vigilance, who-defers-to-whom. That's the substance of behaviour, and a c
 second shot at individual ID (a limp reads the same from any angle, where a single still — pose
 + soft glass — does not). **On by default**, and safe to leave on: the clips folder is a
 **rolling window** — past the `clips_max_gb` disk budget (default 10 GB ≈ two busy weeks) the
-oldest clips are pruned automatically, file and DB row both. (Want to keep them all? `backup.py`
-archives each day before the pruner reaches it — see [Backups](#backups).)
+oldest clip **files** are pruned automatically. The prune is *soft*: the DB row stays, stamped
+`pruned_at`, so everything the clip taught the system — motion tracks, tracklet appearance
+vectors, individual links — **outlives the video** instead of resetting every budget cycle.
+Watch/play surfaces simply stop offering the pruned footage. (Want the videos themselves kept
+too? `backup.py` archives each day before the pruner reaches it — see [Backups](#backups).)
 
 ```powershell
 .\.venv\Scripts\python.exe backyard_cam.py                           # clips record by default

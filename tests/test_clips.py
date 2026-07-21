@@ -329,3 +329,93 @@ def test_bad_clip_codec_falls_back_to_mp4v(conn, tmp_path):
     cfg = dataclasses.replace(config.CONFIG, clip_codec="vp9", clips_dir=tmp_path / "clips")
     rec = clips.ClipRecorder(cfg, conn)
     assert rec.cv2_codec == "mp4v"
+
+
+# --- soft prune: the derived re-ID/behaviour data outlives the video --------------------
+
+def _stocked_clip(clip_cfg, conn, name, *, mtime, started_at, n_tracks=0, embed_first=False):
+    """A fake on-disk clip (1 MiB, controlled mtime) + its DB row, optionally with sustained
+    tracklets and an appearance vector on the first one. Returns the clips.id."""
+    import os
+    p = clip_cfg.clips_dir / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\0" * (1024 * 1024))
+    os.utime(p, (mtime, mtime))
+    cid = db.insert_clip(
+        conn, source=db.SOURCE_GLASS_DOOR_CAM, clip_path=db.rel_to_root(p),
+        started_at=started_at, ended_at=None, fps=10.0, width=160, height=120,
+        frame_count=100, detection_count=5, max_confidence=0.9)
+    if n_tracks:
+        db.insert_clip_tracks(
+            conn, clip_id=cid, model="m", n_samples=100,
+            tracklets=[{"track_json": "[]", "n_hits": 40, "features": {}}] * n_tracks)
+        if embed_first:
+            tid = conn.execute("SELECT id FROM clip_tracks WHERE clip_id = ?", (cid,)).fetchone()[0]
+            db.insert_clip_track_embedding(conn, track_id=tid, model="megadescriptor-l-384",
+                                           dim=3, embedding=b"\0" * 12, n_frames=8)
+    conn.commit()
+    return cid
+
+
+def test_prune_is_soft_and_derived_data_survives(clip_cfg, clip_conn):
+    import sqlite3
+
+    import stats
+    clip_conn.row_factory = sqlite3.Row   # the shared conn fixture does this; clip_conn doesn't
+    # Three 1 MiB clips, oldest first; a ~1.2 MiB budget forces the oldest TWO out.
+    a = _stocked_clip(clip_cfg, clip_conn, "a.mp4", mtime=1_000, started_at="2026-06-01T21:00:00",
+                      n_tracks=1, embed_first=True)      # mined: track + appearance vector
+    b = _stocked_clip(clip_cfg, clip_conn, "b.mp4", mtime=2_000, started_at="2026-06-02T21:00:00",
+                      n_tracks=1)                        # tracked but not yet embedded
+    c = _stocked_clip(clip_cfg, clip_conn, "c.mp4", mtime=3_000, started_at="2026-06-03T21:00:00")
+    cfg = dataclasses.replace(clip_cfg, clips_max_gb=1.2 * 1024 * 1024 / (1024 ** 3))
+
+    assert clips.prune_clips(cfg, clip_conn) == 2
+    assert not (clip_cfg.clips_dir / "a.mp4").exists()
+    assert not (clip_cfg.clips_dir / "b.mp4").exists()
+    assert (clip_cfg.clips_dir / "c.mp4").exists()
+
+    # Every row survives; only the pruned ones carry the stamp.
+    stamps = dict(clip_conn.execute("SELECT id, pruned_at FROM clips").fetchall())
+    assert set(stamps) == {a, b, c}
+    assert stamps[a] and stamps[b] and stamps[c] is None
+
+    # The mined signal is intact -- this is the whole point of the soft prune.
+    assert clip_conn.execute("SELECT COUNT(*) FROM clip_tracks WHERE clip_id = ?", (a,)).fetchone()[0] == 1
+    assert clip_conn.execute(
+        "SELECT COUNT(*) FROM clip_track_embeddings e JOIN clip_tracks t ON t.id = e.track_id "
+        "WHERE t.clip_id = ?", (a,)).fetchone()[0] == 1
+    assert len(db.load_clip_track_embeddings(clip_conn, "megadescriptor-l-384")) == 1
+
+    # Work-lists that need the VIDEO skip pruned clips (b's unembedded track is unreachable now;
+    # c still queues for extraction) -- and playback surfaces only offer what can actually play.
+    assert [r["id"] for r in db.clips_needing_tracks(clip_conn, "m")] == [c]
+    assert db.clip_tracks_needing_embedding(clip_conn, "megadescriptor-l-384", 30) == []
+    assert ([r["clip_path"] for r in stats.load_clips(clip_conn)]
+            == [db.rel_to_root(clip_cfg.clips_dir / "c.mp4").replace("\\", "/")])
+
+    # A second pass finds the folder inside budget -- pruned ghosts can't loop.
+    assert clips.prune_clips(cfg, clip_conn) == 0
+
+
+def test_pruned_pair_clip_still_flags_co_presence(clip_cfg, clip_conn):
+    import sqlite3
+
+    import individuals
+    clip_conn.row_factory = sqlite3.Row
+    d = db.insert_detection(
+        clip_conn, timestamp="2026-06-01T21:00:30-07:00", source=db.SOURCE_GLASS_DOOR_CAM,
+        detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10), frame_w=100, frame_h=100,
+        crop_path="crops/x.jpg", species="raccoon")
+    vid = db.insert_visit(
+        clip_conn, source=db.SOURCE_GLASS_DOOR_CAM, species="raccoon", individual_id=None,
+        started_at="2026-06-01T21:00:00-07:00", ended_at="2026-06-01T21:10:00-07:00",
+        detection_count=1, max_confidence=0.9, representative_detection_id=d)
+    db.assign_visit(clip_conn, [d], vid)
+    pair = _stocked_clip(clip_cfg, clip_conn, "pair.mp4", mtime=1_000,
+                         started_at="2026-06-01T21:01:00-07:00", n_tracks=2)
+    clip_conn.execute("UPDATE clips SET pruned_at = '2026-06-20T14:00:00-07:00' WHERE id = ?", (pair,))
+    clip_conn.commit()
+
+    # The co-presence SIGNAL must outlive the footage: the analytics join keeps pruned rows.
+    assert individuals.clip_co_presence_by_visit(clip_conn, "raccoon") == {vid: 1}

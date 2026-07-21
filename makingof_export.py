@@ -227,7 +227,8 @@ def export_pipeline(conn) -> None:
         # find an overlapping clip for the wide frame + motion mask
         clip = conn.execute(
             "SELECT clip_path, started_at, ended_at FROM clips WHERE source=? "
-            "AND started_at <= ? AND COALESCE(ended_at, started_at) >= ? LIMIT 1",
+            "AND started_at <= ? AND COALESCE(ended_at, started_at) >= ? "
+            "AND pruned_at IS NULL LIMIT 1",
             (d["source"], v["started_at"], v["started_at"])).fetchone()
         frames = _extract_frames(clip["clip_path"], bbox_norm) if clip else None
         if not frames:                       # the scrubber needs the wide frame + motion mask
@@ -619,7 +620,7 @@ def export_copresence(conn) -> None:
     if v:
         clip = conn.execute(
             "SELECT clip_path FROM clips WHERE source=? AND started_at <= ? "
-            "AND COALESCE(ended_at, started_at) >= ? LIMIT 1",
+            "AND COALESCE(ended_at, started_at) >= ? AND pruned_at IS NULL LIMIT 1",
             (v["source"], v["started_at"], v["started_at"])).fetchone()
         if clip:
             fr = _extract_frames(clip["clip_path"], None)
