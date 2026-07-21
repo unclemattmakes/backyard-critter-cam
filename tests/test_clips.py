@@ -331,6 +331,122 @@ def test_bad_clip_codec_falls_back_to_mp4v(conn, tmp_path):
     assert rec.cv2_codec == "mp4v"
 
 
+# --- clip_scale must never hand the encoder odd dimensions ------------------------------
+
+def test_clip_scale_output_dimensions_are_even(clip_cfg, clip_conn):
+    """libx264 (yuv420p) refuses odd frame sizes, and 0.667 x 1920 = 1280.64 -- the old fx/fy
+    resize rounded that to 1281 and ffmpeg died on the first frame of EVERY clip (2026-07-20,
+    a full day of clips silently lost). _prep must round the scaled size down to even."""
+    cfg = dataclasses.replace(clip_cfg, clip_scale=0.667)
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    prepped = rec._prep(np.zeros((1080, 1920, 3), dtype=np.uint8))
+    assert prepped.shape == (720, 1280, 3)          # not 1281 -- and both dimensions even
+
+    # An awkward source size still comes out even (int(161*0.5)=80, int(121*0.5)=60).
+    rec2 = clips.ClipRecorder(dataclasses.replace(clip_cfg, clip_scale=0.5), clip_conn)
+    h, w = rec2._prep(np.zeros((121, 161, 3), dtype=np.uint8)).shape[:2]
+    assert w % 2 == 0 and h % 2 == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_h264_records_at_1080p_with_clip_scale_0667(clip_cfg, clip_conn):
+    """End-to-end regression for the 2026-07-20 outage: the LIVE geometry (1920x1080 capture,
+    clip_scale 0.667, H.264 pipe) must produce a real, decodable clip -- not a silent drop."""
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264", clip_scale=0.667)
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    assert rec.use_ffmpeg is True
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    rec.note_detection(now=0.0, detections=[FakeDetection(0.9)])
+    for i in range(6):
+        rec.note_detection(now=i * 0.1, detections=[FakeDetection(0.6)])
+        rec.note_frame(frame, now=i * 0.1, loop_fps=15.0)
+    clip_path = rec.clip_path
+    rec.finalize()
+
+    assert rec.use_ffmpeg is True                  # the pipe survived -- no fallback needed
+    assert _count_clip_rows(clip_conn) == 1
+    row = clip_conn.execute(
+        "SELECT width, height FROM clips ORDER BY id DESC LIMIT 1").fetchone()
+    assert row == (1280, 720)                      # even dimensions, ~720p as configured
+    assert clip_path.exists() and clip_path.stat().st_size > 0
+    assert _decode_frame_count(clip_path) == 6
+
+
+# --- a dying ffmpeg pipe must be caught, not silently counted into ----------------------
+
+class _DyingPipeWriter:
+    """Mimics ffmpeg's real first-write death (bad geometry): looks open until write() is
+    first called, then reports dead. write() swallows everything, like the real pipe writer."""
+    def __init__(self, path, fps, size):
+        self.writes = 0
+
+    def isOpened(self):
+        return self.writes == 0
+
+    def write(self, frame):
+        self.writes += 1
+
+    def release(self, timeout=None):
+        pass
+
+
+def test_dead_ffmpeg_pipe_falls_back_to_cv2_and_keeps_the_clip(clip_cfg, clip_conn,
+                                                               monkeypatch, capsys):
+    """If the ffmpeg pipe dies on the first write, _check_writer must rebuild the clip on the
+    cv2 writer from the pre-roll ring -- LOUDLY -- instead of counting frames into a dead pipe
+    and silently dropping the 0-byte file at finalize (the 2026-07-20 failure shape)."""
+    monkeypatch.setattr(clips, "_FFMPEG", "ffmpeg-stub")          # "ffmpeg is available"
+    monkeypatch.setattr(clips, "_FfmpegWriter", _DyingPipeWriter)  # ...but its pipe dies
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264", clip_pre_roll_s=3.0)
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    assert rec.use_ffmpeg is True
+
+    for i in range(3):                             # pre-roll buffered before the visit
+        rec.note_frame(_frame(), now=i * 0.1, loop_fps=15.0)
+    rec.note_detection(now=0.35, detections=[FakeDetection(0.9)])
+    assert rec.use_ffmpeg is False                 # fallback engaged at clip start
+    assert rec.frame_count == 3                    # ring re-dumped into the cv2 writer
+    rec.note_frame(_frame(), now=0.4, loop_fps=15.0)
+    rec.note_frame(_frame(), now=0.5, loop_fps=15.0)
+    clip_path = rec.clip_path
+    rec.finalize()
+
+    assert "ffmpeg pipe died" in capsys.readouterr().out
+    assert _count_clip_rows(clip_conn) == 1        # the clip SURVIVED
+    assert _decode_frame_count(clip_path) == 5     # 3 pre-roll + 2 live, all recovered
+
+
+class _OpenButUselessWriter:
+    """A writer that claims to be healthy but never puts a byte on disk -- the shape of a
+    failure _check_writer can't see. finalize must then complain, not shrug."""
+    def __init__(self, path, fps, size):
+        pass
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        pass
+
+    def release(self, timeout=None):
+        pass
+
+
+def test_clip_dropped_with_no_file_is_loud(clip_cfg, clip_conn, monkeypatch, capsys):
+    """The finalize branch that drops a frames-written-but-no-file clip used to be SILENT --
+    which is how a completely dead recorder hid for a whole day. It must print."""
+    monkeypatch.setattr(clips, "_FFMPEG", "ffmpeg-stub")
+    monkeypatch.setattr(clips, "_FfmpegWriter", _OpenButUselessWriter)
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    rec = clips.ClipRecorder(cfg, clip_conn)
+    rec.note_detection(now=0.0, detections=[FakeDetection(0.9)])
+    rec.note_frame(_frame(), now=0.1, loop_fps=15.0)
+    rec.finalize()
+
+    assert "DROPPED" in capsys.readouterr().out
+    assert _count_clip_rows(clip_conn) == 0        # no row for a clip that has no file
+
+
 # --- soft prune: the derived re-ID/behaviour data outlives the video --------------------
 
 def _stocked_clip(clip_cfg, conn, name, *, mtime, started_at, n_tracks=0, embed_first=False):

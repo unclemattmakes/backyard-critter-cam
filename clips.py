@@ -286,8 +286,14 @@ class ClipRecorder:
     # -- frame ingestion -----------------------------------------------------------
     def _prep(self, frame):
         if self.scale != 1.0:
-            return cv2.resize(frame, None, fx=self.scale, fy=self.scale,
-                              interpolation=cv2.INTER_AREA)
+            h, w = frame.shape[:2]
+            # Round the scaled size DOWN to EVEN: libx264 (yuv420p) refuses odd dimensions, and
+            # an innocent-looking scale hits one easily -- 0.667 x 1920 = 1280.64, which fx/fy
+            # rounding turned into 1281, killing ffmpeg on the first frame of every clip
+            # (2026-07-20: a full day of clips lost to exactly this).
+            nw = max(2, int(w * self.scale) & ~1)
+            nh = max(2, int(h * self.scale) & ~1)
+            return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
         return frame
 
     def note_frame(self, frame, now: float, loop_fps: float | None = None) -> None:
@@ -308,6 +314,7 @@ class ClipRecorder:
             if prepped is None:
                 prepped = self._prep(frame)
             self._write(prepped)
+            self._check_writer()
             if (now - self.last_det_t) > self.post_roll or (now - self.started_t) > self.max_s:
                 self.finalize()
 
@@ -362,6 +369,7 @@ class ClipRecorder:
         # Prepend the buffered pre-roll so the clip opens on the animal arriving.
         for _t, f in list(self.ring):
             self._write(f)
+        self._check_writer()   # ffmpeg rejects bad input by DYING on the first write -- catch it now
 
     def _open_writer(self, w: int, h: int):
         """Open the clip sink: an ffmpeg/H.264 pipe when configured + available, else cv2's mp4v
@@ -394,6 +402,29 @@ class ClipRecorder:
             self.writer = writer
         self.writer.write(frame)
         self.frame_count += 1
+
+    def _check_writer(self) -> None:
+        """Fall back to the cv2 writer if the ffmpeg pipe has DIED on this clip. ffmpeg rejects
+        bad input by exiting on the very first frame (e.g. an odd frame size), and
+        `_FfmpegWriter.write` deliberately swallows the broken pipe -- so without this check the
+        recorder keeps counting frames into a dead pipe and finalize() finds only a 0-byte file
+        to silently drop. That exact combination hid a completely dead recorder for a full day
+        (2026-07-20). Rebuilding from the pre-roll ring means a death at clip start (the common
+        case: encoder init rejects the frame geometry) loses nothing; a rare genuinely-mid-clip
+        death keeps the last-few-seconds tail rather than dropping the clip outright."""
+        if not isinstance(self.writer, _FfmpegWriter) or self.writer.isOpened():
+            return
+        print(f"[clips] ffmpeg pipe died on {_rel(self.clip_path)} -- rebuilding this clip on "
+              f"the OpenCV '{self.cv2_codec}' writer (and using it for the rest of the run).")
+        self.use_ffmpeg = False
+        try:
+            self.writer.release(timeout=1)
+        except Exception:
+            pass
+        self.writer = None
+        self.frame_count = 0
+        for _t, f in list(self.ring):     # best-available rebuild from the buffer we still hold
+            self._write(f)
 
     def finalize(self, shutdown: bool = False) -> None:
         """Close the current clip (if any) and write its DB row. Safe to call when not recording and
@@ -434,7 +465,14 @@ class ClipRecorder:
                   f"{self.detection_count} det)")
             prune_clips(self.cfg, self.conn)   # keep the rolling window inside the disk budget
         elif self.clip_path is not None:
-            # Opened but nothing got written -- drop the empty file.
+            if self.frame_count > 0:
+                # Frames were handed to a writer but nothing usable landed on disk: the encoder
+                # died and the fallback couldn't save it either. Say so LOUDLY -- this branch
+                # dropping clips in silence is how a dead recorder went unnoticed for a whole
+                # day (2026-07-20). Never make this quiet again.
+                print(f"[clips] DROPPED {_rel(self.clip_path)} -- {self.frame_count} frame(s) "
+                      "written but the file is missing/empty (video writer died).")
+            # Drop the empty/partial file, if any.
             try:
                 if self.clip_path.exists():
                     self.clip_path.unlink()

@@ -526,6 +526,11 @@ too? `backup.py` archives each day before the pruner reaches it — see [Backups
 - All knobs (pre/post-roll, max length, fps, downscale, codec, trigger classes, disk budget)
   live in `config.py`; `clip_scale < 1.0` trims the in-RAM buffer and file size if memory is
   tight; `record_clips = False` turns recording off permanently (incl. the family launchers).
+- **If the encoder dies, you'll know.** Scaled clip sizes are rounded down to *even* dimensions
+  (libx264 refuses odd ones — `0.667 × 1920 = 1281` once killed ffmpeg on the first frame of
+  every clip and a full day of footage vanished in silence); a pipe that dies mid-clip is caught,
+  the clip is rebuilt on the OpenCV fallback writer from the pre-roll buffer, and a clip that
+  still can't reach disk is dropped with a **loud** `[clips] DROPPED …` log line, never quietly.
 
 ---
 
