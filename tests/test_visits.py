@@ -179,3 +179,38 @@ def test_empty_db_builds_no_visits(conn):
     summary = visits.build_visits(conn, gap_minutes=5, verbose=False)
     assert summary == {"visits": 0, "detections": 0}
     assert _visit_rows(conn) == []
+
+
+# --- refresh (the shared best-effort rebuild every pipeline step calls) -------------------
+
+def test_refresh_folds_new_species_into_existing_visits(conn):
+    """THE trail-cam sequence (2026-07-22): visits built while species were still NULL must pick
+    up their dominant label on the next refresh -- classify.py refreshes after labeling for
+    exactly this."""
+    a = _det(conn, minutes=0)
+    b = _det(conn, minutes=1)
+    assert visits.refresh(conn, gap_minutes=5) is True
+    assert _visit_rows(conn)[0]["species"] is None       # built before classification
+
+    for det_id in (a, b):
+        db.set_species(conn, det_id, "raccoon", 0.9)
+    conn.commit()
+    assert visits.refresh(conn, gap_minutes=5) is True
+    assert _visit_rows(conn)[0]["species"] == "raccoon"  # the re-refresh folds the labels in
+
+
+def test_refresh_restores_row_factory(conn):
+    """Callers keep using their connection afterwards (classify.py unpacks rows positionally), so
+    refresh must not leave sqlite3.Row set on a connection that didn't have it."""
+    conn.row_factory = None
+    _det(conn, minutes=0)
+    assert visits.refresh(conn, gap_minutes=5) is True
+    assert conn.row_factory is None
+
+
+def test_refresh_never_raises(db_path):
+    """The best-effort contract: a failed refresh reports False, never an exception -- it must not
+    take down the import/labeling/shutdown that already succeeded."""
+    c = db.connect(db_path)
+    c.close()
+    assert visits.refresh(c, gap_minutes=5) is False

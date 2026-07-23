@@ -332,6 +332,8 @@ Every saved crop gets a **species** name, not just the coarse `animal` label —
 **editing the candidate-species list is free**: the list in `classify.py` (`SPECIES_LABELS`, a
 Pacific-Northwest backyard starter set) is just text — tweak it for your yard and re-run, no
 retraining. It's resumable and re-runnable; by default only crops without a species are named.
+Whenever it writes labels it also refreshes the **visit ledger**, so each visit's dominant
+species tracks the new labels with no manual `visits.py` step.
 
 ```powershell
 .\.venv\Scripts\python.exe classify.py              # name every unlabeled crop (GPU)
@@ -571,8 +573,11 @@ how direct the path, how much it moved) and each named individual a **motion fin
 aggregated across its clips. Speed stays hedged — it's in frame-fraction units, so a nearer animal
 reads faster; direction and straightness are the trustworthy parts.
 
-The visit ledger refreshes itself on rig shutdown and after trail-cam imports; `visits.py` is
-only needed manually after offline label edits.
+The visit ledger refreshes itself at every step that changes what it would say: on rig shutdown,
+after a trail-cam import, and whenever `classify.py` writes species labels (at the end of a
+one-shot run, and in `--watch` each time a naming backlog drains) — so a batch import ends with
+*labeled* visits on its own. `visits.py` is only needed manually after offline edits (say,
+hand-run SQL).
 
 ---
 
@@ -755,7 +760,9 @@ Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
 - **Later — trail-cam batch importer:** ✅ `import_trailcam.py` — dump the SD card into a folder,
   `python import_trailcam.py <folder>` runs the same detector over it and writes crops with
   `source='trail_cam_sd'`. EXIF timestamps, idempotent re-runs, `--watch` a drop folder. Same
-  pipeline downstream (species ID, re-ID, behaviour all key off the `source` column).
+  pipeline downstream (species ID, re-ID, behaviour all key off the `source` column): the rig's
+  naming helper labels the new crops if it's running (else run `python classify.py`), and the
+  visit ledger refreshes itself again when the labels land.
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —
 augment the critter-knower, don't replace them. And: boring and robust over clever; most of

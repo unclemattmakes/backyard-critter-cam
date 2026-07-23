@@ -6,6 +6,11 @@ below, and the top match + its score are written to detections.species / .specie
 Because it's zero-shot, EDITING THE LABEL LIST IS FREE -- tweak it for your yard and re-run,
 no retraining. Re-runnable and resumable: by default only rows with species IS NULL are done.
 
+Labeling here is what gives VISITS their species (a visit carries the dominant label of its
+crops), so whenever this module writes labels it also refreshes the visit ledger -- at the end
+of a one-shot run, and in --watch whenever a naming backlog drains. That's what lets a trail-cam
+batch import end with LABELED visits with no manual `python visits.py` afterwards.
+
   python classify.py                 # backfill all unlabeled crops (GPU)
   python classify.py --device cpu    # ... on CPU (slower, but no GPU contention with the rig)
   python classify.py --redo          # re-classify everything (e.g. after editing the labels)
@@ -30,6 +35,7 @@ from collections import Counter
 import config
 import db
 import detector
+import visits
 from clipfilter import NONANIMAL_LABEL
 
 # --- Your yard's candidate species. Common names work well. Keep it to species you actually
@@ -208,14 +214,34 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
     print(f"[naming] BioCLIP 2 ready on {device}; naming new crops as they arrive "
           f"(checking every {interval:.0f}s).")
     _write_naming_status("ready", device=device, named=sum(session.values()))
-    while not stop_event.is_set():
-        rows = fetch_pending(conn, min_confidence, redo=False)
-        if rows:
-            print(f"[naming] {len(rows)} new crop(s) to name...")
-            tally, clf, device = classify_rows(conn, clf, device, rows, batch_size, afilter=afilter)
-            session.update(tally)
-        _write_naming_status("ready", device=device, named=sum(session.values()))  # heartbeat
-        stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
+    ledger_dirty = False   # labels written that the visit ledger hasn't folded in yet
+    try:
+        while not stop_event.is_set():
+            rows = fetch_pending(conn, min_confidence, redo=False)
+            if rows:
+                print(f"[naming] {len(rows)} new crop(s) to name...")
+                tally, clf, device = classify_rows(conn, clf, device, rows, batch_size,
+                                                   afilter=afilter)
+                session.update(tally)
+                if tally:
+                    ledger_dirty = True
+            elif ledger_dirty:
+                # A quiet poll after a naming burst = the backlog is drained. Fold the fresh
+                # labels into the visit ledger NOW (a visit carries its crops' dominant species),
+                # so a batch import ends with LABELED visits by itself -- before this, 90 of 113
+                # trail-cam visits (2026-07-22) sat species-less until a manual `python visits.py`.
+                # Refreshing on this trailing edge -- not after every batch -- keeps the rebuild
+                # (and its short write lock) off the hot path while crops are still streaming in:
+                # during live activity it runs about once per lull, not once per poll.
+                visits.refresh(conn, config.CONFIG.visit_gap_minutes)
+                ledger_dirty = False
+            _write_naming_status("ready", device=device, named=sum(session.values()))  # heartbeat
+            stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
+    finally:
+        # Stopped mid-burst (standalone --watch Ctrl-C during a backlog): don't strand the labels
+        # already written -- best-effort, so shutdown never gets slower than one quick rebuild.
+        if ledger_dirty:
+            visits.refresh(conn, config.CONFIG.visit_gap_minutes)
     _write_naming_status("stopped", device=device, named=sum(session.values()))
     return session
 
@@ -281,6 +307,12 @@ def main() -> int:
     tally, clf, args.device = classify_rows(conn, clf, args.device, rows, args.batch_size,
                                             afilter=afilter)
 
+    if tally:
+        # New labels change what visits would say (a visit carries its crops' dominant species),
+        # so end the run by folding them into the visit ledger. This is what completes the
+        # trail-cam pipeline (import_trailcam.py -> classify.py) -- and the --redo path after a
+        # label-list edit -- without a manual `python visits.py`.
+        visits.refresh(conn, config.CONFIG.visit_gap_minutes)
     conn.close()
     print("\nDone. Species tally this run:")
     for sp, n in tally.most_common():

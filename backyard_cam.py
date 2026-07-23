@@ -18,7 +18,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -1289,13 +1288,9 @@ def run(cfg: config.Config) -> None:
             web.shutdown(server)
         cv2.destroyAllWindows()
         # Keep the visit ledger fresh: collapse this session's detections into visit events so the
-        # dashboard's Behaviour tab is current without a manual `python visits.py`. Subsecond here.
-        try:
-            conn.row_factory = sqlite3.Row
-            visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
-            print("  visit ledger refreshed.")
-        except Exception as e:
-            print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
+        # dashboard's Behaviour tab is current without a manual `python visits.py`. Best-effort
+        # (visits.refresh never raises) and subsecond here.
+        visits.refresh(conn, cfg.visit_gap_minutes)
         conn.close()
         total_saved = sum(r.get("saved", 0) for r in results.values())
         total_clips = sum(r.get("clips", 0) for r in results.values())

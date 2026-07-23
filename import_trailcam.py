@@ -23,6 +23,14 @@ Same detector, same crop convention, same DB. The only real differences from the
   python import_trailcam.py D:\dump --processed-dir D:\done  # move each file after import
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
 
+SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
+ledger is refreshed right away so the Behaviour tab shows the new visits -- unlabeled at first.
+classify.py fills the labels (the rig's naming helper picks them up within moments if it's
+running; otherwise run `python classify.py`) and refreshes the ledger AGAIN when it does, so the
+pipeline ends with labeled visits either way -- no manual `python visits.py`. (Before classify
+did that second refresh, 90 of 113 trail-cam visits sat species-less until a manual rebuild --
+hit for real 2026-07-22.)
+
 IDEMPOTENCY (re-runs must not double-import). Three layers, all boring on purpose:
   * ledger: a plain-text sidecar next to the DB (backyard.db.imported-<source>.txt) records every
     file imported for this `source`, one 'basename|capture-second' key per line (e.g.
@@ -59,7 +67,7 @@ skipped; one bad file never aborts the batch.
 from __future__ import annotations
 
 import argparse
-import sqlite3
+import json
 import sys
 import time
 from dataclasses import replace
@@ -312,15 +320,38 @@ def move_to_processed(path: Path, processed_dir: Path) -> None:
 
 
 def refresh_visits(conn, cfg: config.Config) -> None:
-    """Re-collapse detections into visit events after an import lands, so the dashboard's
-    Behaviour tab includes the trail-cam visits without a manual `python visits.py`. Best-effort
-    and subsecond at this scale; an error never fails an import that already succeeded."""
+    """Fold the just-imported detections into the visit ledger, so the dashboard's Behaviour tab
+    shows the trail-cam visits right away. At this point they are UNLABELED -- ingest_file leaves
+    species NULL on purpose -- and they stay that way until classify.py names the crops, which
+    refreshes the ledger AGAIN itself (that second refresh is what ends the pipeline with labeled
+    visits; _print_next_step tells the user which way it'll happen). Best-effort by visits.refresh's
+    contract: an error never fails an import that already succeeded."""
+    visits.refresh(conn, cfg.visit_gap_minutes)
+
+
+def _naming_helper_alive() -> bool:
+    """True when a live species-naming helper (classify.py --watch, normally spawned by the rig)
+    has a FRESH heartbeat in its status file -- the same loading/ready-under-30s rule the
+    dashboard header uses (web._naming_status). Read-only and best-effort: any problem (no file,
+    stale, unparseable) reads as 'not running'."""
     try:
-        conn.row_factory = sqlite3.Row
-        visits.build_visits(conn, cfg.visit_gap_minutes, verbose=False)
-        print("  visit ledger refreshed.")
-    except Exception as e:
-        print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
+        data = json.loads(config.NAMING_STATUS_FILE.read_text())
+        return (data.get("state") in ("loading", "ready")
+                and (time.time() - float(data.get("ts", 0))) <= 30)
+    except Exception:
+        return False
+
+
+def _print_next_step(saved: int) -> None:
+    """One line on how the new crops get their species. The import itself leaves species NULL, so
+    the visits just refreshed are unlabeled until classify.py runs -- and classify refreshes the
+    ledger again when it labels them, so neither path needs a manual `python visits.py`."""
+    if _naming_helper_alive():
+        print(f"  {saved} new crop(s) await species labels -- the rig's naming helper is running "
+              "and will label them shortly (the visit ledger refreshes itself again then).")
+    else:
+        print(f"  {saved} new crop(s) await species labels -- run `python classify.py` to name "
+              "them (it refreshes the visit ledger itself when done).")
 
 
 def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
@@ -490,6 +521,7 @@ def main() -> int:
                   f"{cfg.db_path}{extra}.")
             if saved:
                 refresh_visits(conn, cfg)
+                _print_next_step(saved)
             rc = 0
     finally:
         conn.close()

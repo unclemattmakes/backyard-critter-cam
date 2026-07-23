@@ -96,6 +96,32 @@ def build_visits(conn, gap_minutes: float, *, verbose: bool = True) -> dict:
     return {"visits": n_visits, "detections": n_stamped}
 
 
+def refresh(conn, gap_minutes: float) -> bool:
+    """Best-effort rebuild for pipeline steps that change what visits would say -- new capture
+    (rig shutdown, trail-cam import) and fresh species labels (classify.py). One shared helper so
+    every step prints the same messages and honours the same contract: NEVER raise -- a failed
+    refresh must not fail the capture/import/labeling that already succeeded (the fallback is the
+    manual `python visits.py`). Subsecond at this scale. Returns True on success.
+
+    build_visits reads columns by name, so row_factory is switched to sqlite3.Row for the rebuild
+    and restored after -- callers like classify.py unpack rows positionally and keep their
+    connection for further work."""
+    prior_factory = conn.row_factory
+    try:
+        conn.row_factory = sqlite3.Row
+        build_visits(conn, gap_minutes, verbose=False)
+        print("  visit ledger refreshed.")
+        return True
+    except Exception as e:
+        print(f"  [visits] could not refresh visit events (run `python visits.py`): {e}")
+        return False
+    finally:
+        try:
+            conn.row_factory = prior_factory
+        except Exception:
+            pass   # a dead connection can't take the restore -- nothing left to protect
+
+
 def print_stats(conn) -> None:
     """Quick read-back: visits + dwell by species, so you can eyeball the collapse."""
     total = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
