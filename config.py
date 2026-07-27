@@ -129,6 +129,32 @@ class Config:
     reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).
 
+    # ---- Auto-white-balance recovery --------------------------------------------
+    # Some webcams have a BROKEN manual white balance. Measured on the 2026-07 glass-door cam
+    # (2026-07-25): with AUTO_WB off, EVERY WB_TEMPERATURE from 2800 K to 6500 K renders red
+    # ~40% below green (R/G 0.34-0.70 across the whole sweep) -- the cyan/green cast that made
+    # daytime crops look washed out and flat. Its AUTO white balance is fine (R/G ~0.98), and
+    # re-asserting AUTO_WB=1 pulls it back within ~2 s. But anything that writes a manual WB
+    # value drops it into that broken state for the REST of the session -- including the
+    # dashboard's own WB slider, which posts {AUTO_WB: 0, WB_TEMPERATURE: v} by design. Half the
+    # sampled hours of 2026-07-21..25 sat in the bad state.
+    # So: sample the frame's red/green ratio periodically and, when it sits in the red-starved
+    # band, put the camera back into auto. Re-asserting auto is a no-op when the camera is
+    # already there, so a false positive costs nothing but a log line.
+    # A DELIBERATE manual choice is honoured: once the dashboard sends AUTO_WB=0 the watchdog
+    # stands down for that camera until auto white balance is switched back on.
+    wb_auto_recover: bool = True
+    # Trip below this frame-wide red/green ratio. The two states are far apart (good ~0.85-1.10,
+    # broken ~0.57-0.72), so anywhere in the gap works; 0.78 sits in the middle of it.
+    wb_recover_ratio: float = 0.78
+    wb_recover_interval_s: float = 20.0   # How often to sample the ratio (cheap: a strided mean).
+    # Don't judge white balance on a frame too dark to carry colour -- a night scene under an
+    # amber yard light is LEGITIMATELY far from neutral, and that's not a fault to correct.
+    wb_recover_min_luma: float = 40.0
+    # Consecutive bad samples before acting, so one odd frame (a red-brown animal filling the
+    # view, headlights sweeping the fence) can't trigger it.
+    wb_recover_strikes: int = 2
+
     # ---- Multiple cameras (optional) --------------------------------------------
     # None = single-camera mode: the flat camera_index/source fields above are the one camera.
     # Set a list of CameraSpec to run SEVERAL cameras at once (USB + networked), each on its own

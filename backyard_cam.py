@@ -377,6 +377,89 @@ def probe_writable_controls(cap) -> dict:
     return out
 
 
+class WhiteBalanceWatchdog:
+    """Put a camera back into AUTO white balance when its colour goes red-starved.
+
+    Why this exists: the 2026-07 glass-door cam's MANUAL white balance is broken. Measured
+    2026-07-25 by sweeping the live rig, every WB_TEMPERATURE from 2800 K to 6500 K rendered red
+    30-66% below green (R/G 0.34-0.70) -- no setting on that axis reaches neutral, because colour
+    TEMPERATURE only moves the blue<->amber axis and the fault is on green<->magenta. Its AUTO
+    white balance is correct (R/G ~0.98) and recovers ~2 s after AUTO_WB is re-asserted. Since
+    the dashboard's WB slider posts {AUTO_WB: 0, WB_TEMPERATURE: v}, one nudge leaves the rig
+    cyan-cast for the rest of the session -- and most DAYLIGHT hours of 2026-07-21..25 were in
+    that state (R/G 0.57-0.72 against the old camera's 0.96-1.10).
+
+    Scope: this only judges frames bright enough to carry colour (wb_recover_min_luma). The
+    camera's NIGHT rendering is a separate open question -- it is strongly green (R/G ~0.85,
+    B/G ~0.57) where the old camera under the same yard light was amber (R/G ~2.2) -- but with
+    no known-good night reference for this sensor there's nothing to recover TO, so nights are
+    left alone rather than "corrected" toward a guess.
+
+    The check is deliberately cheap and deliberately blunt: a strided channel mean every
+    `wb_recover_interval_s`, and re-asserting auto when the camera is already in auto costs
+    nothing, so being wrong is free. See config.wb_auto_recover for the knobs."""
+
+    def __init__(self, cfg: config.Config, tag: str = ""):
+        self.cfg, self.tag = cfg, tag
+        self.enabled = bool(cfg.wb_auto_recover)
+        self.user_manual = False      # the dashboard asked for manual WB -- stand down
+        self._next_check = 0.0
+        self._strikes = 0
+        self.recoveries = 0            # how many times we've pulled it back this session
+        self.last_ratio: float | None = None
+
+    def note_settings(self, settings: dict) -> None:
+        """Watch dashboard-applied settings for a deliberate manual/auto white-balance choice."""
+        if "AUTO_WB" not in (settings or {}):
+            return
+        val = settings["AUTO_WB"]
+        self.user_manual = (val is not None and float(val) < 0.5)
+        if self.user_manual:
+            self._strikes = 0
+
+    @staticmethod
+    def _sample(frame) -> tuple[float, float]:
+        """(red/green ratio, luma-ish mean) from a strided sample -- ~1/64th of the pixels."""
+        small = frame[::8, ::8]
+        b = float(small[:, :, 0].mean())
+        g = float(small[:, :, 1].mean())
+        r = float(small[:, :, 2].mean())
+        return r / max(g, 1e-6), (r + g + b) / 3.0
+
+    def check(self, cap, frame, now: float) -> bool:
+        """Sample the frame and, if it's persistently red-starved, restore auto white balance.
+        Returns True when it acted. Cheap enough to call every frame -- it self-rate-limits."""
+        if not self.enabled or self.user_manual or frame is None:
+            return False
+        if now < self._next_check:
+            return False
+        self._next_check = now + self.cfg.wb_recover_interval_s
+        try:
+            ratio, luma = self._sample(frame)
+        except Exception:
+            return False
+        self.last_ratio = ratio
+        if luma < self.cfg.wb_recover_min_luma:
+            self._strikes = 0            # too dark to judge colour; a warm night is not a fault
+            return False
+        if ratio >= self.cfg.wb_recover_ratio:
+            self._strikes = 0
+            return False
+        self._strikes += 1
+        if self._strikes < self.cfg.wb_recover_strikes:
+            return False
+        self._strikes = 0
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_WB, 1.0)
+        except Exception:
+            return False
+        self.recoveries += 1
+        print(f"{self.tag} white balance looked red-starved (R/G {ratio:.2f} < "
+              f"{self.cfg.wb_recover_ratio:.2f}) -- restored AUTO_WB "
+              f"(recovery #{self.recoveries}).")
+        return True
+
+
 def capture_backend(cfg: config.Config) -> int:
     """Pick the OpenCV capture backend. DirectShow is a Windows-only API, so we only use it on
     Windows (and only when enabled); on Linux/macOS we pass CAP_ANY and let OpenCV choose the
@@ -946,6 +1029,12 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         # Probe writable sliders once (local cams only; a network cam has none we can set).
         writable = {} if spec.is_url else (probe_writable_controls(cap) if bridge is not None else {})
 
+        # Auto-white-balance recovery. A network stream's colour is the camera's own business,
+        # so this is local-cams-only like the rest of the UVC handling.
+        wb_guard = WhiteBalanceWatchdog(cfg, tag)
+        if spec.is_url:
+            wb_guard.enabled = False
+
         gate = MotionGate(cfg)
         last_detect_t = last_dets_t = 0.0
         last_dets: list[Detection] = []
@@ -993,16 +1082,25 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     apply_camera_settings(cap, eff_profiles.get(period, {}))
                     print(f"{tag} sun crossed -- switched to '{period}' profile")
 
+            # --- White-balance watchdog (self-rate-limited; see WhiteBalanceWatchdog) ---
+            wb_guard.check(cap, frame, now)
+
             # --- Live camera controls from the dashboard (web thread -> this capture thread) ---
             if bridge is not None:
                 pending = bridge.take_pending()
                 if pending and not spec.is_url:
                     apply_camera_settings(cap, pending)
+                    wb_guard.note_settings(pending)   # honour a deliberate manual-WB choice
                 if now - last_ctrl_pub >= 1.0:
                     last_ctrl_pub = now
                     snap = {} if spec.is_url else read_camera_controls(cap)
                     snap["period"] = active_period
                     snap["writable"] = writable
+                    # Colour health, so a cyan-cast session is visible instead of just looking
+                    # "a bit off": ~1.0 = neutral, well under 1 = the red-starved manual-WB state.
+                    snap["wb_ratio"] = (round(wb_guard.last_ratio, 3)
+                                        if wb_guard.last_ratio is not None else None)
+                    snap["wb_recoveries"] = wb_guard.recoveries
                     snap["network"] = spec.is_url   # the dashboard hides sliders for a network cam
                     # Coarsen the published coords (~10 km) -- a LAN/DNS-rebind client can read this.
                     snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
