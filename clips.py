@@ -108,10 +108,27 @@ def _safe_source(source: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in str(source)) or "cam"
 
 
+def _source_budgets(cfg: config.Config) -> dict[str, float]:
+    """Map of clips/<subdir> -> budget in BYTES, keyed by the on-disk directory name (the
+    _safe_source spelling), so a scan can look a file's budget up from its path alone. Sources
+    without an override -- and legacy clips sitting directly under clips/, which predate the
+    per-source layout -- fall into the shared `None` bucket on cfg.clips_max_gb."""
+    out = {None: (cfg.clips_max_gb or 0) * (1024 ** 3)}
+    for source, gb in (getattr(cfg, "clips_max_gb_by_source", None) or {}).items():
+        out[_safe_source(source)] = (gb or 0) * (1024 ** 3)
+    return out
+
+
 def prune_clips(cfg: config.Config, conn) -> int:
-    """Keep clips/ under cfg.clips_max_gb by deleting the OLDEST clip FILES. This is what makes
+    """Keep clips/ under its disk budget by deleting the OLDEST clip FILES. This is what makes
     always-on recording safe on a family rig -- the folder is a rolling window, never an
     unbounded grower. Returns clips removed.
+
+    Budgets are PER SOURCE (cfg.clips_max_gb_by_source, else the shared cfg.clips_max_gb), and
+    each source only ever prunes its own files. One shared oldest-first pool silently made the
+    sources compete: importing a trail-cam card's 9 GB of video would have evicted nearly every
+    glass-door clip, which is backwards -- the live rig can re-record tomorrow, an SD card's
+    footage is gone the moment the card is formatted.
 
     SOFT prune: only the video file is deleted; the clips ROW stays, stamped `pruned_at`. The
     row's children -- clip_tracks, clip_track_embeddings, and their individual_id links -- are
@@ -121,44 +138,58 @@ def prune_clips(cfg: config.Config, conn) -> int:
     by backup.py before pruning reaches it anyway; what it taught us is not. Playback surfaces
     filter on `pruned_at IS NULL`; the analytical joins keep using the full table.
     Best-effort: a locked/missing file is skipped, never fatal. 0/None budget = no cap."""
-    budget = (cfg.clips_max_gb or 0) * (1024 ** 3)
-    if budget <= 0 or not cfg.clips_dir.exists():
+    if not cfg.clips_dir.exists():
         return 0
-    files = []
+    budgets = _source_budgets(cfg)
+    buckets: dict[str | None, list] = {}
     for p in cfg.clips_dir.rglob("*.mp4"):
         try:
             st = p.stat()                  # one stat per file (was two), inside the try ...
         except OSError:
             continue                       # ... so a file vanishing mid-scan skips that file,
-        files.append((st.st_mtime, st.st_size, p))   # not the whole prune (live writer rotating)
-    total = sum(sz for _, sz, _ in files)
-    if total <= budget:
-        return 0
+        try:                               # ... not the whole prune (live writer rotating).
+            top = p.relative_to(cfg.clips_dir).parts[0]
+        except (ValueError, IndexError):
+            top = None
+        # A file directly under clips/ has no source dir (its 'top' is the filename itself) --
+        # bucket those with the other unbudgeted legacy clips rather than inventing a source.
+        key = top if (top in budgets and top != p.name) else None
+        buckets.setdefault(key, []).append((st.st_mtime, st.st_size, p))
+
     removed = 0
-    for _mt, sz, p in sorted(files):           # oldest first
+    for key, files in buckets.items():
+        budget = budgets.get(key, budgets[None])
+        if budget <= 0:                        # 0/None budget = this source is never pruned
+            continue
+        total = sum(sz for _, sz, _ in files)
         if total <= budget:
-            break
-        try:
-            p.unlink()
-        except OSError:
-            continue                           # in use / already gone -- try the next one
-        total -= sz
-        removed += 1
-        # Drop the browser transcode (clips_web mirror) too, so the web cache never outlives its
-        # clip -- it stays inside the same rolling budget and is regenerated on demand if needed.
-        try:
-            (cfg.clips_dir.parent / "clips_web" / p.relative_to(cfg.clips_dir)).unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
-        try:
-            conn.execute("UPDATE clips SET pruned_at = ? WHERE clip_path = ?",
-                         (db.now_local_iso(), _rel(p)))
-            conn.commit()
-        except Exception:
-            pass                               # unstamped row is harmless; next prune retries
-    if removed:
-        print(f"[clips] pruned {removed} oldest clip(s) to stay under "
-              f"{cfg.clips_max_gb:g} GB (rolling window).")
+            continue
+        n_here = 0
+        for _mt, sz, p in sorted(files):       # oldest first, WITHIN this source only
+            if total <= budget:
+                break
+            try:
+                p.unlink()
+            except OSError:
+                continue                       # in use / already gone -- try the next one
+            total -= sz
+            n_here += 1
+            # Drop the browser transcode (clips_web mirror) too, so the web cache never outlives
+            # its clip -- it stays inside the same rolling budget and is regenerated on demand.
+            try:
+                (cfg.clips_dir.parent / "clips_web" / p.relative_to(cfg.clips_dir)).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+            try:
+                conn.execute("UPDATE clips SET pruned_at = ? WHERE clip_path = ?",
+                             (db.now_local_iso(), _rel(p)))
+                conn.commit()
+            except Exception:
+                pass                           # unstamped row is harmless; next prune retries
+        if n_here:
+            removed += n_here
+            print(f"[clips] pruned {n_here} oldest {key or 'legacy'} clip(s) to stay under "
+                  f"{budget / 1024 ** 3:g} GB (rolling window).")
     return removed
 
 

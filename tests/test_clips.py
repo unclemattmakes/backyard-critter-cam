@@ -535,3 +535,91 @@ def test_pruned_pair_clip_still_flags_co_presence(clip_cfg, clip_conn):
 
     # The co-presence SIGNAL must outlive the footage: the analytics join keeps pruned rows.
     assert individuals.clip_co_presence_by_visit(clip_conn, "raccoon") == {vid: 1}
+
+
+# --- per-source prune budgets: an SD-card import must not evict the live rig ------------
+
+def _sourced_clip(clip_cfg, conn, source, name, *, mtime, mib=1):
+    """A fake on-disk clip under clips/<safe_source>/<name> with a controlled mtime + its row."""
+    import os
+    p = clip_cfg.clips_dir / clips._safe_source(source) / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\0" * (1024 * 1024 * mib))
+    os.utime(p, (mtime, mtime))
+    cid = db.insert_clip(
+        conn, source=source, clip_path=db.rel_to_root(p), started_at="2026-07-27T21:00:00-07:00",
+        ended_at=None, fps=30.0, width=1920, height=1080, frame_count=360,
+        detection_count=1, max_confidence=0.9)
+    conn.commit()
+    return cid
+
+
+def _mib_budget(n):
+    return n * 1024 * 1024 / (1024 ** 3)
+
+
+def test_prune_budgets_are_per_source(clip_cfg, clip_conn):
+    """The regression this whole split exists for: importing a card's videos used to evict the
+    live rig's clips, because one oldest-first budget covered the whole folder and trail-cam
+    files carry OLDER mtimes than today's live footage."""
+    live = [_sourced_clip(clip_cfg, clip_conn, db.SOURCE_GLASS_DOOR_CAM, f"live{i}.mp4",
+                          mtime=9_000 + i) for i in range(3)]
+    # Trail-cam clips are older (copy2 preserves the card's mtimes) -- under one shared,
+    # oldest-first budget these would be *safe* and the live clips would be the ones deleted.
+    card = [_sourced_clip(clip_cfg, clip_conn, db.SOURCE_TRAIL_CAM_SD, f"card{i}.mp4",
+                          mtime=1_000 + i) for i in range(4)]
+    cfg = dataclasses.replace(
+        clip_cfg,
+        clips_max_gb=_mib_budget(3),                              # live: 3 MiB, holds all 3
+        clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(2)},   # card: 2 MiB, sheds 2
+    )
+
+    assert clips.prune_clips(cfg, clip_conn) == 2
+    # Every live clip survives even though they are the NEWEST files present ...
+    for i in range(3):
+        assert (clip_cfg.clips_dir / "glass_door_cam" / f"live{i}.mp4").exists()
+    # ... and the card shed only its own two oldest.
+    assert not (clip_cfg.clips_dir / "trail_cam_sd" / "card0.mp4").exists()
+    assert not (clip_cfg.clips_dir / "trail_cam_sd" / "card1.mp4").exists()
+    assert (clip_cfg.clips_dir / "trail_cam_sd" / "card2.mp4").exists()
+    assert (clip_cfg.clips_dir / "trail_cam_sd" / "card3.mp4").exists()
+
+    stamps = dict(clip_conn.execute("SELECT id, pruned_at FROM clips").fetchall())
+    assert all(stamps[c] is None for c in live)
+    assert stamps[card[0]] and stamps[card[1]]
+    assert stamps[card[2]] is None and stamps[card[3]] is None
+    assert clips.prune_clips(cfg, clip_conn) == 0        # stable second pass
+
+
+def test_prune_zero_budget_source_is_never_pruned(clip_cfg, clip_conn):
+    """A 0 budget means 'this source is archive-grade' -- the escape hatch for footage that
+    cannot be re-recorded, and it must not fall back to the shared cap."""
+    _sourced_clip(clip_cfg, clip_conn, db.SOURCE_TRAIL_CAM_SD, "keep.mp4", mtime=1_000, mib=4)
+    cfg = dataclasses.replace(clip_cfg, clips_max_gb=_mib_budget(1),
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: 0})
+    assert clips.prune_clips(cfg, clip_conn) == 0
+    assert (clip_cfg.clips_dir / "trail_cam_sd" / "keep.mp4").exists()
+
+
+def test_prune_unbudgeted_source_uses_shared_cap(clip_cfg, clip_conn):
+    """A source with no override still rolls on clips_max_gb -- the split adds a bucket, it
+    doesn't quietly exempt everything that isn't listed."""
+    for i in range(3):
+        _sourced_clip(clip_cfg, clip_conn, db.SOURCE_GLASS_DOOR_CAM, f"g{i}.mp4", mtime=1_000 + i)
+    cfg = dataclasses.replace(clip_cfg, clips_max_gb=_mib_budget(2),
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: 99})
+    assert clips.prune_clips(cfg, clip_conn) == 1
+    assert not (clip_cfg.clips_dir / "glass_door_cam" / "g0.mp4").exists()
+
+
+def test_prune_legacy_flat_clips_still_roll(clip_cfg, clip_conn):
+    """Clips written before the per-source layout sit directly under clips/ with no source dir.
+    They must land in the shared bucket, not be read as a source named 'a.mp4' (which would give
+    every one of them its own private budget and stop pruning entirely)."""
+    a = _stocked_clip(clip_cfg, clip_conn, "a.mp4", mtime=1_000, started_at="2026-06-01T21:00:00")
+    _stocked_clip(clip_cfg, clip_conn, "b.mp4", mtime=2_000, started_at="2026-06-02T21:00:00")
+    cfg = dataclasses.replace(clip_cfg, clips_max_gb=_mib_budget(1),
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: 99})
+    assert clips.prune_clips(cfg, clip_conn) == 1
+    assert not (clip_cfg.clips_dir / "a.mp4").exists()
+    assert dict(clip_conn.execute("SELECT id, pruned_at FROM clips").fetchall())[a]

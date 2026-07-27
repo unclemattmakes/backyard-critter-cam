@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 
 import config
+import db
 import import_trailcam
 from detector import Detection
 
@@ -199,3 +200,148 @@ def test_ledger_roundtrip_mixed_with_legacy_lines(db_path):
     with open(import_trailcam.ledger_path(db_path, "trail_cam_sd"), "a", encoding="utf-8") as f:
         f.write("IMAG0002.JPG\n")                      # a line as written before the fix
     assert import_trailcam.read_ledger(db_path, "trail_cam_sd") == {key}
+
+
+# --- videos: the behaviour clips that used to be left on the card -----------------------
+
+def _write_video(path: Path, *, seconds=2.0, fps=10.0, size=(120, 160)) -> Path:
+    """A small real .mp4 on disk (mp4v so no ffmpeg is required in CI), written frame by frame so
+    _probe_video's cv2 fallback reports an honest duration."""
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    w = cv2.VideoWriter(str(path), fourcc, fps, (size[1], size[0]))
+    rng = np.random.default_rng(1)
+    for _ in range(int(seconds * fps)):
+        w.write((rng.random((size[0], size[1], 3)) * 255).astype(np.uint8))
+    w.release()
+    return path
+
+
+def _video_cfg(tmp_path, db_path):
+    """A Config pinned ENTIRELY inside tmp -- crops, clips, and db_path. db_path matters more than
+    it looks: ledger_path() derives the sidecar import ledger from it, so a cfg that keeps the real
+    CONFIG.db_path makes tests append to (and, for a deleted-ledger test, unlink) the project's
+    live ledger. Injecting a stale key there silently retires a real file from the next import."""
+    return replace(config.CONFIG, crops_dir=tmp_path / "crops", clips_dir=tmp_path / "clips",
+                   db_path=db_path,
+                   clips_max_gb=0)          # 0 = no cap, so tests never race the pruner
+
+
+def _import_videos(folder, conn, cfg, skip, *, require_animal=True, window_s=30.0):
+    return import_trailcam.import_videos(
+        folder, conn, cfg, source="trail_cam_sd", recursive=False, skip=skip,
+        window_s=window_s, require_animal=require_animal)
+
+
+def _seed_detection(conn, when: str, conf=0.9):
+    """One trail-cam detection at `when` ('YYYY-mm-dd HH:MM:SS' local) -- a video's animal gate."""
+    iso = datetime.strptime(when, "%Y-%m-%d %H:%M:%S").astimezone().isoformat()
+    return db.insert_detection(
+        conn, timestamp=iso, source="trail_cam_sd", detection_class="animal", confidence=conf,
+        bbox=(0, 0, 10, 10), frame_w=100, frame_h=100, crop_path="crops/x.jpg")
+
+
+def test_video_span_ends_at_mtime(tmp_path):
+    """A trail cam's mtime is when it FINISHED writing the clip, so started_at is mtime minus
+    duration. Getting this backwards would file every clip ~12s late and break the pairing."""
+    v = _write_video(tmp_path / "IMAG0007.MP4", seconds=2.0, fps=10.0)
+    _set_mtime(v, "2026-07-22 21:29:42")
+    meta = import_trailcam._probe_video(v)
+    assert meta is not None
+    start, end = import_trailcam.video_span(v, meta)
+    assert end.strftime("%H:%M:%S") == "21:29:42"
+    assert start.strftime("%H:%M:%S") == "21:29:40"      # 2s clip -> starts two seconds earlier
+
+
+def test_video_with_animal_is_copied_and_rowed(conn, db_path, tmp_path):
+    """The happy path: a clip whose trigger produced a detection is COPIED into clips/<source>/
+    (never referenced on the card, which gets formatted) and gets a clips row carrying the
+    trigger's detection count."""
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0007.MP4", seconds=2.0, fps=10.0)
+    _set_mtime(v, "2026-07-22 21:29:42")
+    _seed_detection(conn, "2026-07-22 21:29:38")        # the still burst, just before the video
+
+    stored, already, empty = _import_videos(tmp_path, conn, cfg, set())
+    assert (stored, already, empty) == (1, 0, 0)
+
+    row = conn.execute("SELECT source, clip_path, started_at, ended_at, width, height, "
+                       "frame_count, detection_count FROM clips").fetchone()
+    assert row["source"] == "trail_cam_sd"
+    assert row["detection_count"] == 1
+    assert row["width"] == 160 and row["height"] == 120
+    assert row["started_at"] < row["ended_at"]
+    dest = config.ROOT / row["clip_path"] if not Path(row["clip_path"]).is_absolute() else Path(row["clip_path"])
+    assert dest.exists()
+    assert dest.parent == cfg.clips_dir / "trail_cam_sd" / "2026-07-22"
+    assert import_trailcam.SRC_TAG + "IMAG0007" in dest.name   # traceable back to the card
+    assert v.exists()                                          # the card is never modified
+
+
+def test_video_without_animal_is_skipped(conn, db_path, tmp_path):
+    """An empty sun/wind trigger writes no clip and costs no disk -- but IS ledgered, so the next
+    run doesn't re-probe it to reach the same verdict."""
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0009.MP4")
+    _set_mtime(v, "2026-07-22 13:00:00")
+    _seed_detection(conn, "2026-07-22 21:29:38")        # hours away -- not this trigger
+
+    skip = set()
+    assert _import_videos(tmp_path, conn, cfg, skip) == (0, 0, 1)
+    assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 0
+    assert not (cfg.clips_dir / "trail_cam_sd").exists()
+    assert import_trailcam.video_skip_key(v) in skip
+
+
+def test_all_videos_overrides_the_animal_gate(conn, db_path, tmp_path):
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0009.MP4")
+    _set_mtime(v, "2026-07-22 13:00:00")
+    assert _import_videos(tmp_path, conn, cfg, set(), require_animal=False) == (1, 0, 0)
+    assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 1
+
+
+def test_video_import_is_idempotent_via_ledger_and_db(conn, db_path, tmp_path):
+    """Re-running over the same card must not duplicate clips -- through the sidecar ledger AND,
+    if that is deleted, through the clips table (the same belt-and-braces the stills have)."""
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0007.MP4")
+    _set_mtime(v, "2026-07-22 21:29:42")
+    _seed_detection(conn, "2026-07-22 21:29:38")
+
+    skip = set()
+    assert _import_videos(tmp_path, conn, cfg, skip)[0] == 1
+    # Second pass, same in-memory skip-set.
+    assert _import_videos(tmp_path, conn, cfg, skip) == (0, 1, 0)
+    # Third pass with the ledger thrown away: DB recovery alone must still skip it.
+    import_trailcam.ledger_path(cfg.db_path, "trail_cam_sd").unlink(missing_ok=True)
+    recovered = import_trailcam.imported_video_keys(conn, "trail_cam_sd")
+    assert _import_videos(tmp_path, conn, cfg, recovered) == (0, 1, 0)
+    assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 1
+
+
+def test_unreadable_video_is_retried_not_retired(conn, db_path, tmp_path):
+    """A torn/locked file probes as unreadable. It must NOT be ledgered -- retiring a real clip
+    on the strength of one bad read is exactly the kind of silent loss the stills path avoids."""
+    cfg = _video_cfg(tmp_path, db_path)
+    bad = tmp_path / "IMAG0011.MP4"
+    bad.write_bytes(b"not really an mp4")
+    skip = set()
+    assert _import_videos(tmp_path, conn, cfg, skip) == (0, 0, 0)
+    assert skip == set()
+    assert import_trailcam.read_ledger(cfg.db_path, "trail_cam_sd") == set()
+
+
+def test_stills_ledger_and_video_ledger_do_not_collide(conn, db_path, tmp_path):
+    """IMAG0007.JPG and IMAG0007.MP4 share a stem and can share a second. Their keys must stay
+    distinct, or importing one would silently retire the other."""
+    cfg = _video_cfg(tmp_path, db_path)
+    img = _write_image(tmp_path / "IMAG0007.JPG")
+    _set_mtime(img, "2026-07-22 21:29:42")
+    vid = _write_video(tmp_path / "IMAG0007.MP4")
+    _set_mtime(vid, "2026-07-22 21:29:42")
+
+    skip = _seeded_skip(conn, cfg.db_path)
+    imported, saved, _ = _import(tmp_path, conn, cfg, skip)
+    assert (imported, saved) == (1, 1)                  # the still went in ...
+    stored, already, _ = _import_videos(tmp_path, conn, cfg, skip)
+    assert (stored, already) == (1, 0)                  # ... and did NOT mask the video

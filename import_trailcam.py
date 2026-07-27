@@ -17,10 +17,28 @@ Same detector, same crop convention, same DB. The only real differences from the
   * trail-cam NIGHT frames are often IR GRAYSCALE -- the detector handles those fine (structure
     survives even when colour washes out; see PLAN.md "Day vs. night / color vs. IR").
 
+VIDEOS (added 2026-07-27). In hybrid mode the camera writes a JPG burst at the trigger and an
+MP4 a couple of seconds later. The stills are still the pipeline food -- they carry the crops,
+species and re-ID -- but the MP4s are the BEHAVIOUR signal, and they used to be ignored entirely:
+9 GB of gait, dwell and who-defers-to-whom sat on a card that gets formatted every cycle. They
+now import as `clips` rows, the same table the live recorder writes, so clipmotion/clipembed and
+the dashboard's player treat them exactly like glass-door clips (the TC02 already writes H.264,
+so nothing is transcoded). Two things are deliberately different from a still import:
+  * a video is COPIED into clips/<source>/<date>/ -- the card is its only home, and a row
+    pointing at D:\ would dangle the moment the card is pulled;
+  * only clips whose trigger produced an animal crop are kept (--all-videos overrides). The
+    stills already answered "was anything there", and on a sun-triggered card that gate halved
+    the disk cost. Empty triggers are common: see the 227-frame sun storm of 2026-07-13.
+Disk is bounded per SOURCE (config.clips_max_gb_by_source), because one shared oldest-first
+budget let an SD-card import evict the live rig's rolling window -- backwards, since the rig can
+re-record tomorrow and the card's footage dies at the next format.
+
   python import_trailcam.py D:\DCIM\100MEDIA                 # ingest one SD-card dump (GPU)
   python import_trailcam.py D:\dump --recursive              # walk subfolders too
   python import_trailcam.py D:\dump --device cpu             # no GPU (slower; fine for batch)
   python import_trailcam.py D:\dump --processed-dir D:\done  # move each file after import
+  python import_trailcam.py D:\dump --no-videos              # stills only, ignore the .MP4s
+  python import_trailcam.py D:\dump --all-videos             # keep empty-trigger clips too
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
 
 SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
@@ -71,11 +89,12 @@ import json
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
 
+import clips
 import config
 import db
 import visits
@@ -88,6 +107,16 @@ from detector import CudaUnavailableError, Detection, Detector
 
 # Image extensions we ingest. Trail cams write JPEG; PNG is accepted for completeness / exports.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+# Video extensions we ingest as behaviour clips. The TC02 writes H.264 .MP4 -- the same codec
+# clips.py records for the live rig -- so an imported clip plays in the dashboard with no
+# transcode and clipmotion.py reads it exactly like a glass-door clip.
+VIDEO_EXTS = {".mp4"}
+
+# How far outside a clip's own time span a still's detection may sit and still count as the same
+# trigger event. Generous on purpose, and measured: on a 599-clip card every clip either had a
+# detection within a couple of seconds or none within a minute, so the exact value isn't delicate.
+VIDEO_PAIR_WINDOW_S = 30.0
 
 # Largest image we'll decode from an (untrusted) SD card. cv2.imread allocates a full uncompressed
 # buffer sized from the file header, so a 'decompression bomb' (tiny file, huge declared dimensions)
@@ -303,6 +332,211 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
     return len(dets), saved
 
 
+def list_videos(folder: Path, recursive: bool) -> list[Path]:
+    """Every video file in `folder` (optionally walking subfolders), sorted like list_images.
+    Case-insensitive on extension (SD cards write .MP4)."""
+    walker = folder.rglob("*") if recursive else folder.glob("*")
+    return sorted(p for p in walker if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+
+
+def _probe_video(path: Path) -> dict | None:
+    """{duration_s, fps, width, height, frame_count} for one video, or None if it can't be read.
+    ffprobe first (exact container duration), else OpenCV, which every install already has --
+    cv2 reports frame count and fps, and duration is derived from them. Never raises."""
+    import shutil as _sh
+    ffprobe = _sh.which("ffprobe")
+    if ffprobe:
+        try:
+            import subprocess
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                 "stream=width,height,r_frame_rate,nb_frames", "-show_entries",
+                 "format=duration", "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=30)
+            d = json.loads(r.stdout or "{}")
+            st = (d.get("streams") or [{}])[0]
+            num, _, den = (st.get("r_frame_rate") or "0/1").partition("/")
+            fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+            dur = float((d.get("format") or {}).get("duration") or 0.0)
+            n = int(st.get("nb_frames") or 0) or (int(round(dur * fps)) if fps else 0)
+            if dur > 0 and st.get("width"):
+                return {"duration_s": dur, "fps": fps or None, "width": int(st["width"]),
+                        "height": int(st["height"]), "frame_count": n}
+        except Exception:
+            pass                                   # fall through to the cv2 path
+    try:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        if not (n and fps and w):
+            return None
+        return {"duration_s": n / fps, "fps": fps, "width": w, "height": h, "frame_count": n}
+    except Exception:
+        return None
+
+
+def video_span(path: Path, meta: dict) -> tuple[datetime, datetime]:
+    """(started_at, ended_at) for a trail-cam video, both tz-aware local. A video file's mtime is
+    when the camera FINISHED writing it, not when recording began -- verified on this TC02 against
+    the burned-in overlay clock, where mtime minus duration matched the visible start time. So the
+    end is the mtime and the start is derived, which is the opposite of the stills (whose EXIF
+    stamp is the trigger instant)."""
+    ended = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+    return ended - timedelta(seconds=float(meta["duration_s"])), ended
+
+
+def video_skip_key(path: Path) -> str:
+    """Idempotency key for one video: filename + its mtime second. Deliberately keyed on the RAW
+    mtime rather than the derived start time -- the skip check then costs one stat() and never has
+    to probe a file it is about to skip (probing 599 clips on every re-run to decide they're all
+    duplicates is exactly the kind of slow no-op this ledger exists to avoid)."""
+    ts = datetime.fromtimestamp(path.stat().st_mtime).astimezone().strftime(KEY_TS_FMT)
+    return skip_key(path.name, ts)
+
+
+def imported_video_keys(conn, source: str) -> set[str]:
+    """Video skip keys recovered from the `clips` table -- the belt-and-braces fallback for videos,
+    mirroring imported_keys() for stills. The original filename comes from the 'src-<stem>' tag in
+    clip_path and the mtime second from the row's `ended_at` (which IS the mtime by video_span's
+    contract), so the pair reconstructs exactly what video_skip_key would produce. Rows whose path
+    or timestamp doesn't parse contribute nothing: a bare name must never skip a file."""
+    out: set[str] = set()
+    for cp, ended_at in conn.execute(
+        "SELECT clip_path, ended_at FROM clips WHERE source = ?", (source,)
+    ):
+        if not cp or not ended_at:
+            continue
+        name = Path(cp).name
+        i = name.find(SRC_TAG)
+        if i == -1:
+            continue
+        stem = Path(name[i + len(SRC_TAG):]).stem
+        try:
+            ts = datetime.fromisoformat(ended_at).strftime(KEY_TS_FMT)
+        except ValueError:
+            continue
+        # The ledger keys on the full filename; recovery only knows the stem, so emit both
+        # spellings and let import_videos accept either (same trick as the stills path).
+        out.add(skip_key(stem, ts))
+    return out
+
+
+def paired_detections(conn, source: str, start: datetime, end: datetime,
+                      window_s: float) -> tuple[int, float | None]:
+    """(n_detections, max_confidence) for the stills that belong to this clip's trigger event --
+    every `source` detection landing within `window_s` of the clip's own span. The window reaches
+    BACKWARDS from the start because the camera writes the JPG burst at the trigger and only
+    begins the MP4 a couple of seconds later, so the animal's stills sit just before the video."""
+    lo = (start - timedelta(seconds=window_s)).isoformat()
+    hi = (end + timedelta(seconds=window_s)).isoformat()
+    n, mx = conn.execute(
+        "SELECT COUNT(*), MAX(confidence) FROM detections "
+        "WHERE source = ? AND timestamp >= ? AND timestamp <= ?", (source, lo, hi)).fetchone()
+    return int(n or 0), mx
+
+
+def ingest_video(path: Path, conn, cfg: config.Config, source: str, *,
+                 window_s: float, require_animal: bool) -> str:
+    """Import ONE trail-cam video as a behaviour clip: probe it, decide whether its trigger caught
+    an animal, copy it into clips/<source>/<date>/ and write the `clips` row. Never raises on a
+    bad file. Returns one of:
+      'stored'     -- copied and rowed;
+      'no-animal'  -- deliberately skipped, a settled decision;
+      'unreadable' / 'copy-failed' -- TRANSIENT, so the caller must NOT mark it imported.
+    That last distinction matters: a video still being written (or on a flaky card) probes as
+    unreadable, and ledgering it would retire the file forever on the strength of a torn read.
+
+    The copy is deliberate: the card is the ONLY home for these files and gets formatted every
+    cycle, so a clips row pointing at D:\\ would dangle the moment the card is pulled. copy2
+    preserves the mtime so an imported clip ages honestly in the rolling window."""
+    meta = _probe_video(path)
+    if meta is None:
+        print(f"  skip (unreadable video, will retry next run): {path.name}")
+        return "unreadable"
+    start, end = video_span(path, meta)
+    n_det, max_conf = paired_detections(conn, source, start, end, window_s)
+    if require_animal and n_det == 0:
+        # No still from this trigger produced an animal crop. On this camera that means sun,
+        # wind or heat tripped the PIR -- the clip is empty. Cheap to re-import later with
+        # --all-videos if that assumption ever proves wrong.
+        return "no-animal"
+
+    day = start.strftime("%Y-%m-%d")
+    stamp = start.strftime(KEY_TS_FMT) + f"-{start.microsecond // 1000:03d}"
+    dest_dir = cfg.clips_dir / clips._safe_source(source) / day
+    dest = dest_dir / f"{stamp}_{SRC_TAG}{path.stem}{path.suffix.lower()}"
+    try:
+        import shutil as _sh
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        _sh.copy2(path, dest)                       # copy2 keeps mtime -> honest prune ordering
+    except OSError as e:
+        print(f"  [warn] could not copy {path.name} into clips/: {e}")
+        return "copy-failed"
+
+    db.insert_clip(
+        conn, source=source, clip_path=_rel(dest),
+        started_at=start.isoformat(), ended_at=end.isoformat(),
+        fps=meta.get("fps"), width=meta.get("width"), height=meta.get("height"),
+        frame_count=int(meta.get("frame_count") or 0),
+        detection_count=n_det, max_confidence=max_conf,
+    )
+    print(f"  [{start.isoformat()}] clip {meta['duration_s']:.1f}s "
+          f"{meta.get('width')}x{meta.get('height')} ({n_det} det) -> {_rel(dest)}  ({path.name})")
+    return "stored"
+
+
+# ingest_video outcomes that are SETTLED -- the file has been dealt with and its ledger line can
+# be written. Anything else is transient (torn/locked file) and must stay unledgered so the next
+# run retries it.
+_VIDEO_DONE = {"stored", "no-animal"}
+
+
+def import_videos(folder: Path, conn, cfg: config.Config, *, source: str, recursive: bool,
+                  skip: set[str], window_s: float, require_animal: bool,
+                  processed_dir: Path | None = None) -> tuple[int, int, int]:
+    """Import every video in `folder` once, as behaviour clips. Same idempotency contract as
+    import_folder (the shared ledger, keyed per file), and the same never-fail-the-batch posture.
+    Returns (stored, skipped_already, skipped_no_animal).
+
+    Videos are imported AFTER the stills on purpose: the animal gate reads the detections the
+    stills just wrote, so the two passes must not be interleaved."""
+    videos = list_videos(folder, recursive)
+    if not videos:
+        return 0, 0, 0
+    print(f"\nFound {len(videos)} video(s) in {folder}. Importing as clips "
+          f"(source='{source}'{'' if require_animal else ', ALL videos'}) ...")
+    stored = already = empty = 0
+    for path in videos:
+        try:
+            key = video_skip_key(path)
+        except OSError:
+            print(f"  skip (vanished mid-scan): {path.name}")
+            continue
+        stem_key = skip_key(path.stem, key.split(LEDGER_KEY_SEP, 1)[1])
+        if key in skip or stem_key in skip:
+            already += 1
+            continue
+        status = ingest_video(path, conn, cfg, source, window_s=window_s,
+                              require_animal=require_animal)
+        if status not in _VIDEO_DONE:
+            continue                    # transient -- leave it unledgered so a re-run retries it
+        stored += (status == "stored")
+        # A no-animal video is still ledgered: that verdict came from its trigger's stills, which
+        # don't change on a re-run, so re-probing it every cycle would burn minutes to reach the
+        # same answer. --all-videos is the way to bring those in later.
+        empty += (status == "no-animal")
+        skip.add(key)
+        append_ledger(cfg.db_path, source, key)
+        if processed_dir is not None:
+            move_to_processed(path, processed_dir)
+    return stored, already, empty
+
+
 def move_to_processed(path: Path, processed_dir: Path) -> None:
     """Move an imported file into processed_dir so re-runs (and --watch) skip it. On a name
     collision there, suffix '_1', '_2', ... rather than clobbering an existing file. Best-effort:
@@ -410,6 +644,8 @@ def watch_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
     with --processed-dir, which also drains the folder as it goes."""
     print(f"Watching {folder} for new trail-cam images every {interval:g}s "
           f"(source='{source}'; Ctrl-C to stop).")
+    print("  [watch] stills only -- videos are imported by a one-shot run over the card, where "
+          "every clip is finished being written.")
     total_imported = total_saved = 0
     try:
         while True:
@@ -458,6 +694,13 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="Poll the folder forever, importing newly dropped files (Ctrl-C to stop).")
     p.add_argument("--interval", type=float, default=10.0,
                    help="Seconds between polls in --watch mode.")
+    p.add_argument("--no-videos", dest="videos", action="store_false", default=True,
+                   help="Import stills only; leave the card's .MP4 clips alone.")
+    p.add_argument("--all-videos", action="store_true",
+                   help="Import EVERY video, not just the ones whose trigger produced an animal "
+                        "crop. Doubles the disk cost on a sun-triggered card.")
+    p.add_argument("--video-pair-window", type=float, default=VIDEO_PAIR_WINDOW_S,
+                   help="Seconds around a clip's span to look for its trigger's detections.")
     args = p.parse_args()
 
     cfg = replace(
@@ -504,6 +747,8 @@ def main() -> int:
     # UNION the DB crop_paths (belt-and-braces if the ledger was deleted, and what covers files
     # imported back when ledger lines were bare basenames). See module docstring.
     skip = read_ledger(cfg.db_path, args.source) | imported_keys(conn, args.source)
+    if args.videos:
+        skip |= imported_video_keys(conn, args.source)   # the clips-table half of the recovery
     if skip:
         print(f"  {len(skip)} file(s) already imported for source='{args.source}' -- will skip them.")
 
@@ -516,9 +761,22 @@ def main() -> int:
             imported, saved, skipped = import_folder(
                 folder, detector, conn, cfg, source=args.source, recursive=args.recursive,
                 processed_dir=processed_dir, skip=skip)
+            # Videos AFTER the stills: the animal gate reads the detections the stills just wrote.
+            v_stored = v_already = v_empty = 0
+            if args.videos:
+                v_stored, v_already, v_empty = import_videos(
+                    folder, conn, cfg, source=args.source, recursive=args.recursive, skip=skip,
+                    window_s=args.video_pair_window, require_animal=not args.all_videos,
+                    processed_dir=processed_dir)
+                if v_stored:
+                    clips.prune_clips(cfg, conn)    # honour this source's own rolling budget
             extra = f" (skipped {skipped} already-imported)" if skipped else ""
             print(f"\nDone. Imported {imported} file(s); saved {saved} crop(s) to "
                   f"{cfg.db_path}{extra}.")
+            if args.videos:
+                v_extra = f", {v_already} already-imported" if v_already else ""
+                print(f"  Clips: stored {v_stored} video(s); skipped {v_empty} with no animal "
+                      f"in the trigger{v_extra}.")
             if saved:
                 refresh_visits(conn, cfg)
                 _print_next_step(saved)
