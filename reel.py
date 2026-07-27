@@ -58,6 +58,7 @@ MAX_SEGMENTS = 14      # hard cap on moments
 BURST_GAP_MIN = 8.0    # same-species clips closer than this collapse into one burst
 BURST_EXTRA_MIN = 25.0 # a burst longer than this earns a second moment (a long feeding session)
 KEEP_REELS = 40        # built reels kept on disk (older ones deleted after a successful build)
+_POSTER_EVERY_S = 3    # sample the finished reel this often when choosing its poster frame
 _PLAN_VERSION = 2      # bump to invalidate every cached reel (encoder/planner changes)
 
 # key -> (state, monotonic_ts); state is 'building' or 'failed: <reason>'. Failed builds retry
@@ -310,7 +311,7 @@ def _paths_for(cfg, plan):
     return key, out, out.with_suffix(".json")
 
 
-def _manifest_from(cfg, plan, out: Path) -> dict:
+def _manifest_from(cfg, plan, out: Path, poster: Path | None = None) -> dict:
     """Chapter offsets accumulate the segments' MEASURED durations (an encoder rounds each cut
     to whole frames), so a seek to chapter 12 lands on chapter 12, not half a second early."""
     at, segs = 0.0, []
@@ -321,10 +322,15 @@ def _manifest_from(cfg, plan, out: Path) -> dict:
                      "thumb": c["thumb"], "n_dets": c["n_dets"]})
         at += secs
     rel = out.relative_to(cfg.clips_dir.parent).as_posix()   # "clips/reels/..." for /media/
-    return {"version": _PLAN_VERSION, "edition": plan["edition"], "anchor": plan["anchor"],
-            "title": plan["title"], "start": plan["start"], "end": plan["end"],
-            "clip_path": rel, "seconds": round(at, 1), "segments": segs,
-            "n_source_clips": plan["n_source_clips"]}
+    man = {"version": _PLAN_VERSION, "edition": plan["edition"], "anchor": plan["anchor"],
+           "title": plan["title"], "start": plan["start"], "end": plan["end"],
+           "clip_path": rel, "seconds": round(at, 1), "segments": segs,
+           "n_source_clips": plan["n_source_clips"]}
+    # Absent on reels built before posters existed -- the dashboard falls back to the old
+    # plate/thumb backdrop, so an old cached reel still renders.
+    if poster is not None and poster.exists():
+        man["poster_path"] = poster.relative_to(cfg.clips_dir.parent).as_posix()
+    return man
 
 
 def _run_ffmpeg(args, timeout):
@@ -342,6 +348,37 @@ def _probe_duration(p: Path) -> float | None:
         return float((r.stdout or "").strip())
     except (ValueError, subprocess.SubprocessError, OSError):
         return None
+
+
+def _make_poster(out: Path, workdir: Path) -> Path | None:
+    """Pick a real full-size frame OUT OF THE STITCHED REEL to use as its poster image.
+
+    Why: the Dispatch hero and the player's poster used to fall back to a per-moment `thumb`,
+    which is an animal CROP -- and crops are tight cutouts, often tiny. Measured 2026-07-26 on
+    the night reel: the chosen plate crop was 389x292 (~4x upscale to a ~1500 px hero) and the
+    chapter-thumb fallback was 96x103 (~16x). Blown up that far a crop is a wall of soft ovals,
+    which reads as "the camera is broken" when the video behind it is fine 1280x720.
+
+    Selection is dependency-free (no cv2 in the web path): dump a candidate every few seconds in
+    one decode pass, then keep the LARGEST JPEG. At a fixed quality, the biggest file is the
+    frame carrying the most detail -- a sharp, well-lit frame beats a dark or motion-smeared one.
+    Returns the poster path, or None if anything fails (callers fall back to the old behaviour)."""
+    cand = workdir / "poster"
+    cand.mkdir(parents=True, exist_ok=True)
+    try:
+        _run_ffmpeg(["-i", str(out), "-vf", f"fps=1/{_POSTER_EVERY_S}", "-q:v", "2",
+                     str(cand / "c_%03d.jpg")], timeout=120)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    shots = sorted(cand.glob("c_*.jpg"), key=lambda p: p.stat().st_size, reverse=True)
+    if not shots:
+        return None
+    poster = out.with_suffix(".jpg")
+    try:
+        shutil.copyfile(shots[0], poster)
+    except OSError:
+        return None
+    return poster
 
 
 def build_reel(cfg, plan) -> dict:
@@ -399,7 +436,8 @@ def build_reel(cfg, plan) -> dict:
         except Exception:
             _concat_reencode()
         tmp.replace(out)
-        manifest = _manifest_from(cfg, plan, out)
+        poster = _make_poster(out, workdir)      # a real frame, not an upscaled crop
+        manifest = _manifest_from(cfg, plan, out, poster)
         man_path.write_text(json.dumps(manifest), encoding="utf-8")
         _prune_reels(cfg)
         return manifest
@@ -412,6 +450,7 @@ def _prune_reels(cfg) -> None:
     for p in reels[:-KEEP_REELS]:
         p.unlink(missing_ok=True)
         p.with_suffix(".json").unlink(missing_ok=True)
+        p.with_suffix(".jpg").unlink(missing_ok=True)     # its poster frame
 
 
 def reel_status(cfg, edition="auto", date=None, now=None) -> dict:

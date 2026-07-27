@@ -95,7 +95,10 @@ function playHighlightReel(man,title){
       <div class="lab">${esc(fmtClock(s.start)||'')}${s.species?' · '+esc(nameOf(s.species)):''}</div>
     </div>`).join('');
   const v=$('#clip-video');
-  if(__chapters[0].thumb) v.poster=media(__chapters[0].thumb); else v.removeAttribute('poster');
+  // Same story as the Dispatch hero: prefer a real reel frame; a chapter thumb is a small crop
+  // and stretching it across the player is what made the video look broken before it played.
+  const pos=man.poster_path||__chapters[0].thumb;
+  if(pos) v.poster=media(pos); else v.removeAttribute('poster');
   v.src=media(man.clip_path);
   v.onended=null;
   v.ontimeupdate=()=>__reelSyncChapter();
@@ -941,9 +944,11 @@ function reelSection(d, rl){
   if(!ready && !playlist.length) return '';
   const ed=d.edition==='night'?'night':'day';
   if(ready){
-    // Hero backdrop: the plate (the period's SHARPEST frame) over a chapter thumb — a tight
-    // crop blown up to hero width reads as a wall of blur.
-    const poster=(d.plate&&d.plate.crop_path)||(rl.segments.find(s=>s.thumb)||{}).thumb;
+    // Hero backdrop: a real full-size frame lifted out of the stitched reel. The old fallbacks
+    // are CROPS — tight animal cutouts, measured as small as 96×103 — and at ~1500px hero width
+    // that's a 4–16× upscale, i.e. the wall of blurry ovals. Kept only for reels built before
+    // posters existed, which have no poster_path.
+    const poster=rl.poster_path||(d.plate&&d.plate.crop_path)||(rl.segments.find(s=>s.thumb)||{}).thumb;
     const chaps=rl.segments.map((s,i)=>`
       <div class="fs" data-i="${i}" onclick="reelChap(${i})">
         <div class="ft" style="background-image:url('${s.thumb?media(s.thumb):''}')"><span class="dur">${fmtDur(s.seconds)}</span></div>
