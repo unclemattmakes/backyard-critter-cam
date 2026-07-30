@@ -202,6 +202,84 @@ def _is_allowed_host(raw: str, web_host: str = "") -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def _origin_authority(raw: str):
+    """(host, port) for an Origin header like 'http://192.168.1.50:8000', or None if it isn't a
+    plain http(s) origin we can parse -- which covers the literal 'null' a sandboxed iframe or a
+    file:// page sends, and any garbage."""
+    u = urllib.parse.urlsplit((raw or "").strip())
+    if u.scheme not in ("http", "https"):
+        return None
+    try:
+        host, port = u.hostname, u.port
+    except ValueError:                          # non-numeric port
+        return None
+    if not host:
+        return None
+    return host.lower(), port or (443 if u.scheme == "https" else 80)
+
+
+def _host_authority(raw: str, default_port):
+    """(host, port) for a Host header -- 'localhost', '192.168.1.50:8000', '[::1]:8000'. Borrows
+    urlsplit's authority parser so the IPv6 brackets and the :port suffix are handled once."""
+    u = urllib.parse.urlsplit("//" + (raw or "").strip())
+    try:
+        host, port = u.hostname, u.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host.lower(), port or default_port
+
+
+def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=0) -> bool:
+    """True only if `origin` names THIS dashboard. A cross-site page's Origin is its own name, so
+    it never matches -- which is the whole point: the peer-IP and Host checks both PASS for a
+    request the operator's own browser makes while sitting on someone else's site.
+    Accepts the configured web_host, loopback, and -- the LAN case -- whatever name or IP the
+    request's own Host header carries, since a browser only sends an Origin equal to its Host when
+    it loaded the page from this very server. The Host branch is gated on _is_allowed_host so a
+    DNS-rebinding name can't satisfy both headers at once."""
+    got = _origin_authority(origin)
+    if got is None:
+        return False
+    port = int(web_port or 0)
+    allowed = {("localhost", port), ("127.0.0.1", port), ("::1", port)}
+    wh = str(web_host or "").strip().lower()
+    if wh and wh not in ("0.0.0.0", "::"):      # a wildcard bind isn't a name a browser can send
+        allowed.add((wh, port))
+    if _is_allowed_host(host_header, web_host):
+        mine = _host_authority(host_header, got[1])
+        if mine is not None:
+            allowed.add(mine)
+    return got in allowed
+
+
+def _is_json_content_type(raw: str) -> bool:
+    """True for 'application/json', with an optional '; charset=...' parameter. Requiring it on
+    POST closes the no-preflight path on its own: without CORS a cross-origin fetch may only send
+    text/plain, x-www-form-urlencoded or multipart/form-data, and the preflight that application/json
+    triggers is one we never answer."""
+    return (raw or "").split(";", 1)[0].strip().lower() == "application/json"
+
+
+def _csrf_refusal(method: str, headers, web_host: str = "", web_port=0):
+    """The 403 body for a state-changing request that didn't come from this dashboard, or None if it
+    may proceed. GET/HEAD change nothing and pass untouched; every POST -- present and future --
+    must carry an Origin naming us and a JSON Content-Type. A MISSING Origin is refused too: fetch
+    and XHR always send one, so only hand-rolled tooling lacks it, and a curl user just adds
+    -H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json'.
+    Without this, any page the operator happens to be browsing could fetch
+    /api/individual with {"from": "Notch", "to": ""} and blank months of hand-confirmed re-ID
+    labels -- no preflight, no confirm, no undo. `headers` is anything with a .get()."""
+    if method != "POST":
+        return None
+    if not _is_same_origin(headers.get("Origin"), headers.get("Host"), web_host, web_port):
+        return b"forbidden: POST needs an Origin naming this dashboard (cross-site request guard)"
+    if not _is_json_content_type(headers.get("Content-Type")):
+        return b"forbidden: POST needs Content-Type: application/json (cross-site request guard)"
+    return None
+
+
 # Media types served from /media (crops, frames, and now behaviour clips). Video needs a correct
 # Content-Type AND HTTP Range support, or a browser <video> won't stream or seek.
 _MEDIA_TYPES = {
@@ -385,7 +463,16 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
         def _lan_guard(self) -> bool:
             """Refuse non-local clients when bound to the network (cfg.lan_only). Returns True if
             the request may proceed. Localhost is always allowed; on the LAN launcher this keeps the
-            dashboard reachable from your own devices but invisible to the wider internet."""
+            dashboard reachable from your own devices but invisible to the wider internet.
+            Both do_GET and do_POST call this first, so the cross-site check below covers every
+            mutating endpoint by construction -- including the ones nobody has written yet."""
+            # Runs before the lan_only shortcut: a rig deliberately opened past the LAN still must
+            # not take POSTs from other people's pages.
+            refusal = _csrf_refusal(self.command, self.headers,
+                                    getattr(cfg, "web_host", ""), getattr(cfg, "web_port", 0))
+            if refusal is not None:
+                self._send(403, "text/plain", refusal)
+                return False
             if not getattr(cfg, "lan_only", True):
                 return True
             host = self.client_address[0] if self.client_address else ""

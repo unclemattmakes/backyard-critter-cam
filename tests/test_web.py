@@ -1,6 +1,7 @@
 """
 Unit tests for web.py's pure helpers -- HTTP Range parsing (used to stream/seek video clips),
-the camera-control whitelist, and the media-path containment check (path-traversal guard). These
+the camera-control whitelist, the media-path containment check (path-traversal guard), and the
+cross-site guard that decides which POSTs the dashboard will act on. These
 never start a server or open a socket; they exercise the parsing/validation logic the dashboard
 relies on. (web.py imports only stdlib + db/stats/behavior/config, so importing it is cheap.)
 """
@@ -55,6 +56,76 @@ def test_is_within_true_for_child(tmp_path):
 
 def test_is_within_false_for_outside(tmp_path):
     assert web._is_within(Path("/etc/passwd"), tmp_path / "crops") is False
+
+
+# ---- _csrf_refusal: only THIS dashboard's own pages may POST ------------------------
+# The peer-IP and Host guards both pass for a request the operator's own browser makes from some
+# other site, so a POST additionally needs a same-origin Origin and a JSON Content-Type.
+_JSON = {"Content-Type": "application/json"}
+
+
+def _headers(origin=None, host="127.0.0.1:8000", ctype="application/json"):
+    h = {"Host": host}
+    if origin is not None:
+        h["Origin"] = origin
+    if ctype is not None:
+        h["Content-Type"] = ctype
+    return h
+
+
+def test_csrf_allows_own_origin_post():
+    assert web._csrf_refusal("POST", _headers("http://127.0.0.1:8000"), "127.0.0.1", 8000) is None
+    assert web._csrf_refusal("POST", _headers("http://localhost:8000", host="localhost:8000"),
+                             "127.0.0.1", 8000) is None
+
+
+def test_csrf_allows_lan_origin_matching_own_host():
+    # LAN mode (bound to 0.0.0.0, reached by the machine's IP): the browser sends that IP as both
+    # Origin and Host, which is the same-origin case and must keep working.
+    assert web._csrf_refusal("POST", _headers("http://192.168.1.50:8000", host="192.168.1.50:8000"),
+                             "0.0.0.0", 8000) is None
+
+
+def test_csrf_refuses_cross_site_origin():
+    assert web._csrf_refusal("POST", _headers("http://evil.example"), "127.0.0.1", 8000) is not None
+    # A rebinding name can't satisfy both headers: the Host guard rejects it, so the Origin/Host
+    # match is not available to it.
+    assert web._csrf_refusal("POST", _headers("http://evil.example", host="evil.example"),
+                             "127.0.0.1", 8000) is not None
+    assert web._csrf_refusal("POST", _headers("null"), "127.0.0.1", 8000) is not None
+
+
+def test_csrf_refuses_missing_origin():
+    # fetch/XHR always send Origin, so an absent one is hand-rolled tooling -- refuse it rather
+    # than blanket-trusting the omission.
+    assert web._csrf_refusal("POST", {"Host": "127.0.0.1:8000", **_JSON},
+                             "127.0.0.1", 8000) is not None
+
+
+def test_csrf_refuses_non_json_content_type():
+    # text/plain is the "simple request" that needs no CORS preflight -- the actual attack shape.
+    assert web._csrf_refusal("POST", _headers("http://127.0.0.1:8000", ctype="text/plain"),
+                             "127.0.0.1", 8000) is not None
+    assert web._csrf_refusal("POST", _headers("http://127.0.0.1:8000", ctype=None),
+                             "127.0.0.1", 8000) is not None
+    # A charset parameter is fine.
+    assert web._csrf_refusal(
+        "POST", _headers("http://127.0.0.1:8000", ctype="application/json; charset=utf-8"),
+        "127.0.0.1", 8000) is None
+
+
+def test_csrf_leaves_gets_alone():
+    # Reads are unaffected: no Origin, no Content-Type, cross-site referrer -- all still served.
+    assert web._csrf_refusal("GET", {"Host": "127.0.0.1:8000"}, "127.0.0.1", 8000) is None
+    assert web._csrf_refusal("GET", _headers("http://evil.example", ctype="text/plain"),
+                             "127.0.0.1", 8000) is None
+
+
+def test_is_json_content_type_variants():
+    assert web._is_json_content_type("application/json") is True
+    assert web._is_json_content_type("APPLICATION/JSON ;charset=UTF-8") is True
+    assert web._is_json_content_type("text/plain") is False
+    assert web._is_json_content_type("") is False
 
 
 # ---- _live_now: the Live tab's "who's here now?" payload (visit + cast + recent log) ----
