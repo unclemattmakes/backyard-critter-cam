@@ -15,7 +15,11 @@ the same open_clip gate the live rig uses; without it the decoy demo still stand
 BioCLIP verdicts.
 
 PRIVACY: only detection_class='animal' crops are ever exported, and a name denylist drops any
-person label (e.g. 'homeowner') and the non-critter labels. No full frames except wide frames
+person label (add your own household's individual names to config.privacy_deny_names) and the
+non-critter labels. That denylist works on the LABEL, so it
+cannot catch a person the detector boxed as an animal and BioCLIP then named a species -- for those
+there is PRIVACY_DENY_IDS, an explicit list of detection ids that are refused outright. Check the
+exported crops by eye and add anything that shouldn't be public. No full frames except wide frames
 pulled from behaviour clips, which are yard-only by construction.
 
     python makingof_export.py            # build the whole dataset from the DB
@@ -45,8 +49,20 @@ OUT = ROOT / "making-of"
 DATA = OUT / "data"
 MEDIA = OUT / "media"
 
-# Labels that must never reach the public page: the non-critter denylist + any person label.
-PRIVACY_DENY = set(_NON_CRITTER) | {"homeowner", "person", "people", "human"}
+# Labels that must never reach the public page: the non-critter denylist + any person label. Add the
+# individual names you've given the humans in your own household -- the dashboard will happily let
+# you name yourself as an individual, and that name is then a label like any other.
+PRIVACY_DENY = set(_NON_CRITTER) | {"person", "people", "human"} | {
+    n.strip().lower() for n in config.CONFIG.privacy_deny_names
+}
+
+# Detection ids that must never reach the public page, whatever they claim to be. 11110 and 11111
+# are one person bent over the retaining wall: MegaDetector boxed them as 'animal' and BioCLIP,
+# which has no "none of the above", named them 'brown rat' at 0.49 and 0.30. A denylist of species
+# NAMES is blind to that by construction -- the name is wrong, that's the whole problem -- so a
+# vetoed detection needs its id refused outright. Add an id here after seeing a crop you don't want
+# public; it stays out of every export from then on.
+PRIVACY_DENY_IDS = {11110, 11111}
 
 
 # --------------------------------------------------------------------------------------------
@@ -94,6 +110,23 @@ def copy_crop(rel_path, *, kind="crops", prefix="crop", key=None, size=None) -> 
         print(f"    ! copy failed for {rel_path}: {e}")
         return None
     return f"media/{kind}/{stem}.jpg"
+
+
+def _deny_ids_sql(col="id"):
+    """SQL fragment + bound params that drop PRIVACY_DENY_IDS from a detections query. Bound, not
+    interpolated, the same way PRIVACY_DENY is bound in export_meta."""
+    return (" AND %s NOT IN (%s)" % (col, ",".join("?" * len(PRIVACY_DENY_IDS))),
+            sorted(PRIVACY_DENY_IDS))
+
+
+def _deny_crop_paths(conn):
+    """The stored crop_paths behind PRIVACY_DENY_IDS. The un-blend finale gets handed crop paths by
+    individuals.unblend_visit rather than detection ids, so that one call site filters on path."""
+    if not PRIVACY_DENY_IDS:
+        return set()
+    return {r[0] for r in conn.execute(
+        "SELECT crop_path FROM detections WHERE crop_path IS NOT NULL AND id IN (%s)"
+        % ",".join("?" * len(PRIVACY_DENY_IDS)), sorted(PRIVACY_DENY_IDS)).fetchall()}
 
 
 def _crop_path(conn, det_id):
@@ -214,12 +247,13 @@ def export_pipeline(conn) -> None:
              AND v.representative_detection_id IS NOT NULL
            ORDER BY v.detection_count DESC LIMIT 30""").fetchall()
     samples = []
+    deny_sql, deny = _deny_ids_sql()
     for v in rows:
         d = conn.execute(
             "SELECT id, timestamp, source, confidence, bbox_x1, bbox_y1, bbox_x2, bbox_y2, "
             "frame_w, frame_h, crop_path, crop_quality, species, species_confidence, "
-            "species_source, individual_id, visit_id FROM detections WHERE id=?",
-            (v["rep"],)).fetchone()
+            "species_source, individual_id, visit_id FROM detections WHERE id=?" + deny_sql,
+            (v["rep"], *deny)).fetchone()
         if not d or not d["crop_path"]:
             continue
         bbox_norm = [d["bbox_x1"] / d["frame_w"], d["bbox_y1"] / d["frame_h"],
@@ -262,12 +296,13 @@ DECOY_PICKS = [
 
 def export_decoy(conn, score=False) -> None:
     tray, srcs = [], []
+    deny_sql, deny = _deny_ids_sql()
     for species, truth, k in DECOY_PICKS:
         rows = conn.execute(
             "SELECT id, crop_path, species, species_confidence, species_source "
             "FROM detections WHERE detection_class='animal' AND species=? "
-            "AND crop_path IS NOT NULL AND COALESCE(species_verified,0)!=1 "
-            "ORDER BY confidence DESC LIMIT ?", (species, k * 4)).fetchall()
+            "AND crop_path IS NOT NULL AND COALESCE(species_verified,0)!=1" + deny_sql +
+            " ORDER BY confidence DESC LIMIT ?", (species, *deny, k * 4)).fetchall()
         added = 0
         for r in rows:
             web = copy_crop(r["crop_path"], kind="crops", prefix="decoy", key=r["id"], size=300)
@@ -316,10 +351,11 @@ def _score_gate(conn, tray, srcs):
     # Two real p_nonanimal distributions, so the demo's threshold slider shows the actual
     # separation: confident real animals (should be ~0) vs the gate-rejected non-animals
     # (should be high). The 0.60 cut lives in the empty gap between the two clouds.
+    deny_sql, deny = _deny_ids_sql()
     def cohort(where, limit=160):
         rs = conn.execute(
-            f"SELECT crop_path FROM detections WHERE {where} AND crop_path IS NOT NULL "
-            "ORDER BY id LIMIT ?", (limit,)).fetchall()
+            f"SELECT crop_path FROM detections WHERE {where} AND crop_path IS NOT NULL"
+            + deny_sql + " ORDER BY id LIMIT ?", (*deny, limit)).fetchall()
         ps = [str(db.crop_abspath(r["crop_path"])) for r in rs
               if db.crop_abspath(r["crop_path"]).exists()]
         return [round(float(pn), 3) for _, pn in af.judge(ps)] if ps else []
@@ -341,13 +377,14 @@ MIN_PROTO_CROPS = 10        # thin visits make noisy prototypes; show their crop
 
 def export_appearance(conn) -> None:
     # embedded, confirmed raccoon crops grouped by (individual, visit)
+    deny_sql, deny = _deny_ids_sql("d.id")
     rows = conn.execute(
         """SELECT d.id, d.individual_id, d.visit_id, d.crop_path, d.crop_quality, e.embedding
            FROM detections d JOIN detection_embeddings e
              ON e.detection_id=d.id AND e.model=?
            WHERE d.species='raccoon' AND d.individual_source='human'
-             AND d.individual_id IS NOT NULL AND d.visit_id IS NOT NULL""",
-        (EMBED_MODEL,)).fetchall()
+             AND d.individual_id IS NOT NULL AND d.visit_id IS NOT NULL""" + deny_sql,
+        (EMBED_MODEL, *deny)).fetchall()
     by_vis = defaultdict(list)
     for r in rows:
         if r["individual_id"] in CAST:
@@ -474,7 +511,9 @@ def export_reid_game(conn) -> None:
         ranked = rank_templates(matcher.protos[vid], others)
         if not ranked:
             continue
-        members = sorted(matcher._by_visit.get(vid, []),
+        # the matcher's rows are loaded by individuals.py, so the id veto lands here, not in SQL
+        members = sorted((m for m in matcher._by_visit.get(vid, [])
+                          if m["id"] not in PRIVACY_DENY_IDS),
                          key=lambda r: -(r["crop_quality"] or 0))[:5]
         crops = [c for c in (copy_crop(_crop_path(conn, m["id"]), kind="crops", prefix="game",
                                        key=m["id"], size=240) for m in members) if c]
@@ -499,6 +538,7 @@ def _unblend_finale(conn, matcher):
     (real ground truth) and where the split is clean. Each cluster keeps its clip-template
     suggestion (who the separated animal looks like) when one exists."""
     cand = [vid for vid in matcher.protos if matcher.is_multi(vid)]
+    denied_paths = _deny_crop_paths(conn)
     best = None
     for vid in cand:
         try:
@@ -517,9 +557,10 @@ def _unblend_finale(conn, matcher):
         if best is None or score > best["_score"]:
             glist = []
             for gi, g in enumerate(groups[:2]):
+                keep = [rc for rc in (g.get("rep_crops") or []) if rc not in denied_paths]
                 reps = [c for c in (copy_crop(rc, kind="crops", prefix="ub",
                                               key=f"{vid}_{gi}_{i}", size=200)
-                                    for i, rc in enumerate(g.get("rep_crops") or [])) if c]
+                                    for i, rc in enumerate(keep)) if c]
                 sugg = (g.get("suggestion") or [])
                 glist.append({"n": g["n"], "cohesion": g["cohesion"], "rep_crops": reps[:4],
                               "label": g.get("label"),
@@ -584,10 +625,11 @@ def export_glass(conn) -> None:
     """A spread of real raccoon crops across the crop_quality range, tagged day/night, so the demo
     can scrub from the softest glass-flared night shots to the crispest daytime ones."""
     import statistics
+    deny_sql, deny = _deny_ids_sql()
     rows = conn.execute(
         """SELECT id, crop_path, crop_quality, timestamp FROM detections
-           WHERE species='raccoon' AND crop_quality IS NOT NULL AND crop_path IS NOT NULL
-           ORDER BY crop_quality""").fetchall()
+           WHERE species='raccoon' AND crop_quality IS NOT NULL AND crop_path IS NOT NULL"""
+        + deny_sql + " ORDER BY crop_quality", deny).fetchall()
     if not rows:
         _write_json("glass.json", {"crops": []}); return
     n = len(rows)

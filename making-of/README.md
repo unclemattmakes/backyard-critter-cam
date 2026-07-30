@@ -18,8 +18,11 @@ python makingof_export.py --score    # also runs the open_clip non-animal gate f
 still works on the stored BioCLIP verdicts; the threshold strip is just omitted.
 
 Privacy: the exporter only ever exports `detection_class='animal'` crops and drops a name denylist
-(person labels, non-critter labels). The only wide frames are pulled from behaviour clips, which are
-yard-only by construction.
+(person labels, non-critter labels). That filter reads the LABEL, so a person the detector boxed as
+an animal and BioCLIP then named a species will slip past it — for those there's
+`PRIVACY_DENY_IDS` in `makingof_export.py`, a list of detection ids refused outright. Look at the
+exported crops before you publish and add anything that shouldn't be public. The only wide frames
+are pulled from behaviour clips, which are yard-only by construction.
 
 ## View it
 

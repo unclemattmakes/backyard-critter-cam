@@ -7,10 +7,23 @@ so whatever you set here overrides the defaults in config.py -- and never enters
 
 
 def apply(cfg):
-    # Your camera's location, used only for the sun-driven day/night camera profiles.
-    # Leave these unset (delete the lines) to disable sun profiles and simply auto-expose.
-    cfg.latitude = 0.0    # decimal degrees, e.g. 40.7128
-    cfg.longitude = 0.0   # decimal degrees, e.g. -74.0060
+    # Every override below is commented out, so a straight copy of this file changes nothing.
+    # This `pass` is what keeps that legal Python -- a function whose whole body is comments
+    # won't import. Leave it; uncomment the lines you actually want.
+    pass
+
+    # Your camera's location. It drives the sun-driven day/night camera profiles and the
+    # dashboard's dawn/dusk buckets; left unset (as below) both simply switch off -- the rig
+    # auto-exposes and the stats stop splitting Day from Night. Don't leave a placeholder 0/0
+    # in: nothing treats it as "unset", and the Gulf of Guinea puts dawn at 22:40 local.
+    # cfg.latitude = 47.6     # decimal degrees
+    # cfg.longitude = -122.3  # decimal degrees, negative for west
+
+    # The individual names you've given the humans in your household. Name yourself in the
+    # dashboard and the re-ID queue stops offering you up as a new raccoon -- but that name is
+    # then a label like any other, so list it here and makingof_export.py will never publish a
+    # crop carrying it. Belongs in this untracked file, not in config.py.
+    # cfg.privacy_deny_names = ("yourname", "housemate")
 
     # Power-user option (the default 'auto' already uses the GPU when it works, else CPU). Set
     # 'cuda' to REQUIRE a working NVIDIA GPU and fail loud if a wrong torch build can't use it,
@@ -53,6 +66,14 @@ def apply(cfg):
     # kept. Boxes are (x1, y1, x2, y2) in full-resolution frame pixels -- read them off the
     # repeated rows in the DB, or the preview. Full story at `ignore_zones` in config.py.
     # cfg.ignore_zones = {"glass_door_cam": [(1127, 595, 1234, 701)]}
+
+    # Running a SECOND source (a trail cam's SD card, another rig)? Give it its own slice of the
+    # clips/ disk budget. Without this all sources share one pool pruned oldest-first, so importing
+    # a full card evicts an equal amount of your live footage -- which is the wrong trade, because
+    # the live rig can record tomorrow and the card gets formatted. Key by the source string
+    # exactly as it appears in clips.source; a source you don't list shares the global
+    # cfg.clips_max_gb. 0 = never pruned.
+    # cfg.clips_max_gb_by_source = {"trail_cam_sd": 15.0}
 
     # Where backup.py archives the rig's generated content (clips/crops/db). Point it at a
     # folder your cloud client syncs (Google Drive, Dropbox, OneDrive) so uploads are automatic;

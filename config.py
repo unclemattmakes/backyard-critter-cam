@@ -383,11 +383,15 @@ class Config:
     reid_proto_min_crops: int = 3       # fewer embedded crops than this = too thin to suggest on
     reid_suggest_min_conf: float = 0.5  # embedding gate: crops below this confidence don't vote
     # Best-match similarity below this = "possibly someone new" (novelty flag). Set to the eval
-    # optimum: eval.py measured same-vs-different individual separation at ROC-AUC 0.81 with the
-    # Youden-J best operating point at cosine 0.31 (reports/eval_*.json, reid.separation.
-    # best_threshold). The old 0.55 was over-conservative -- it wrongly flagged ~7 of 61 correctly-
-    # matched raccoon visits as "possibly someone new". Since suggest-confirm still has a human
-    # approve every match, the looser cut mostly just recovers true returnees.
+    # optimum: eval.py's Youden-J best operating point on same-vs-different individual separation
+    # (reid.separation.best_threshold in the report it writes). The old 0.55 was over-conservative
+    # -- it wrongly flagged ~7 of 61 correctly-matched raccoon visits as "possibly someone new".
+    # Since suggest-confirm still has a human approve every match, the looser cut mostly just
+    # recovers true returnees. Separation itself got HARDER as the cast grew: ROC-AUC was 0.81
+    # over two raccoons, and 0.635 (top-1 0.637 over 113 leave-one-out probes) on the 2026-07-18
+    # run with five. That drop is the honest number -- more lookalike raccoons means more
+    # confusable pairs, not a regression -- and the best threshold barely moved (0.29). Re-run
+    # `python eval.py --reid` on your own corpus rather than trusting either figure.
     reid_novel_threshold: float = 0.31
     # >= this many frames with two separated raccoon boxes = a multi-animal visit: it gets a
     # "2+ raccoons" badge and its (blended) prototype never becomes a suggestion template.
@@ -405,7 +409,7 @@ class Config:
     # similarity regime than the still prototypes, so they need their OWN threshold (measured
     # 2026-06-16: same-individual clip<->clip 0.52 / cross-space still<->clip-centroid 0.65, vs
     # ~0.10-0.18 for different individuals -- both separate cleanly at 0.40). Distinct from the
-    # still-still novelty cut (reid_novel_threshold 0.55).
+    # still-still novelty cut (reid_novel_threshold 0.31).
     reid_clip_match_threshold: float = 0.40
     # AUTO-ASSIGN (the "review by exception" tier): the nightly batch (run_clipmotion.bat ->
     # individuals.py --auto-assign) names a solo visit AUTOMATICALLY when its best match clears
@@ -415,13 +419,16 @@ class Config:
     # suggestion templates and never ground behaviour links (clipmotion --link is human-only) --
     # a wrong auto name can't teach the matcher or contaminate ground truth. The dashboard queue
     # shows each as "auto: <name>" with one-tap promote (-> human) / reject (-> never re-named).
-    # 0.0 DISABLES the pass. Don't guess values: run `python eval.py --reid` -- its auto-assign
-    # sweep recommends the max-coverage operating point with ZERO wrong names and ZERO novel-
-    # animal false-accepts on your own confirmed corpus (re-run it as the cast grows).
-    # Current values = the sweep on 2026-07-17's corpus (113 LOO probes over a 5-raccoon cast,
-    # reports/eval_20260718T030508Z.json): named 17/113 (15%) with zero errors. Deliberately
-    # conservative -- the confident head of the distribution, not the whole queue.
-    reid_auto_threshold: float = 0.76
+    # 0.0 DISABLES the pass, and that is what SHIPS: an operating point is a property of one
+    # corpus, one camera and one cast, so the default must not put machine-written names on a
+    # stranger's animals. Don't guess values: run `python eval.py --reid` -- its auto-assign sweep
+    # recommends the max-coverage operating point with ZERO wrong names and ZERO novel-animal
+    # false-accepts on your own confirmed corpus (re-run it as the cast grows), then set the two
+    # bars here. For reference, this author's own numbers are 0.76 / 0.12 -- the sweep on
+    # 2026-07-17's corpus (113 LOO probes over a 5-raccoon cast) named 17/113 (15%) with zero
+    # errors. Deliberately conservative even there: the confident head of the distribution, not
+    # the whole queue. The margin below is inert while the threshold is 0.
+    reid_auto_threshold: float = 0.0
     reid_auto_margin: float = 0.12
 
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
@@ -434,6 +441,14 @@ class Config:
     classify_live: bool = True
     classify_device: str = "cpu"        # 'cpu' (default; no GPU contention) or 'cuda'.
     classify_interval_s: float = 5.0    # Seconds between checks for new crops to name.
+
+    # Individual names belonging to the humans in your household. The dashboard will let you name
+    # yourself as an individual (handy -- it stops the re-ID queue offering you up as a new raccoon),
+    # and that name is then a label like any other. makingof_export.py refuses to publish any crop
+    # carrying one, on top of the generic person/people/human labels. Set it in config_local.py so
+    # your name never rides along in a commit; a label-based filter can't catch a person the
+    # detector mislabelled, so still review exported crops by eye.
+    privacy_deny_names: tuple = ()
 
     # ---- Non-animal prefilter (general CLIP, runs BEFORE BioCLIP) ----------------
     # BioCLIP is organism-only: it can't say "that's not an animal", so MegaDetector's coarse
@@ -504,7 +519,12 @@ CONFIG = Config()
 # them there, so they never enter version control. Applied last, over the defaults above.
 try:
     import config_local  # type: ignore
-
+except ModuleNotFoundError as exc:
+    # Having no config_local.py is the normal case, so that one is silent. But a bare
+    # `except ImportError` also swallowed a ModuleNotFoundError raised from INSIDE the file:
+    # one typo'd import in the user's own overrides and every override vanished without a
+    # word, which is a miserable thing to debug. Only the absent module itself passes.
+    if exc.name != "config_local":
+        raise
+else:
     config_local.apply(CONFIG)
-except ImportError:
-    pass
