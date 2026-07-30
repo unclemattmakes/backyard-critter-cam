@@ -1,5 +1,8 @@
 # Backyard Critter Cam
 
+[![tests](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml/badge.svg)](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml)
+[![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
 A live backyard-critter detection rig. A USB webcam points through a sliding glass door at
 the yard; the program watches the feed, wakes a real animal detector only when something
 moves, draws live bounding boxes, and saves a cropped image + a database row for every
@@ -15,7 +18,31 @@ for. It captures, **names the species** on every crop (BioCLIP 2), **re-identifi
 animals** across nights — down to telling apart two raccoons that only ever show up together —
 and reads their **behaviour** off short video clips, all surfaced in a local web
 **dashboard** you can leave open in a browser tab. The design philosophy and the rest of the
-roadmap live in [PLAN.md](PLAN.md).
+roadmap live in [the plan](docs/plan.md).
+
+---
+
+## Contents
+
+- [How it works](#how-it-works) — the pipeline, one box at a time
+- [Notes on the detector](#notes-on-the-detector) — why Ultralytics directly, not PytorchWildlife
+- [Requirements](#requirements) · [Setup](#setup) · [Running](#running) — including
+  [several cameras at once](#multiple-cameras-usb--networked) and the
+  [web dashboard](#web-dashboard---serve)
+- [Species identification (phase 2)](#species-identification-phase-2) — BioCLIP 2, and how far
+  to trust a label
+- [Individual re-identification (phase 3)](#individual-re-identification-phase-3) — the
+  suggest-confirm loop
+- [Behaviour clips (phase 4 capture)](#behaviour-clips-phase-4-capture) ·
+  [Behaviour analysis (phase 4)](#behaviour-analysis-phase-4)
+- [Output](#output) · [Backups](#backups) · [Database schema](#database-schema) ·
+  [Configuration](#configuration)
+- [Security & privacy](#security--privacy) — there is no login; read this before the dashboard
+  leaves your machine
+- [Responsible use](#responsible-use) — it is a camera pointed at the outdoors
+- [Tests](#tests) · [Roadmap](#roadmap) · [Contributing](#contributing) ·
+  [License & attribution](#license--attribution) — the model weights have their own terms
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -84,15 +111,29 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
   detector on real motion, so it stays usable). Pass **`--device cpu`** to force CPU, or
   **`--device cuda`** to require the GPU and fail loud if a wrong torch build can't use it.
 - **Python 3.10 or newer** (built and tested on 3.14; the app checks this at startup).
+- **`ffmpeg` and `ffprobe` on your PATH — strongly recommended, not required.** Two features are
+  built on them. Clips are recorded by piping frames to ffmpeg (`clip_codec = "h264"`); with no
+  ffmpeg the recorder falls back to OpenCV's `mp4v` writer, and no browser decodes `mp4v`, so
+  those clips won't play in the dashboard — the server's on-demand transcode is *also* ffmpeg, so
+  there's nothing to fall back to. And the Dispatch's stitched highlight reel is an ffmpeg concat,
+  so without it the reel returns `ffmpeg not found on PATH` and the panel stays empty. Everything
+  else — detection, crops, species, re-ID, motion tracks — works fine without it.
 
-> **Blackwell / RTX 50-series note (important).** This machine's RTX 5050 is compute
-> capability **sm_120**. A stock `pip install torch` (a CUDA 12.6 build) *appears* to work
-> (`torch.cuda.is_available()` returns `True`) but then dies at the first real GPU op with
-> `CUDA error: no kernel image is available for execution on the device`. You need a
-> **CUDA 12.8+ build of torch**. `setup.bat` installs the right **cu130** wheels for you when it
-> detects an NVIDIA GPU. The app verifies this at startup by running a real GPU op: with
+  ```
+  winget install Gyan.FFmpeg     # Windows (or: choco install ffmpeg)
+  sudo apt install ffmpeg        # Debian / Ubuntu
+  brew install ffmpeg            # macOS
+  ```
+
+> **Blackwell / RTX 50-series note (important).** Any RTX 50-series card (Blackwell — this was
+> built on a 5050) is compute capability **sm_120**. A stock `pip install torch` (a CUDA 12.6
+> build) *appears* to work (`torch.cuda.is_available()` returns `True`) but then dies at the
+> first real GPU op with `CUDA error: no kernel image is available for execution on the device`.
+> You need a **CUDA 12.8+ build of torch**. `setup.bat` installs the right **cu130** wheels for
+> you when it detects an NVIDIA GPU. The app verifies this at startup by running a real GPU op: with
 > `--device cuda` a wrong build fails loudly and early; with the default `--device auto` it falls
-> back to the CPU instead (never stuck — just slower).
+> back to the CPU instead (never stuck — just slower). If you'd rather not chase CUDA wheels at
+> all, a CPU-only install works everywhere; it's only slower per detector wake.
 
 ---
 
@@ -183,7 +224,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
 | `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
-| `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` with oldest-first pruning). |
+| `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` — or a per-camera budget from `clips_max_gb_by_source` — with oldest-first pruning). |
 | `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
 | `--no-preview` | Headless; quit with Ctrl+C. |
@@ -302,14 +343,9 @@ focus, white balance — read from and pushed to the *running* camera, so you ca
 glass-door shot without restarting (a live companion to `tune.py`).
 
 - Built on Python's stdlib `http.server` — **no web framework, no new dependencies**.
-- **Localhost only** by default (it shows your camera). To watch from a phone on the same
-  network add `--host 0.0.0.0`. Even then the dashboard accepts connections **only from your
-  local network** (loopback + private/LAN addresses): it refuses *direct* connections from the
-  wider internet **and** validates the `Host` header to block DNS-rebinding from a malicious site
-  you visit. That stops the common exposure paths — but it is **not a login**, so anyone already
-  on your Wi-Fi has full access (including label edits). Don't port-forward it or put it on an
-  untrusted network; for real remote access, front it with a VPN or an authenticating reverse
-  proxy. Set `lan_only = False` in `config_local.py` only if you've done exactly that.
+- **Localhost only** by default (it shows your camera), with LAN access an explicit opt-in and
+  **no login at any point** — read [Security & privacy](#security--privacy) before you make it
+  reachable from anything but the machine it runs on.
 - Runs in the same process as capture; combine with `--no-preview` for a headless,
   browser-only rig, or keep the native window too.
 - **Species names appear on their own:** the rig starts the naming **helper** (`classify.py
@@ -321,7 +357,8 @@ glass-door shot without restarting (a live companion to `tune.py`).
 - **Clips just play.** Clips recorded in legacy `mp4v` aren't browser-playable, so the server
   transcodes them to H.264 **on demand** into a `clips_web/` cache (with range-request seeking);
   H.264 clips are served as-is and the originals are never touched, so `clipmotion.py` still
-  reads them.
+  reads them. Both halves of that need [ffmpeg](#requirements) — with none on PATH the original
+  is served and the browser refuses it.
 
 ---
 
@@ -360,13 +397,21 @@ species tracks the new labels with no manual `visits.py` step.
   digest, exactly like `not an animal`.
 - **How far to trust a label — and the day/night catch.** A read-only eval harness (`eval.py`)
   grades the auto labels against your confirmed/corrected verdicts and writes a timestamped JSON
-  to `reports/` (gitignored). Its headline finding: species labels at **`species_confidence` ≥ 0.8
-  are ~94% accurate overall — but that trust does not survive the dark.** By day the high-confidence
-  slice is nearly perfect; **at night it drops to ~63%**, because through-glass IR is monochrome and
-  soft, so a confident night label is *far* likelier to be wrong than a confident day one. Read
-  night labels with more suspicion, and re-run `eval.py` after you change the label list or a
-  threshold to see the numbers move. (The grading only works because `model_species` snapshots the
-  model's original call, so your corrections *teach* the eval instead of erasing the thing it scores.)
+  to `reports/` (gitignored — so these are numbers to *reproduce*, not to read out of the repo).
+  Its headline finding: species labels at **`species_confidence` ≥ 0.8 are ~94% accurate overall —
+  but that trust does not survive the dark.** Day rows grade **96%**; **night rows ~63%**, and even
+  the *confident* night rows only reach 68%, because through-glass IR is monochrome and soft, so a
+  confident night label is *far* likelier to be wrong than a confident day one. Read night labels
+  with more suspicion.
+  **Know how thin that is.** On the **2026-07-01** run those percentages come from **165 gradable
+  rows** — only 165, because a human correction overwrites `species`, so the model's own call
+  survives on the prediction-intact slice alone. Of those, **138 are day and 27 night**, and
+  **129 are raccoon**. So "94% / 63%" is really *one species, one camera, three weeks*, and the
+  night figure rests on 27 rows. Treat it as the shape of the problem (confidence lies in the
+  dark), not as a benchmark, and re-run `eval.py` on your own corpus — after you change the label
+  list or a threshold — to see your numbers. (The grading only works because `model_species`
+  snapshots the model's original call, so your corrections *teach* the eval instead of erasing the
+  thing it scores.)
 
 ---
 
@@ -402,17 +447,17 @@ after a species (raccoons first) has banked a few hundred readable crops.
   cross-session *same-individual* similarity (~0.5) overlaps with *different-individual*
   similarity — there's no clean threshold that maps clusters straight to individuals. That's
   by design: appearance is **one axis**, surfaced to *augment* your eye, not replace it (see
-  [PLAN.md](PLAN.md)). Hand-labelling the obvious clusters + the neighbour lookup is the
+  [the plan](docs/plan.md)). Hand-labelling the obvious clusters + the neighbour lookup is the
   intended workflow; behaviour (phase 4) is the other axis.
 
 ### The suggest-confirm loop (`individuals.py`)
 
 Single crops can't be matched across sessions — but **whole visits can**. Averaging a visit's
-best crops into one *prototype* washes out the pose/burst noise: on real data, the same
-raccoon's visits on different nights match at **0.83–0.93** while two *different* raccoons
-photographed **in the same frame** (same light, same glass — the perfect controlled test,
-courtesy of a two-raccoon visit) score only ~0.36–0.42. `individuals.py` builds on that:
-every unconfirmed raccoon visit gets a suggestion — the nearest *human-confirmed* visit's
+best crops into one *prototype* washes out the pose/burst noise: when the cast was **two**
+raccoons, the same raccoon's visits on different nights matched at **0.83–0.93** while the two
+*different* raccoons photographed **in the same frame** (same light, same glass — the perfect
+controlled test, courtesy of a two-raccoon visit) scored only ~0.36–0.42. `individuals.py` builds
+on that: every unconfirmed raccoon visit gets a suggestion — the nearest *human-confirmed* visit's
 name ("looks like Stan 0.84"), or a *"possibly someone new"* flag — and each confirmation
 becomes a new template, so **suggestions sharpen as you confirm**. No training; just
 accumulating verified prototypes. Visits with two raccoons present at once get a "2+ raccoons"
@@ -422,6 +467,18 @@ is behaviour signal; their blended prototype never teaches). The *"possibly some
 (`reid_novel_threshold`) is set to the similarity `eval.py` measured as best-separating
 same-from-different across *all* your confirmed visits — currently **0.31**, not the eyeballed 0.55
 it began with — so re-run `python eval.py --reid` as the cast grows and it reports the new optimum.
+
+**That gap narrowed as the cast grew — the honest, dated version.** 0.83–0.93 against 0.36–0.42
+was measured with **two** raccoons on file. The most recent sweep (**2026-07-18**, five raccoons,
+113 leave-one-out probes over solo visits) reports **ROC-AUC 0.635** and **top-1 identification
+0.637**: same-individual visit pairs now average 0.44 and different-individual pairs 0.32, which is
+a real signal and a badly overlapping one. The code didn't regress — the problem got harder, and
+five look-alike raccoons through one pane of glass is a truer measure of the difficulty than two
+were. It's lopsided per animal, too: the two best-templated raccoons score 40/46 and 31/48 while
+the three thin ones manage 1/19 between them, and some of that spread is probably label noise (one
+misnamed visit poisons its own template), which is another reason to re-measure rather than
+believe. `reports/` is gitignored, so these aren't numbers you can read out of a checkout — run
+`python eval.py --reid` and get your own.
 
 The **dashboard's Individuals tab** is the intended surface: a "Who is this?" review queue
 with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
@@ -481,10 +538,17 @@ stamped `individual_source='auto'`. Auto names count on tracking surfaces (roll 
 but deliberately **never feed the suggestion templates** and never ground behaviour links — a
 wrong auto name can't teach the matcher anything. In the queue each one shows as **auto: Stan**
 with **✓ keep** (promotes it to a real, template-feeding confirmation) and **✗ not them** (clears
-it *and* pins the visit so the nightly pass won't re-name it). It ships **disabled**: run
-`python eval.py --reid` — its auto-assign sweep recommends the max-coverage bars that made **zero
-wrong calls and zero novel-animal false-accepts on your own confirmed corpus** — then set
-`reid_auto_threshold` / `reid_auto_margin` to those values and re-run the eval as the cast grows.
+it *and* pins the visit so the nightly pass won't re-name it).
+
+It ships **disabled** — `reid_auto_threshold = 0.0` — and that is deliberate: an operating point is
+a property of one corpus, one camera and one cast, so the default must not write machine-made names
+onto a stranger's animals. To turn it on, **measure it on your own data first**: `python eval.py
+--reid` ends with an auto-assign sweep that reports the max-coverage bars making **zero wrong calls
+and zero novel-animal false-accepts across your confirmed visits**, and you set
+`reid_auto_threshold` / `reid_auto_margin` from that. For reference, on a five-raccoon corpus
+(2026-07-18) the zero-error point was **0.76 / 0.12**, and even there it only named 17 of 113
+visits — 15% coverage. Useful as a place to start a sweep, not a default to trust: those bars are
+tuned to that cast's look-alikes, not yours. Re-run the eval as the cast grows.
 
 ---
 
@@ -495,7 +559,12 @@ dwell, vigilance, who-defers-to-whom. That's the substance of behaviour, and a c
 second shot at individual ID (a limp reads the same from any angle, where a single still — pose
 + soft glass — does not). **On by default**, and safe to leave on: the clips folder is a
 **rolling window** — past the `clips_max_gb` disk budget (default 10 GB ≈ two busy weeks) the
-oldest clip **files** are pruned automatically. The prune is *soft*: the DB row stays, stamped
+oldest clip **files** are pruned automatically. The budget is **per source** where you say so
+(`clips_max_gb_by_source`, default `trail_cam_sd: 15 GB`), because the sources aren't equally
+replaceable: the live rig can always record tomorrow, but a trail-cam clip exists only until the SD
+card is formatted, and one shared oldest-first pool let a 9 GB card import evict an equal slice of
+glass-door footage. Sources you don't list share `clips_max_gb`. The prune is *soft*: the DB row
+stays, stamped
 `pruned_at`, so everything the clip taught the system — motion tracks, tracklet appearance
 vectors, individual links — **outlives the video** instead of resetting every budget cycle.
 Watch/play surfaces simply stop offering the pruned footage. (Want the videos themselves kept
@@ -645,7 +714,7 @@ read off a window-side clock, but globally unambiguous and sortable.
 |--------|-------|
 | `id` | PK. |
 | `timestamp` | Local ISO 8601 with offset. |
-| `source` | `glass_door_cam` in V1. Future: `trail_cam_sd`. |
+| `source` | Which camera wrote the row — `glass_door_cam` for the live rig, `trail_cam_sd` for an SD card run through `import_trailcam.py`, or whatever you name your own cameras in `cfg.cameras`. Everything downstream keys off it. |
 | `detection_class` | Coarse label: `animal` / `person` / `vehicle`. |
 | `confidence` | Detector score 0–1. |
 | `bbox_x1..bbox_y2` | Box in absolute pixels. Stored as 4 columns so it's queryable. |
@@ -726,6 +795,73 @@ The camera's best settings differ with the light, so two pieces handle it:
 
 ---
 
+## Security & privacy
+
+**There is no authentication.** None — no user, no password, no read-only mode. Anyone who can
+reach the dashboard's port sees the live feed, browses every crop and clip, and can edit species
+labels and individual names. That is a deliberate trade for a single-household tool, and it is the
+one thing to keep in mind before the page leaves the machine it runs on.
+
+- **Localhost by default.** The server binds `127.0.0.1:8000`, so nothing off the machine can
+  reach it.
+- **LAN access is an explicit opt-in** — `start_critter_cam_lan.bat`, or `--host 0.0.0.0` — and
+  even then two guards apply. The peer's IP must be loopback or private/link-local (`lan_only`,
+  default `True`), which refuses *direct* connections from the wider internet; and the `Host`
+  header must be `localhost`, a private IP literal, or your configured `web_host`, which is what
+  stops **DNS rebinding** — a malicious site you happen to visit pointing its own hostname at your
+  rig's LAN IP and driving the dashboard through your own browser.
+- **Writes require a same-origin request.** Every `POST` — renaming an individual, assigning a
+  visit, editing a species, deleting a clip, changing a camera control — must carry an `Origin`
+  header matching the dashboard's own, and `Content-Type: application/json`. Without that, any page
+  you happened to have open could quietly `fetch()` your rig and, say, blank the individual off
+  months of hand-confirmed detections; the Host guard above does not stop a plain cross-origin
+  POST. If you drive the API by hand, curl needs both headers:
+  `-H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json'`.
+- **Do not port-forward this to the internet.** The guards above close the common accidental paths;
+  they are not a login and not a substitute for one. Anyone already on your Wi-Fi has full access.
+  If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
+  then set `lan_only = False` in `config_local.py`.
+- **`config_local.py` holds the sensitive bits** — your latitude/longitude, and any RTSP camera
+  credentials. It's gitignored, so it never rides along in a commit; note that `backup.py` *does*
+  copy it into the `meta-<date>.zip`, which usually lands in a cloud-synced folder.
+- **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
+  (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
+  bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about
+  seven weeks: `backyard.db` ~810 MB, `crops/` ~4.7 GB. Deleting old material is a decision the rig
+  deliberately leaves to you, so make it consciously rather than discovering it as a full disk.
+- **Reporting a problem:** see [SECURITY.md](SECURITY.md).
+
+---
+
+## Responsible use
+
+It's a camera pointed at the outdoors, which makes a few things worth saying plainly.
+
+- **Point it at your own property.** Frame the yard you own or rent, not a neighbour's windows,
+  their garden, or a public sidewalk.
+- **Recording people is a different question from recording raccoons.** Depending on where you
+  live, a camera that covers a neighbour's property or a public way can raise consent obligations
+  and sometimes signage or registration ones. Check your local rules before a camera covers
+  anywhere a person would reasonably expect privacy; nothing here is legal advice. (One category
+  you're out of by construction: nothing in this project records **audio** — clips are video only,
+  and audio is where the rules are usually strictest.)
+- **Clips record whole frames.** Person *crops* are filtered by default (`save_classes` is animals
+  only, so a person at the glass is drawn in the preview but never written to `crops/`) — but a
+  clip is video of the **entire frame**. Anyone who walks through an animal-triggered clip is
+  recorded, and `--save-full-frame` writes whole frames to `frames/` as well. The live MJPEG feed
+  shows whatever the camera sees, filtered by nothing.
+- **The showcase exporter filters by *label*.** `makingof_export.py` bakes real DB rows into the
+  frozen page under `making-of/`, and it keeps person-labelled and non-critter detections out **by
+  label** — which works exactly as well as the labels do. A person crop the classifier called
+  something else walks straight through. Look at anything you're about to publish with your own eyes
+  first.
+- **Feeding.** This rig was built watching a feeding spot, and that is a choice with consequences:
+  putting food out for wild animals is regulated or prohibited in some jurisdictions, and it
+  habituates animals to people and concentrates them in one place, which is how disease spreads.
+  Worth knowing before you set a plate out for the data.
+
+---
+
 ## Tests
 
 A pure-logic test suite covers the data-shaping code — visit collapsing, behaviour profiles,
@@ -740,7 +876,7 @@ the DB layer — with **no GPU, camera, or model download needed**:
 
 ## Roadmap
 
-Full plan and design philosophy: **[PLAN.md](PLAN.md)**. The short version:
+Full plan and design philosophy: **[docs/plan.md](docs/plan.md)**. The short version:
 
 - **Phase 1 — Live capture skeleton:** ✅ MOG2 gate → MegaDetector → crop + clip + SQLite row,
   with a live preview window and the web dashboard.
@@ -770,13 +906,42 @@ the value is in capture and accumulation, not the fancy model.
 
 The schema and module layout are arranged so each phase is an addition, not a rewrite.
 
+Two longer write-ups sit in `docs/` if you want the reasoning rather than the summary: a
+[sharing-readiness review](docs/review-2026-06-19.md) of what had to change before this could go
+public, and an [observatory analysis](docs/observatory-2026-06-28.md) of the first weeks of data
+(where the pipeline was quietly wrong, and what the numbers actually supported).
+
 ---
 
-## License
+## Contributing
+
+Bug reports, camera-and-yard reports from a different climate, and patches are all welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for how the repo is laid out, what the tests cover, and the
+house style (boring and robust over clever). Security issues go through
+[SECURITY.md](SECURITY.md) instead of a public issue.
+
+---
+
+## License & attribution
 
 Copyright © 2026 Matt Scott. Licensed under the **GNU Affero General Public License v3.0** — see [LICENSE](LICENSE).
 
 The rig runs MegaDetector v6 through [Ultralytics](https://github.com/ultralytics/ultralytics), which is **AGPL-3.0**, so this project is AGPL-3.0 as well. Note the network-use clause: if you run a modified version as a network service (for example, exposing the dashboard to others), you must offer those users the corresponding source.
+
+**The model weights are licensed separately, and the code's licence does not cover them.** They
+download at first run and never enter this repo, so it is easy to miss that each carries its own
+terms — and one of them is non-commercial:
+
+| Weights | Licence | What that means here |
+|---------|---------|----------------------|
+| **MegaDetector v6** (detector) | CC-BY-4.0 | Attribution is a *condition*, not a courtesy — credit Microsoft AI for Good Lab wherever you use its output. |
+| **BioCLIP 2** (species) | MIT | Permissive; the authors ask that you cite the paper. |
+| **MegaDescriptor-L-384** (re-ID) | CC-BY-**NC**-4.0 | **Non-commercial.** No commercial use of the model or its embeddings, whatever the code's licence says. |
+
+So "AGPL-3.0, commercial use permitted" describes the *code* only. A commercial deployment has to
+drop the re-ID phase or swap in a differently-licensed embedder — `detection_embeddings` is keyed
+by `model` precisely so a second embedder can be added without a migration. Full attribution text,
+citations and links: **[NOTICE.md](NOTICE.md)**.
 
 ---
 

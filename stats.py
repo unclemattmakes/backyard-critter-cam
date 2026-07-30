@@ -333,7 +333,7 @@ def species_overview(cfg) -> dict | None:
             "SUM(CASE WHEN species_verified = 0 THEN 1 ELSE 0 END) rejected "
             "FROM detections WHERE species IS NOT NULL GROUP BY species ORDER BY n DESC"
         ).fetchall()
-        # Drop non-critter human-correction labels (chair, bricks, "not an animal", homeowner, ...)
+        # Drop non-critter human-correction labels (chair, bricks, "not an animal", person, ...)
         # so the catalogue and the "Rarely Seen" cards stay about real animals -- same filter the
         # period digest applies (see _NON_CRITTER). Real rarities (Douglas squirrel) are NOT here.
         rows = [r for r in rows if (r["species"] or "").lower() not in _NON_CRITTER]
@@ -749,14 +749,16 @@ _MOON_PHASES = [
 
 _SUN_CACHE: dict = {}   # (date.toordinal(), lat, lon) -> (dawn, dusk); stable per date, so memoize.
 
-# Human-correction labels that aren't actual visitors -- false triggers (patio bricks, a blurry
-# smear), the feeding station, or Matt himself. Excluded from the digest's roll / plate / novelty
-# so "who visited" stays about animals. Genuine rare species (Douglas squirrel, Anna's hummingbird)
-# are NOT here -- they're real and SHOULD surface. The unclassified coarse label 'animal' is kept
-# in the roll (a real critter, just unnamed) but excluded from novelty/quiet headlines.
+# Non-critter labels: things a human correction can name that aren't actual visitors -- false
+# triggers (patio bricks, a blurry smear), the feeding station, the household itself. Excluded from
+# the digest's roll / plate / novelty so "who visited" stays about animals. Genuine rare species
+# (Douglas squirrel, Anna's hummingbird) are NOT here -- they're real and SHOULD surface. The
+# unclassified coarse label 'animal' is kept in the roll (a real critter, just unnamed) but excluded
+# from novelty/quiet headlines. Operators: add the individual names you use for your own household
+# (yourself, housemates, your own pets if you don't want them counted) to this set.
 _NON_CRITTER = {
-    # seen in this DB (human corrections of false triggers / the feeder / Matt himself)
-    "bricks", "brick", "blur", "blurry", "cat food", "catfood", "food", "homeowner",
+    # human corrections of false triggers and of the feeder
+    "bricks", "brick", "blur", "blurry", "cat food", "catfood", "food",
     "door", "porch", "broom", "chair",
     # likely future static-object corrections + generic non-visitors
     "fence", "wall", "table", "plant", "pot", "hose", "shadow", "reflection", "leaf", "leaves",

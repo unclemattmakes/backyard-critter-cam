@@ -11,7 +11,12 @@ loading open_clip.
 """
 from __future__ import annotations
 
-import torch
+import pytest
+
+# The only hard third-party import in the suite that isn't cv2 or numpy. Skip rather than fail
+# collection so a lean checkout (or a CPU-only CI job that skipped the 2 GB torch wheel) still
+# runs the other 280-odd tests.
+torch = pytest.importorskip("torch")
 
 import clipfilter
 from clipfilter import AnimalFilter, decision

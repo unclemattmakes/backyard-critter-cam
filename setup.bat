@@ -53,6 +53,19 @@ REM 4) The rest of the dependencies.
 echo Installing the remaining requirements ...
 "%VPY%" -m pip install -r requirements.txt || (echo [ERROR] requirements install failed. & pause & exit /b 1)
 
+REM 5) ffmpeg is not a Python dependency, so pip can't install it -- but the rig quietly loses
+REM    two features without it: clips fall back to the mp4v codec no browser will play, and the
+REM    Dispatch highlight reel stitches with ffmpeg or not at all. Warn, don't fail.
+where ffmpeg >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo [WARNING] ffmpeg is not on PATH. Everything still runs, but behaviour clips fall back
+  echo           to an mp4v codec browsers refuse to play, and the Dispatch highlight reel
+  echo           will report "ffmpeg not found on PATH" instead of stitching a reel.
+  echo           Install it with:  winget install Gyan.FFmpeg
+  echo           then open a NEW terminal so the updated PATH is picked up.
+)
+
 echo.
 echo === Setup complete! ===
 echo Start the app by double-clicking  start_critter_cam.bat

@@ -19,8 +19,10 @@ import sys
 
 import backyard_cam
 
-PY = r"C:\Users\you\projects\backyard\.venv\Scripts\python.exe"
-ROOT = r"C:\Users\you\projects\backyard"
+# Fake install paths: they only ever get spliced into the synthetic command-line strings below,
+# so nothing here is launched and the real interpreter's location is irrelevant.
+PY = r"C:\rig\backyard\.venv\Scripts\python.exe"
+ROOT = r"C:\rig\backyard"
 
 
 def _rig(pid: int, source: int = 0) -> tuple[int, str]:

@@ -5,6 +5,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# packaging leftovers from an editable/`pip install .` of pyproject.toml (regenerated, never edited)
+*.egg-info/
+build/
+dist/
 
 # ===== Virtual environment =====
 .venv/

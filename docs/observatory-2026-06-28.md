@@ -1,9 +1,15 @@
 # The Backyard Observatory — Data, UX & Product Analysis
 
+> **Archived snapshot — the observatory as it looked on 2026-06-28**, over the first 22 days of
+> data. Kept for the engineering history: most of the roadmap below has since been built, and the
+> counts are frozen at a DB that has roughly tripled since. Findings that were acted on are marked
+> *since fixed*. Do not read this as current documentation — the [README](../README.md) is the
+> current doc.
+
 > Generated 2026-06-28 from a multi-agent analysis of ~3 weeks of live data (6 specialist
 > analysts → independent data-truth verifier (92 claims re-derived, 20 corrected) →
 > synthesis). Scope: the data we've collected, the ML pipeline, and the dashboard UX.
-> Companion to [PLAN.md](PLAN.md) (design philosophy) and [REVIEW.md](REVIEW.md)
+> Companion to [plan.md](plan.md) (design philosophy) and [review-2026-06-19.md](review-2026-06-19.md)
 > (code-review / sharing-readiness). This one is about the *observatory*, not the code.
 >
 > *Window: 2026-06-07 → 2026-06-28, one camera. The DB is still being written, so raw
@@ -57,7 +63,7 @@ compound:
 hand-run batch that was last run on 06-16. It is resumable (only untracked clips are
 processed), so the fix is one command plus a cron.
 
-**Why it matters:** PLAN.md's signature feature is the **two-axis "looks like X but isn't
+**Why it matters:** the plan's signature feature is the **two-axis "looks like X but isn't
 acting like X"** readout, where behaviour is the *strong* axis for raccoons (appearance is
 weak through glass). The behaviour axis is starved at every level — the ore isn't mined
 (06-16 cutoff), and even the 506 tracked clips are never tied to Notch or Stan. The
@@ -79,19 +85,24 @@ db.set_clip_track_individual`) and **has never been used once**.
 
 ### UX — the daily loop opens on the wrong thing
 
-- **The first screen leads with junk.** The Live tab (default landing) renders "Rarely Seen
+- **✅ FIXED (2026-07-01) — The first screen leads with junk.** `species_overview` now applies the
+  `_NON_CRITTER` denylist (`stats.py:336-339`), so chair/bricks/porch are gone from the "Rarely
+  Seen" cards and the catalogue. The diagnosis below is the 2026-06-28 state, not current
+  behaviour. The Live tab (default landing) renders "Rarely Seen
   top 3" from `species_overview` (`stats.py:286`), which — unlike Calendar and Dispatch —
   **does not apply the `_NON_CRITTER` denylist**. The three "rare visitors" a guest sees are
   literally **chair, bricks, porch**. Real rarities (Steller's jay 6, Townsend's chipmunk 6,
   bushtit 12) are buried, and the Specimen Catalogue lists all 9 junk labels as species.
   **One-line server fix**, identical to the filter `period_digest` already uses at
   `stats.py:635`. This is the worst first-impression bug for a share-with-friends site.
-- **The app boots into a livestream of an empty yard.** Activity peaks 21:00–02:00; the
+- **✅ FIXED — The app boots into a livestream of an empty yard.** The Dispatch is the default tab
+  now, and it opens on last night. Activity peaks 21:00–02:00; the
   default Live tab during daylight shows a dead feed and camera sliders, not "who visited
   overnight." The **Dispatch** is the perfect daily artifact (`stats.py:600` already computes
   novel/quiet flags, plate-of-the-night, highlight reel) but it's the *second* tab. Land on
   the Dispatch, or banner "Last night: 12 raccoon visits, 1 new →" atop Live.
-- **No "who's back / who's overdue."** Every named animal has a precise last-seen (Stan
+- **✅ FIXED — No "who's back / who's overdue."** The Dispatch carries a cast roll call with
+  last-seen dates and overdue chips. Every named animal has a precise last-seen (Stan
   06-27, Notch 06-26 = 2d ago, Miss B. 06-23 = 5d ago) but the Individuals tab shows none of
   it. For someone who *names raccoons*, "Notch hasn't been seen in 2 days" is the line that
   makes them open the app daily. Data is one `MAX(timestamp)` per individual.
@@ -115,13 +126,16 @@ db.set_clip_track_individual`) and **has never been used once**.
   **01:44**, eastern cottontail 06-11 **01:18** — are almost certainly nocturnal mammals
   misclassified. A cheap **circadian-plausibility prior** would flag these before they
   pollute richness/novelty.
-- **`domestic dog` (177) and `brown rat` (206) are NOT denylisted.** Both flow into richness,
+- **Partly addressed — `domestic dog` (177) and `brown rat` (206) are NOT denylisted.** They are
+  still real-ish labels rather than denylist entries (deliberately), but `stats.review_queue` now
+  ranks them first as `_REVIEW_SUSPECT` so the manual pass below is a few clicks. Both flow into richness,
   the catalogue, and species cards unsuppressed and 100% unverified. Dog is **entirely
   diurnal** (0 rows 21:00–05:59, peaks 9–10am and 4–6pm) → real dogs or daytime confusion,
   *not* nocturnal-raccoon misID. Rat is **bimodal** (9am food-plate false-fires + 3am/10pm
   real rats) with the **lowest mean species_confidence of any common species (0.557)**. These
   ~380 crops are the **highest-value manual-review target** in the whole DB.
-- **The two-axis verdict fires on arrival-hour alone.** `twoaxis.py:75` sets `verdict='FITS'
+- **✅ FIXED — The two-axis verdict fires on arrival-hour alone.** `twoaxis.py:75` now reads
+  `verdict = "FITS" if (arrival_ok and dwell_ok)`. Originally: `twoaxis.py:75` sets `verdict='FITS'
   if arrival_ok else 'DISAGREES'` — `dwell_ok` is computed (line 72) and discarded. A
   "raccoon" that shows up at a normal hour but bolts in 3s reads as FITS. Fold the
   already-computed dwell (and motion, once tracks are backfilled) into the verdict.
@@ -142,7 +156,9 @@ db.set_clip_track_individual`) and **has never been used once**.
   including a **36-minute, 128-detection "not an animal" visit** (a stuck glass-door
   reflection). Any "switch headline metrics to visits" change must apply `_NON_CRITTER` at the
   visit layer, or a reflection becomes the longest-dwelling "visitor" of its night.
-- **Perf landmines that scale with the DB.** `visits_page` (`stats.py:407`) `SELECT`s the
+- **✅ FIXED — Perf landmines that scale with the DB.** `visits_page` scans a bounded newest-first
+  window (and says so with `window: true`); the `/api/stats` poll is single-pass. Originally:
+  `visits_page` (`stats.py:407`) `SELECT`s the
   *entire* detection table with no LIMIT and recomputes visits in Python on every request;
   `compute_stats` does the same on the 6s `/api/stats` poll. Serve from the materialized
   `visits` table with `LIMIT/OFFSET` and cache the poll.
@@ -180,6 +196,10 @@ strongest data-grounded argument for a second camera). Twilight-*drift* charts a
 
 ## 3. How to improve the observatory — prioritized roadmap
 
+*Since built: A and B per the 2026-07-01 status update above, plus C (the denylist reaches
+`species_overview`) and D (the Dispatch is the landing tab and carries the roll call). E and F–L are
+still open. This table is the 2026-06-28 ranking, not a current backlog.*
+
 | # | Move | Value | Effort | Tied to |
 |---|---|---|---|---|
 | A | **Re-run + cron `clipmotion.py`** | Very high | Low | Unfreezes 12 days / ~2,806 clips of behaviour |
@@ -202,6 +222,10 @@ the door"), never collapsing to one oracle answer.
 ---
 
 ## If you do five things
+
+*Four of these five were done between 2026-06-28 and 2026-07-01; the hand-review of the suspect
+crops (#5) is still open, though it now has a ranked queue waiting for it. Kept as written for the
+record.*
 
 1. **`python clipmotion.py` now, then cron it nightly + a "tracks N days behind" badge.**
    Unfreezes **~2,806 of 3,310 clips** and 12 days of behaviour. The whole Phase-4 arm has

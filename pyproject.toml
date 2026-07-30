@@ -1,0 +1,24 @@
+# This is NOT packaging metadata. The project is run as scripts from the repo root
+# (`python backyard_cam.py --serve`, `python classify.py`, ...) with flat modules importing each
+# other by bare name, and there is deliberately no [build-system] table: nothing here is ever
+# built, installed, or published to an index, so there is no version to declare either. The file
+# exists for the two things below -- a machine-readable statement of the Python floor and the
+# license, and a stable home for the pytest config.
+
+[project]
+name = "backyard-critter-cam"
+description = "A backyard webcam that detects, identifies, and re-identifies the animals that visit it."
+# 3.10 is a real floor, not a guess. `setup.sh` and `setup.bat` both refuse an older interpreter
+# and backyard_cam.py re-checks at startup. The syntax alone would parse on 3.9 -- every module
+# carries `from __future__ import annotations`, so the `X | Y` annotations are never evaluated --
+# but backyard_cam.py uses argparse.BooleanOptionalAction and the whole thing has only ever been
+# run on 3.10+ (built and tested on 3.14), so claiming 3.9 would be claiming something untested.
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so `import db`, `import visits`, ... resolve to the modules at
+# the root without an install step. tests/conftest.py also does this by hand, which is what kept
+# the suite working before this file existed -- but that only helps once conftest has been
+# imported, and it depended on pytest picking the right rootdir. This makes it explicit.
+pythonpath = ["."]

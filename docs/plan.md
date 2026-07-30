@@ -1,10 +1,15 @@
 # Backyard Critter Cam — Project Plan
 
+> **Archived snapshot — the plan as written on 2026-06-07, before any of it was built.** Kept for
+> the engineering history: it is where the two-axis idea and the phase order come from, and the
+> per-phase ✅ notes show how reality landed against it. Do not read it as current documentation —
+> the [README](../README.md) is the current doc.
+
 > Canonical project plan (authored by Matt, 2026-06-07). This document is the single source of
 > truth for the system's *design and philosophy*; module/README comments defer to it.
 >
 > **Status (updated 2026-06-18): all four phases are now built.** See the per-phase ✅ markers
-> below, and the [README](README.md) for how to run each. The plan's *principles* (two separate
+> below, and the [README](../README.md) for how to run each. The plan's *principles* (two separate
 > axes; boring-and-robust over clever) are unchanged — what follows is the original reasoning,
 > annotated where reality has since filled it in.
 

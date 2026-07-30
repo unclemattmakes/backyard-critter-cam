@@ -8,8 +8,12 @@ so we put that root on sys.path here rather than turning the package into someth
 installable.
 
 Scope of the suite: pure logic only. Nothing here loads the camera, the network, a GPU, or
-any ML model (MegaDetector / BioCLIP / MegaDescriptor). clips.py needs cv2 + numpy, which ARE
-installed; everything else is stdlib.
+any ML model (MegaDetector / BioCLIP / MegaDescriptor) -- but "no model" is not the same as
+"no dependency", and the difference bites in CI. The suite needs cv2 (clips, quality,
+import_trailcam, backyard_cam), numpy (clipembed, clipmotion, eval, evalmetrics, individuals,
+reid, reidutil) and torch (test_clipfilter, which hand-builds unit vectors rather than loading
+open_clip). Everything else is stdlib. torch is the only one guarded by importorskip, so a
+lean environment loses one test file instead of collapsing at collection.
 """
 from __future__ import annotations
 

@@ -3,8 +3,8 @@ Back up everything the rig GENERATES into a cloud-synced folder.
 
 The one honest risk to this project is the single disk under it: the code lives on GitHub and
 the model weights re-download from Zenodo, but the clips, crops and database exist nowhere
-else. This script archives exactly that generated content into a destination folder -- in
-practice a Google-Drive-synced folder, so the actual cloud upload is Drive's job, not ours.
+else. This script archives exactly that generated content into a destination folder -- normally
+one your cloud client (Google Drive, Dropbox, OneDrive) syncs, so the upload is its job, not ours.
 
 Design notes (why it looks the way it does):
 
@@ -256,10 +256,12 @@ def main() -> int:
 
     if args.dest is None:
         raise SystemExit(
-            "No backup destination configured. Set it once in config_local.py, e.g.\n"
+            "No backup destination configured. There is no default: point it at a folder YOUR "
+            "cloud client syncs (Google Drive, Dropbox, OneDrive, a NAS mount). Set it once in "
+            "config_local.py, substituting your own path:\n"
             "    from pathlib import Path\n"
-            "    cfg.backup_dest = Path(r'C:\\project-content\\backyard')\n"
-            "(point it at a cloud-synced folder), or pass --dest."
+            "    cfg.backup_dest = Path(r'C:\\cloud-synced-folder\\backyard')\n"
+            "or pass --dest for a one-off."
         )
     dest: Path = args.dest
     dest.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,39 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  pytest:
+    name: pytest (ubuntu, CPU-only)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 rather than the 3.14 this rig runs on: pyproject's floor is 3.10, and 3.12 is the
+          # version every dependency here has had prebuilt wheels for the longest. The suite is
+          # pure logic, so the interpreter version it passes on is not the interesting variable.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # requirements.txt deliberately omits torch (setup.sh / setup.bat pick a build per
+          # machine). This runner has no GPU, so take the CPU wheels -- ~250MB instead of ~3GB.
+          # tests/test_clipfilter.py importorskips torch, so omitting this would silently skip a
+          # test file rather than fail -- install it so CI actually covers the non-animal gate.
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          # A GitHub runner has no libGL.so.1, so `import cv2` from the normal opencv-python wheel
+          # dies at collection (four test modules import it). Swap in the headless build AFTER
+          # requirements, because ultralytics' metadata requires opencv-python and pulls it back.
+          # Nothing in the suite imports ultralytics, so the dangling requirement is harmless.
+          pip uninstall -y opencv-python
+          pip install "opencv-python-headless>=4.10,<5"
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q

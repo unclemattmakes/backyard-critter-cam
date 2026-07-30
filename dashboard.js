@@ -729,8 +729,9 @@ async function renderDay(params,body){
 }
 
 /* ---------- shared: species glyphs (calendar + dispatch) ---------- */
-// Non-visitor human-correction labels -- mirror of stats._NON_CRITTER. Hidden from glances.
-const NONCRITTER=new Set(['bricks','brick','blur','blurry','cat food','catfood','food','homeowner',
+// Non-visitor labels -- mirror of stats._NON_CRITTER, which is also where an operator adds the
+// individual names their own household gets labelled with. Hidden from glances.
+const NONCRITTER=new Set(['bricks','brick','blur','blurry','cat food','catfood','food',
   'door','porch','broom','chair','fence','wall','table','plant','pot','hose','shadow','reflection','leaf','leaves',
   'rock','stick','sticks','ground','tree','bush','person','people','human','vehicle','car','unknown','unidentified',
   'nothing','empty','none','background','n/a','na','','not an animal']);
