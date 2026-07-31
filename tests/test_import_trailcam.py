@@ -345,3 +345,50 @@ def test_stills_ledger_and_video_ledger_do_not_collide(conn, db_path, tmp_path):
     assert (imported, saved) == (1, 1)                  # the still went in ...
     stored, already, _ = _import_videos(tmp_path, conn, cfg, skip)
     assert (stored, already) == (1, 0)                  # ... and did NOT mask the video
+
+
+# ---- --backup-first ------------------------------------------------------------------------
+# run_backup_first's RETURN VALUE is the only thing standing between a failed archive and a prune
+# that deletes clips the card no longer holds (it gets formatted every cycle). Every path that
+# didn't demonstrably archive must read False, so main() skips the prune. False on doubt.
+
+def _patched_backup(monkeypatch, result):
+    """Run run_backup_first with subprocess.run stubbed to `result` (a CompletedProcess, or an
+    Exception to raise). Returns (verdict, argv_of_the_call)."""
+    import subprocess
+    seen: list = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    verdict = import_trailcam.run_backup_first(replace(config.CONFIG, backup_dest=Path("dest")))
+    return verdict, (seen[0] if seen else None)
+
+
+def test_backup_first_reports_success(monkeypatch):
+    """A clean backup returns True -- and shells out to backup.py with THIS interpreter, so the
+    archiver runs in the same venv (a bare 'python' could miss the project's deps entirely)."""
+    import subprocess
+    import sys as _sys
+    ok, argv = _patched_backup(monkeypatch, subprocess.CompletedProcess([], 0))
+    assert ok is True
+    assert argv[0] == _sys.executable and Path(argv[1]).name == "backup.py"
+
+
+def test_backup_first_reports_failure_so_the_prune_is_skipped(monkeypatch):
+    """A non-zero exit must read False. Treating a failed archive as success is exactly how the
+    budget would get enforced against footage that exists nowhere else."""
+    import subprocess
+    ok, _ = _patched_backup(monkeypatch, subprocess.CompletedProcess([], 1))
+    assert ok is False
+
+
+def test_backup_first_survives_a_crashing_archiver(monkeypatch):
+    """backup.py missing / unlaunchable raises rather than returning -- that must be False too,
+    not an exception that aborts an import the card is waiting on."""
+    ok, _ = _patched_backup(monkeypatch, OSError("no such file"))
+    assert ok is False

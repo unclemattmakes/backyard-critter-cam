@@ -31,7 +31,11 @@ so nothing is transcoded). Two things are deliberately different from a still im
     the disk cost. Empty triggers are common: see the 227-frame sun storm of 2026-07-13.
 Disk is bounded per SOURCE (config.clips_max_gb_by_source), because one shared oldest-first
 budget let an SD-card import evict the live rig's rolling window -- backwards, since the rig can
-re-record tomorrow and the card's footage dies at the next format.
+re-record tomorrow and the card's footage dies at the next format. That same asymmetry is what
+--backup-first is for: where the card is formatted every cycle, a prune does not TRIM the clip
+history, it DESTROYS it, so the flag archives (backup.py) before the import and skips the prune
+outright if that archive fails. Enforcing a disk budget against the only surviving copy is never
+the right trade.
 
   python import_trailcam.py D:\DCIM\100MEDIA                 # ingest one SD-card dump (GPU)
   python import_trailcam.py D:\dump --recursive              # walk subfolders too
@@ -40,6 +44,7 @@ re-record tomorrow and the card's footage dies at the next format.
   python import_trailcam.py D:\dump --no-videos              # stills only, ignore the .MP4s
   python import_trailcam.py D:\dump --all-videos             # keep empty-trigger clips too
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
+  python import_trailcam.py D:\DCIM\100MEDIA --backup-first  # archive before anything can prune
 
 SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
 ledger is refreshed right away so the Behaviour tab shows the new visits -- unlabeled at first.
@@ -553,6 +558,37 @@ def move_to_processed(path: Path, processed_dir: Path) -> None:
         print(f"  [warn] imported but could not move {path.name} to {processed_dir}: {e}")
 
 
+def run_backup_first(cfg: config.Config) -> bool:
+    """Archive clips/crops/db (backup.py) BEFORE this import can prune anything. True on success.
+
+    The ORDERING is the whole point. prune_clips enforces a per-source disk budget by deleting the
+    OLDEST clips, and for a trail cam that is not a trim but a destruction: the card is formatted
+    every cycle, so clips/<source>/ holds the only copy that footage will ever have. Archiving
+    first means the clips actually at risk -- the old ones -- are already in the backup before
+    anything can delete them. (backup.py skips TODAY's folder, but today's clips are the newest
+    and so the last thing a prune would touch; they're archived on the next run.)
+
+    Shelling out rather than importing backup.py keeps its argparse/logging setup to itself, and
+    means a crash in the archiver can't take the import down with it.
+    """
+    import subprocess
+    script = Path(__file__).with_name("backup.py")
+    # flush before handing the terminal to the child: backup.py writes to this same stream, and an
+    # unflushed buffer here would print our banner AFTER its output in a redirected log.
+    print(f"\n[backup] archiving to {cfg.backup_dest} before importing, so a prune can never "
+          "evict un-archived footage ...", flush=True)
+    try:
+        r = subprocess.run([sys.executable, str(script)], cwd=str(script.parent))
+    except Exception as e:
+        print(f"  [backup] could not run {script.name}: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"  [backup] FAILED (exit {r.returncode}) -- see the output above.")
+        return False
+    print("  [backup] done.")
+    return True
+
+
 def refresh_visits(conn, cfg: config.Config) -> None:
     """Fold the just-imported detections into the visit ledger, so the dashboard's Behaviour tab
     shows the trail-cam visits right away. At this point they are UNLABELED -- ingest_file leaves
@@ -696,6 +732,11 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="Seconds between polls in --watch mode.")
     p.add_argument("--no-videos", dest="videos", action="store_false", default=True,
                    help="Import stills only; leave the card's .MP4 clips alone.")
+    p.add_argument("--backup-first", action="store_true",
+                   help="Run backup.py BEFORE importing, so any clip this run might prune is "
+                        "archived first. Recommended whenever the card is formatted every cycle, "
+                        "because a prune then deletes the ONLY copy. If the backup fails the "
+                        "import still runs, but the prune is skipped for that run.")
     p.add_argument("--all-videos", action="store_true",
                    help="Import EVERY video, not just the ones whose trigger produced an animal "
                         "crop. Doubles the disk cost on a sun-triggered card.")
@@ -721,6 +762,19 @@ def main() -> int:
         print(f"[ERROR] Not a folder: {folder}")
         return 1
     processed_dir = Path(args.processed_dir) if args.processed_dir else None
+
+    # Archive BEFORE anything else, while we still hold no DB connection of our own (backup.py
+    # snapshots the database) and before a single new clip can push the budget over. A FAILED
+    # backup does not stop the import -- it disables the prune instead, which is the fail-safe
+    # direction: worst case clips/ runs over budget until the next successful backup, where the
+    # other way round costs footage that exists nowhere else.
+    prune_ok = True
+    if args.backup_first:
+        prune_ok = run_backup_first(cfg)
+        if not prune_ok:
+            print("  [backup] PRUNE DISABLED for this run: without a fresh archive, evicting the "
+                  "oldest clips could destroy their only copy. clips/ may exceed "
+                  "clips_max_gb_by_source until the next successful backup.")
 
     cfg.crops_dir.mkdir(parents=True, exist_ok=True)
     conn = db.connect(cfg.db_path)
@@ -768,7 +822,7 @@ def main() -> int:
                     folder, conn, cfg, source=args.source, recursive=args.recursive, skip=skip,
                     window_s=args.video_pair_window, require_animal=not args.all_videos,
                     processed_dir=processed_dir)
-                if v_stored:
+                if v_stored and prune_ok:
                     clips.prune_clips(cfg, conn)    # honour this source's own rolling budget
             extra = f" (skipped {skipped} already-imported)" if skipped else ""
             print(f"\nDone. Imported {imported} file(s); saved {saved} crop(s) to "
