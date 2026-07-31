@@ -10,12 +10,16 @@ Design notes (why it looks the way it does):
 
 * Per-DAY zip archives for media, not per-month. clips/ is a ROLLING window -- the live rig
   prunes the oldest clips past clips_max_gb (~2 weeks of footage at current rates), so a clip
-  can be recorded AND deleted between two monthly runs. A day folder is frozen once its date
-  has passed, so each is zipped exactly once, the morning after. An existing CLIPS archive is
-  never rebuilt: the source may since have been legitimately pruned, and rebuilding from a
-  pruned folder would shrink the archive -- the whole point is that the archive OUTLIVES the
-  pruning. (crops/ archives, by contrast, ARE rebuilt if the source folder gained files: crops
-  are never pruned, but a trail-cam SD import can add photos to a past date.)
+  can be recorded AND deleted between two monthly runs. A day folder is *mostly* frozen once its
+  date has passed, so each is zipped once, the morning after -- but "mostly" is not "always": a
+  trail-cam SD import backfills whatever dates the card recorded, and the dump day always gets
+  two separate batches, because the card goes straight back in the camera and the next dump
+  brings the rest of that same day. So archives are APPEND-ONLY: an existing one is never
+  rebuilt (rebuilding from a since-pruned source would shrink it, and the whole point is that
+  the archive OUTLIVES the pruning), but files the source has and the archive lacks are merged
+  in. The comparison is by NAME, not by count, because one day folder can lose files to the
+  pruner and gain files from an import between two runs -- and then it holds FEWER files than
+  its archive while still holding some that belong in it.
 * Media zips are STORED, not compressed: mp4 and jpg are already compressed, so deflating them
   buys ~nothing and burns CPU. Zipping still pays because Drive syncs one ~75 MB file far
   faster than ~2,000 individual crop JPEGs (per-file sync overhead dominates small files).
@@ -42,6 +46,7 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -119,22 +124,57 @@ def zip_tree(src_dir: Path, out_zip: Path, arc_root: Path, compression: int, dry
     return n, total
 
 
-def member_count(zip_path: Path) -> int | None:
-    """How many files an existing archive holds (None = unreadable). Only the central
-    directory is read, so this is cheap even on a multi-GB zip."""
+def archived_names(zip_path: Path) -> set[str] | None:
+    """The arcnames of the files an existing archive holds (None = unreadable). Only the central
+    directory is read, so this is cheap even on a multi-GB zip. Names rather than a count because
+    a count cannot tell "nine unchanged" from "six of those nine pruned, three new ones imported":
+    both directions move at once in a day folder, and only the names say which files are missing."""
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            return sum(1 for i in zf.infolist() if not i.is_dir())
+            return {i.filename for i in zf.infolist() if not i.is_dir()}
     except (OSError, zipfile.BadZipFile):
         return None
 
 
-def archive_media(src_root: Path, out_dir: Path, today: date, *, rebuild_if_grown: bool, dry_run: bool) -> dict:
-    """Per-day archives for one media root (clips/crops/frames). Today's folder is skipped --
-    it's still being written to; the next run finalizes it. rebuild_if_grown: re-archive a past
-    day whose source gained files (crops after an SD import); clips pass False because there a
-    shrunken source means PRUNED, and the archive must win."""
-    stats = {"created": 0, "skipped": 0, "files": 0, "bytes": 0}
+def add_to_zip(new_files: list[Path], out_zip: Path, arc_root: Path, compression: int,
+               dry_run: bool) -> tuple[int, int]:
+    """Add files to an EXISTING archive, keeping every member already in it -- merge, never
+    rebuild. What the archive holds is often the only copy left (the clips pruner deletes from
+    the source; the trail cam's card is formatted every cycle), so a file that once made it in is
+    never dropped just because the source no longer has it. The new members are appended to a
+    COPY that then replaces the original, because appending in place rewrites the central
+    directory: an interrupted run would leave the archive it was extending unreadable. Returns
+    (files, bytes) added."""
+    total = sum(p.stat().st_size for p in new_files)
+    if dry_run:
+        log.info("would add %d file(s) (%.1f MB) to %s", len(new_files), total / 2**20, out_zip.name)
+        return len(new_files), total
+    tmp = out_zip.with_name(out_zip.name + ".tmp")
+    shutil.copy2(out_zip, tmp)
+    n = 0
+    with zipfile.ZipFile(tmp, "a", compression=compression) as zf:
+        for p in new_files:
+            try:
+                zf.write(p, p.relative_to(arc_root))
+                n += 1
+            except FileNotFoundError:
+                log.warning("vanished while zipping (pruned?): %s", p)
+    os.replace(tmp, out_zip)
+    log.info("added %d file(s) to %s  (now %.1f MB)", n, out_zip.name,
+             out_zip.stat().st_size / 2**20)
+    return n, total
+
+
+def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool) -> dict:
+    """Per-day archives for one media root (clips/crops/frames). Today's folder is skipped -- it's
+    still being written to; the next run finalizes it. A past day that is already archived is
+    normally skipped outright, but any file its source folder holds and its archive doesn't gets
+    MERGED in, because a past day is not as frozen as it looks: a trail-cam SD import backfills
+    every date the card recorded, and the dump day gets a second batch a few days later when the
+    rest of that day comes off the card. Meanwhile the pruner is deleting from those same folders,
+    so a day can be simultaneously shorter than its archive and holding files that never reached
+    it -- hence the by-name diff, and hence merging rather than rebuilding."""
+    stats = {"created": 0, "merged": 0, "skipped": 0, "files": 0, "bytes": 0}
     out_dir.mkdir(parents=True, exist_ok=True)
     for stale in out_dir.glob("*.zip.tmp"):
         log.warning("removing leftover partial from an interrupted run: %s", stale.name)
@@ -144,24 +184,30 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, rebuild_if_grow
             log.info("skipping %s (still today -- archived on the next run)",
                      day.relative_to(src_root.parent))
             continue
-        source_files = sum(1 for p in day.rglob("*") if p.is_file())
-        if source_files == 0:
+        source = [p for p in sorted(day.rglob("*")) if p.is_file()]
+        if not source:
             continue  # a pruned-empty leftover folder; nothing to archive
         out_zip = out_dir / f"{stem}.zip"
         if out_zip.exists():
-            if rebuild_if_grown:
-                have = member_count(out_zip)
-                if have is not None and source_files > have:
-                    log.info("%s grew since archived (%d -> %d files): rebuilding",
-                             out_zip.name, have, source_files)
-                else:
-                    stats["skipped"] += 1
-                    continue
-            else:
+            have = archived_names(out_zip)
+            if have is None:
+                log.warning("%s exists but cannot be read -- leaving it alone; check it by hand "
+                            "(a good archive is never overwritten by this script)", out_zip.name)
                 stats["skipped"] += 1
                 continue
-        n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED, dry_run=dry_run)
-        stats["created"] += 1
+            new = [p for p in source if p.relative_to(ROOT).as_posix() not in have]
+            if not new:
+                stats["skipped"] += 1
+                continue
+            log.info("%s gained %d file(s) since it was archived (%d already in it): merging",
+                     out_zip.name, len(new), len(have))
+            n, b = add_to_zip(new, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                              dry_run=dry_run)
+            stats["merged"] += 1
+        else:
+            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                            dry_run=dry_run)
+            stats["created"] += 1
         stats["files"] += n
         stats["bytes"] += b
     return stats
@@ -279,17 +325,18 @@ def main() -> int:
     log.info("backup starting: %s -> %s%s", ROOT, dest, " (DRY RUN)" if args.dry_run else "")
     failures = 0
 
-    # Media roots: clips never rebuild (pruning would shrink the archive); crops/frames rebuild
-    # if a past day gained files (SD-card imports write into old dates).
-    media = [(CONFIG.clips_dir, False), (CONFIG.crops_dir, True), (CONFIG.frames_dir, True)]
-    for src_root, regrow in media:
+    # Media roots, all archived the same way: a new day is zipped whole, an already-archived day
+    # is topped up with whatever it has gained (SD-card imports write into past dates, in clips as
+    # well as crops) and never rebuilt, because the pruner has been deleting from those same
+    # folders and the archive must win.
+    for src_root in (CONFIG.clips_dir, CONFIG.crops_dir, CONFIG.frames_dir):
         if not src_root.is_dir():
             continue
         try:
-            s = archive_media(src_root, dest / src_root.name, today,
-                              rebuild_if_grown=regrow, dry_run=args.dry_run)
-            log.info("%s: %d day(s) archived (%d files, %.1f MB), %d already done",
-                     src_root.name, s["created"], s["files"], s["bytes"] / 2**20, s["skipped"])
+            s = archive_media(src_root, dest / src_root.name, today, dry_run=args.dry_run)
+            log.info("%s: %d day(s) archived, %d topped up (%d files, %.1f MB), %d already done",
+                     src_root.name, s["created"], s["merged"], s["files"], s["bytes"] / 2**20,
+                     s["skipped"])
         except Exception:
             log.exception("archiving %s failed", src_root.name)
             failures += 1
