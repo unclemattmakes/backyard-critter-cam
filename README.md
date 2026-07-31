@@ -688,9 +688,11 @@ then:
   tuning shots, logs, your `config_local.py`).
 - **The backup outlives the clip pruner.** `clips/` is a rolling window (`clips_max_gb`), so
   run the backup at least **weekly**: each day folder is archived the morning after it
-  completes, well inside the ~two-week prune horizon, and an existing clips archive is never
-  rebuilt from a (possibly since-pruned) source. Crops archives *do* refresh if a past day
-  gains files — a trail-cam import backfilling old dates.
+  completes, well inside the ~two-week prune horizon, and an existing archive is never rebuilt
+  from a (possibly since-pruned) source. It *is* topped up, though: files a past day has gained
+  since it was archived get merged in — a trail-cam import backfills old dates, and the day you
+  dump the card arrives in two batches, because the card goes straight back in the camera and
+  the rest of that day comes off it next time. Archives only ever grow.
 - **Idempotent** — run it as often as you like; finished days are skipped in seconds. Restore
   instructions land in a `README.txt` beside the archives (short version: unzip everything
   into the project root).
