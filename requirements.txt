@@ -25,6 +25,14 @@ opencv-python>=4.10,<5
 # cryptominer -- and <9 stops a future major auto-installing. For a stronger guarantee, generate a
 # hashed lockfile (pip-compile --generate-hashes) and install with --require-hashes.
 ultralytics>=8.4,<9
+# numpy and pillow are imported DIRECTLY all over this codebase (embed.py, reid.py, eval.py,
+# import_trailcam.py, ...), so they are declared directly -- ultralytics/pybioclip happen to pull
+# them in today, but an upstream dropping a transitive dep must not break this install.
+numpy>=1.26,<3
+pillow>=10,<12
+# The general-CLIP "is this even an animal?" gate (clipfilter.py) imports open_clip directly;
+# declared in its own right rather than ridden in as a pybioclip dependency.
+open_clip_torch>=2.24,<3
 # Sun-driven day/night camera profiles (daynight.py). Without it the rig still runs, but
 # current_period() can't resolve dawn/dusk and the profiles disable (camera just auto-exposes).
 astral>=3.2,<4

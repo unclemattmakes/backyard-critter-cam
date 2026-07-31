@@ -8,7 +8,8 @@ const jarg=s=>esc(JSON.stringify(s==null?'':String(s)));
 // Word-initial capitals only: "townsend's chipmunk" -> "Townsend's Chipmunk" (never Townsend'S),
 // "band-tailed pigeon" -> "Band-tailed Pigeon" (bird-guide style keeps the hyphenated tail lower).
 const cap1=s=>s.replace(/(^|[\s(])(\S)/g,(m,p,c)=>p+c.toUpperCase());
-const media=p=>'/media/'+encodeURI(p);
+// encodeURI leaves apostrophes alone, and these paths land inside url('...') in style attributes.
+const media=p=>'/media/'+encodeURI(p).replace(/'/g,'%27');
 // playful pseudo-taxonomic labels (flavour only)
 const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','eastern gray squirrel':'Sciurus carolinensis',
   'dark-eyed junco':'Junco hyemalis','domestic cat':'Felis catus','virginia opossum':'Didelphis virginiana',

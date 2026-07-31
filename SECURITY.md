@@ -58,9 +58,14 @@ authenticating tunnel — and leave this bound to loopback behind it.
 
 - **Model weights are executable.** A YOLO `.pt` is a pickle, and Ultralytics loads it with
   `weights_only=False`, so a tampered weight file is remote code execution on your machine.
-  `detector.py` therefore verifies every downloaded *and cached* weight against a pinned
-  SHA-256 and refuses to load on a mismatch. Not every MDv6 variant is pinned yet; the
-  unpinned ones print a note saying integrity was not verified. If you add a variant, pin it.
+  `detector.py` therefore verifies every downloaded *and cached* MDv6 weight against a pinned
+  SHA-256 and refuses to load on a mismatch — all five variants are pinned. If you add a new
+  variant, pin it. The other three models are a different story: BioCLIP 2 (species names),
+  MegaDescriptor (re-ID), and the OpenCLIP gate are fetched from Hugging Face at runtime by
+  their libraries (pybioclip / timm / open_clip) with **no revision and no hash** — this repo
+  does not verify them, and they change whenever upstream does. You are trusting Hugging Face
+  and the publishing orgs on first download. If that bothers you, pre-download the weights
+  once, verify them yourself, and let the libraries' caches serve your copy from then on.
 - **The database and the media are plain files.** `backyard.db`, `crops/`, and `clips/` are
   unencrypted and readable by anything running as your user. They contain timestamped video of
   your own property, and possibly of people walking past it — MegaDetector has a `person`

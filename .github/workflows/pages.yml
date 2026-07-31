@@ -1,0 +1,34 @@
+name: pages
+
+# Publishes the static making-of/ site to GitHub Pages. Needs Pages switched on once in the
+# repo settings (Settings -> Pages -> Source: "GitHub Actions"); until that's done this
+# workflow fails with a clear "Pages not enabled" error and touches nothing.
+on:
+  push:
+    branches: [main]
+    paths: ['making-of/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: making-of
+      - id: deployment
+        uses: actions/deploy-pages@v4

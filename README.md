@@ -20,11 +20,23 @@ and reads their **behaviour** off short video clips, all surfaced in a local web
 **dashboard** you can leave open in a browser tab. The design philosophy and the rest of the
 roadmap live in [the plan](docs/plan.md).
 
+**No camera handy? Start with the [making-of site](making-of/).** It's a static, camera-free
+walk-through of the whole system — eight interactive demos built on a frozen slice of this
+rig's real database (real crops, real embeddings, real mistakes). No GPU, no install:
+
+```bash
+python -m http.server 8011 --directory making-of
+```
+
+then open `http://localhost:8011`.
+
 ---
 
 ## Contents
 
 - [How it works](#how-it-works) — the pipeline, one box at a time
+- [The making-of site](making-of/README.md) — the system explained through eight interactive
+  demos; **no hardware needed**
 - [Notes on the detector](#notes-on-the-detector) — why Ultralytics directly, not PytorchWildlife
 - [Requirements](#requirements) · [Setup](#setup) · [Running](#running) — including
   [several cameras at once](#multiple-cameras-usb--networked) and the
@@ -139,6 +151,13 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
 
 ## Setup
 
+Get the code first (or grab the ZIP from GitHub):
+
+```bash
+git clone https://github.com/unclemattmakes/backyard-critter-cam.git
+cd backyard-critter-cam
+```
+
 **Easiest — run the setup script.** It creates the virtual environment and installs the torch
 build that matches your hardware (CUDA if you have an NVIDIA GPU, CPU otherwise), then the rest:
 
@@ -248,7 +267,7 @@ List the cameras in `config_local.py` (copy `config_local.example.py`):
 ```python
 from config import CameraSpec
 def apply(cfg):
-    cfg.latitude, cfg.longitude = 47.6, -122.3
+    cfg.latitude, cfg.longitude = 40.7128, -74.0060
     cfg.cameras = [
         CameraSpec("glass_door_cam", 0, name="Glass door"),                 # USB webcam, index 0
         CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
@@ -951,8 +970,10 @@ citations and links: **[NOTICE.md](NOTICE.md)**.
 
 - **`[CUDA ERROR] ... no kernel image is available` / capability sm_120:** your torch is the
   wrong CUDA build. Reinstall with the cu130 wheels (see [Setup](#setup) step 2).
-- **`Could not open camera index 0`:** run `--list-cameras`; another app (Zoom, Camera,
-  ComfyUI) may be holding the webcam. Close it or pick a different index.
+- **`could not open camera src=0 yet -- will keep trying to connect` repeating:** the rig never
+  gives up on a camera, so this line repeats instead of erroring out. Another app (Zoom, Camera,
+  ComfyUI) may be holding the webcam, or the index is wrong — close the other app, or run
+  `--list-cameras` and pick a different index.
 - **No detections though motion shows:** lower `--min-confidence`, or check lighting; the red
   dot (top-right of the preview) confirms the motion gate is firing.
 - **Too many / too few motion triggers:** tune `--motion-min-area` (lower = more sensitive).

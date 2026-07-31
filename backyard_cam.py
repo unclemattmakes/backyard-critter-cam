@@ -1420,8 +1420,9 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     p.add_argument("--model-version", default=c.model_version,
                    help="MDV6-yolov10-c | MDV6-yolov9-c | MDV6-rtdetr-c | MDV6-yolov10-e | MDV6-yolov9-e")
     p.add_argument("--device", default=c.device, choices=["cuda", "cpu", "auto"],
-                   help="Inference device: cuda (default, requires an NVIDIA GPU) | cpu (no GPU "
-                        "needed, slower) | auto (GPU if it genuinely runs, else CPU).")
+                   help="Inference device: auto (GPU when it genuinely runs, else CPU) | cuda "
+                        "(REQUIRE an NVIDIA GPU, fail loud without one) | cpu (no GPU needed, "
+                        "slower).")
     p.add_argument("--min-confidence", type=float, default=c.min_confidence)
     p.add_argument("--motion-min-area", type=int, default=c.motion_min_area,
                    help="Largest motion blob (px) needed to wake the detector.")

@@ -31,7 +31,7 @@ coordinates, camera indices, and ignore zones.
 python -m pytest tests/ -q
 ```
 
-294 tests at the time of writing, and they should stay green. They are pure logic: no GPU, no
+328 tests at the time of writing, and they should stay green. They are pure logic: no GPU, no
 camera, no model download, no network. A test that needs any of those four is a test that will
 be skipped forever, which is worse than no test.
 

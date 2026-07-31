@@ -4,7 +4,7 @@ cd /d "%~dp0"
 REM ---------------------------------------------------------------------------
 REM The nightly "keep individual-tracking automatic" batch. Task Scheduler runs
 REM this daily (task BackyardCritterCam-MotionTracks, ~2pm -- the activity trough,
-REM so it doesn't fight the 9pm-2am capture peak for the GPU). Order matters:
+REM so it doesn't fight the overnight capture peak for the GPU). Order matters:
 REM   1) clipmotion.py          -- motion tracks for every NEW behaviour clip
 REM   2) embed.py               -- appearance vectors for new still crops (all
 REM                                species, down to the 0.5 suggestion gate;

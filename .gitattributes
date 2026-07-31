@@ -18,3 +18,7 @@
 *.db     binary
 *.sqlite binary
 *.sqlite3 binary
+
+# Keep GitHub's language stats honest: the making-of site's demo JS + baked JSON would
+# otherwise out-count the Python and label this a JavaScript project.
+making-of/** linguist-documentation

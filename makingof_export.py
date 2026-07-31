@@ -56,12 +56,12 @@ PRIVACY_DENY = set(_NON_CRITTER) | {"person", "people", "human"} | {
     n.strip().lower() for n in config.CONFIG.privacy_deny_names
 }
 
-# Detection ids that must never reach the public page, whatever they claim to be. 11110 and 11111
-# are one person bent over the retaining wall: MegaDetector boxed them as 'animal' and BioCLIP,
-# which has no "none of the above", named them 'brown rat' at 0.49 and 0.30. A denylist of species
-# NAMES is blind to that by construction -- the name is wrong, that's the whole problem -- so a
-# vetoed detection needs its id refused outright. Add an id here after seeing a crop you don't want
-# public; it stays out of every export from then on.
+# Detection ids that must never reach the public page, whatever they claim to be. A name denylist
+# can't catch a detection whose label is simply WRONG: MegaDetector boxes something it shouldn't
+# have, and BioCLIP -- which has no "none of the above" -- confidently names it some species
+# anyway. The name is wrong, that's the whole problem, so a vetoed detection needs its id refused
+# outright. Add an id here after seeing a crop you don't want public; it stays out of every export
+# from then on.
 PRIVACY_DENY_IDS = {11110, 11111}
 
 

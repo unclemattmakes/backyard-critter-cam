@@ -495,7 +495,7 @@ def link_all(conn, *, dry_run: bool = False, species: str | None = None) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: motion fingerprints from behaviour clips.")
-    p.add_argument("--device", default="cuda", choices=["cuda", "cpu", "auto"],
+    p.add_argument("--device", default=config.CONFIG.device, choices=["cuda", "cpu", "auto"],
                    help="Detector device (cpu avoids GPU contention with the live rig).")
     p.add_argument("--sample-hz", type=float, default=None,
                    help="Detector samples per second of clip (default: EVERY frame, for gait).")

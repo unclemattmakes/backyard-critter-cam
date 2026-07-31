@@ -16,8 +16,8 @@ def apply(cfg):
     # dashboard's dawn/dusk buckets; left unset (as below) both simply switch off -- the rig
     # auto-exposes and the stats stop splitting Day from Night. Don't leave a placeholder 0/0
     # in: nothing treats it as "unset", and the Gulf of Guinea puts dawn at 22:40 local.
-    # cfg.latitude = 47.6     # decimal degrees
-    # cfg.longitude = -122.3  # decimal degrees, negative for west
+    # cfg.latitude = 40.7128    # decimal degrees
+    # cfg.longitude = -74.0060  # decimal degrees, negative for west
 
     # The individual names you've given the humans in your household. Name yourself in the
     # dashboard and the re-ID queue stops offering you up as a new raccoon -- but that name is

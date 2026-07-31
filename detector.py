@@ -43,11 +43,11 @@ class Detection:
 # that integrity isn't verified. To pin one, download it once and run:
 #   python -c "import hashlib;print(hashlib.sha256(open('weights/<file>','rb').read()).hexdigest())"
 MDV6_WEIGHTS: dict[str, tuple[str, str, str | None]] = {
-    "MDV6-yolov9-c":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1",       "MDV6-yolov9-c.pt", None),
-    "MDV6-yolov9-e":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-e-1280.pt?download=1",  "MDV6-yolov9-e-1280.pt", None),
+    "MDV6-yolov9-c":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1",       "MDV6-yolov9-c.pt", "daa6cd5d2e3fd52754889cd9c702f73c0349a8388318952e6eaf83e0667543e4"),
+    "MDV6-yolov9-e":  ("https://zenodo.org/records/15398270/files/MDV6-yolov9-e-1280.pt?download=1",  "MDV6-yolov9-e-1280.pt", "15909cd77250fbdde454ed3c67618cc85c396373da514c67b34e434d7b5a59fa"),
     "MDV6-yolov10-c": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-c.pt?download=1",      "MDV6-yolov10-c.pt", "21ee78a2d4887128e2a4920937d3295b493f44d788d13e1a635378c16dd74ef7"),
-    "MDV6-yolov10-e": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-e-1280.pt?download=1", "MDV6-yolov10-e-1280.pt", None),
-    "MDV6-rtdetr-c":  ("https://zenodo.org/records/15398270/files/MDV6-rtdetr-c.pt?download=1",       "MDV6-rtdetr-c.pt", None),
+    "MDV6-yolov10-e": ("https://zenodo.org/records/15398270/files/MDV6-yolov10-e-1280.pt?download=1", "MDV6-yolov10-e-1280.pt", "4a3a3d380ce7e151b2a8b991ab5d86f329ccd7b0b33e5d3ba0593a1166d55109"),
+    "MDV6-rtdetr-c":  ("https://zenodo.org/records/15398270/files/MDV6-rtdetr-c.pt?download=1",       "MDV6-rtdetr-c.pt", "a1d55d2c538fb250f09b9ef8054e4cfa5634beb724dfcc8224746ae2b45f3254"),
 }
 
 # MegaDetector's coarse classes. The weights carry model.names too; we prefer those at
@@ -103,10 +103,11 @@ def resolve_device(device: str) -> tuple[str, str]:
     """Resolve a requested device into a concrete ``(device, label)`` pair, applying the rig's
     policy. ``device`` is one of:
 
-      'cuda' (default) -- REQUIRE a working NVIDIA GPU; raise CudaUnavailableError with an
+      'cuda'           -- REQUIRE a working NVIDIA GPU; raise CudaUnavailableError with an
                           actionable fix if torch can't actually compute on it. Preserves the
                           original fail-loud behaviour, so a wrong-arch torch build (the
                           Blackwell sm_120 trap) never limps along silently on the main rig.
+                          (The config default is 'auto'; 'cuda' is the strict opt-in.)
       'cpu'            -- force CPU inference. No GPU needed; slower per frame, but the motion
                           gate only wakes the detector on real motion (rate-limited), so a
                           backyard rig stays usable on a laptop CPU.

@@ -5,8 +5,9 @@
 > per-phase ✅ notes show how reality landed against it. Do not read it as current documentation —
 > the [README](../README.md) is the current doc.
 
-> Canonical project plan (authored by Matt, 2026-06-07). This document is the single source of
-> truth for the system's *design and philosophy*; module/README comments defer to it.
+> *(Original header, kept as written — "canonical" described its role while the system was being
+> built:)* Canonical project plan (authored by Matt, 2026-06-07). This document is the single
+> source of truth for the system's *design and philosophy*; module/README comments defer to it.
 >
 > **Status (updated 2026-06-18): all four phases are now built.** See the per-phase ✅ markers
 > below, and the [README](../README.md) for how to run each. The plan's *principles* (two separate

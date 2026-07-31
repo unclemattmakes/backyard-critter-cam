@@ -713,8 +713,9 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
     p.add_argument("--recursive", action="store_true",
                    help="Walk subfolders too (SD cards often nest under DCIM/100MEDIA/...).")
     p.add_argument("--device", default=c.device, choices=["cuda", "cpu", "auto"],
-                   help="Inference device: cuda (default, like the live rig; requires an NVIDIA "
-                        "GPU) | cpu (no GPU, slower -- fine for an overnight batch) | auto.")
+                   help="Inference device: auto (GPU when it genuinely runs, else CPU) | cuda "
+                        "(REQUIRE an NVIDIA GPU) | cpu (no GPU, slower -- fine for an "
+                        "overnight batch).")
     p.add_argument("--min-confidence", type=float, default=c.min_confidence,
                    help="Minimum detector confidence to save a crop.")
     p.add_argument("--source", default=db.SOURCE_TRAIL_CAM_SD,

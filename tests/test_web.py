@@ -58,6 +58,48 @@ def test_is_within_false_for_outside(tmp_path):
     assert web._is_within(Path("/etc/passwd"), tmp_path / "crops") is False
 
 
+# ---- _is_allowed_host: the DNS-rebinding guard --------------------------------------
+# The peer-IP check can't stop a site that resolves its OWN name to the rig's LAN IP -- the
+# request comes from the victim's local browser. The Host header is what gives it away.
+def test_allowed_host_localhost_and_loopback():
+    assert web._is_allowed_host("localhost:8000") is True
+    assert web._is_allowed_host("127.0.0.1:8000") is True
+    assert web._is_allowed_host("[::1]:8000") is True
+
+
+def test_allowed_host_private_and_link_local_literals():
+    assert web._is_allowed_host("192.168.1.23:8000") is True
+    assert web._is_allowed_host("10.0.0.5") is True
+    assert web._is_allowed_host("169.254.9.9") is True
+
+
+def test_allowed_host_rejects_public_names_and_ips():
+    # The rebinding shape: the attacker's own hostname, pointed at the rig's LAN IP.
+    assert web._is_allowed_host("evil.example:8000") is False
+    assert web._is_allowed_host("8.8.8.8") is False
+
+
+def test_allowed_host_accepts_configured_web_host_only_when_configured():
+    assert web._is_allowed_host("mycam.lan:8000", web_host="mycam.lan") is True
+    assert web._is_allowed_host("mycam.lan:8000") is False
+
+
+def test_allowed_host_missing_header_allowed():
+    # HTTP/1.0 tooling may omit Host; a browser's rebinding fetch cannot.
+    assert web._is_allowed_host("") is True
+
+
+def test_allowed_host_ipv4_mapped_ipv6():
+    assert web._is_allowed_host("[::ffff:192.168.1.23]:8000") is True
+    assert web._is_allowed_host("[::ffff:8.8.8.8]:8000") is False
+
+
+# ---- the bind default: loopback unless the operator deliberately opens up -----------
+def test_web_host_defaults_to_loopback():
+    # A silent regression here (0.0.0.0) would put the no-auth dashboard on the LAN by default.
+    assert config.Config().web_host == "127.0.0.1"
+
+
 # ---- _csrf_refusal: only THIS dashboard's own pages may POST ------------------------
 # The peer-IP and Host guards both pass for a request the operator's own browser makes from some
 # other site, so a POST additionally needs a same-origin Origin and a JSON Content-Type.

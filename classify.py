@@ -43,11 +43,12 @@ from clipfilter import NONANIMAL_LABEL
 # STARTER list (PNW backyard) -- edit it and re-run. Validated 2026-06-08: BioCLIP 2 nailed
 # raccoon / American crow / domestic cat and a dark-eyed junco from this set.
 _DEFAULT_SPECIES_LABELS = [
-    # --- Mammals: common in Pacific Northwest / Puget Sound lowland backyards ---
+    # --- Mammals: common in Pacific Northwest lowland backyards ---
     "raccoon", "Virginia opossum", "eastern gray squirrel", "Douglas squirrel",
     "eastern cottontail", "Townsend's chipmunk", "brown rat", "domestic cat", "domestic dog",
-    # --- Birds: common Puget Sound backyard / ground feeders (frequency-ranked from WA data:
-    #     song sparrow, dark-eyed junco, black-capped chickadee and American crow are the top 4) ---
+    # --- Birds: common Pacific Northwest backyard / ground feeders (frequency-ranked from
+    #     regional feeder-count data: song sparrow, dark-eyed junco, black-capped chickadee
+    #     and American crow are the top 4) ---
     "song sparrow", "dark-eyed junco", "golden-crowned sparrow", "white-crowned sparrow",
     "house sparrow", "spotted towhee", "American crow", "Steller's jay", "California scrub-jay",
     "black-capped chickadee", "chestnut-backed chickadee", "house finch", "American goldfinch",
