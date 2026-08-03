@@ -563,3 +563,14 @@
   .conn-pill[hidden]{ display:none; }
   .conn-pill .cp-dot{ width:6px; height:6px; border-radius:50%; background:var(--rust);
     animation:pulse 2s infinite; }
+
+  /* ---------- rig warning strip (battery / USB-wedge) ----------
+     Deliberately the loudest thing on the page: these are the two states where the rig needs a
+     HUMAN (plug the charger in / replug the camera), and a phone-sized screen must show them
+     without scrolling. Battery = bordered notice; wedge = filled alarm. */
+  .rig-warn{ margin:10px 14px 0; padding:8px 14px; text-align:center; border-radius:3px;
+    font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--rust); border:1px solid var(--rust); background:rgba(192,95,62,.10); }
+  .rig-warn.wedge{ color:#fff; background:var(--rust); border-color:var(--rust); font-weight:600;
+    animation:pulse 2s infinite; }
+  .rig-warn[hidden]{ display:none; }

@@ -296,6 +296,16 @@ async function refreshHeader(){
   let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
   if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+  /* Rig warning strip: a wedged camera outranks a battery warning (it already IS the
+     consequence). Text comes verbatim from the rig (powerguard.py) so the three surfaces --
+     console, HUD, here -- always tell the same story. */
+  const warn=$('#rigwarn');
+  if(warn){
+    const wedged=v.wedge&&v.wedge.message, batt=v.power&&v.power.warning;
+    if(wedged){ warn.textContent='⚠ '+v.wedge.message; warn.className='rig-warn wedge'; warn.hidden=false; }
+    else if(batt){ warn.textContent='⚠ '+v.power.warning; warn.className='rig-warn'; warn.hidden=false; }
+    else warn.hidden=true;
+  }
 }
 
 /* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no

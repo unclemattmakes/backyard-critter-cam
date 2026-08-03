@@ -20,6 +20,10 @@
   <div class="rule"></div>
 </header>
 
+<!-- Rig warning strip (on-battery / wedged camera) — filled by refreshHeader() from
+     /api/camera's power+wedge fields; hidden whenever there's nothing to shout about. -->
+<div id="rigwarn" class="rig-warn" hidden></div>
+
 <nav class="tabs">
   <button id="tab-live" onclick="show('live')">Live Observation</button>
   <button id="tab-dispatch" class="on" onclick="show('dispatch')">The Dispatch</button>

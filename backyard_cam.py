@@ -34,6 +34,7 @@ import clips
 import config
 import daynight
 import db
+import powerguard
 import quality
 import stats
 import visits
@@ -407,6 +408,13 @@ class WhiteBalanceWatchdog:
         self._strikes = 0
         self.recoveries = 0            # how many times we've pulled it back this session
         self.last_ratio: float | None = None
+        # Wedge tell (2026-07-30): a real manual-WB trap recovers ~2 s after AUTO_WB is
+        # re-asserted, so the NEXT judged sample (>= interval later) being bad again means the
+        # re-assert didn't take -- that's the USB-wedge signature, not the WB trap. We verify
+        # each recovery on its next bright-enough sample and count the consecutive failures;
+        # powerguard.WedgeDetector consumes the streak.
+        self._verify_pending = False
+        self.failed_streak = 0
 
     def note_settings(self, settings: dict) -> None:
         """Watch dashboard-applied settings for a deliberate manual/auto white-balance choice."""
@@ -442,8 +450,21 @@ class WhiteBalanceWatchdog:
         if luma < self.cfg.wb_recover_min_luma:
             self._strikes = 0            # too dark to judge colour; a warm night is not a fault
             return False
+        # Verify the previous recovery on its first bright-enough follow-up sample: auto WB
+        # takes ~2 s, this sample is >= wb_recover_interval_s later, so "still bad" means the
+        # re-assert didn't take (the wedge), not that it hasn't settled yet.
+        if self._verify_pending:
+            self._verify_pending = False
+            if ratio < self.cfg.wb_recover_ratio:
+                self.failed_streak += 1
+                print(f"{self.tag} white balance did NOT recover after the AUTO_WB re-assert "
+                      f"(R/G {ratio:.2f}; failed recovery x{self.failed_streak}) -- the "
+                      "USB-wedge signature, not the manual-WB trap.")
+            else:
+                self.failed_streak = 0
         if ratio >= self.cfg.wb_recover_ratio:
             self._strikes = 0
+            self.failed_streak = 0
             return False
         self._strikes += 1
         if self._strikes < self.cfg.wb_recover_strikes:
@@ -454,6 +475,7 @@ class WhiteBalanceWatchdog:
         except Exception:
             return False
         self.recoveries += 1
+        self._verify_pending = True
         print(f"{self.tag} white balance looked red-starved (R/G {ratio:.2f} < "
               f"{self.cfg.wb_recover_ratio:.2f}) -- restored AUTO_WB "
               f"(recovery #{self.recoveries}).")
@@ -790,7 +812,7 @@ def draw_detections(frame, detections: list[Detection]) -> None:
 
 def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
              saved: int, source: str, model: str, period: str | None = None,
-             recording: bool = False) -> None:
+             recording: bool = False, warnings: list[str] | None = None) -> None:
     lines = [
         f"{source}  |  {model}" + (f"  |  {period}" if period else ""),
         f"FPS {fps:4.1f}   motion {int(motion_area):>6} px   saved {saved}",
@@ -801,6 +823,13 @@ def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
         cv2.putText(frame, text, (10, y), FONT, 0.55, (0, 0, 0), 3, cv2.LINE_AA)      # shadow
         cv2.putText(frame, text, (10, y), FONT, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         y += 24
+    # Rig warnings (on-battery, wedged camera): bigger, alarm-red, impossible to miss --
+    # these are the "walk over and do something" lines (see powerguard.py).
+    for text in (warnings or []):
+        y += 6
+        cv2.putText(frame, text, (10, y), FONT, 0.62, (0, 0, 0), 4, cv2.LINE_AA)      # shadow
+        cv2.putText(frame, text, (10, y), FONT, 0.62, (0, 60, 255), 2, cv2.LINE_AA)
+        y += 28
     if motion:  # red "motion" dot, top-right
         cv2.circle(frame, (frame.shape[1] - 20, 20), 8, (0, 0, 255), -1)
     if recording:  # "REC" tag under the motion dot while a behaviour clip is being written
@@ -974,7 +1003,7 @@ def _stop_naming(proc, tag: str | None = None) -> None:
 
 # ---- Per-camera capture worker -----------------------------------------------------
 def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
-                latest_frames, latest_lock, stop_event, results):
+                latest_frames, latest_lock, stop_event, results, powermon=None, healer=None):
     """One camera's whole capture pipeline, run in its own thread:
         read -> MOG2 motion gate -> (shared) MegaDetector on motion -> save crop + DB row + clip,
         then publish an annotated frame to this camera's web FrameBuffer and the preview grid.
@@ -1035,6 +1064,13 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         if spec.is_url:
             wb_guard.enabled = False
 
+        # USB-wedge watch (powerguard.py): garbage-frame detection + the device-reset ladder.
+        # Local USB cams only -- a network cam can't be pnputil-cycled, and its stream tearing
+        # is the transport's problem (rtsp-over-TCP), not a UVC wedge.
+        wedge = powerguard.WedgeDetector(cfg, tag, healer=healer)
+        if spec.is_url:
+            wedge.enabled = False
+
         gate = MotionGate(cfg)
         last_detect_t = last_dets_t = 0.0
         last_dets: list[Detection] = []
@@ -1062,6 +1098,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                         break                       # only None when we're shutting down
                     active_period = None            # re-apply the profile after a reconnect
                     last_profile_check = 0.0
+                    # Fresh capture, fresh background model: after a standby wake (or a heal's
+                    # device reset) the scene lighting has usually changed, and the OLD model
+                    # would read the whole frame as one giant motion blob for a minute -- which
+                    # both churns the detector and looks exactly like the wedge signature.
+                    # Rebuilding re-learns the scene in seconds; the warmup gate covers the gap.
+                    gate = MotionGate(cfg)
+                    frame_count = 0
+                    wedge.note_reconnect(time.monotonic())
                 continue
             read_fails = 0
             frame_count += 1
@@ -1101,6 +1145,10 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     snap["wb_ratio"] = (round(wb_guard.last_ratio, 3)
                                         if wb_guard.last_ratio is not None else None)
                     snap["wb_recoveries"] = wb_guard.recoveries
+                    # Rig health, for the dashboard's warning strip: on-battery and wedge state
+                    # (see powerguard.py -- these are the "walk over and do something" signals).
+                    snap["power"] = powermon.snapshot() if powermon is not None else None
+                    snap["wedge"] = wedge.snapshot()
                     snap["network"] = spec.is_url   # the dashboard hides sliders for a network cam
                     # Coarsen the published coords (~10 km) -- a LAN/DNS-rebind client can read this.
                     snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
@@ -1110,6 +1158,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             # --- Motion gate (per-camera background model + threshold) ---
             motion_area = gate.update(frame)
             motion = (frame_count > MOTION_WARMUP_FRAMES) and (motion_area > eff_motion_min_area)
+
+            # --- Wedge watch: feed the cheap signals, advance the detect->heal->replug ladder ---
+            if wedge.enabled:
+                if frame_count > MOTION_WARMUP_FRAMES:
+                    fh, fw = frame.shape[:2]
+                    wedge.note_motion(now, motion_area / float(max(1, fh * fw)))
+                wedge.note_wb(wb_guard.failed_streak)
+                wedge.update(now)
 
             # --- Behaviour clip: buffer pre-roll every frame; write + auto-stop while recording ---
             if recorder is not None:
@@ -1124,6 +1180,12 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 except Exception as e:  # never let one bad frame kill the loop
                     print(f"{tag} detector error on a frame (skipping): {e}")
                     dets = []
+                if dets:
+                    # Any MegaDetector hit (even a zone-dropped one) vetoes the pegged-motion
+                    # wedge rule: real structure in the frame means big motion is an animal or
+                    # a scene change, not UVC garbage. (The 07-30 noise variant that DID score
+                    # "animal" is caught by the WB rule instead.)
+                    wedge.note_detections(now)
                 if dets and ignore_zones:
                     dets, zoned_out = drop_ignored(dets, ignore_zones, cfg.ignore_zone_iou)
                     ignored += len(zoned_out)
@@ -1178,9 +1240,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
                 show = last_dets if (now - last_dets_t) <= cfg.box_display_ttl_s else []
                 draw_detections(disp, show)
+                warns = []
+                if powermon is not None and powermon.warning:
+                    warns.append(powermon.warning)
+                if wedge.message:
+                    warns.append(wedge.message)
                 draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion, saved=saved,
                          source=spec.display_name, model=cfg.model_version, period=active_period,
-                         recording=recorder is not None and recorder.recording)
+                         recording=recorder is not None and recorder.recording, warnings=warns)
                 if want_stream:
                     ok_enc, buf = cv2.imencode(".jpg", disp,
                                                [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
@@ -1293,6 +1360,25 @@ def run(cfg: config.Config) -> None:
             print("  power: WARNING -- could not hold the system awake; if the box sleeps it may "
                   "suspend the camera and stop the app. (Also turn off USB selective suspend.)")
 
+        # Battery watch + wedge self-heal plumbing (powerguard.py). ONE monitor and ONE healer
+        # for the rig (one physical box, one hardware-reset budget); each camera worker gets its
+        # own WedgeDetector. The immediate poll makes an on-battery LAUNCH warn right away
+        # instead of power_poll_s later.
+        powermon = powerguard.PowerMonitor(cfg)
+        powermon.poll(time.monotonic())
+        threading.Thread(target=powermon.monitor, args=(stop_event,),
+                         name="powermon", daemon=True).start()
+        healer = powerguard.SelfHealer(cfg, "[usb-heal]")
+        if sys.platform == "win32" and cfg.wedge_guard:
+            if cfg.wedge_self_heal and healer.available():
+                print("  wedge guard: ON -- garbage-frame watch + automatic USB device reset "
+                      f"(task '{cfg.wedge_heal_task}').")
+            elif cfg.wedge_self_heal:
+                print("  wedge guard: ON (detect + banner only) -- run setup_selfheal.bat once, "
+                      "as admin, to enable automatic USB device resets.")
+            else:
+                print("  wedge guard: ON (detect + banner only; self-heal disabled in config).")
+
         # Build the (shared) detector first: resolves the device (a real GPU compute-check for
         # 'cuda'/'auto') and downloads the weights on first run, failing loud with device='cuda'.
         print(f"Loading MegaDetector v6 ({cfg.model_version}) on {cfg.device} ...")
@@ -1357,7 +1443,7 @@ def run(cfg: config.Config) -> None:
             t = threading.Thread(
                 target=_run_camera, name=f"cam-{s.source}",
                 args=(s, cfg, detector, det_lock, frame_buffers, control_bridges,
-                      latest_frames, latest_lock, stop_event, results),
+                      latest_frames, latest_lock, stop_event, results, powermon, healer),
                 daemon=True)
             t.start()
             threads.append(t)

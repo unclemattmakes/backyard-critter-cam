@@ -995,6 +995,21 @@ citations and links: **[NOTICE.md](NOTICE.md)**.
   It's Windows-only and a clean no-op elsewhere; a failure to set the request is now **logged
   loudly** at startup (`power: WARNING …`) rather than failing silently. If the machine still
   sleeps, check that no power policy is force-sleeping it and read that startup log line.
+  **Caveat: the request only wins on AC power.** On battery, Windows naps into Modern Standby at
+  the DC idle timeout no matter what — so a rig running on battery warns hard on all three
+  surfaces (console, preview HUD, a dashboard banner) until you plug the charger in.
+- **The preview turns into torn color bands / pink-and-red garbage while the camera stays
+  "connected":** the webcam's USB stream has **wedged** — usually after standby suspend-cycled it
+  (see the battery caveat above). The camera keeps delivering frames, but they're corrupt, and
+  **no app-level recovery works**: reopening the capture just reattaches the same broken stream
+  (one real wedge shrugged off 19 reopens and 5 white-balance resets; a physical unplug/replug
+  fixed it instantly). The rig detects the state (`CAMERA WEDGE detected` in the log, plus a HUD
+  line and dashboard banner) and — if you've run **`setup_selfheal.bat` once, as admin** — fixes
+  it alone: that setup registers an elevated scheduled task the unprivileged rig can fire, which
+  `pnputil` disable/enable-cycles the camera (the software version of a replug; device-side story
+  in `logs/usb_reset.log`). Resets are budgeted (default 2/hour); past that, or without the
+  setup, the banner asks for a human replug. Preview `usb_reset.ps1 -DryRun` first if you want to
+  confirm which device it would cycle; knobs live under `wedge_*` in `config.py`.
 - **Killed it with Task Manager / `taskkill /F` (or it crashed)?** The species-naming helper is
   its own process and never exits by itself, so a hard-killed rig used to leave it running
   invisibly — and the **next** launch then ran *two* BioCLIP workers fighting over CPU and the

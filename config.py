@@ -155,6 +155,33 @@ class Config:
     # view, headlights sweeping the fence) can't trigger it.
     wb_recover_strikes: int = 2
 
+    # ---- Power + USB-wedge guard (see powerguard.py) ----------------------------
+    # The keep-awake only wins on AC: on battery, Windows Modern-Standby-naps at the DC idle
+    # timeout and suspend-cycles the USB cam until its stream WEDGES -- still delivering frames,
+    # but torn garbage (2026-07-29..31, three evenings running). Warn hard while on battery.
+    power_warn: bool = True             # console + HUD + dashboard warning while on battery
+    power_poll_s: float = 30.0          # how often to sample AC/battery state
+    power_warn_repeat_s: float = 600.0  # re-print the console warning this often while on DC
+    # Wedge detection. Two observed signatures, either sufficient:
+    #  * the WB watchdog's recovery didn't take, repeatedly (R/G stays pinned through AUTO_WB
+    #    re-asserts; a real manual-WB trap recovers in ~2 s) -- the 07-30 "striped static";
+    #  * the largest motion blob pins near the whole frame for a sustained stretch while
+    #    MegaDetector finds NOTHING in it -- the 07-31 "torn slabs". (A close animal filling
+    #    the view is excluded: it gets detected, and any detection vetoes the trigger.)
+    wedge_guard: bool = True
+    wedge_wb_failures: int = 2          # consecutive failed WB recoveries -> wedged
+    wedge_motion_frac: float = 0.55     # largest blob >= this fraction of the frame ...
+    wedge_motion_sustain_s: float = 60.0  # ... for this long, detection-free -> wedged
+    wedge_clear_s: float = 30.0         # signature-free this long -> healthy again
+    # Self-heal: fire the elevated scheduled task (registered ONCE by setup_selfheal.bat) that
+    # pnputil disable/enable-cycles the camera -- the software version of the unplug/replug that
+    # cured the 07-30 wedge. Unregistered/off, the rig still detects + banners the wedge; it
+    # just can't fix it alone. Budgeted so a persistent fault can't churn the hardware.
+    wedge_self_heal: bool = True
+    wedge_heal_task: str = "BackyardCritterCam-UsbReset"
+    wedge_heal_verify_s: float = 90.0   # grace after a reset before re-judging the signature
+    wedge_heal_max_per_hour: int = 2    # then stop resetting and ask for a human replug
+
     # ---- Multiple cameras (optional) --------------------------------------------
     # None = single-camera mode: the flat camera_index/source fields above are the one camera.
     # Set a list of CameraSpec to run SEVERAL cameras at once (USB + networked), each on its own
@@ -411,6 +438,25 @@ class Config:
     # ~0.10-0.18 for different individuals -- both separate cleanly at 0.40). Distinct from the
     # still-still novelty cut (reid_novel_threshold 0.31).
     reid_clip_match_threshold: float = 0.40
+    # STILL-TRACKLET un-blend (the multi-animal splitter, 2026-07-31): when a visit holds 2+
+    # animals, its detections are chained into per-animal TRACKLETS (time + box continuity), each
+    # tracklet's crops are averaged into a mini-prototype, and the tracklets are clustered into
+    # the individual animals -- with a hard cannot-link constraint (two boxes in the SAME frame are
+    # never the same animal, no threshold needed). Measured on this corpus (2026-07-31, n=492/2319
+    # raccoon pairs): two co-present raccoons score median 0.19 at crop level while one animal
+    # frame-to-frame scores 0.72 -- the same separation that makes clip un-blend work, available
+    # even when a visit has no clips (trail-cam photo cycles, pruned footage).
+    # Max seconds a tracklet may bridge between saved crops. Conservative on purpose: a fragment
+    # re-merges by appearance in the clustering step, but a chain that runs across two animals
+    # poisons its prototype and nothing downstream can split it again. 20 s covers the usual
+    # still cadence; the 26 s gap that separated Stan's wall-frames on 2026-07-31 stays split.
+    reid_track_link_gap_s: float = 20.0
+    # A still-tracklet cluster's centroid vs the confirmed-visit templates: suggestions show at or
+    # above this cosine. Its own regime, like the clip threshold: a tracklet averages 5-30 crops
+    # from ONE session, so it sits between crop-level noise (~0.5 ceiling) and full visit
+    # prototypes (0.83+). 0.55 is a provisional cut pending an eval.py sweep -- suggestions are
+    # human-confirmed, so a loose value costs a click, not contamination.
+    reid_track_match_threshold: float = 0.55
     # AUTO-ASSIGN (the "review by exception" tier): the nightly batch (run_clipmotion.bat ->
     # individuals.py --auto-assign) names a solo visit AUTOMATICALLY when its best match clears
     # BOTH bars: nearest-confirmed-visit similarity >= reid_auto_threshold AND lead over the
