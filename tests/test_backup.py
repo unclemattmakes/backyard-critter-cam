@@ -26,6 +26,7 @@ diff is by NAME and the merge is append-only; both halves are pinned below.
 """
 from __future__ import annotations
 
+import logging
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -258,6 +259,71 @@ def test_each_camera_and_day_is_diffed_separately(project, dest):
     assert stats["merged"] == 1 and stats["skipped"] == 1
     assert _basenames(dest / "clips" / ZIP) == set(BATCH1) | set(BATCH2)
     assert _basenames(dest / "clips" / f"clips-glass_door_cam-{DAY}.zip") == {"x.mp4"}
+
+
+# --- clips/reels/: expected company, deliberately not archived ---------------------------
+
+# What reel.py leaves in clips/reels/: the stitched mp4, its chapter manifest, its poster frame.
+REEL = "reel_2026-07-30_night_4492a4da96"
+REEL_FILES = [f"{REEL}.mp4", f"{REEL}.json", f"{REEL}.jpg"]
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_reels_are_not_archived(project, dest):
+    """A reel is cut from the very clips this script archives, keyed by a hash of that cut list,
+    and rebuilt on demand -- so it earns no zip of its own and no room in anyone else's."""
+    _clips(project, BATCH1)
+    _write(project / "clips" / "reels", REEL_FILES)
+
+    stats = _archive(project, dest)
+
+    assert stats["created"] == 1                                   # the day, and only the day
+    assert [p.name for p in sorted((dest / "clips").glob("*.zip"))] == [ZIP]
+    assert _basenames(dest / "clips" / ZIP) == set(BATCH1)
+
+
+def test_reels_are_passed_over_without_a_word(project, dest, caplog):
+    """The noise bug (2026-08-02): reels/ is not a date folder, so day_dirs took it for a camera
+    source and warned once per FILE inside -- about 60 of the run's ~75 lines, burying the INFO
+    lines that say what was actually archived. Including the leftovers of a build that crashed."""
+    _clips(project, BATCH1)
+    _write(project / "clips" / "reels", REEL_FILES)
+    _write(project / "clips" / "reels" / f".build_{REEL[-10:]}", ["seg00.mp4", "list.txt"])
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        _archive(project, dest)
+
+    assert _warnings(caplog) == []
+
+
+def test_a_genuine_surprise_under_clips_still_warns(project, dest, caplog):
+    """The warning has a job: a layout change -- or something dropped into clips/ by hand -- must
+    be noticed rather than silently skipped past. Only the known cache is exempt from it."""
+    _clips(project, BATCH1)
+    _write(project / "clips" / "reels", REEL_FILES)
+    (project / "clips" / "stray.txt").write_text("dropped here by hand")
+    _write(project / "clips" / "glass_door_cam" / "scratch", ["x.mp4"])   # not a date, one down
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        _archive(project, dest)
+
+    warned = " | ".join(_warnings(caplog))
+    assert "stray.txt" in warned and "scratch" in warned
+    assert REEL not in warned
+
+
+def test_day_dirs_skips_reels_without_losing_the_days(project):
+    """reels/ sits beside the day folders under clips/, so pin it at the enumeration itself: it
+    must not become a camera source, and the real days around it must still all be found."""
+    _clips(project, ["a.mp4"], day="2026-07-24", source="glass_door_cam")
+    _write(project / "clips" / "2026-07-23", ["old.mp4"])
+    _write(project / "clips" / "reels", REEL_FILES)
+
+    assert [stem for _, stem in backup.day_dirs(project / "clips")] == [
+        "clips-2026-07-23", "clips-glass_door_cam-2026-07-24"]
 
 
 # --- refusing to damage an archive -------------------------------------------------------
