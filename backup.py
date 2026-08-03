@@ -61,6 +61,15 @@ log = logging.getLogger("backup")
 # Day folders under clips//crops//frames/ are named by local calendar date.
 DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Entries that sit BESIDE the day folders, are expected there, and are deliberately not archived.
+# clips/reels/ is reel.py's output -- the stitched highlight reels, plus their .json manifests and
+# .jpg posters. Those are a CACHE, not content: each reel is cut from the very clips this script
+# does archive, its filename is a hash of that cut list, and reel.py rebuilds one on demand (and
+# deletes all but the newest KEEP_REELS anyway). Archiving them would store the same footage a
+# second time, in a form nothing restores from. Named one by one rather than pattern-matched, so
+# that anything ELSE appearing under a media root is still surfaced as the surprise it is.
+NOT_ARCHIVED = frozenset({"reels"})
+
 # Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID artifacts,
 # tracklet thumbnails, tuning shots, logs, reports, and the machine's private config. All cheap,
 # all annoying to lose. (Weights and .venv are deliberately absent: re-downloadable.)
@@ -79,14 +88,20 @@ def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
     oldest days first -- oldest first so we archive the days nearest the pruning axe before it
     falls. Handles BOTH clip layouts: the legacy flat clips/<date>/ AND the multi-camera
     clips/<source>/<date>/ (each camera writes under its own source name since 2026-06-26), so
-    those archives are per-camera-per-day: clips-glass_door_cam-2026-06-26.zip. Anything else
-    is surfaced (a future layout change should be noticed, not silently skipped)."""
+    those archives are per-camera-per-day: clips-glass_door_cam-2026-06-26.zip. NOT_ARCHIVED
+    entries are passed over quietly; anything else is surfaced (a future layout change should be
+    noticed, not silently skipped)."""
     out: list[tuple[Path, str]] = []
     if not src_root.is_dir():
         return out
     for p in sorted(src_root.iterdir()):
         if p.is_dir() and DAY_DIR_RE.match(p.name):
             out.append((p, f"{src_root.name}-{p.name}"))
+        elif p.name in NOT_ARCHIVED:
+            # Expected, and not ours to copy. Warning about it once per FILE inside buried the run
+            # (60 of ~75 lines on 2026-08-02); a warning nobody can act on trains you to ignore
+            # the ones you can.
+            log.debug("skipping %s (regenerable, deliberately not archived)", p)
         elif p.is_dir():
             # A per-camera source subdir: its date folders live one level down.
             for q in sorted(p.iterdir()):
@@ -275,7 +290,8 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
 
   clips/      one zip per camera per day of video clips (clips-<camera>-<date>.zip; days
               before the multi-camera layout are just clips-<date>.zip). Uncompressed
-              inside -- mp4 already is.
+              inside -- mp4 already is. The highlight reels (clips/reels/ on the machine)
+              are NOT here: each is stitched from these clips and rebuilds itself on demand.
   crops/      one zip per calendar day of detection crops (JPEGs)
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config
