@@ -1227,7 +1227,7 @@ function reidCard(v){
     <button class="gear" onclick="postVisitLabel({visit_id:${v.visit_id}},{verify:true},loadIndividuals)" title="confirm this species for the whole visit">✓</button>
     ${speciesSelect(spId,sp)}
     <button class="gear" onclick="visitSpeciesCorrect({visit_id:${v.visit_id}},'${spId}',loadIndividuals)">correct</button></div>`;
-  const ub=v.multi?`<div style="margin-top:8px"><button class="gear" onclick="toggleUnblend(${v.visit_id})" title="separate the two animals using the clips, then name each">⚖ un-blend the animals</button>
+  const ub=v.multi?`<div style="margin-top:8px"><button class="gear" onclick="toggleUnblend(${v.visit_id})" title="separate the animals (from the clips, or the stills when there are none), then name each">⚖ un-blend the animals</button>
     <div id="ub-${v.visit_id}" style="display:none;margin-top:8px"></div></div>`:'';
   // Naming evidence: a one-click "play this visit's clips" button + a strip of its sharpest crops
   // (each enlarges via the global /media/ lightbox), so the eye has more than the one hero angle.
@@ -1250,8 +1250,10 @@ function reidCard(v){
     ${ub}
   </div>`;
 }
-/* Un-blend: cluster a pair visit's clip tracklets into the two animals, name each. The labels
-   land on the tracklets (clip-space), giving the pair member who is never solo a clean template. */
+/* Un-blend: cluster a multi-animal visit's tracklets into its animals, name each. Two bases,
+   same card: the CLIPS basis clusters clip tracklets (labels land on the tracklets, clip-space);
+   the STILLS basis (d.basis==='stills', when the clips can't separate) chains the visit's saved
+   crops into per-animal tracklets and labels stamp detection ids directly. */
 let REID_UNBLEND={};
 async function toggleUnblend(vid){
   const box=document.getElementById('ub-'+vid); if(!box) return;
@@ -1260,31 +1262,33 @@ async function toggleUnblend(vid){
 }
 async function renderUnblend(vid){
   const box=document.getElementById('ub-'+vid); if(!box) return;
-  box.innerHTML='<p class="lbl" style="opacity:.7">Separating the animals from the clips…</p>';
+  box.innerHTML='<p class="lbl" style="opacity:.7">Separating the animals…</p>';
   let d; try{ d=await fetch('/api/reid/unblend?visit_id='+vid).then(r=>r.json()); }
   catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
   REID_UNBLEND[vid]=d.groups||[];
-  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'no clip tracklets to separate (needs clipmotion + clipembed)')}</p>`; return; }
+  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'nothing to separate yet — needs clip tracklets (clipmotion + clipembed) or embedded still crops (embed.py --co-present)')}</p>`; return; }
   const co=(d.co_present&&d.co_present.names)||[];
   const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
   const hint=co.length>=2
-    ? `The two biggest groups are the pair you logged. ✓ a suggested name and the other is filled in by elimination — or just tap a name onto each.`
+    ? (co.length===2
+      ? `The two biggest groups are the pair you logged. ✓ a suggested name and the other is filled in by elimination — or just tap a name onto each.`
+      : `The biggest groups are the ${co.length} animals you logged. ✓ what the matcher resolves; tap the rest on by eye.`)
     : anySugg
-    ? `The two biggest groups are usually the pair. ✓ a clip-match to confirm, or correct it — each label sharpens the next visit.`
-    : `The two biggest groups are usually the pair — name each clean single animal. Once you've named both pair members once, future pair visits will <b>auto-suggest</b> them from the clips.`;
+    ? `The two biggest groups are usually the pair. ✓ a match to confirm, or correct it — each label sharpens the next visit.`
+    : `The biggest groups are usually the animals — name each clean single animal. Once each is named once, future multi visits will <b>auto-suggest</b> them.`;
   // If a human logged who was here, surface that pair up top — it's what drives the one-click
   // assign + elimination on the groups below.
   const coLog=co.length>=2
     ? `<div class="ub-colog">📓 You logged <b>${co.map(n=>esc(cap1(n))).join(' + ')}</b> here together${d.co_present.observed_at?` · ${esc(fmtClock(d.co_present.observed_at)||'')}`:''}.</div>`
     : '';
-  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} clip tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} ${d.basis==='stills'?'still':'clip'} tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
     +coLog
     +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
 }
 function reidUnblendGroup(vid,g,i){
   const thumbs=(g.rep_crops||[]).slice(0,8).map(c=>
     `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('')
-    || '<span class="lbl" style="opacity:.5">no thumbnails yet — they appear once this visit&rsquo;s clips have been processed.</span>';
+    || '<span class="lbl" style="opacity:.5">no thumbnails yet — they appear once this visit&rsquo;s clips or crops have been processed.</span>';
   const lab=g.label?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(g.label)} ✓</span>`:'';
   const iid='ubn-'+vid+'-'+i;
   const top=(g.suggestion||[])[0];
@@ -1296,16 +1300,20 @@ function reidUnblendGroup(vid,g,i){
   const quick=(!g.label?(g.co_names||[]):[]).filter(n=>n!==g.co_elim && !(top&&n===top.name))
     .map(n=>`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(n)})" title="you logged this pair as here together">＋ ${esc(cap1(n))}</button>`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
-    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s) · coh ${g.cohesion}</div></div>
+    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s)${g.n_crops?` · ${g.n_crops} crop(s)`:''} · coh ${g.cohesion}</div></div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${lab}${elim}${sugg}${quick}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
   </div>`;
+}
+/* Which ids this group's label lands on: clip tracklets (clips basis) or detection ids (stills). */
+function unblendBody(g,name){
+  return JSON.stringify(g.track_ids?{track_ids:g.track_ids,name}:{detection_ids:g.detection_ids,name});
 }
 function reidUnblendConfirm(vid,i,name){
   const g=(REID_UNBLEND[vid]||[])[i]; if(!g) return;
   const restore=busyBtn();   // the clicked ✓/★/＋ suggestion button
   fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json()).then(r=>{
+    body:unblendBody(g,name)}).then(r=>r.json()).then(r=>{
       if(r.error){ restore(); alert(r.error); return; } renderUnblend(vid);
     }).catch(e=>{ restore(); connFail(); });
 }
@@ -1316,7 +1324,7 @@ async function reidUnblendLabel(vid,i){
   const g=(REID_UNBLEND[vid]||[])[i]; if(!g){ restore(); return; }
   try{
     const r=await fetch('/api/reid/unblend/label',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({track_ids:g.track_ids,name})}).then(r=>r.json());
+      body:unblendBody(g,name)}).then(r=>r.json());
     if(r.error){ restore(); alert(r.error); return; }
     renderUnblend(vid);
   }catch(e){ restore(); connFail(); }

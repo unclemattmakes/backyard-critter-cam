@@ -743,3 +743,153 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
     r2 = m2.auto_assign(conn, threshold=0.8, margin=0.1, dry_run=True)
     assert [a["visit_id"] for a in r2["assigned"]] == [fresh]
     assert db.visit_labels_by_source(conn, "auto", "raccoon") == {}
+
+
+# ---------------------------------------------------------------------------
+# Still tracklets + the stills un-blend basis (the multi-animal splitter).
+# ---------------------------------------------------------------------------
+
+def test_still_tracklets_two_parallel_animals_and_cannot_link():
+    left = lambda i: (0 + i * 5, 100, 60 + i * 5, 160)     # ambling right, 3 s per frame
+    right = (400, 100, 460, 160)                            # parked
+    rows = []
+    for i in range(3):
+        rows.append((10 + i, _ts(i * 0.05), left(i)))
+        rows.append((20 + i, _ts(i * 0.05), right))
+    tracks, cannot = individuals.still_tracklets(rows)
+    assert sorted(map(sorted, tracks)) == [[10, 11, 12], [20, 21, 22]]
+    assert cannot == {(0, 1)}                               # same-frame = two bodies, pinned apart
+
+
+def test_still_tracklets_merges_detector_double_box():
+    a = (100, 100, 200, 200)
+    a_jit = (105, 105, 205, 205)                            # IoU ~0.82: one animal boxed twice
+    rows = [(1, _ts(0), a), (2, _ts(0), a_jit), (3, _ts(0.05), (110, 110, 210, 210))]
+    tracks, cannot = individuals.still_tracklets(rows)
+    assert len(tracks) == 1 and sorted(tracks[0]) == [1, 2, 3]
+    assert cannot == set()                                  # a double-box is NOT co-presence
+
+
+def test_still_tracklets_splits_on_position_jump():
+    # The 2026-07-31 case: a coherent ground track, then a far-away wall box 9 s later. The
+    # distance gate (~1.6 body lengths here) refuses the link -- that box was a kit, not Stan.
+    ground = [(1, _ts(0.0), (800, 800, 1060, 950)), (2, _ts(0.10), (820, 810, 1090, 955))]
+    wall = [(3, _ts(0.25), (1150, 420, 1380, 600))]
+    tracks, cannot = individuals.still_tracklets(ground + wall)
+    assert sorted(map(sorted, tracks)) == [[1, 2], [3]]
+    assert cannot == set()                                  # never shared a frame
+
+
+def test_still_tracklets_fragments_across_a_long_gap():
+    # 30 s between sightings of the same spot: beyond link_gap_s, so two fragments (they
+    # re-merge by appearance in the clustering step -- fragmenting is the safe direction).
+    rows = [(1, _ts(0.0), (100, 100, 200, 200)), (2, _ts(0.5), (100, 100, 200, 200))]
+    tracks, _cannot = individuals.still_tracklets(rows)
+    assert sorted(map(sorted, tracks)) == [[1], [2]]
+
+
+def test_unblend_visit_stills_separates_and_seeds(conn):
+    # Two animals sharing every frame: a Stan-lookalike on the left, an unknown kit on the
+    # right (low-conf, as second animals are). Appearance separates them, the sighting log
+    # seeds the names: Stan by template match, Kit 1 by elimination.
+    u_stan, u_kit = _unit(1, 0), _unit(0, 1)
+    left, right = [], []
+    for i in range(3):
+        l = _det(conn, minutes=i * 0.05, bbox=(0, 0, 60, 60))
+        r = _det(conn, minutes=i * 0.05, bbox=(400, 0, 460, 60), confidence=0.3)
+        _embed(conn, l, u_stan)
+        _embed(conn, r, u_kit)
+        left.append(l)
+        right.append(r)
+    vid = _visit(conn, left + right, start_min=0.0, end_min=0.2)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan", "Kit 1"],
+                            span_start=_ts(0.0), span_end=_ts(0.2))
+    out = individuals.unblend_visit_stills(conn, vid, templates=[("Stan", 999, u_stan)])
+    assert out["basis"] == "stills" and out["n_tracklets"] == 2
+    assert len(out["groups"]) == 2
+    by_ids = {tuple(sorted(g["detection_ids"])): g for g in out["groups"]}
+    assert set(by_ids) == {tuple(sorted(left)), tuple(sorted(right))}
+    gl, gr = by_ids[tuple(sorted(left))], by_ids[tuple(sorted(right))]
+    assert gl["suggestion"] and gl["suggestion"][0]["name"] == "Stan"
+    assert not gr["suggestion"]                             # orthogonal: below the threshold
+    assert gl["co_elim"] == "Stan"                          # appearance resolves Stan's side...
+    assert gr["co_elim"] == "Kit 1"                         # ...and the kit closes by elimination
+    # Quick-picks exclude names claimed by the OTHER group -- fully resolved, so one name each.
+    assert gl["co_names"] == ["Stan"] and gr["co_names"] == ["Kit 1"]
+
+
+def test_unblend_stills_labelled_group_consumes_its_logged_name(conn):
+    # Stan's live-stamped track arrives as an already-LABELLED group; the log says Stan + Kit 1.
+    # The kit group must not be offered "+ Stan", and -- one name, one group left -- the kit
+    # closes by elimination with NO templates at all (label + log, the cold-start case).
+    u = _unit(1, 1)                                         # identical appearance: no help there
+    a = [_det(conn, minutes=i * 0.05, bbox=(0, 0, 60, 60)) for i in range(2)]
+    b = [_det(conn, minutes=i * 0.05, bbox=(400, 0, 460, 60)) for i in range(2)]
+    for d in a + b:
+        _embed(conn, d, u)
+    db.set_individual_bulk(conn, a, "Stan")
+    vid = _visit(conn, a + b, start_min=0.0, end_min=0.1)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan", "Kit 1"],
+                            span_start=_ts(0.0), span_end=_ts(0.1))
+    out = individuals.unblend_visit_stills(conn, vid)       # templates: none
+    by_label = {g["label"]: g for g in out["groups"]}
+    assert set(by_label) == {"Stan", None}
+    assert by_label["Stan"].get("co_elim") is None          # labelled: the chip already shows
+    assert by_label["Stan"]["co_names"] == ["Stan"]
+    assert by_label[None]["co_names"] == ["Kit 1"]          # Stan is claimed, not offered
+    assert by_label[None]["co_elim"] == "Kit 1"             # closed by elimination, cold start
+
+
+def test_unblend_visit_stills_cannot_link_beats_lookalike_appearance(conn):
+    # Littermate kits: identical embeddings, but co-present in every frame. The same-frame
+    # cannot-link must hold the clusters apart where appearance can't.
+    u = _unit(1, 1)
+    a = [_det(conn, minutes=i * 0.05, bbox=(0, 0, 60, 60)) for i in range(2)]
+    b = [_det(conn, minutes=i * 0.05, bbox=(400, 0, 460, 60)) for i in range(2)]
+    for d in a + b:
+        _embed(conn, d, u)
+    vid = _visit(conn, a + b, start_min=0.0, end_min=0.1)
+    out = individuals.unblend_visit_stills(conn, vid)
+    assert len(out["groups"]) == 2                          # NOT merged into one lookalike blob
+
+
+def test_visitmatcher_sighting_multi_flags_visit_without_co_frames(conn):
+    # Kits arrive one at a time: zero same-instant frames, yet the human logged 2+ names --
+    # the third multi signal (2026-07-31, the Stan + 3 kits span).
+    dets = [_det(conn, minutes=i * 0.2) for i in range(4)]
+    for d in dets:
+        _embed(conn, d, _unit(1, 0))
+    vid = _visit(conn, dets, start_min=0.0, end_min=0.8)
+    matcher = VisitMatcher(conn, "raccoon")
+    assert matcher.is_multi(vid) is False                   # no detector-side signal
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM,
+                            names=["Stan", "Kit 1", "Kit 2"],
+                            span_start=_ts(0.0), span_end=_ts(0.8))
+    matcher = VisitMatcher(conn, "raccoon")                 # sightings load at init
+    assert matcher.is_multi(vid) is True
+    assert matcher.suggest(vid)["co_present_sighting"] is True
+
+
+def test_co_present_visit_ids_frames_and_sightings(conn):
+    # Visit A holds a same-frame separated pair -> in. Visit B is solo -> out, until a
+    # multi-name sighting overlaps it (the human saw what the stills didn't).
+    a1 = _det(conn, minutes=0, bbox=(0, 0, 10, 10))
+    a2 = _det(conn, minutes=0, bbox=(50, 50, 60, 60))
+    va = _visit(conn, [a1, a2], start_min=0.0, end_min=0.1)
+    b1 = _det(conn, minutes=5)
+    vb = _visit(conn, [b1], start_min=5.0, end_min=5.1)
+    assert individuals.co_present_visit_ids(conn) == {va}
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan", "Kit 1"],
+                            span_start=_ts(5.0), span_end=_ts(5.1))
+    assert individuals.co_present_visit_ids(conn) == {va, vb}
+
+
+def test_fetch_for_embedding_visit_ids_restriction(conn):
+    # The --co-present widening pass: low-conf crops come back ONLY for the named visits.
+    d1 = _det(conn, minutes=0, confidence=0.3)
+    d2 = _det(conn, minutes=5, confidence=0.3)
+    v1 = _visit(conn, [d1])
+    _visit(conn, [d2], start_min=5.0, end_min=5.1)
+    rows = db.fetch_for_embedding(conn, individuals.EMBED_MODEL, species=None,
+                                  min_confidence=0.25, redo=False, visit_ids={v1})
+    assert [r[0] for r in rows] == [d1]

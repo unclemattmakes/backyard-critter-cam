@@ -9,6 +9,10 @@ REM   1) clipmotion.py          -- motion tracks for every NEW behaviour clip
 REM   2) embed.py               -- appearance vectors for new still crops (all
 REM                                species, down to the 0.5 suggestion gate;
 REM                                batch 16 stays VRAM-safe beside the live rig)
+REM   2b) embed.py --co-present -- LOW-conf vectors, only in plausibly multi-
+REM                                animal visits: the second animal is nearly
+REM                                always the low-conf box, and the still-
+REM                                tracklet splitter is blind without it
 REM   3) clipembed.py           -- appearance vectors for new sustained tracklets
 REM   4) clipmotion.py --link   -- attach solo-clip tracks to their HUMAN-named
 REM                                individual (auto names don't ground behaviour)
@@ -23,6 +27,8 @@ echo [%date% %time%] motion tracks for new clips...
 ".venv\Scripts\python.exe" clipmotion.py --device auto
 echo [%date% %time%] appearance embeddings for new crops...
 ".venv\Scripts\python.exe" embed.py --species all --min-confidence 0.5 --batch-size 16
+echo [%date% %time%] low-conf embeddings for multi-animal visits...
+".venv\Scripts\python.exe" embed.py --species all --co-present --min-confidence 0.25 --batch-size 16
 echo [%date% %time%] appearance embeddings for new clip tracklets...
 ".venv\Scripts\python.exe" clipembed.py --device auto
 echo [%date% %time%] linking solo tracks to named individuals...

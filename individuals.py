@@ -37,6 +37,7 @@ first round of naming is "name these groups", not "name 1653 crops".
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from collections import defaultdict
@@ -118,6 +119,108 @@ def co_present_frames(rows, iou_max: float = 0.45) -> int:
                for i in range(len(boxes)) for j in range(i + 1, len(boxes))):
             n += 1
     return n
+
+
+def _parse_ts(ts):
+    """ISO timestamp -> datetime, or None for anything unparseable (a malformed import row must
+    not abort a whole visit's tracklet build)."""
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _norm_centre_dist(a, b) -> float:
+    """Centre-to-centre distance between two boxes in units of their mean diagonal -- a
+    scale-free "how many body-lengths did it move" gate for chaining stills. A close-up animal
+    (huge box) may travel hundreds of pixels between saved crops and still be continuous; a
+    distant one (small box) moving the same pixels has crossed the yard."""
+    ax, ay = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+    bx, by = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+    da = ((a[2] - a[0]) ** 2 + (a[3] - a[1]) ** 2) ** 0.5
+    db_ = ((b[2] - b[0]) ** 2 + (b[3] - b[1]) ** 2) ** 0.5
+    diag = (da + db_) / 2.0
+    if diag <= 0:
+        return float("inf")
+    return (((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5) / diag
+
+
+def still_tracklets(rows, *, link_gap_s: float = 20.0, iou_max: float = 0.45):
+    """Chain one species' still detections into per-animal TRACKLETS -- clipmotion's job, done on
+    the sparse saved-crop stream, so a visit can be separated even when it has no usable clips
+    (trail-cam photo cycles, pruned footage, the recorder off). `rows` =
+    [(det_id, iso_timestamp, (x1, y1, x2, y2)), ...]. Returns (tracks, cannot): `tracks` =
+    [[det_id, ...], ...] in first-appearance order, and `cannot` = {(track_i, track_j), ...} --
+    pairs of tracks observed in the SAME frame, which are therefore DIFFERENT animals. That
+    constraint is free and absolute (one body cannot be in two places), and it's what keeps
+    lookalike littermate kits apart downstream where appearance alone can't.
+
+    Three steps, each deliberately conservative -- a fragmented track re-merges by appearance in
+    the clustering step, but a chain that runs across two animals poisons its prototype and
+    nothing downstream can split it again:
+      1. same-frame boxes at pairwise IoU >= `iou_max` merge into ONE observation (the detector
+         double-boxing one animal -- co_present_frames' empirical 0.45 cut, used in reverse);
+      2. an observation joins the best-scoring active track whose last box it continues (IoU, or
+         centre distance within about one body length) across a gap of at most `link_gap_s`
+         seconds (validated 2026-07-31: the position jump that separated Stan's ground track
+         from a kit's wall-frames fails the distance gate at ~1.5 body lengths);
+      3. each track takes at most ONE observation per frame (structural, not scored) -- which is
+         exactly what makes the cannot-link pairs trustworthy."""
+    frames = defaultdict(list)
+    for det_id, ts, box in rows:
+        frames[ts].append((det_id, box))
+    order = sorted(((t, members) for ts, members in frames.items()
+                    if (t := _parse_ts(ts)) is not None), key=lambda x: x[0])
+
+    tracks = []          # each: {"ids": [...], "box": last box, "t": last-seen datetime}
+    cannot = set()
+    for t, members in order:
+        # 1. Merge double-boxes into observations (greedy connected grouping on IoU >= iou_max).
+        obs = []
+        for det_id, box in members:
+            for o in obs:
+                if iou(o["box"], box) >= iou_max:
+                    o["ids"].append(det_id)
+                    o["box"] = (min(o["box"][0], box[0]), min(o["box"][1], box[1]),
+                                max(o["box"][2], box[2]), max(o["box"][3], box[3]))
+                    break
+            else:
+                obs.append({"ids": [det_id], "box": tuple(box)})
+        # 2. Score every (active track, observation) pair that passes the continuity gate.
+        cands = []
+        for ti, tr in enumerate(tracks):
+            dt = (t - tr["t"]).total_seconds()
+            if dt < 0 or dt > link_gap_s:
+                continue
+            for oi, o in enumerate(obs):
+                i = iou(tr["box"], o["box"])
+                nd = _norm_centre_dist(tr["box"], o["box"])
+                if i >= 0.05 or nd <= 1.0:
+                    # Overlap-continuations outrank pure distance links.
+                    cands.append((i + max(0.0, 1.0 - nd), ti, oi))
+        # 3. Greedy assignment, each track and each observation used at most once this frame.
+        cands.sort(key=lambda c: -c[0])
+        used_t, used_o = set(), set()
+        placed = []                      # track index of every observation in this frame
+        for _, ti, oi in cands:
+            if ti in used_t or oi in used_o:
+                continue
+            used_t.add(ti)
+            used_o.add(oi)
+            tracks[ti]["ids"].extend(obs[oi]["ids"])
+            tracks[ti]["box"] = obs[oi]["box"]
+            tracks[ti]["t"] = t
+            placed.append(ti)
+        for oi, o in enumerate(obs):
+            if oi not in used_o:
+                placed.append(len(tracks))
+                tracks.append({"ids": list(o["ids"]), "box": o["box"], "t": t})
+        # Co-present observations pin their tracks apart for good.
+        placed.sort()
+        for a in range(len(placed)):
+            for b in range(a + 1, len(placed)):
+                cannot.add((placed[a], placed[b]))
+    return [tr["ids"] for tr in tracks], cannot
 
 
 def pose_groups(conn, individual_id: str, *, distance: float = 0.35, max_crops: int = 400,
@@ -310,6 +413,187 @@ def _seed_unblend_from_co_presence(co_names, built, elim_templates, thr) -> None
         top[gi][0]["co_elim"] = nm
 
 
+def unblend_visit_stills(conn, visit_id: int, *, distance: float = 0.45, templates=None,
+                         cfg=None) -> dict:
+    """The STILLS basis for un-blend: separate a multi-animal visit using tracklets chained from
+    its saved crops (still_tracklets), for visits the clip basis can't serve -- trail-cam photo
+    cycles, pruned footage, the recorder off, or simply too few clip tracklets. Same group shape
+    as unblend_visit, with `detection_ids` in place of `track_ids`: labelling a stills group
+    stamps individual_id onto the crops directly (db.set_individual_bulk, source='human'), which
+    survives visit renumbering the same way every detection-level label does.
+
+    Validated at corpus scale 2026-07-31 (n=492 same-frame raccoon pairs vs n=2319 adjacent-frame
+    pairs): two co-present raccoons score median 0.19 cosine at crop level while one animal
+    frame-to-frame scores 0.72 -- so tracklet mini-prototypes separate cleanly, and the
+    same-frame CANNOT-LINK pairs hold the split even where appearance is ambiguous (lookalike
+    littermates). Crops are loaded with NO confidence gate: the second animal is nearly always
+    the low-confidence box (2,423 of 2,500 unembedded co-present pair sides sat under the 0.5
+    embed gate), so vectorless crops still take part structurally -- they chain, they constrain,
+    they get stamped -- they just don't vote on appearance.
+
+    `templates` = VisitMatcher.templates() rows: the human-confirmed SOLO visits. That's the
+    still-space explicit set, so ONE template tier suffices where the clip basis needs two
+    (there's no coarse solo-attribution layer to keep out of open suggestions). Suggestions gate
+    at cfg.reid_track_match_threshold and are EXCLUSIVE across groups -- a visit's two animals
+    can't both be Stan. Returns {visit_id, basis: 'stills', n_tracklets, groups:
+    [{detection_ids, n, n_crops, cohesion, rep_crops, label, suggestion, co_names, co_elim}],
+    co_present, note}."""
+    cfg = cfg or config.CONFIG
+    thr = cfg.reid_track_match_threshold
+    v = conn.execute("SELECT source, species, started_at, ended_at FROM visits WHERE id = ?",
+                     (int(visit_id),)).fetchone()
+    out = {"visit_id": visit_id, "basis": "stills", "n_tracklets": 0, "groups": [], "note": None,
+           "co_present": {"names": [], "observed_at": None, "n": 0}}
+    if v is None:
+        out["note"] = "no such visit"
+        return out
+    out["co_present"] = db.co_present_sighting_names(conn, v["source"], v["started_at"],
+                                                     v["ended_at"])
+    sp = v["species"]
+    if sp is None:       # species-less visit: scope to its dominant species (apply_visit_label's rule)
+        r = conn.execute(
+            "SELECT species FROM detections WHERE visit_id = ? AND species IS NOT NULL "
+            "GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1", (int(visit_id),)).fetchone()
+        sp = r[0] if r else None
+    where = "d.visit_id = ?" + ("" if sp is None else " AND d.species = ?")
+    params = [int(visit_id)] + ([] if sp is None else [sp])
+    rows = conn.execute(
+        f"""SELECT d.id, d.timestamp, d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2,
+                   d.crop_quality, d.crop_path, d.individual_id, e.embedding
+            FROM detections d LEFT JOIN detection_embeddings e
+              ON e.detection_id = d.id AND e.model = ?
+            WHERE {where} ORDER BY d.timestamp""", [EMBED_MODEL] + params).fetchall()
+    if not rows:
+        out["note"] = "no detections on this visit"
+        return out
+    byid = {r["id"]: r for r in rows}
+    tracks, cannot = still_tracklets(
+        [(r["id"], r["timestamp"], (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]))
+         for r in rows], link_gap_s=cfg.reid_track_link_gap_s)
+    out["n_tracklets"] = len(tracks)
+    if len(tracks) < 2:
+        out["note"] = "only one animal-track in the stills -- nothing to separate"
+        return out
+    protos = []
+    for ids in tracks:
+        vecs = [reidutil.decode_vector(byid[i]["embedding"]) for i in ids
+                if byid[i]["embedding"] is not None]
+        quals = [byid[i]["crop_quality"] for i in ids if byid[i]["embedding"] is not None]
+        protos.append(prototype(np.stack(vecs), quals, cfg.reid_proto_top_k) if vecs else None)
+    # Cluster the tracklets that can vote on appearance, under the same-frame cannot-links. A
+    # vectorless tracklet (every crop below the embed gate -- run embed.py --co-present) stays
+    # its own group: honest, and the eye can still name it from the rep crops.
+    vt = [i for i, p in enumerate(protos) if p is not None]
+    pos = {t: k for k, t in enumerate(vt)}
+    clusters = []
+    if len(vt) >= 2:
+        P = np.stack([protos[i] for i in vt])
+        S = P @ P.T
+        D = np.clip(1.0 - S, 0.0, None)
+        np.fill_diagonal(D, 0.0)
+        cl = {(pos[a], pos[b]) for a, b in cannot if a in pos and b in pos}
+        labels = reidutil.cluster_cosine_constrained(D, distance, cl)
+        grouped = defaultdict(list)
+        for k, l in zip(vt, labels):
+            grouped[l].append(k)
+        clusters = list(grouped.values())
+    elif vt:
+        clusters = [[vt[0]]]
+    clusters += [[i] for i, p in enumerate(protos) if p is None]
+
+    built = []           # (group_dict, normalized centroid or None), like unblend_visit's shape
+    for tidx in clusters:
+        det_ids = [i for t in tidx for i in tracks[t]]
+        members = sorted((byid[i] for i in det_ids), key=lambda m: -(m["crop_quality"] or 0))
+        pvecs = [protos[t] for t in tidx if protos[t] is not None]
+        coh = reidutil.mean_pairwise_cosine(np.stack(pvecs)) if len(pvecs) > 1 else 1.0
+        cen = None
+        if pvecs:
+            c = np.stack(pvecs).mean(axis=0)
+            nrm = np.linalg.norm(c)
+            cen = c / nrm if nrm else c
+        labelled = {m["individual_id"] for m in members if m["individual_id"]}
+        built.append(({
+            "detection_ids": [int(i) for i in det_ids],
+            "n": len(tidx), "n_crops": len(det_ids), "cohesion": round(coh, 2),
+            "rep_crops": [m["crop_path"].replace("\\", "/") for m in members
+                          if m["crop_path"]][:8],
+            "label": sorted(labelled)[0] if len(labelled) == 1 else None,
+            "suggestion": [],
+        }, cen))
+    built.sort(key=lambda gc: -gc[0]["n_crops"])
+
+    # Suggestions vs the confirmed-visit still templates, EXCLUSIVE across groups: rank each
+    # cluster, then let the strongest claim win each name -- the other groups fall through to
+    # their next candidate. Two animals in one visit cannot share an identity.
+    if templates:
+        ranked = [([(n, s) for n, s, _v in rank_templates(cen, templates) if s >= thr][:5]
+                   if cen is not None else []) for _gd, cen in built]
+        taken: dict = {}
+        for s, gi, n in sorted(((s, gi, n) for gi, lst in enumerate(ranked) for n, s in lst),
+                               key=lambda x: -x[0]):
+            if gi in taken or n in taken.values():
+                continue
+            taken[gi] = n
+        for gi, (gd, _cen) in enumerate(built):
+            gd["suggestion"] = [{"name": n, "similarity": round(s, 3)} for n, s in ranked[gi]
+                                if taken.get(gi) == n or n not in taken.values()][:3]
+    out["groups"] = [gd for gd, _ in built]
+    _seed_stills_from_co_presence(out["co_present"]["names"], built, templates or [], thr)
+    return out
+
+
+def _seed_stills_from_co_presence(co_names, built, templates, thr) -> None:
+    """The N-way generalization of _seed_unblend_from_co_presence, for the stills basis (a mother
+    with three kits is four logged names, not a pair). Names get CLAIMED in three rounds, each
+    with uniqueness (two co-present clusters can never share a name):
+      1. a cluster already LABELLED with a logged name has claimed it -- the 2026-07-31 kit visit
+         opened with Stan's live-stamped ground track as a labelled group, and offering "+ Stan"
+         on the kit groups would invite exactly the mislabel this module exists to prevent;
+      2. appearance resolves what it can, RESTRICTED to the logged names (a choice the human
+         already vouched for), greedily by similarity;
+      3. when exactly ONE name and ONE cluster remain, ELIMINATION closes it -- which, thanks to
+         round 1, works even with no templates at all (label + log, the cold-start case).
+    Each cluster's `co_names` quick-picks then exclude names claimed elsewhere, and a resolved
+    unlabelled cluster carries its name as `co_elim` (the dashboard's starred from-your-log
+    pick). With "Stan + 3 kits" logged and only Stan resolved: the three kit groups keep three
+    kit quick-picks -- until two are named, when the last closes by elimination. Mutates
+    `built`'s group dicts; no-op without 2+ names."""
+    if len(co_names) < 2 or not built:
+        return
+    top = built[:min(len(co_names), len(built))]
+    logged = list(co_names)
+    # Round 1: existing labels claim their logged name.
+    assign: dict = {}
+    for gi, (gd, _cen) in enumerate(top):
+        if gd["label"] in set(logged) and gd["label"] not in assign.values():
+            assign[gi] = gd["label"]
+    # Round 2: appearance, restricted to the logged names, greedy-unique by similarity.
+    restricted = [t for t in (templates or []) if t[0] in set(logged)]
+    if restricted:
+        picks = []
+        for gi, (_gd, cen) in enumerate(top):
+            if gi in assign or cen is None:
+                continue
+            m = rank_templates(cen, restricted)
+            if m and m[0][1] >= thr:
+                picks.append((m[0][1], gi, m[0][0]))
+        for _s, gi, n in sorted(picks, key=lambda x: -x[0]):
+            if gi in assign or n in assign.values():
+                continue
+            assign[gi] = n
+    # Round 3: one name, one cluster left -> elimination.
+    left_names = [n for n in logged if n not in assign.values()]
+    left_groups = [gi for gi in range(len(top)) if gi not in assign]
+    if len(left_names) == 1 and len(left_groups) == 1:
+        assign[left_groups[0]] = left_names[0]
+    for gi, (gd, _cen) in enumerate(top):
+        claimed_elsewhere = {n for g2, n in assign.items() if g2 != gi}
+        gd["co_names"] = [n for n in logged if n not in claimed_elsewhere]
+        if gi in assign and not gd["label"]:
+            gd["co_elim"] = assign[gi]
+
+
 def clips_for_individual(conn, individual_id: str, species: str = "raccoon", limit: int = 24,
                          cfg=None) -> list:
     """Behaviour clips attributable to one confirmed individual: clips that overlap (in time, same
@@ -382,6 +666,69 @@ def clip_co_presence_by_visit(conn, species: str) -> dict:
     return dict(out)
 
 
+def multi_name_sighting_spans(conn) -> list:
+    """(source, span_start, span_end) for every live sighting that logged 2+ names -- direct
+    human testimony that a span held multiple animals, the third multi-visit signal beside the
+    stills badge and clip co-presence. A kit convoy can enter the sparse stills one animal at a
+    time (zero same-instant frames) and still be four animals; the 2026-07-31 "Stan + 3 kits"
+    span did exactly that. A sighting with no span falls back to its observed_at instant (the
+    db.co_present_sighting_names convention). Empty on a DB no writer has migrated yet."""
+    try:
+        rows = conn.execute(
+            "SELECT source, observed_at, span_start, span_end, names FROM live_sightings"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for r in rows:
+        src, observed, s0, s1, names_json = tuple(r)
+        try:
+            names = json.loads(names_json) if names_json else []
+        except ValueError:
+            names = []
+        if len(names) >= 2:
+            out.append((src, s0 or observed, s1 or observed))
+    return out
+
+
+def co_present_visit_ids(conn, *, iou_max: float = 0.45, min_frames: int = 1,
+                         include_sightings: bool = True) -> set:
+    """Visit ids that plausibly hold 2+ animals -- the target list for embed.py's --co-present
+    widening pass. GENEROUS on purpose (min_frames=1, vs the badge's reid_co_presence_min=3):
+    a false positive costs a few extra low-confidence embeddings, a miss leaves a kit with no
+    vectors and the splitter blind. Counts same-species same-frame box pairs at IoU < iou_max
+    per visit; with `include_sightings`, adds visits overlapped by a multi-name live sighting
+    (the human SAW two+, whatever the stills caught)."""
+    per_visit: dict = defaultdict(lambda: defaultdict(list))   # visit -> (ts, species) -> boxes
+    for r in conn.execute(
+            """SELECT visit_id, timestamp, species, bbox_x1, bbox_y1, bbox_x2, bbox_y2
+               FROM detections WHERE visit_id IS NOT NULL AND species IS NOT NULL"""):
+        per_visit[r["visit_id"]][(r["timestamp"], r["species"])].append(
+            (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]))
+    out = set()
+    for vid, frames in per_visit.items():
+        n = 0
+        for boxes in frames.values():
+            if len(boxes) < 2:
+                continue
+            if any(iou(boxes[i], boxes[j]) < iou_max
+                   for i in range(len(boxes)) for j in range(i + 1, len(boxes))):
+                n += 1
+                if n >= min_frames:
+                    out.add(vid)
+                    break
+    if include_sightings:
+        spans = multi_name_sighting_spans(conn)
+        if spans:
+            for v in conn.execute("SELECT id, source, started_at, ended_at FROM visits"):
+                if v["id"] in out:
+                    continue
+                if any(src == v["source"] and _iso_overlap(s0, s1, v["started_at"], v["ended_at"])
+                       for src, s0, s1 in spans):
+                    out.add(v["id"])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The matcher: visit prototypes + confirmed templates, loaded once per request.
 # ---------------------------------------------------------------------------
@@ -433,6 +780,15 @@ class VisitMatcher:
         self.rejected = db.rejected_visit_ids(conn, species)  # human said "leave unnamed" -- hands off
         self._co_cache: dict = {}
         self.clip_co_presence = clip_co_presence_by_visit(conn, species)  # {visit_id: n_clips}
+        # THIRD multi-animal signal: the human's own live log. A kit convoy can enter the sparse
+        # stills one animal at a time (zero same-instant frames) and still be four animals -- the
+        # 2026-07-31 "Stan + 3 kits" span did exactly that. A sighting logging 2+ names over a
+        # visit is direct testimony, stronger than either detector-side badge.
+        self._visit_meta = {v["id"]: (v["source"], v["started_at"], v["ended_at"])
+                            for v in conn.execute(
+                                "SELECT id, source, started_at, ended_at FROM visits")}
+        self._multi_sightings = multi_name_sighting_spans(conn)
+        self._sighting_cache: dict = {}
         # CLIP-space templates: an individual's labelled tracklets, the only way a never-solo pair
         # member (Elliot) gets matched. Built from confirmed SOLO visits + explicit un-blend labels.
         solo = {vid: nm for vid, nm in self.confirmed.items() if not self.is_multi(vid)}
@@ -445,13 +801,28 @@ class VisitMatcher:
             self._co_cache[visit_id] = co_present_frames(self._co_rows.get(visit_id, ()))
         return self._co_cache[visit_id]
 
+    def sighting_multi(self, visit_id: int) -> bool:
+        """True when a human live-logged 2+ names over a span overlapping this visit (cached)."""
+        if visit_id not in self._sighting_cache:
+            meta = self._visit_meta.get(visit_id)
+            hit = False
+            if meta and self._multi_sightings:
+                src, s0, s1 = meta
+                hit = any(src == m[0] and _iso_overlap(m[1], m[2], s0, s1)
+                          for m in self._multi_sightings)
+            self._sighting_cache[visit_id] = hit
+        return self._sighting_cache[visit_id]
+
     def is_multi(self, visit_id: int) -> bool:
-        """A visit holds 2+ animals if EITHER signal fires: the detection badge (simultaneous
-        separated boxes in the sparse live stills) OR clip co-presence (>= min_clips clips with
-        two sustained tracklets -- the full-rate clips catch pairs the stills miss)."""
+        """A visit holds 2+ animals if ANY signal fires: the detection badge (simultaneous
+        separated boxes in the sparse live stills), clip co-presence (>= min_clips clips with
+        two sustained tracklets -- the full-rate clips catch pairs the stills miss), or a
+        multi-name LIVE SIGHTING overlapping the visit (the human watched 2+ animals arrive,
+        even if they never shared a saved frame)."""
         return (self.co_presence(visit_id) >= self.cfg.reid_co_presence_min
                 or self.clip_co_presence.get(visit_id, 0)
-                >= self.cfg.reid_clip_co_presence_min_clips)
+                >= self.cfg.reid_clip_co_presence_min_clips
+                or self.sighting_multi(visit_id))
 
     def templates(self) -> list:
         """(name, visit_id, prototype) for every confirmed SOLO visit with a usable prototype.
@@ -466,6 +837,7 @@ class VisitMatcher:
                "n_embedded": len(self._by_visit.get(visit_id, ())),
                "co_present_frames": self.co_presence(visit_id),
                "co_present_clips": self.clip_co_presence.get(visit_id, 0),
+               "co_present_sighting": self.sighting_multi(visit_id),
                "multi": self.is_multi(visit_id),
                "confirmed_as": self.confirmed.get(visit_id),
                "auto_as": self.auto.get(visit_id),
@@ -498,6 +870,8 @@ class VisitMatcher:
                 ev.append(f"{out['co_present_frames']} still frame(s)")
             if out["co_present_clips"]:
                 ev.append(f"{out['co_present_clips']} clip(s)")
+            if out["co_present_sighting"]:
+                ev.append("your live log")
             out["note"] = (f"2+ raccoons here ({' + '.join(ev)} show two at once) -- the "
                            f"suggestion is a blend; name the visit by its main animal, or skip")
         return out

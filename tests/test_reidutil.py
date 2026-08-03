@@ -78,3 +78,30 @@ def test_cluster_cosine_from_precomputed_distance_matches_vector_path():
 def test_cluster_cosine_singleton_returns_ones():
     assert list(reidutil.cluster_cosine(np.stack([_unit(1, 0, 0)]), threshold=0.3)) == [1]
     assert list(reidutil.cluster_cosine(dist=np.zeros((1, 1)), threshold=0.3)) == [1]
+
+
+def test_cluster_cosine_constrained_matches_unconstrained_without_cannot():
+    a, b = _unit(1, 0, 0), _unit(0, 1, 0)
+    X = np.stack([a, a, b, b])
+    S = X @ X.T
+    D = np.clip(1.0 - S, 0.0, None)
+    np.fill_diagonal(D, 0.0)
+    labels = reidutil.cluster_cosine_constrained(D, 0.3)
+    def groups(lbls):
+        return {frozenset(i for i in range(len(lbls)) if lbls[i] == c) for c in set(lbls)}
+    assert groups(labels) == {frozenset({0, 1}), frozenset({2, 3})}
+
+
+def test_cluster_cosine_constrained_cannot_link_holds_lookalikes_apart():
+    # Three identical vectors (distance 0 everywhere) -- unconstrained clustering would make one
+    # blob. The cannot-link between 0 and 1 (same-frame tracklets = two bodies) must hold them
+    # apart, while 2 still joins one of them.
+    D = np.zeros((3, 3))
+    labels = reidutil.cluster_cosine_constrained(D, 0.3, cannot={(0, 1)})
+    assert labels[0] != labels[1]
+    assert len(set(labels)) == 2
+
+
+def test_cluster_cosine_constrained_singleton_and_empty():
+    assert list(reidutil.cluster_cosine_constrained(np.zeros((1, 1)), 0.3)) == [1]
+    assert list(reidutil.cluster_cosine_constrained(np.zeros((0, 0)), 0.3)) == []

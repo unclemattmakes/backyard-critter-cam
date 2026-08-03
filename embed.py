@@ -27,10 +27,15 @@ use the GPU freely.
   python embed.py --redo               # recompute even crops already embedded
   python embed.py --device cpu         # no GPU (slow; the model is heavy)
   python embed.py --limit 50           # just the first 50 (quick check)
+  python embed.py --species all --co-present --min-confidence 0.25
+                                       # LOW-conf crops, but ONLY in plausibly multi-animal
+                                       # visits -- the still-tracklet splitter's food (the
+                                       # second animal is nearly always a low-conf box)
 """
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import time
 
@@ -145,15 +150,30 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0, help="Max crops to process (0 = all).")
     p.add_argument("--redo", action="store_true",
                    help="Re-embed crops that already have a vector (e.g. after a model change).")
+    p.add_argument("--co-present", action="store_true",
+                   help="Only visits that plausibly hold 2+ animals (same-frame separated boxes, "
+                        "or a multi-name live sighting). Pair with a LOW --min-confidence: the "
+                        "second animal is nearly always the low-confidence box (measured "
+                        "2026-07-31: 2,423 of 2,500 unembedded co-present pair sides sat under "
+                        "the 0.5 gate), and the still-tracklet splitter is blind without these "
+                        "vectors. The nightly batch runs this after the main pass.")
     args = p.parse_args()
 
     species = None if args.species.lower() == "all" else args.species
     tag = model_tag()
     conn = db.connect(config.CONFIG.db_path)
 
+    visit_ids = None
+    if args.co_present:
+        # Lazy import: individuals pulls numpy/scipy, which a plain embed run doesn't need.
+        import individuals
+        conn.row_factory = sqlite3.Row
+        visit_ids = individuals.co_present_visit_ids(conn)
+        print(f"Co-present pass: {len(visit_ids)} candidate multi-animal visit(s).")
+
     rows = db.fetch_for_embedding(conn, tag, species=species,
                                   min_confidence=args.min_confidence, redo=args.redo,
-                                  limit=args.limit)
+                                  limit=args.limit, visit_ids=visit_ids)
     if not rows:
         print(f"Nothing to embed -- all caught up (model '{tag}', "
               f"{'all species' if species is None else species}, "

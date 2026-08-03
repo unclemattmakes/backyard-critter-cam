@@ -671,16 +671,26 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     pass
 
         def _unblend_label(self, data):
-            """Assign an individual to a cluster of clip tracklets (the un-blend action):
-            {"track_ids": [...], "name": "Notch"}. name=""/null clears."""
-            ids = data.get("track_ids") or []
-            if not isinstance(ids, list) or not ids:
-                self._json({"error": "missing track_ids"}, code=400)
+            """Assign an individual to an un-blend cluster: {"track_ids": [...], "name": "Notch"}
+            labels clip TRACKLETS (clip-space, the clips basis); {"detection_ids": [...], "name":
+            ...} stamps still CROPS directly (individual_source='human' -- the stills basis, whose
+            labels survive visit renumbering like every detection-level label). name=""/null
+            clears either way."""
+            tids = data.get("track_ids") or []
+            dids = data.get("detection_ids") or []
+            tids = tids if isinstance(tids, list) else []
+            dids = dids if isinstance(dids, list) else []
+            if not tids and not dids:
+                self._json({"error": "missing track_ids or detection_ids"}, code=400)
                 return
             name = (str(data.get("name") or "").strip()) or None
             conn = db.connect(cfg.db_path)
             try:
-                n = db.set_clip_track_individual(conn, [int(t) for t in ids], name)
+                n = 0
+                if tids:
+                    n += db.set_clip_track_individual(conn, [int(t) for t in tids], name)
+                if dids:
+                    n += db.set_individual_bulk(conn, [int(i) for i in dids], name)
                 self._json({"ok": True, "labelled": n, "name": name})
             finally:
                 conn.close()
@@ -1037,7 +1047,12 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
 
 
 def _reid_unblend(cfg, visit_id: str) -> dict:
-    """Separate a multi-animal visit into its individuals via clip-tracklet clustering."""
+    """Separate a multi-animal visit into its individuals: clip-tracklet clustering first (the
+    full-frame-rate basis, validated on the Notch/Elliot pair), falling back to STILL-tracklet
+    clustering when the clips can't separate (photo-only trail-cam cycles, pruned footage, or
+    simply fewer than two embedded tracklets). Both bases return the same group shape; stills
+    groups carry `detection_ids` (labels stamp the crops directly) where clip groups carry
+    `track_ids`, and the payload's `basis` says which ran."""
     import individuals
     try:
         vid = int(visit_id)
@@ -1057,12 +1072,23 @@ def _reid_unblend(cfg, visit_id: str) -> dict:
         # that bars it from open suggestions is harmless here). Build it from a matcher's solo map;
         # best-effort, since it's only a disambiguation aid on top of the quick-pick.
         elim = templates
+        matcher = None
         try:
-            elim = individuals.VisitMatcher(conn, cfg.reid_species, cfg=cfg).clip_templates
+            matcher = individuals.VisitMatcher(conn, cfg.reid_species, cfg=cfg)
+            elim = matcher.clip_templates
         except Exception:
             pass
-        return individuals.unblend_visit(conn, vid, templates=templates,
-                                         elim_templates=elim, cfg=cfg)
+        out = individuals.unblend_visit(conn, vid, templates=templates,
+                                        elim_templates=elim, cfg=cfg)
+        out["basis"] = "clips"
+        if len(out.get("groups") or []) >= 2:
+            return out
+        # The clips couldn't split this visit -- try the stills basis. Its suggestions rank
+        # against the confirmed-visit STILL templates (human-only, like everything
+        # template-shaped in this system).
+        stills = individuals.unblend_visit_stills(
+            conn, vid, templates=(matcher.templates() if matcher else []), cfg=cfg)
+        return stills if len(stills.get("groups") or []) >= 2 else out
     finally:
         conn.close()
 

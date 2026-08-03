@@ -625,17 +625,25 @@ def embedded_ids(conn: sqlite3.Connection, model: str) -> set[int]:
 
 
 def fetch_for_embedding(conn: sqlite3.Connection, model: str, *, species: Optional[str],
-                        min_confidence: float, redo: bool, limit: int = 0):
+                        min_confidence: float, redo: bool, limit: int = 0,
+                        visit_ids=None):
     """Animal crops that should get an appearance vector: above the usability gate, optionally
-    restricted to one species. Unless --redo, rows already embedded for `model` are skipped."""
+    restricted to one species. Unless --redo, rows already embedded for `model` are skipped.
+    `visit_ids` (a set) restricts to those visits' detections -- the --co-present widening pass
+    embeds LOW-confidence crops only where a second animal is plausible, so the global gate
+    keeps meaning what it always meant everywhere else."""
     where = "detection_class = 'animal' AND confidence >= ?"
     params: list = [min_confidence]
     if species:
         where += " AND species = ?"
         params.append(species)
     rows = conn.execute(
-        f"SELECT id, crop_path FROM detections WHERE {where} ORDER BY id", params
+        f"SELECT id, crop_path, visit_id FROM detections WHERE {where} ORDER BY id", params
     ).fetchall()
+    if visit_ids is not None:
+        wanted = set(visit_ids)
+        rows = [r for r in rows if r[2] in wanted]
+    rows = [(r[0], r[1]) for r in rows]
     if not redo:
         done = embedded_ids(conn, model)
         rows = [r for r in rows if r[0] not in done]
