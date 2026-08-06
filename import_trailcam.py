@@ -37,6 +37,17 @@ history, it DESTROYS it, so the flag archives (backup.py) before the import and 
 outright if that archive fails. Enforcing a disk budget against the only surviving copy is never
 the right trade.
 
+STATIC FALSE-FIRES are dropped between the stills and the videos (staticfilter.py, added
+2026-08-05). A detector pointed at a yard fires on furniture: on the 2026-08-04 card a covered
+Weber grill, its chimney starter, a dark gap that read as eyeshine and a shrub lit by the IR
+flash produced 395 of 789 detections -- half the cycle, labelled 'brown rat' and 'Virginia
+opossum' by a classifier doing its job on a barbecue. The live rig fixes this with hand-measured
+config.ignore_zones, which is wrong HERE: this camera is repositioned on purpose, and a stale
+zone fails silently. So the filter derives the spots per batch instead -- boxes that repeat in
+one place for hours are furniture, because an animal's box changes shape as it moves -- and the
+ORDER matters: it runs before the video pass so the clip gate never buys disk for footage whose
+only 'animal' was the grill. --no-static-filter keeps everything.
+
   python import_trailcam.py D:\DCIM\100MEDIA                 # ingest one SD-card dump (GPU)
   python import_trailcam.py D:\dump --recursive              # walk subfolders too
   python import_trailcam.py D:\dump --device cpu             # no GPU (slower; fine for batch)
@@ -45,6 +56,7 @@ the right trade.
   python import_trailcam.py D:\dump --all-videos             # keep empty-trigger clips too
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
   python import_trailcam.py D:\DCIM\100MEDIA --backup-first  # archive before anything can prune
+  python import_trailcam.py D:\dump --no-static-filter       # keep static false-fires too
 
 SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
 ledger is refreshed right away so the Behaviour tab shows the new visits -- unlabeled at first.
@@ -102,6 +114,7 @@ import cv2
 import clips
 import config
 import db
+import staticfilter
 import visits
 from config import CONFIG
 # Reuse the live rig's exact crop + path logic so trail-cam crops are byte-for-byte the same
@@ -743,6 +756,18 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                         "crop. Doubles the disk cost on a sun-triggered card.")
     p.add_argument("--video-pair-window", type=float, default=VIDEO_PAIR_WINDOW_S,
                    help="Seconds around a clip's span to look for its trigger's detections.")
+    p.add_argument("--no-static-filter", dest="static_filter", action="store_false", default=True,
+                   help="KEEP static false-fires (a grill, a post, foliage lit by the IR flash) "
+                        "instead of dropping boxes that sit in one spot for hours. The filter "
+                        "measures those spots per batch rather than from config, so it survives "
+                        "moving the camera -- see staticfilter.py.")
+    p.add_argument("--static-min-count", type=int, default=staticfilter.DEFAULT_MIN_COUNT,
+                   help="Detections in one spot before the static filter calls it furniture.")
+    p.add_argument("--static-min-span-minutes", type=float,
+                   default=staticfilter.DEFAULT_MIN_SPAN_MINUTES,
+                   help="How long one spot must keep firing before it counts as static.")
+    p.add_argument("--static-iou", type=float, default=staticfilter.DEFAULT_IOU,
+                   help="How identical two boxes must be to count as the same spot.")
     args = p.parse_args()
 
     cfg = replace(
@@ -813,9 +838,25 @@ def main() -> int:
                               recursive=args.recursive, processed_dir=processed_dir,
                               skip=skip, interval=args.interval)
         else:
+            # Watermark BEFORE the pass: every detections row above this id is one THIS run wrote,
+            # which is what scopes the static filter to a single card -- i.e. to one camera
+            # placement, the only span over which "the same spot" means anything.
+            first_new_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM detections").fetchone()[0]
             imported, saved, skipped = import_folder(
                 folder, detector, conn, cfg, source=args.source, recursive=args.recursive,
                 processed_dir=processed_dir, skip=skip)
+            # Static false-fires go BEFORE the videos, not after: the clip gate keeps a video whose
+            # trigger produced an animal crop, so a grill scoring 'animal' would otherwise buy
+            # disk space for footage of nothing happening -- and on a card that is the only copy,
+            # that space is spent against real footage.
+            dropped_static = 0
+            if saved and args.static_filter:
+                dropped_static = staticfilter.sweep_batch(
+                    conn, cfg, args.source, min_id=first_new_id, iou=args.static_iou,
+                    min_count=args.static_min_count,
+                    min_span_minutes=args.static_min_span_minutes)
+                saved -= dropped_static
             # Videos AFTER the stills: the animal gate reads the detections the stills just wrote.
             v_stored = v_already = v_empty = 0
             if args.videos:
@@ -828,6 +869,10 @@ def main() -> int:
             extra = f" (skipped {skipped} already-imported)" if skipped else ""
             print(f"\nDone. Imported {imported} file(s); saved {saved} crop(s) to "
                   f"{cfg.db_path}{extra}.")
+            if dropped_static:
+                print(f"  Static filter dropped {dropped_static} false-fire detection(s) -- "
+                      f"listed in "
+                      f"{staticfilter.manifest_path(cfg.db_path, args.source).name}.")
             if args.videos:
                 v_extra = f", {v_already} already-imported" if v_already else ""
                 print(f"  Clips: stored {v_stored} video(s); skipped {v_empty} with no animal "

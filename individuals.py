@@ -23,6 +23,21 @@ Multi-animal visits (the pair): frames holding two separated raccoon boxes mark 
 "2+ raccoons". Its blended prototype never becomes a template, and the badge itself is signal --
 co-arrival is a behaviour fingerprint (PLAN.md: surface appearance and behaviour separately).
 
+Two guards protect the human label set -- the only irreplaceable thing in this project (2026-08-05
+evaluation, docs/identity-eval-2026-08-05.md, phases A2 and C1):
+  * SOURCE GUARD -- a visit is only ever ranked, fitted or auto-named against templates confirmed
+    on the SAME camera. Cross-camera appearance is not a weak signal, it is no signal (best
+    similarity across the entire 397x93 matrix: 0.363), while 83.7% of trail-cam visit PAIRS
+    already clear the novelty cut -- so one cross-camera name that sticks would let refit() offer
+    ~83 more visits under it. Plain source equality, because Matt moves cameras on purpose and a
+    hand-measured zone would fail silently the day one moves.
+  * TEMPLATE FLOOR -- auto_assign refuses to WRITE a name backed by fewer than
+    cfg.reid_auto_min_templates confirmed solo visits. The cast is Stan 48 / Notch 46 / Pedro 36
+    then Elliot 4 / CutiePie 3 / The Dude 1; the tier has already machine-named visits off a
+    single template, and no threshold swept on one visit is a measurement.
+Both are refusals, never re-rankings: what the matcher believes is unchanged, it just declines to
+spend the label set on it.
+
 Cold start, before anything is confirmed: --bootstrap clusters the unconfirmed visit prototypes
 into a handful of visit-groups (5-8 on real data, vs the 319 useless crop-level clusters) so the
 first round of naming is "name these groups", not "name 1653 crops".
@@ -270,15 +285,10 @@ def _iso_overlap(a0, a1, b0, b1) -> bool:
         return False
 
 
-def clip_templates(conn, solo_visits: dict, *, cfg=None) -> dict:
-    """{name: (centroid, n_tracklets)} -- a per-individual CLIP-space appearance template = the
-    mean (re-normalized) of that individual's labelled tracklet prototypes. A tracklet is
-    attributed to an individual if EITHER it carries an explicit un-blend label
-    (clip_tracks.individual_id), OR its clip overlaps a confirmed SOLO visit of that individual
-    (`solo_visits` = {visit_id: name}). So the lone resident (Stan) gets a clip template for free,
-    while the never-solo pair member (Elliot) gets one the moment its cluster is un-blend-labelled
-    -- which is the whole point: it's how Elliot becomes findable. Clip space is its own regime,
-    matched with cfg.reid_clip_match_threshold, never the still novelty cut."""
+def _clip_template_vectors(conn, solo_visits: dict) -> dict:
+    """{(clip_source, name): [vector, ...]} -- the attribution pass behind clip_templates(). Kept
+    KEYED BY SOURCE so a caller can honour the source guard without re-reading every embedding
+    (VisitMatcher folds this once into an all-source view plus one view per camera)."""
     rows = db.load_clip_track_embeddings(conn, EMBED_MODEL)
     if not rows:
         return {}
@@ -296,13 +306,39 @@ def clip_templates(conn, solo_visits: dict, *, cfg=None) -> dict:
                     name = nm
                     break
         if name:
-            groups[name].append(reidutil.decode_vector(r["embedding"]))
+            groups[(r["clip_source"], name)].append(reidutil.decode_vector(r["embedding"]))
+    return dict(groups)
+
+
+def _fold_clip_templates(groups: dict, source=None) -> dict:
+    """{name: (centroid, n_tracklets)} from _clip_template_vectors' output. `source` restricts to
+    tracklets recorded on ONE camera -- the SOURCE GUARD (see VisitMatcher.templates)."""
+    per_name: dict = defaultdict(list)
+    for (src, name), vecs in groups.items():
+        if source is not None and src != source:
+            continue
+        per_name[name].extend(vecs)
     out = {}
-    for name, vecs in groups.items():
+    for name, vecs in per_name.items():
         c = np.stack(vecs).mean(axis=0)
         nrm = np.linalg.norm(c)
         out[name] = (c / nrm if nrm else c, len(vecs))
     return out
+
+
+def clip_templates(conn, solo_visits: dict, *, source=None, cfg=None) -> dict:
+    """{name: (centroid, n_tracklets)} -- a per-individual CLIP-space appearance template = the
+    mean (re-normalized) of that individual's labelled tracklet prototypes. A tracklet is
+    attributed to an individual if EITHER it carries an explicit un-blend label
+    (clip_tracks.individual_id), OR its clip overlaps a confirmed SOLO visit of that individual
+    (`solo_visits` = {visit_id: name}). So the lone resident (Stan) gets a clip template for free,
+    while the never-solo pair member (Elliot) gets one the moment its cluster is un-blend-labelled
+    -- which is the whole point: it's how Elliot becomes findable. Clip space is its own regime,
+    matched with cfg.reid_clip_match_threshold, never the still novelty cut.
+
+    `source` (optional) keeps only tracklets recorded on that camera -- the source guard, for
+    callers ranking against a probe from a known source."""
+    return _fold_clip_templates(_clip_template_vectors(conn, solo_visits), source)
 
 
 def unblend_visit(conn, visit_id: int, *, distance: float = 0.45, templates: dict = None,
@@ -449,6 +485,12 @@ def unblend_visit_stills(conn, visit_id: int, *, distance: float = 0.45, templat
         return out
     out["co_present"] = db.co_present_sighting_names(conn, v["source"], v["started_at"],
                                                      v["ended_at"])
+    # SOURCE GUARD: a template confirmed on ANOTHER camera may not rank here (or seed a
+    # co-presence elimination). Same rule, same reason as VisitMatcher.templates -- and a
+    # template whose visit can't be resolved to a source is dropped too, failing closed.
+    if templates:
+        tsrc = dict(conn.execute("SELECT id, source FROM visits"))
+        templates = [t for t in templates if tsrc.get(t[1]) == v["source"]]
     sp = v["species"]
     if sp is None:       # species-less visit: scope to its dominant species (apply_visit_label's rule)
         r = conn.execute(
@@ -733,6 +775,11 @@ def co_present_visit_ids(conn, *, iou_max: float = 0.45, min_frames: int = 1,
 # The matcher: visit prototypes + confirmed templates, loaded once per request.
 # ---------------------------------------------------------------------------
 
+# Sentinel for VisitMatcher.templates(): "every source", which is NOT the same as source=None
+# ("visits whose source is unknown"). Anything that ranks must pass a real source.
+_ALL_SOURCES = object()
+
+
 class VisitMatcher:
     """Loads one species' embedded crops grouped by visit, builds prototypes, and answers
     "who does visit N look like?" against the human-confirmed visits. Read-only over the DB."""
@@ -778,6 +825,10 @@ class VisitMatcher:
         self.confirmed = db.confirmed_visit_labels(conn, species)   # {visit_id: name}
         self.auto = db.visit_labels_by_source(conn, "auto", species)  # nightly auto-assigned names
         self.rejected = db.rejected_visit_ids(conn, species)  # human said "leave unnamed" -- hands off
+        # THE ROSTER: {casefolded name: last day resident (or None)} for individuals the human has
+        # marked departed. Loaded here so auto_assign can consult it; deliberately NOT consulted by
+        # templates(), suggest(), refit() or any ranking -- see is_departed().
+        self.departed = db.departed_individuals(conn)
         self._co_cache: dict = {}
         self.clip_co_presence = clip_co_presence_by_visit(conn, species)  # {visit_id: n_clips}
         # THIRD multi-animal signal: the human's own live log. A kit convoy can enter the sparse
@@ -787,12 +838,20 @@ class VisitMatcher:
         self._visit_meta = {v["id"]: (v["source"], v["started_at"], v["ended_at"])
                             for v in conn.execute(
                                 "SELECT id, source, started_at, ended_at FROM visits")}
+        # SOURCE GUARD (2026-08-05 eval, phase C1): which camera each visit came from. Every
+        # ranking below is scoped to ONE source -- see templates().
+        self.visit_source = {vid: m[0] for vid, m in self._visit_meta.items()}
         self._multi_sightings = multi_name_sighting_spans(conn)
         self._sighting_cache: dict = {}
         # CLIP-space templates: an individual's labelled tracklets, the only way a never-solo pair
         # member (Elliot) gets matched. Built from confirmed SOLO visits + explicit un-blend labels.
         solo = {vid: nm for vid, nm in self.confirmed.items() if not self.is_multi(vid)}
-        self.clip_templates = clip_templates(conn, solo, cfg=self.cfg)
+        _clip_groups = _clip_template_vectors(conn, solo)
+        # The all-source fold stays as the public attribute (web.py's un-blend elimination pool);
+        # matching a still prototype uses the per-source fold via clip_templates_for().
+        self.clip_templates = _fold_clip_templates(_clip_groups)
+        self._clip_templates_src = {s: _fold_clip_templates(_clip_groups, s)
+                                    for s in set(self.visit_source.values())}
 
     def co_presence(self, visit_id: int) -> int:
         """Frames in this visit with two separated boxes of this species (cached). Counted over
@@ -824,16 +883,70 @@ class VisitMatcher:
                 >= self.cfg.reid_clip_co_presence_min_clips
                 or self.sighting_multi(visit_id))
 
-    def templates(self) -> list:
+    def is_departed(self, name, started) -> bool:
+        """Has the human recorded that `name` had already left the yard by the time a visit
+        starting at `started` happened? A DATE comparison, not a blanket exclusion.
+
+        Why this exists: one of this cast's raccoons stopped appearing on 2026-06-30 and never
+        came back, but its 46 templates did not stop existing -- so at the recommended operating
+        point the auto tier lined up to write that name onto two visits on 2026-07-03, three days
+        after the animal was last here. That error is invisible to every metric the project has,
+        because leave-one-visit-out scores against labels and a departed animal's labels simply
+        stop: the probe set can never contain the case "named an animal that no longer lives
+        here". So the fact comes from the human, who knows it, via db.set_individual_status.
+
+        Deliberately narrow, in both directions:
+          * a visit that started ON OR BEFORE the effective date is NOT blocked -- it happened
+            while the animal was resident, and those are exactly the visits still worth naming
+            (the unreviewed backlog reaches back well before any departure);
+          * only auto_assign asks. Ranking, suggestions, templates and every cast surface treat a
+            departed individual exactly as before, because a human may look at an old visit and
+            recognise it. This guard governs what the MACHINE writes, nothing else.
+
+        Fails closed on the two cases where residency cannot be established: no effective date
+        recorded, or a visit with no start timestamp."""
+        if not self.departed:
+            return False
+        key = str(name or "").strip().casefold()
+        if key not in self.departed:
+            return False
+        last_day = self.departed[key]
+        if not last_day or not started:
+            return True                       # departed, but nothing to compare -> never auto-write
+        return str(started)[:10] > str(last_day)[:10]
+
+    def templates(self, source=_ALL_SOURCES) -> list:
         """(name, visit_id, prototype) for every confirmed SOLO visit with a usable prototype.
-        Multi-animal visits are excluded -- their prototype blends two animals."""
-        return [(name, vid, self.protos[vid]) for vid, name in self.confirmed.items()
+        Multi-animal visits are excluded -- their prototype blends two animals.
+
+        THE SOURCE GUARD. Pass a `source` and only that camera's confirmed visits come back; the
+        default returns every source, which is the corpus-wide view ("does ANY template exist?",
+        the cast surfaces) and must never be handed to a ranker. Measured 2026-08-05: across the
+        whole 397x93 cross-source matrix the best similarity is 0.363, so scoping costs nothing
+        today -- but 83.7% of trail-cam visit PAIRS already clear the 0.31 novelty cut, so the
+        first cross-camera name that sticks would let refit() propose ~83 of the other 92
+        trail-cam visits under it. A source-equality test is the one form of this guard that
+        survives Matt moving a camera: no geometry, no per-source thresholds, no camera list.
+        `source=None` means "visits whose source is unknown" (fail closed), not "any"."""
+        rows = [(name, vid, self.protos[vid]) for vid, name in self.confirmed.items()
                 if vid in self.protos and not self.is_multi(vid)]
+        if source is _ALL_SOURCES:
+            return rows
+        return [t for t in rows if self.visit_source.get(t[1]) == source]
+
+    def templates_for(self, visit_id: int) -> list:
+        """The ONLY template pool a probe from `visit_id` may be ranked against: same source."""
+        return self.templates(self.visit_source.get(visit_id))
+
+    def clip_templates_for(self, visit_id: int) -> dict:
+        """Same guard for the CLIP-space templates: tracklets recorded on this visit's camera."""
+        return self._clip_templates_src.get(self.visit_source.get(visit_id), {})
 
     def suggest(self, visit_id: int) -> dict:
         """The suggestion read-out for one visit: ranked candidates, novelty flag, co-presence.
         Degrades honestly -- explains WHY there's no suggestion when there isn't one."""
         out = {"visit_id": visit_id,
+               "source": self.visit_source.get(visit_id),
                "n_embedded": len(self._by_visit.get(visit_id, ())),
                "co_present_frames": self.co_presence(visit_id),
                "co_present_clips": self.clip_co_presence.get(visit_id, 0),
@@ -850,11 +963,20 @@ class VisitMatcher:
         # Cross-space clip match (still prototype vs each individual's clip-template centroid): an
         # ADDITIONAL signal that can name a clip-templated individual -- including one with no still
         # template at all (Elliot). Surfaced separately from the still-based candidates.
-        cm = clip_match(self.protos[visit_id], self.clip_templates, self.cfg.reid_clip_match_threshold)
+        cm = clip_match(self.protos[visit_id], self.clip_templates_for(visit_id),
+                        self.cfg.reid_clip_match_threshold)
         out["clip_candidates"] = [{"name": n, "similarity": round(s, 3), "n_tracklets": k}
                                   for n, s, k in cm[:3]]
-        temps = self.templates()
+        # SOURCE GUARD: rank only against templates confirmed on THIS visit's camera.
+        temps = self.templates_for(visit_id)
         if not temps:
+            if self.templates():           # templates exist, just not on this camera
+                out["note"] = (
+                    f"no confirmed {out['source']} visit yet -- identity is never matched across "
+                    f"cameras (the best cross-camera similarity ever measured on this corpus is "
+                    f"0.363, which is a fact about the cameras, not the animal). Confirm a "
+                    f"{out['source']} visit to start this camera's own template set.")
+                return out
             out["note"] = ("clip-template match only (no still templates yet)"
                            if out["clip_candidates"] else
                            "no confirmed individuals yet -- name a visit (or bootstrap groups) first")
@@ -922,16 +1044,23 @@ class VisitMatcher:
         they were only named on multi-animal visits (their prototype blends two animals). Those
         individuals CANNOT be matched until a solo visit is confirmed for them -- surfacing that
         is the difference between a silent miss and an actionable nudge."""
-        temps = self.templates()
-        templated = {n for n, _, _ in temps}
+        templated = {n for n, _, _ in self.templates()}
         untemplated = sorted(set(self.confirmed.values()) - templated)
         fits: dict = {}
         novel = []
+        by_source: dict = {}
         for v in self.protos:
             # Auto-assigned visits are already handled (their card shows the auto chip; undo
             # returns them here) -- listing them again as "fits" would double-surface them.
             if v in self.confirmed or v in self.auto or self.is_multi(v):
                 continue
+            # SOURCE GUARD: a visit is only ever fitted to its OWN camera's templates. This is the
+            # phase-C1 hazard in one line -- without it, one confirmed cross-camera name lets this
+            # loop propose the whole of the other camera's corpus under it.
+            src = self.visit_source.get(v)
+            if src not in by_source:
+                by_source[src] = self.templates(src)
+            temps = by_source[src]
             ranked = rank_templates(self.protos[v], temps) if temps else []
             if ranked and ranked[0][1] >= self.cfg.reid_novel_threshold:
                 name, sim, via = ranked[0]
@@ -942,12 +1071,19 @@ class VisitMatcher:
                 novel.append(v)
         for lst in fits.values():
             lst.sort(key=lambda r: -r["similarity"])
-        return {"fits": fits, "novel_groups": self._cluster_visits(novel, distance),
+        # The residual clusters WITHIN a source too: a candidate-new-individual group spanning two
+        # cameras invites one name onto both, which is the same mislabel by another door.
+        novel_groups = []
+        for src in sorted({self.visit_source.get(v) for v in novel}, key=lambda s: (s is None, s)):
+            novel_groups += self._cluster_visits(
+                [v for v in novel if self.visit_source.get(v) == src], distance)
+        novel_groups.sort(key=lambda g: -len(g["visits"]))
+        return {"fits": fits, "novel_groups": novel_groups,
                 "untemplated": untemplated,
                 "n_fit": sum(len(l) for l in fits.values()), "n_novel": len(novel)}
 
     def auto_assign(self, conn, *, threshold: float = None, margin: float = None,
-                    dry_run: bool = False) -> dict:
+                    min_templates: int = None, dry_run: bool = False) -> dict:
         """The "review by exception" tier: NAME the unambiguous solo visits automatically, so the
         human reviews what the machine did instead of confirming everything by hand. A visit is
         auto-named only when its best match clears BOTH bars: nearest-confirmed-visit similarity
@@ -962,22 +1098,43 @@ class VisitMatcher:
           - skips human-confirmed, already-auto-named, and human-REJECTED visits (the reject
             tombstone is what makes an undo stick across nightly runs);
           - one-individual casts still need the full margin over an empty runner-up (0.0), so a
-            lone template can't vacuum up everything above the threshold.
+            lone template can't vacuum up everything above the threshold;
+          - SOURCE GUARD (2026-08-05): a visit is only ranked against its OWN camera's templates,
+            and a camera with no confirmed visit of its own gets no auto names at all
+            (`no_same_source_template`). See templates() for the measurement;
+          - TEMPLATE FLOOR (2026-08-05): a name backed by fewer than `min_templates` confirmed
+            SOLO visits ON THIS SOURCE is never written (`thin_templates`). Measured: the shipped
+            corpus is Stan 48 / Notch 46 / Pedro 36 / Elliot 4 / CutiePie 3 / The Dude 1, and this
+            tier has already auto-named a CutiePie visit and a The Dude visit off ONE template
+            each. Nothing swept on a 1-4 visit individual is a measurement, so the tier must not
+            spend the human label set on it. The thin individual still COMPETES in the ranking --
+            it can still block an assignment as the runner-up -- it just can't be written;
+          - THE ROSTER (2026-08-05): a name a human has marked DEPARTED is never written onto a
+            visit that started after the departure date (`departed`). Templates outlive the
+            animal: this cast's Notch stopped appearing on 2026-06-30 and the tier still lined up
+            to name two 2026-07-03 visits after him. Note what this is NOT -- it is not a recency
+            gate on template age, which was implemented, measured and rejected (wrong-name rate
+            0.119 -> 0.137 for LESS coverage). It is a fact the human supplies and the machine
+            cannot infer, and it is a DATE test: visits from before the departure are still
+            auto-nameable, and the departed individual is still ranked, suggested and templated
+            everywhere else. See is_departed().
 
         Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped}."""
         cfg = self.cfg
         threshold = cfg.reid_auto_threshold if threshold is None else threshold
         margin = cfg.reid_auto_margin if margin is None else margin
+        min_templates = (cfg.reid_auto_min_templates if min_templates is None else min_templates)
         if not threshold or threshold <= 0:
             return {"enabled": False, "assigned": [], "skipped": {},
                     "note": "disabled -- set reid_auto_threshold from eval.py --reid's sweep"}
-        temps = self.templates()
         out = {"enabled": True, "threshold": threshold, "margin": margin,
+               "min_templates": min_templates,
                "assigned": [], "skipped": defaultdict(int)}
-        if not temps:
+        if not self.templates():
             out["skipped"]["no_templates"] = len(self.protos)
             out["skipped"] = dict(out["skipped"])
             return out
+        by_source: dict = {}
         for vid in sorted(self.protos):
             if vid in self.confirmed:
                 out["skipped"]["confirmed"] += 1
@@ -991,6 +1148,13 @@ class VisitMatcher:
             if self.is_multi(vid):
                 out["skipped"]["multi_animal"] += 1
                 continue
+            src = self.visit_source.get(vid)
+            if src not in by_source:
+                by_source[src] = self.templates(src)
+            temps = by_source[src]
+            if not temps:
+                out["skipped"]["no_same_source_template"] += 1
+                continue
             ranked = rank_templates(self.protos[vid], temps)
             name, sim, _via = ranked[0]
             lead = sim - (ranked[1][1] if len(ranked) > 1 else 0.0)
@@ -999,6 +1163,19 @@ class VisitMatcher:
                 continue
             if lead < margin:
                 out["skipped"]["ambiguous"] += 1          # near-tie between two individuals
+                continue
+            # The floor is checked LAST on purpose: `thin_templates` then counts exactly the
+            # visits this guard took off the assignment list, not every visit whose top match
+            # happened to be a thin individual -- so a dry run reads as "the floor cost you N".
+            if sum(1 for n, _v, _p in temps if n == name) < min_templates:
+                out["skipped"]["thin_templates"] += 1
+                continue
+            # THE ROSTER, checked last for the same reason: `departed` counts exactly the names
+            # this guard refused to write. The visit is SKIPPED, not re-awarded to the runner-up --
+            # the margin was measured against the departed individual, so handing the name down
+            # the ranking would write a name no bar was ever cleared for.
+            if self.is_departed(name, self.visit_started.get(vid)):
+                out["skipped"]["departed"] += 1
                 continue
             if not dry_run:
                 db.label_visit(conn, vid, name, source="auto")
@@ -1079,7 +1256,8 @@ def main() -> int:
                 return 0
             verb = "would name" if args.dry_run else "named"
             print(f"Auto-assign ({args.species}, similarity >= {r['threshold']:.2f}, "
-                  f"margin >= {r['margin']:.2f}): {verb} {len(r['assigned'])} visit(s).")
+                  f"margin >= {r['margin']:.2f}, >= {r['min_templates']} template(s) per name, "
+                  f"same camera only): {verb} {len(r['assigned'])} visit(s).")
             for a in r["assigned"]:
                 print(f"  visit #{a['visit_id']:<6} {_fmt_started(a['started'])}  "
                       f"{a['name']}  sim {a['similarity']:.2f}  lead {a['margin']:.2f}")

@@ -581,8 +581,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json(stats.review_queue(cfg))
                 elif path == "/api/reid/queue":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self._json(_reid_queue(cfg, species=(q.get("species") or [cfg.reid_species])[0],
-                                           limit=max(1, min(int((q.get("limit") or [30])[0]), 100))))
+                    self._json(_reid_queue(
+                        cfg, species=(q.get("species") or [cfg.reid_species])[0],
+                        limit=_qs_int(q, "limit", 30, 1, 100),
+                        offset=_qs_int(q, "offset", 0, 0, 1_000_000),
+                        mode=(q.get("mode") or ["recent"])[0]))
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
@@ -644,6 +647,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                 if path == "/api/camera":
                     control_bridges[self._src()].request(_clean_settings(data))
                     self._json({"ok": True})
+                elif path == "/api/individual/status":
+                    self._individual_status(data)
                 elif path == "/api/individual":
                     self._individual_action(data)
                 elif path == "/api/reid/confirm":
@@ -782,6 +787,29 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             finally:
                 conn.close()
 
+        def _individual_status(self, data):
+            """THE ROSTER: record that an individual has left the yard, or take it back.
+            {"name": "Notch", "status": "departed", "effective_date": "2026-06-30"} -- the date is
+            the LAST DAY it was here. {"status": "resident"} undoes it.
+
+            Changes exactly one thing: the nightly auto-assign pass stops writing that name onto
+            visits that started AFTER that date (individuals.VisitMatcher.is_departed). Nothing is
+            hidden, no label is touched, and older visits stay auto-nameable -- the animal really
+            was here then. The date is what makes that possible, so it is not optional in spirit;
+            omitting it fails closed (no auto-name at any time) rather than open."""
+            conn = db.connect(cfg.db_path)
+            try:
+                row = db.set_individual_status(
+                    conn, (data.get("name") or ""),
+                    status=(data.get("status") or "departed"),
+                    effective_date=data.get("effective_date"), note=data.get("note"))
+            except ValueError as e:      # empty name / unknown status / unparseable date -> 400
+                self._json({"error": str(e)}, code=400)
+                return
+            finally:
+                conn.close()
+            self._json({"ok": True, **row})
+
         def _individual_action(self, data):
             """Name / merge / clear an individual group: {"from": "raccoon_c01", "to": "Notch"}.
             to="" or null clears the label. Naming two groups the same name merges them. The visit
@@ -918,17 +946,222 @@ def _naming_status() -> dict:
         return {"state": "off"}
 
 
-def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
-    """The Individuals tab's review queue: recent visits of `species` with a WHO suggestion each
+def _qs_int(q: dict, key: str, default: int, lo: int, hi: int) -> int:
+    """One integer query parameter, clamped to [lo, hi]. Garbage falls back to `default` rather
+    than raising -- a hand-typed ?limit=abc should not become a 500."""
+    try:
+        return max(lo, min(int((q.get(key) or [default])[0]), hi))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---- review-queue modes (the queue is the only source of templates) --------------------
+# `recent` is what the dashboard has always shown and stays the default; the other three are
+# opt-in filters over the WHOLE species pool, because a recent-only window reaches a few dozen
+# visits out of hundreds and human confirmations are the only thing that grows the template set.
+# All four are computed from stored columns + the appearance prototypes, so nothing here is
+# calibrated to a camera position and a camera move can't silently stale them out.
+QUEUE_MODES = ("recent", "unreviewed_auto", "ambiguous", "stale")
+
+
+def _days_since(ts, now=None):
+    """Whole-ish days between an ISO timestamp and now (float, one decimal). None if unparseable."""
+    t = db.parse_local(ts) if ts else None
+    if t is None:
+        return None
+    from datetime import datetime as _dt
+    ref = now or _dt.now().astimezone()
+    return round((ref - t).total_seconds() / 86400.0, 1)
+
+
+def _template_freshness(matcher, now=None) -> dict:
+    """{name: {n_templates, newest_template, days_since_template}} over each individual's
+    CONFIRMED SOLO visits -- exactly the set `templates()` hands the matcher.
+
+    This is the priority list, not a decoration: measured on this corpus, leave-one-visit-out
+    top-1 falls 0.818 -> 0.482 -> 0.222 as the newest usable template ages 0 -> 7 -> 21 days.
+    An individual whose freshest template is a month old effectively cannot be recognised."""
+    out: dict = {}
+    for name, vid, _proto in matcher.templates():
+        started = matcher.visit_started.get(vid)
+        e = out.setdefault(name, {"n_templates": 0, "newest_template": None})
+        e["n_templates"] += 1
+        if started and (e["newest_template"] is None or started > e["newest_template"]):
+            e["newest_template"] = started
+    for e in out.values():
+        e["days_since_template"] = _days_since(e["newest_template"], now)
+    return out
+
+
+def _appearance_rank(matcher, vid):
+    """(name, similarity, lead) for one visit from the APPEARANCE templates only -- the same two
+    numbers auto_assign gates on, so a mode built on them shows exactly what the auto tier sees.
+
+    Two things it deliberately does NOT do. It takes no behaviour or adjacency input: the queue's
+    filters must not become a second, sloppier ranker (two-axis principle). And it ranks through
+    `templates_for`, the SOURCE-GUARDED pool -- a probe is only compared with templates from its
+    own camera, so a visit from an untemplated camera ranks against nothing and drops out of the
+    filters rather than being sorted by noise."""
+    import individuals
+    if vid not in matcher.protos:
+        return None
+    temps = (matcher.templates_for(vid) if hasattr(matcher, "templates_for")
+             else matcher.templates())
+    if not temps:
+        return None
+    ranked = individuals.rank_templates(matcher.protos[vid], temps)
+    if not ranked:
+        return None
+    name, sim, _via = ranked[0]
+    return name, sim, sim - (ranked[1][1] if len(ranked) > 1 else 0.0)
+
+
+def _queue_filter(cfg, matcher, rows, mode, freshness):
+    """Keep the visits `mode` addresses, newest first (the caller's row order is preserved).
+
+      recent           -- everything; today's behaviour, unchanged.
+      unreviewed_auto  -- machine-named and neither kept nor rejected by a human. These wear a
+                          name nobody confirmed; each one is a single click from being a template
+                          or a tombstone.
+      ambiguous        -- the appearance match clears the similarity bar but its lead over the
+                          runner-up INDIVIDUAL is under the margin. This is precisely what
+                          auto_assign refuses (its `ambiguous` skip bucket), which makes it the
+                          highest-information click on offer: the machine cannot resolve it and
+                          says so; the eye usually can.
+      stale            -- unreviewed visits whose top candidate is an individual whose newest
+                          human template has aged past reid_queue_stale_days. Confirming one
+                          refreshes the template the next week of matching stands on.
+    """
+    if mode not in QUEUE_MODES:
+        mode = "recent"
+    if mode == "recent":
+        return mode, list(rows)
+    # 'ambiguous' mirrors the auto tier's OWN two bars when the tier is live, so the mode shows
+    # exactly the visits it refuses on the margin (its `ambiguous` skip bucket). While the tier is
+    # disabled -- reid_auto_threshold 0.0, the shipped default, and the state this mode is most
+    # useful in -- both bars go inert, so fall back to the novelty cut and the queue's own margin.
+    auto_on = (cfg.reid_auto_threshold or 0) > 0
+    clears = max(cfg.reid_auto_threshold or 0.0, cfg.reid_novel_threshold)
+    margin = (cfg.reid_auto_margin if auto_on and (cfg.reid_auto_margin or 0) > 0
+              else cfg.reid_queue_ambiguous_margin)
+    out = []
+    for v in rows:
+        vid = v["id"]
+        if mode == "unreviewed_auto":
+            if vid in matcher.auto and vid not in matcher.confirmed and vid not in matcher.rejected:
+                out.append(v)
+            continue
+        # ambiguous / stale both look at an UNREVIEWED visit's appearance ranking.
+        if vid in matcher.confirmed or vid in matcher.rejected or matcher.is_multi(vid):
+            continue
+        r = _appearance_rank(matcher, vid)
+        if r is None:
+            continue
+        name, sim, lead = r
+        if mode == "ambiguous":
+            if sim >= clears and lead < margin:
+                out.append(v)
+        elif mode == "stale":
+            days = (freshness.get(name) or {}).get("days_since_template")
+            if sim >= cfg.reid_novel_threshold and days is not None \
+                    and days >= cfg.reid_queue_stale_days:
+                out.append(v)
+    return mode, out
+
+
+def _adjacency_context(rows_by_source, matcher, v):
+    """DISPLAY-ONLY: the nearest same-source visit within an hour that already carries a human
+    name ("started 6 min after the visit you named Stan").
+
+    Measured on this corpus, adjacent same-source visits inside 60 min are the same individual
+    67-77% of the time against a 28% base rate -- genuinely worth showing a human. It is NOT
+    worth scoring: as a ranking input under session blocking it fired 3 times and was wrong 3
+    times, and adjacency + a same-night template are the same confound. So this rides in its own
+    payload field, is never consulted by _appearance_rank, and never touches the sort order."""
+    lst = rows_by_source.get(v["source"]) or []
+    try:
+        i = lst.index(v["id"])
+    except ValueError:
+        return None
+    best = None
+    # `lst` is newest-first, so i+1 is the OLDER neighbour -- this visit started AFTER it.
+    for j, direction in ((i + 1, "after"), (i - 1, "before")):
+        if j < 0 or j >= len(lst):
+            continue
+        other = lst[j]
+        name = matcher.confirmed.get(other)
+        if not name:
+            continue
+        a, b = matcher.visit_started.get(v["id"]), matcher.visit_started.get(other)
+        ta, tb = db.parse_local(a) if a else None, db.parse_local(b) if b else None
+        if ta is None or tb is None:
+            continue
+        gap = abs((ta - tb).total_seconds())
+        if gap <= _ADJACENT_CONTEXT_S and (best is None or gap < best["gap_s"]):
+            best = {"name": name, "visit_id": other, "gap_s": int(gap), "direction": direction}
+    return best
+
+
+_ADJACENT_CONTEXT_S = 3600.0   # the measured window; display only, never a ranking input
+
+
+def _reid_funnel(matcher, pool, source_of, template_sources) -> dict:
+    """Where this species' visits go, counted live: total -> has a prototype -> human-confirmed
+    -> usable (solo) template, plus what the auto tier is looking at.
+
+    Published on the panel because "automation contributes nothing" is useless as a feeling and
+    actionable as a number. `addressable` is the auto tier's own arithmetic -- visits with a
+    prototype that are not confirmed, not multi-animal and not tombstoned -- so the gap between
+    it and `auto_named` is exactly the automation's shortfall. The per-source split matters for
+    the same reason: a source with no templates can never be named from templates, and folding
+    it into one denominator quietly understates every coverage figure."""
+    protos = set(matcher.protos)
+    confirmed = set(matcher.confirmed)
+    multi = {v for v in protos if v not in confirmed and matcher.is_multi(v)}
+    addressable = {v for v in protos
+                   if v not in confirmed and v not in matcher.rejected and v not in multi}
+    by_source: dict = {}
+    for v in pool:
+        s = by_source.setdefault(v["source"], {"source": v["source"], "visits": 0, "confirmed": 0,
+                                               "auto": 0, "addressable": 0, "templated": False})
+        s["visits"] += 1
+        vid = v["id"]
+        s["confirmed"] += int(vid in confirmed)
+        s["auto"] += int(vid in matcher.auto)
+        s["addressable"] += int(vid in addressable)
+    for s in by_source.values():
+        s["templated"] = s["source"] in template_sources
+    return {
+        "visits": len(pool),
+        "with_prototype": len(protos),
+        "confirmed": len(confirmed),
+        "templates": len(matcher.templates()),
+        "multi_animal": len(multi),
+        "addressable": len(addressable),
+        "auto_named": len(matcher.auto),
+        "rejected": len(matcher.rejected),
+        "by_source": sorted(by_source.values(), key=lambda s: -s["visits"]),
+    }
+
+
+def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
+                mode: str = "recent") -> dict:
+    """The Individuals tab's review queue: visits of `species` with a WHO suggestion each
     (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
     nothing is confirmed yet -- the cold-start visit-groups to name first. Read-only; the heavy
     lifting (prototype matching over the embedding matrix) lives in individuals.VisitMatcher and
-    is rebuilt per call, which is fine for a tab that loads on demand."""
+    is rebuilt per call, which is fine for a tab that loads on demand.
+
+    `mode` picks WHICH visits (see QUEUE_MODES); `offset`/`limit` PAGINATE within that mode.
+    Pagination rather than a bigger limit on purpose: the per-visit work below (clip overlap +
+    crop strip) and the matcher rebuild are what cost, so a page stays cheap however deep the
+    filter reaches."""
     import individuals
 
     conn = db.connect_readonly(cfg.db_path)
     if conn is None:
-        return {"species": species, "queue": [], "cast": [], "bootstrap": []}
+        return {"species": species, "queue": [], "cast": [], "bootstrap": [], "mode": "recent",
+                "offset": 0, "limit": limit, "n_matched": 0, "funnel": {}}
     try:
         matcher = individuals.VisitMatcher(conn, species, cfg)
 
@@ -947,10 +1180,27 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
 
         queue = []
         all_clips = stats.load_clips(conn)   # once; overlap-match each visit's footage in memory
-        rows = conn.execute(
+        # The WHOLE species pool, newest first. The mode filters it and offset/limit page it --
+        # the expensive per-visit work below runs on the page only.
+        pool = conn.execute(
             """SELECT id, source, started_at, ended_at, detection_count, representative_detection_id
-               FROM visits WHERE species = ? ORDER BY started_at DESC LIMIT ?""",
-            (species, limit)).fetchall()
+               FROM visits WHERE species = ? ORDER BY started_at DESC""", (species,)).fetchall()
+        freshness = _template_freshness(matcher)
+        mode, matched = _queue_filter(cfg, matcher, pool, mode, freshness)
+        rows = matched[offset:offset + limit]
+        # Per-source visit order (newest first, same as `pool`), for the display-only temporal
+        # context chip. Built from the whole pool so a page boundary can't hide a neighbour.
+        by_source: dict = {}
+        source_of: dict = {}
+        for v in pool:
+            by_source.setdefault(v["source"], []).append(v["id"])
+            source_of[v["id"]] = v["source"]
+        # Which sources the appearance templates actually come from. A visit from any OTHER source
+        # cannot be matched -- not "is probably a new animal", CANNOT BE MATCHED -- and the card
+        # says so instead of showing a meaningless top-1. Derived from the data, never a source
+        # name in code, so it stays true when a camera is added, moved or retired.
+        template_sources = {source_of.get(tvid) for _n, tvid, _p in matcher.templates()}
+        template_sources.discard(None)
         for v in rows:
             s = matcher.suggest(v["id"])
             # Evidence for the human doing the naming: the clips that rolled during this visit
@@ -965,18 +1215,31 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
                 "ORDER BY crop_quality DESC LIMIT 7",
                 (v["source"], species, v["started_at"], v["ended_at"])).fetchall()]
             vcrops = [c for c in vcrops if c != rep][:6]   # "other" crops -> drop the hero thumb
+            # A visit from a source no template comes from is structurally unmatchable. Measured:
+            # every trail-cam raccoon prototype scores a median 0.249 / max 0.363 against every
+            # glass-door template, and trail-cam-to-trail-cam similarity is flat (0.510 near in
+            # time vs 0.514 far) -- there is no identity structure to threshold. Saying "possibly
+            # someone new" there states something about the ANIMAL when the truth is about the
+            # CAMERA, so the flag rides here and the card swaps the wording.
+            cross_source = bool(template_sources) and v["source"] not in template_sources
             queue.append({
-                "visit_id": v["id"], "started_at": v["started_at"],
+                "visit_id": v["id"], "started_at": v["started_at"], "source": v["source"],
                 "dwell_s": _dwell(v["started_at"], v["ended_at"]),
                 "n_crops": v["detection_count"],
                 "rep_crop": rep,
                 "clips": vclips, "crops": vcrops,
                 "confirmed_as": s["confirmed_as"], "auto_as": s["auto_as"],
+                "rejected": v["id"] in matcher.rejected,
                 "candidates": s["candidates"],
                 "clip_candidates": s["clip_candidates"],
                 "novel": s["novel"], "multi": s["multi"],
+                "cross_source": cross_source,
                 "co_present_frames": s["co_present_frames"],
                 "co_present_clips": s["co_present_clips"],
+                # DISPLAY ONLY -- see _adjacency_context. Never read by any ranking path, and
+                # only offered where there is still a call to make (an already-confirmed visit
+                # doesn't need a hint, it needs to stay out of the way).
+                "context": None if s["confirmed_as"] else _adjacency_context(by_source, matcher, v),
                 "n_embedded": s["n_embedded"], "note": s["note"], "species": species,
             })
 
@@ -992,6 +1255,25 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
         for vid, name in matcher.auto.items():
             if name in cast:               # auto only ever assigns confirmed names, but be safe
                 cast[name]["n_auto"] += 1
+        # TEMPLATE FRESHNESS: how old this individual's newest USABLE (confirmed solo) template is.
+        # n_visits counts confirmations; a confirmation on a 2+-animal visit is NOT a template, so
+        # the two numbers differ and the difference is the point -- an individual can look busy and
+        # still be unrecognisable. See _template_freshness for the decay curve this reads against.
+        # THE ROSTER: what the human has said about who still lives here. A departed individual is
+        # shown, ranked and suggested exactly as before -- the flag only tells the reader why the
+        # stale-template warning next to it is not a to-do, and gives the auto tier the one fact it
+        # can never infer (individuals.VisitMatcher.is_departed).
+        statuses = db.individual_statuses(conn)
+        by_key = {str(k).strip().casefold(): v for k, v in statuses.items()}
+        for name, c in cast.items():
+            f = freshness.get(name) or {}
+            c["n_templates"] = f.get("n_templates", 0)
+            c["newest_template"] = f.get("newest_template")
+            c["days_since_template"] = f.get("days_since_template")
+            st = by_key.get(str(name).strip().casefold()) or {}
+            c["status"] = st.get("status") or "resident"
+            c["departed_on"] = st.get("effective_date")
+            c["status_note"] = st.get("note")
 
         def _group_crops(visit_ids):
             if not visit_ids:
@@ -1041,7 +1323,11 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30) -> dict:
         return {"species": species, "queue": queue,
                 "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
                 "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
-                "novel_threshold": cfg.reid_novel_threshold}
+                "novel_threshold": cfg.reid_novel_threshold,
+                "mode": mode, "modes": list(QUEUE_MODES),
+                "offset": offset, "limit": limit, "n_matched": len(matched),
+                "stale_days": cfg.reid_queue_stale_days,
+                "funnel": _reid_funnel(matcher, pool, source_of, template_sources)}
     finally:
         conn.close()
 

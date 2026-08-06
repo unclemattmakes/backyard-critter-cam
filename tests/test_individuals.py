@@ -90,18 +90,20 @@ def test_co_present_frames_requires_separated_boxes():
 # DB round-trip: label_visit, individual_source, confirmed_visit_labels.
 # ---------------------------------------------------------------------------
 
-def _det(conn, *, minutes, species="raccoon", confidence=0.9, bbox=(0, 0, 10, 10)):
+def _det(conn, *, minutes, species="raccoon", confidence=0.9, bbox=(0, 0, 10, 10),
+         source=db.SOURCE_GLASS_DOOR_CAM):
     return db.insert_detection(
-        conn, timestamp=_ts(minutes), source=db.SOURCE_GLASS_DOOR_CAM,
+        conn, timestamp=_ts(minutes), source=source,
         detection_class="animal", confidence=confidence, bbox=bbox,
-        frame_w=100, frame_h=100, crop_path=f"crops/{minutes}.jpg", species=species,
+        frame_w=100, frame_h=100, crop_path=f"crops/{source}_{minutes}.jpg", species=species,
         crop_quality=10.0,
     )
 
 
-def _visit(conn, det_ids, *, species="raccoon", start_min=0.0, end_min=1.0):
+def _visit(conn, det_ids, *, species="raccoon", start_min=0.0, end_min=1.0,
+           source=db.SOURCE_GLASS_DOOR_CAM):
     vid = db.insert_visit(
-        conn, source=db.SOURCE_GLASS_DOOR_CAM, species=species, individual_id=None,
+        conn, source=source, species=species, individual_id=None,
         started_at=_ts(start_min), ended_at=_ts(end_min), detection_count=len(det_ids),
         max_confidence=0.9, representative_detection_id=det_ids[0])
     db.assign_visit(conn, det_ids, vid)
@@ -293,16 +295,16 @@ def cfg():
     return c
 
 
-def _three_crop_visit(conn, vec, *, start_min, jitter=0.01):
+def _three_crop_visit(conn, vec, *, start_min, jitter=0.01, source=db.SOURCE_GLASS_DOOR_CAM):
     """A visit of three near-identical crops pointing along `vec` (one animal lingering)."""
     base = np.asarray(vec, dtype=np.float32)
     ids = []
     for k in range(3):
-        d = _det(conn, minutes=start_min + k * 0.2)
+        d = _det(conn, minutes=start_min + k * 0.2, source=source)
         v = base + jitter * np.array([k, -k, k], dtype=np.float32)[: len(base)]
         _embed(conn, d, v / np.linalg.norm(v))
         ids.append(d)
-    return _visit(conn, ids, start_min=start_min, end_min=start_min + 1)
+    return _visit(conn, ids, start_min=start_min, end_min=start_min + 1, source=source)
 
 
 def test_suggest_ranks_confirmed_individual_and_flags_novelty(conn, cfg):
@@ -686,7 +688,9 @@ def test_auto_assign_names_only_the_unambiguous(conn, cfg):
     weak = _three_crop_visit(conn, [0, 0, 1], start_min=120)         # looks like nobody
 
     m = VisitMatcher(conn, "raccoon", cfg)
-    r = m.auto_assign(conn, threshold=0.75, margin=0.25)
+    # min_templates=1: this test is about the similarity/margin bars, so the per-individual
+    # template floor (its own test below) is opened right up.
+    r = m.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=1)
     assert r["enabled"] and [a["visit_id"] for a in r["assigned"]] == [clear]
     assert r["assigned"][0]["name"] == "Stan"
     assert r["skipped"]["ambiguous"] == 1                            # the tie
@@ -702,7 +706,7 @@ def test_auto_assign_names_only_the_unambiguous(conn, cfg):
                for lst in m2.refit()["fits"].values() for x in lst)
 
     # Idempotent: the next nightly run (same bars) leaves it alone.
-    r2 = m2.auto_assign(conn, threshold=0.75, margin=0.25)
+    r2 = m2.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=1)
     assert r2["assigned"] == [] and r2["skipped"]["already_auto"] == 1
 
     # Promotion: a human ✓ turns the same name into a real, template-feeding confirmation.
@@ -729,7 +733,7 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
     pair = _visit(conn, ids, start_min=200, end_min=203)
 
     m = VisitMatcher(conn, "raccoon", cfg)
-    r = m.auto_assign(conn, threshold=0.8, margin=0.1)
+    r = m.auto_assign(conn, threshold=0.8, margin=0.1, min_templates=1)   # floor: tested below
     assert r["assigned"] == []
     assert r["skipped"]["human_rejected"] == 1
     assert r["skipped"]["multi_animal"] == 1
@@ -740,9 +744,275 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
     # Dry-run reports but writes nothing.
     fresh = _three_crop_visit(conn, [1, 0.03, 0], start_min=300)
     m2 = VisitMatcher(conn, "raccoon", cfg)
-    r2 = m2.auto_assign(conn, threshold=0.8, margin=0.1, dry_run=True)
+    r2 = m2.auto_assign(conn, threshold=0.8, margin=0.1, min_templates=1, dry_run=True)
     assert [a["visit_id"] for a in r2["assigned"]] == [fresh]
     assert db.visit_labels_by_source(conn, "auto", "raccoon") == {}
+
+
+# ---------------------------------------------------------------------------
+# Auto-assign guardrails: the per-individual TEMPLATE FLOOR and the SOURCE GUARD.
+# Both are refusals that protect the human label set (docs/identity-eval-2026-08-05.md,
+# phases A2 and C1). Neither may change what the matcher believes -- only what it writes.
+# ---------------------------------------------------------------------------
+
+def _named_visits(conn, name, vecs, *, first_min, source=db.SOURCE_GLASS_DOOR_CAM):
+    """Confirm one individual on `len(vecs)` solo visits -> that many usable templates."""
+    out = []
+    for k, vec in enumerate(vecs):
+        v = _three_crop_visit(conn, vec, start_min=first_min + 10 * k, source=source)
+        db.label_visit(conn, v, name)
+        out.append(v)
+    return out
+
+
+def test_auto_assign_template_floor_blocks_a_one_template_name(conn, cfg):
+    """The tier has already machine-named a CutiePie and a The Dude visit off a SINGLE confirmed
+    template. Nothing swept on a one-visit individual is a measurement, so the floor refuses to
+    spend the label set on it -- while a many-template name goes through untouched."""
+    _named_visits(conn, "Stan", [[1, 0, 0], [1, 0.03, 0], [1, -0.02, 0]], first_min=0)
+    _named_visits(conn, "The Dude", [[0, 1, 0]], first_min=100)      # exactly one template
+    dude_like = _three_crop_visit(conn, [0, 1, 0.03], start_min=200)  # unmistakably The Dude
+    stan_like = _three_crop_visit(conn, [1, 0.04, 0], start_min=260)  # unmistakably Stan
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert sorted(n for n, _v, _p in m.templates()) == ["Stan"] * 3 + ["The Dude"]
+
+    # Floor of 1 = today's behaviour: BOTH get named, including the thin one.
+    loose = m.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=1, dry_run=True)
+    assert sorted(a["visit_id"] for a in loose["assigned"]) == sorted([dude_like, stan_like])
+
+    # Floor of 3: the thin name is refused, and refused with its OWN reason -- it did not fail
+    # the similarity bar (that is the whole point: it looked certain).
+    r = m.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=3, dry_run=True)
+    assert [a["visit_id"] for a in r["assigned"]] == [stan_like]
+    assert r["skipped"]["thin_templates"] == 1
+    assert "below_threshold" not in r["skipped"] and "ambiguous" not in r["skipped"]
+    assert r["min_templates"] == 3
+
+    # The thin individual still COMPETES: it can still block an assignment as the runner-up.
+    near_dude = _three_crop_visit(conn, [0.75, 1, 0], start_min=320)
+    m2 = VisitMatcher(conn, "raccoon", cfg)
+    r2 = m2.auto_assign(conn, threshold=0.5, margin=0.25, min_templates=3, dry_run=True)
+    assert near_dude not in [a["visit_id"] for a in r2["assigned"]]
+
+
+def test_auto_assign_floor_default_comes_from_config(conn, cfg):
+    """The floor is a config setting with a safe (cautious) shipped default, not a constant."""
+    assert config.Config().reid_auto_min_templates >= 2
+    cfg.reid_auto_min_templates = 99                      # nobody can clear this
+    _named_visits(conn, "Stan", [[1, 0, 0], [1, 0.03, 0]], first_min=0)
+    probe = _three_crop_visit(conn, [1, 0.04, 0], start_min=100)
+    r = VisitMatcher(conn, "raccoon", cfg).auto_assign(conn, threshold=0.75, margin=0.1,
+                                                       dry_run=True)
+    assert r["assigned"] == [] and r["skipped"]["thin_templates"] == 1
+    assert db.visit_labels_by_source(conn, "auto", "raccoon") == {}
+    assert probe                                          # (the probe was the only candidate)
+
+
+# ---------------------------------------------------------------------------
+# THE ROSTER: an individual the human has marked DEPARTED.
+# Notch's last labelled crop is 2026-06-30 and Matt confirms the animal simply stopped coming --
+# but the 46 templates stayed, and at the recommended operating point the tier lined up to write
+# "Notch" onto two visits on 2026-07-03. This error class is invisible to every metric here (LOO
+# scores against labels; a departed animal's labels stop, so no probe can ever exhibit it), which
+# is why it takes a fact from the human instead of a threshold. NOT a recency gate on template
+# age -- that was measured and made things worse. A DATE test, and only over what is WRITTEN.
+# ---------------------------------------------------------------------------
+
+_ONE_DAY = 1440.0     # minutes; _ts() counts from BASE = 2026-06-10 21:00 local
+
+
+def test_is_departed_is_a_date_comparison_not_a_blanket_exclusion(conn, cfg):
+    db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-30")
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert m.is_departed("Notch", "2026-06-29T23:59:00-07:00") is False   # while resident
+    assert m.is_departed("Notch", "2026-06-30T23:59:00-07:00") is False   # the last day counts
+    assert m.is_departed("Notch", "2026-07-01T00:01:00-07:00") is True    # after
+    assert m.is_departed("notch", "2026-07-03T00:13:00-07:00") is True    # names are free text
+    assert m.is_departed("Pedro", "2026-07-03T00:13:00-07:00") is False   # nobody said anything
+    assert m.is_departed("Notch", None) is True                           # no start -> fail closed
+
+
+def test_auto_assign_will_not_write_a_departed_name_after_the_departure_date(conn, cfg):
+    """The two 2026-07-03 assignments, in miniature: same animal-looking prototype, one visit
+    before the departure and one after. Only the later one is refused, and refused with its own
+    reason -- it did not fail the similarity bar, which is exactly the danger."""
+    _named_visits(conn, "Notch", [[1, 0, 0], [1, 0.03, 0], [1, -0.02, 0]], first_min=0)
+    before = _three_crop_visit(conn, [1, 0.04, 0], start_min=200)                # 2026-06-11
+    after = _three_crop_visit(conn, [1, 0.04, 0], start_min=5 * _ONE_DAY)        # 2026-06-15
+
+    # Without the roster the tier names BOTH -- this is the bug, reproduced.
+    naive = VisitMatcher(conn, "raccoon", cfg).auto_assign(
+        conn, threshold=0.75, margin=0.02, min_templates=1, dry_run=True)
+    assert sorted(a["visit_id"] for a in naive["assigned"]) == sorted([before, after])
+
+    # Matt records what he knows: Notch was last here on the 12th.
+    db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-12",
+                             note="stopped coming")
+    m = VisitMatcher(conn, "raccoon", cfg)
+    r = m.auto_assign(conn, threshold=0.75, margin=0.02, min_templates=1, dry_run=True)
+    assert [a["visit_id"] for a in r["assigned"]] == [before]      # June visits survive
+    assert r["skipped"]["departed"] == 1
+    assert "below_threshold" not in r["skipped"] and "ambiguous" not in r["skipped"]
+
+    # And it holds on a real (non-dry) run: nothing is written for the later visit.
+    m.auto_assign(conn, threshold=0.75, margin=0.02, min_templates=1)
+    assert db.visit_labels_by_source(conn, "auto", "raccoon") == {before: "Notch"}
+
+
+def test_a_departed_individual_is_still_ranked_suggested_and_templated(conn, cfg):
+    """The guard governs the MACHINE's pen, nothing else. Matt may well look at an unreviewed
+    visit and recognise a departed animal -- 231 unconfirmed July visits and 46 unconfirmed June
+    ones are exactly the pile this is for -- so the name must stay on every human surface."""
+    _named_visits(conn, "Notch", [[1, 0, 0], [1, 0.03, 0]], first_min=0)
+    late = _three_crop_visit(conn, [1, 0.04, 0], start_min=5 * _ONE_DAY)
+    db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-12")
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert [n for n, _v, _p in m.templates()] == ["Notch"] * 2     # still a template set
+    s = m.suggest(late)
+    assert s["candidates"][0]["name"] == "Notch"                   # still ranked and suggested
+    assert s["candidates"][0]["similarity"] > 0.9
+    assert late in [x["visit_id"] for x in m.refit()["fits"]["Notch"]]
+    # A human confirmation is untouched by the roster -- the tool augments the judgement.
+    db.label_visit(conn, late, "Notch")
+    assert db.confirmed_visit_labels(conn, "raccoon")[late] == "Notch"
+
+
+def test_departed_with_no_date_blocks_every_auto_write_for_that_name(conn, cfg):
+    """No date means residency can't be established for any visit, so the name is never written.
+    Fail closed -- but only for that name; the rest of the cast is unaffected."""
+    _named_visits(conn, "Notch", [[1, 0, 0], [1, 0.03, 0]], first_min=0)
+    _named_visits(conn, "Pedro", [[0, 1, 0], [0.03, 1, 0]], first_min=100)
+    notchy = _three_crop_visit(conn, [1, 0.04, 0], start_min=200)
+    pedroy = _three_crop_visit(conn, [0.04, 1, 0], start_min=260)
+    db.set_individual_status(conn, "Notch", status="departed")     # no effective_date
+
+    r = VisitMatcher(conn, "raccoon", cfg).auto_assign(
+        conn, threshold=0.75, margin=0.02, min_templates=1, dry_run=True)
+    assert [a["visit_id"] for a in r["assigned"]] == [pedroy]
+    assert r["skipped"]["departed"] == 1
+    assert notchy not in [a["visit_id"] for a in r["assigned"]]
+
+
+def test_marking_an_individual_resident_again_reopens_the_auto_tier(conn, cfg):
+    """A departure is a claim about the world, and Matt can be wrong (or the animal comes back)."""
+    _named_visits(conn, "Notch", [[1, 0, 0], [1, 0.03, 0]], first_min=0)
+    late = _three_crop_visit(conn, [1, 0.04, 0], start_min=5 * _ONE_DAY)
+    db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-12")
+    assert VisitMatcher(conn, "raccoon", cfg).auto_assign(
+        conn, threshold=0.75, margin=0.02, min_templates=1, dry_run=True)["assigned"] == []
+    db.set_individual_status(conn, "Notch", status="resident")
+    r = VisitMatcher(conn, "raccoon", cfg).auto_assign(
+        conn, threshold=0.75, margin=0.02, min_templates=1, dry_run=True)
+    assert [a["visit_id"] for a in r["assigned"]] == [late]
+
+
+def test_the_departed_guard_does_not_hand_the_name_down_the_ranking(conn, cfg):
+    """When the winner is departed the VISIT is skipped, not re-awarded to the runner-up: the
+    margin was measured against the departed individual, so promoting second place would write a
+    name that never cleared a bar."""
+    _named_visits(conn, "Notch", [[1, 0, 0], [1, 0.02, 0]], first_min=0)
+    _named_visits(conn, "Pedro", [[0.8, 0.6, 0], [0.82, 0.58, 0]], first_min=100)
+    probe = _three_crop_visit(conn, [1, 0.05, 0], start_min=5 * _ONE_DAY)   # Notch first, Pedro 2nd
+    db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-12")
+    r = VisitMatcher(conn, "raccoon", cfg).auto_assign(
+        conn, threshold=0.5, margin=0.0, min_templates=1, dry_run=True)
+    assert r["assigned"] == [] and r["skipped"]["departed"] == 1
+    assert probe not in [a["visit_id"] for a in r["assigned"]]
+
+
+def test_source_guard_blocks_a_cross_camera_match_that_would_otherwise_rank(conn, cfg):
+    """Two visits with the SAME prototype, one per camera, against one glass-door template: the
+    same-camera visit matches at ~1.0 and the trail-cam visit does not match at all. Identical
+    numbers, opposite outcomes -- so the rule is source equality, not a threshold. Measured
+    justification: the best cross-source similarity in the whole 397x93 matrix is 0.363, while
+    83.7% of trail-cam visit PAIRS clear the novelty cut, so one cross-camera confirmation would
+    let refit() propose ~83 more visits under that single name."""
+    stan = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, stan, "Stan")
+    twin = _three_crop_visit(conn, [1, 0.02, 0], start_min=60)
+    trail = _three_crop_visit(conn, [1, 0.02, 0], start_min=120, source=db.SOURCE_TRAIL_CAM_SD)
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert m.suggest(twin)["candidates"][0]["name"] == "Stan"        # same camera: ranks
+    s = m.suggest(trail)
+    assert s["source"] == db.SOURCE_TRAIL_CAM_SD
+    assert s["candidates"] == [] and not s["novel"]                  # other camera: never ranks
+    assert "across cameras" in (s["note"] or "")                     # and says why, honestly
+
+    # The pools themselves: scoped for ranking, corpus-wide for "does any template exist?".
+    assert m.templates(db.SOURCE_TRAIL_CAM_SD) == []
+    assert [n for n, _v, _p in m.templates(db.SOURCE_GLASS_DOOR_CAM)] == ["Stan"]
+    assert len(m.templates()) == 1
+
+    # auto_assign: names the twin, refuses the trail-cam visit with its own reason.
+    r = m.auto_assign(conn, threshold=0.75, margin=0.1, min_templates=1, dry_run=True)
+    assert [a["visit_id"] for a in r["assigned"]] == [twin]
+    assert r["skipped"]["no_same_source_template"] == 1
+    # refit: the twin fits Stan, the trail-cam visit falls to the novel residual instead.
+    fit = m.refit()
+    assert [x["visit_id"] for x in fit["fits"]["Stan"]] == [twin]
+    assert trail in {v for g in fit["novel_groups"] for v in g["visits"]}
+
+
+def test_source_guard_survives_a_camera_move(conn, cfg):
+    """The guard may not encode WHERE a camera points: Matt repositions them on purpose. Same
+    animal, same camera, boxes on the opposite side of a re-aimed frame -> still one pool."""
+    a = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, a, "Stan")
+    moved = []
+    for k in range(3):                                   # after the move: far-away geometry
+        d = _det(conn, minutes=60 + k * 0.2, bbox=(900, 700, 990, 790))
+        _embed(conn, d, _unit(1, 0.02, 0))
+        moved.append(d)
+    v = _visit(conn, moved, start_min=60, end_min=61)
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert m.suggest(v)["candidates"][0]["name"] == "Stan"
+
+
+def test_refit_novel_groups_never_span_cameras(conn, cfg):
+    """A candidate-new-individual group spanning two cameras invites one name onto both -- the
+    same mass-mislabel through a different door."""
+    anchor = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, anchor, "Stan")
+    g = _three_crop_visit(conn, [0, 1, 0], start_min=60)
+    t = _three_crop_visit(conn, [0, 1, 0], start_min=120, source=db.SOURCE_TRAIL_CAM_SD)
+    groups = VisitMatcher(conn, "raccoon", cfg).refit()["novel_groups"]
+    assert sorted(len(x["visits"]) for x in groups) == [1, 1]        # identical vectors, NOT merged
+    assert {v for x in groups for v in x["visits"]} == {g, t}
+
+
+def test_source_guard_holds_for_clip_templates_and_stills_unblend(conn, cfg):
+    """The guard covers every path that ranks a prototype: the cross-space clip candidates and
+    the stills un-blend suggestions, not just the still-template ranking."""
+    # A glass-door clip tracklet labelled Elliot; a trail-cam visit that looks exactly like it.
+    _embedded_tracklet(conn, start_min=0, end_min=1, vec=[1, 0, 0], individual="Elliot")
+    same_cam = _three_crop_visit(conn, [1, 0, 0], start_min=60)
+    other_cam = _three_crop_visit(conn, [1, 0, 0], start_min=120, source=db.SOURCE_TRAIL_CAM_SD)
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert [c["name"] for c in m.suggest(same_cam)["clip_candidates"]] == ["Elliot"]
+    assert m.suggest(other_cam)["clip_candidates"] == []
+    assert "Elliot" in m.clip_templates                   # the corpus-wide view is unchanged
+
+    # Stills un-blend: a two-animal TRAIL-CAM visit offered a glass-door template.
+    u = _unit(1, 0)
+    left, right = [], []
+    for i in range(3):
+        l = _det(conn, minutes=200 + i * 0.05, bbox=(0, 0, 60, 60), source=db.SOURCE_TRAIL_CAM_SD)
+        r = _det(conn, minutes=200 + i * 0.05, bbox=(400, 0, 460, 60),
+                 source=db.SOURCE_TRAIL_CAM_SD)
+        _embed(conn, l, u)
+        _embed(conn, r, _unit(0, 1))
+        left.append(l)
+        right.append(r)
+    pair = _visit(conn, left + right, start_min=200, end_min=200.2,
+                  source=db.SOURCE_TRAIL_CAM_SD)
+    glass_template = _visit(conn, [_det(conn, minutes=300)], start_min=300, end_min=300.1)
+    out = individuals.unblend_visit_stills(conn, pair,
+                                           templates=[("Stan", glass_template, u)])
+    assert len(out["groups"]) == 2
+    assert all(g["suggestion"] == [] for g in out["groups"])   # no cross-camera suggestion
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +1074,10 @@ def test_unblend_visit_stills_separates_and_seeds(conn):
     vid = _visit(conn, left + right, start_min=0.0, end_min=0.2)
     db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan", "Kit 1"],
                             span_start=_ts(0.0), span_end=_ts(0.2))
-    out = individuals.unblend_visit_stills(conn, vid, templates=[("Stan", 999, u_stan)])
+    # The template's visit must be a REAL visit on the same camera -- the source guard drops any
+    # template it cannot resolve to this visit's source (see the cross-source test below).
+    tvid = _visit(conn, [_det(conn, minutes=500)], start_min=500, end_min=500.1)
+    out = individuals.unblend_visit_stills(conn, vid, templates=[("Stan", tvid, u_stan)])
     assert out["basis"] == "stills" and out["n_tracklets"] == 2
     assert len(out["groups"]) == 2
     by_ids = {tuple(sorted(g["detection_ids"])): g for g in out["groups"]}
@@ -882,6 +1155,89 @@ def test_co_present_visit_ids_frames_and_sightings(conn):
     db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan", "Kit 1"],
                             span_start=_ts(5.0), span_end=_ts(5.1))
     assert individuals.co_present_visit_ids(conn) == {va, vb}
+
+
+# ---------------------------------------------------------------------------
+# THE TWO-AXIS PRINCIPLE, as a test: behaviour never touches the appearance ranking.
+# ---------------------------------------------------------------------------
+
+# clipmotion's per-tracklet gait/motion features, as stored on clip_tracks.
+GAIT_FEATURES = ("duration_s", "path_len", "net_disp", "straightness", "avg_speed", "peak_speed",
+                 "moving_frac", "area_trend", "stride_hz", "stride_strength", "walk_s")
+
+# Two contradictory behaviour signatures: a beeline trot, and the sit-back-and-handle-it animal
+# that barely moves. (Eating style -- "mouth-first at the dish" vs "grabs it and sits back" -- is
+# the next behaviour feature Matt wants; it lands on these same rows and is bound by this test.)
+_TROTS = {"duration_s": 12.0, "path_len": 9.0, "net_disp": 8.5, "straightness": 0.94,
+          "avg_speed": 0.80, "peak_speed": 1.9, "moving_frac": 0.95, "area_trend": 2.4,
+          "stride_hz": 2.6, "stride_strength": 0.90, "walk_s": 11.0}
+_SITS_BACK = {"duration_s": 90.0, "path_len": 0.4, "net_disp": 0.05, "straightness": 0.02,
+              "avg_speed": 0.01, "peak_speed": 0.05, "moving_frac": 0.05, "area_trend": 0.3,
+              "stride_hz": 0.4, "stride_strength": 0.10, "walk_s": 2.0}
+
+
+def _set_gait(conn, clip_id, feats):
+    """Rewrite one clip's tracklet with a given behaviour signature (clipmotion's own writer)."""
+    db.insert_clip_tracks(conn, clip_id=clip_id, model="m", n_samples=300,
+                          tracklets=[{"track_json": "[]", "n_hits": 40, "features": feats}])
+    got = conn.execute("SELECT straightness, avg_speed, stride_hz, n_hits FROM clip_tracks "
+                       "WHERE clip_id = ?", (clip_id,)).fetchone()
+    assert got["straightness"] == feats["straightness"]      # the features really landed...
+    assert got["n_hits"] == 40                               # ...and the co-presence signal didn't move
+    return got
+
+
+def test_match_ordering_is_invariant_to_behaviour_features(conn, cfg):
+    """THE TWO-AXIS PRINCIPLE (docs/plan.md, README): appearance and behaviour stay on separate
+    axes. Behaviour may raise a flag and may be shown to the human beside a suggestion, but it
+    must NEVER change which individual a visit looks like, or in what order. Measured on this
+    corpus and recorded in docs/identity-eval-2026-08-05.md: nine motion features give LOO
+    balanced accuracy 0.422 vs 0.333 chance (p=0.107), depth-normalized size separates the three
+    adults at p=0.59, and stride_hz exists on 27 of 21,860 tracks with its values piled at the
+    band edges. So behaviour is not merely forbidden here, it is also empty -- but the guarantee
+    is structural, not statistical, which is why it is asserted rather than measured.
+
+    Written to bind the FUTURE: eating style is the next behaviour signal wanted, it lands on
+    these same clip_tracks rows, and this test is what stops it leaking into the ranker."""
+    stan = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    notch = _three_crop_visit(conn, [0, 1, 0], start_min=30)
+    db.label_visit(conn, stan, "Stan")
+    db.label_visit(conn, notch, "Notch")
+    clear = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)      # unmistakably Stan
+    tie = _three_crop_visit(conn, [1, 0.75, 0], start_min=90)        # a near-tie, correctly refused
+    # One clip per visit, ONE sustained tracklet each: enough to carry gait, never enough to
+    # trip clip co-presence (which is a multi-ANIMAL signal, not a behaviour feature).
+    clips = {v: _clip_with_tracks(conn, start_min=s + 0.1, end_min=s + 0.5, n_sustained=1)
+             for v, s in ((stan, 0), (notch, 30), (clear, 60), (tie, 90))}
+
+    def ranking():
+        m = VisitMatcher(conn, "raccoon", cfg)
+        return {
+            "candidates": {v: [(c["name"], c["similarity"]) for c in m.suggest(v)["candidates"]]
+                           for v in (clear, tie)},
+            "novel": {v: m.suggest(v)["novel"] for v in (clear, tie)},
+            "fits": {n: [(x["visit_id"], x["similarity"]) for x in lst]
+                     for n, lst in sorted(m.refit()["fits"].items())},
+            "auto": [(a["visit_id"], a["name"], a["similarity"], a["margin"])
+                     for a in m.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=1,
+                                            dry_run=True)["assigned"]],
+        }
+
+    baseline = ranking()
+    assert baseline["candidates"][clear][0][0] == "Stan"             # the ranking is real...
+    assert [a[0] for a in baseline["auto"]] == [clear]               # ...and it does assign
+
+    # Now hand the two Stan-side visits one signature and the Notch-side visit the other, with
+    # the near-tie matching Stan's exactly: if any gait column reached the ranker, `tie` would
+    # move off its refusal and `clear`'s order would firm up.
+    for v, feats in ((stan, _SITS_BACK), (clear, _SITS_BACK), (notch, _TROTS), (tie, _SITS_BACK)):
+        _set_gait(conn, clips[v], feats)
+    assert ranking() == baseline
+
+    # Swap every signature end-for-end (the near-tie now moves like Notch): still nothing moves.
+    for v, feats in ((stan, _TROTS), (clear, _TROTS), (notch, _SITS_BACK), (tie, _TROTS)):
+        _set_gait(conn, clips[v], feats)
+    assert ranking() == baseline
 
 
 def test_fetch_for_embedding_visit_ids_restriction(conn):
