@@ -1161,15 +1161,28 @@ function renderBehavior(d){
 }
 
 /* ---------- individuals (phase 3: suggest-confirm loop + hand-label the clusters) ---------- */
+/* Which slice of the queue is on screen. 'recent' is the default and is what this panel has
+   always shown; the other modes are opt-in filters over the WHOLE pool, and we PAGINATE them
+   rather than asking for a huge limit (the server rebuilds the matcher per call). */
+let REID_MODE='recent', REID_OFFSET=0;
+const REID_LIMIT=30;
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
   let d=null,q=null;
+  const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`;
   try{
     [q,d]=await Promise.all([
-      fetch('/api/reid/queue').then(r=>r.json()).catch(()=>null),
+      fetch('/api/reid/queue'+qs).then(r=>r.json()).catch(()=>null),
       fetch('/api/individuals').then(r=>r.json())]);
   }catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
   renderIndividuals(d,q);
+}
+function reidSetMode(m){ if(m===REID_MODE) return; REID_MODE=m; REID_OFFSET=0; loadIndividuals(); }
+function reidPage(delta){
+  const n=REID_OFFSET+delta*REID_LIMIT;
+  REID_OFFSET=n<0?0:n;
+  loadIndividuals();
+  const el=document.getElementById('reid-modes'); if(el) el.scrollIntoView({block:'nearest'});
 }
 
 /* The review queue: every recent visit gets a "who is this?" suggestion; you confirm or
@@ -1182,6 +1195,18 @@ function reidInput(id,ph){ return `<input id="${id}" placeholder="${ph}" style="
    button can replay them in the lightbox without re-fetching. Reset each time the queue renders. */
 let REID_VISIT_CLIPS={};
 function reidPlayClips(vid){ const c=REID_VISIT_CLIPS[vid]||[]; if(c.length) playClips(c,0,`visit #${vid}`); }
+/* Temporal context — FOR YOUR EYES ONLY. Adjacent same-camera visits inside an hour turn out to
+   be the same animal 67–77% of the time against a 28% base rate, which is worth knowing while
+   you look at the photo. It is NOT worth scoring: as a ranking input, under session blocking, it
+   fired three times and was wrong three times — a same-night neighbour and a same-night template
+   are the same confound. So this renders next to the suggestion and never enters it. */
+function reidContextChip(v){
+  const c=v.context; if(!c) return '';
+  const m=Math.round((c.gap_s||0)/60);
+  const when=m<1?'moments':(m===1?'1 min':m+' min');
+  const rel=c.direction==='after'?'after':'before';
+  return `<span class="flag" style="background:rgba(200,180,255,.13);border-color:rgba(200,180,255,.38)" title="context only — this never changes the appearance ranking. Adjacent visits on the same camera inside an hour are the same animal about 70% of the time, against a 28% base rate, but as an automatic rule it was wrong every time it fired.">started ${when} ${rel} the visit you named <b>${esc(c.name)}</b></span>`;
+}
 function reidCard(v){
   const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
   const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
@@ -1191,6 +1216,13 @@ function reidCard(v){
   if(v.confirmed_as){
     sugg=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(v.confirmed_as)} ✓</span>`;
     act=`<button class="gear" onclick="reidConfirm(${v.visit_id},null,true)" title="unconfirm this visit">Clear</button>`;
+  }else if(v.rejected){
+    // The reject TOMBSTONE (individual_source 'human', id NULL). Without this chip a rejected
+    // visit re-renders identical to one nobody has looked at, so the click leaves no trace and
+    // the same card asks the same question forever.
+    sugg=`<span class="flag" style="background:rgba(150,150,160,.16);border-color:rgba(180,180,190,.4)" title="you left this one unnamed — the nightly auto-assign pass skips it">you left this unnamed</span>`;
+    act=`<button class="gear" onclick="reidUnreject(${v.visit_id})" title="undo — put this visit back in play for the nightly pass">↺ undo</button>
+         ${reidInput('rq-'+v.visit_id,'or who…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
   }else if(v.auto_as){
     // Named by the nightly auto-assign pass (high similarity + clear margin). Review by
     // exception: ✓ promotes it to a real confirmation (feeds templates); ✗ clears it AND pins
@@ -1201,6 +1233,15 @@ function reidCard(v){
     act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(v.auto_as)})" title="yes, it's ${esc(v.auto_as)} — promote to a confirmed template">✓ keep</button>
          <button class="gear" onclick="reidConfirm(${v.visit_id},null,true,true)" title="not ${esc(v.auto_as)} — clear the auto name; the nightly pass won't re-name this visit">✗ not them</button>
          ${reidInput('rq-'+v.visit_id,'or who…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
+  }else if(v.cross_source){
+    // A visit from a camera no confirmed template comes from. Measured on this corpus: every
+    // trail-cam raccoon prototype scores a median 0.249 (max 0.363) against every glass-door
+    // template, and trail-cam-to-trail-cam similarity is FLAT (0.510 for visits minutes apart vs
+    // 0.514 for visits days apart — no identity structure to threshold). A top-1 here is noise,
+    // and "possibly someone new" would state something about the ANIMAL that is really a fact
+    // about the CAMERA. So say the camera thing, and offer your eye instead of a suggestion.
+    sugg=`<span class="flag" style="background:rgba(150,150,160,.16);border-color:rgba(180,180,190,.4)" title="no confirmed template comes from this camera, and appearance does not carry between cameras here — cross-camera match scores are indistinguishable from noise. Naming this visit is your judgement of the photo, not a machine suggestion.">no cross-camera match is possible <span style="opacity:.7">· ${esc(v.source||'this camera')}</span></span>`;
+    act=`${reidInput('rq-'+v.visit_id,'who is this…')}<button class="gear" onclick="reidConfirm(${v.visit_id})">Name</button>`;
   }else if((v.candidates||[]).length){
     const top=v.candidates[0];
     const rest=v.candidates.slice(1).map(c=>`${esc(c.name)} ${Math.round(c.similarity*100)}%`).join(' · ');
@@ -1216,7 +1257,9 @@ function reidCard(v){
   // Clip-space match: a SEPARATE signal from the un-blended tracklets — the only way a never-solo
   // pair member (Elliot) gets named in a new visit. Shown distinctly; offers a confirm when it's
   // the only suggestion on offer.
-  const clipTop=(v.clip_candidates||[])[0];
+  // Suppressed on a cross-camera visit for the same reason the still match is: the clip templates
+  // come from the other camera too, so a number there is noise wearing a decimal point.
+  const clipTop=v.cross_source? null : (v.clip_candidates||[])[0];
   const clipSugg=clipTop?`<span class="flag" style="background:rgba(120,160,220,.16);border-color:rgba(120,160,220,.45)" title="clip-space appearance match (from un-blended individuals) — a separate signal from the still match">clip-match <b>${esc(clipTop.name)}</b> ${Math.round(clipTop.similarity*100)}%</span>`:'';
   if(clipTop && !v.confirmed_as && !(v.candidates||[]).length){
     act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(clipTop.name)})" title="confirm from the clip-space match">✓ ${esc(clipTop.name)}</button> `+act;
@@ -1241,7 +1284,7 @@ function reidCard(v){
       ${thumb}
       <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
         <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi}</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi} ${reidContextChip(v)}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
     ${strip}
@@ -1388,20 +1431,140 @@ function reidRefitHTML(refit){
   }
   return html;
 }
+/* THE FUNNEL, computed live on every load. Where this species' visits actually go — total, how
+   many carry an appearance prototype, how many a human has confirmed, and how many of those are
+   USABLE templates (solo visits only; a confirmation on a two-animal visit blends two raccoons
+   and can never be matched against). The gap between "addressable" and "auto-named" is the
+   automation's shortfall, stated as a number instead of a feeling. */
+function reidFunnelHTML(f){
+  if(!f||!f.visits) return '';
+  const step=(n,label,title)=>`<span title="${esc(title)}"><b style="font-family:var(--mono)">${n}</b> <span style="opacity:.72">${esc(label)}</span></span>`;
+  const chain=[
+    step(f.visits,'visits','every visit of this species in the database'),
+    step(f.with_prototype,'with a prototype','have enough embedded crops to be compared at all'),
+    step(f.confirmed,'confirmed by you','a human named the visit — the only labels that become templates'),
+    step(f.templates,'usable templates','confirmed AND solo: a two-animal visit blends two prototypes, so it is excluded'),
+  ].join(' <span style="opacity:.4">→</span> ');
+  const side=[`<b style="font-family:var(--mono)">${f.addressable}</b> addressable`,
+              `<b style="font-family:var(--mono)">${f.multi_animal}</b> multi-animal`,
+              `<b style="font-family:var(--mono)">${f.auto_named}</b> auto-named`,
+              f.rejected?`<b style="font-family:var(--mono)">${f.rejected}</b> you left unnamed`:''].filter(Boolean).join(' · ');
+  const srcs=(f.by_source||[]).length>1? `<div class="lbl" style="opacity:.72;margin-top:4px">`+
+    f.by_source.map(s=>`<span title="${s.templated?'confirmed templates exist for this camera':'NO confirmed template comes from this camera — visits here cannot be matched from appearance, whatever the score says'}">${esc(s.source)}: ${s.visits} visits · ${s.confirmed} confirmed${s.templated?'':' · <b>no templates</b>'}</span>`).join(' &nbsp;·&nbsp; ')+`</div>` : '';
+  return `<div class="panel" style="padding:8px 14px;margin-bottom:10px">
+    <div class="lbl" style="opacity:.85">${chain}</div>
+    <div class="lbl" style="opacity:.72;margin-top:4px" title="addressable = has a prototype, not yet confirmed, not multi-animal, not left-unnamed — the visits the automatic tier is allowed to look at">${side}</div>
+    ${srcs}</div>`;
+}
+/* TEMPLATE FRESHNESS. Appearance identity decays: measured here, leave-one-visit-out top-1 goes
+   0.818 → 0.482 → 0.222 as the newest usable template ages 0 → 7 → 21 days, against a 0.348
+   majority-class baseline. So the age of an individual's newest confirmed SOLO visit is not
+   trivia, it is the priority list — stalest first, and loud when it is past the cut. */
+function reidFreshTone(days,staleDays){
+  const cut=staleDays||14;
+  if(days==null) return ['rgba(255,120,90,.16)','rgba(255,120,90,.45)'];
+  if(days>=cut)  return ['rgba(255,120,90,.16)','rgba(255,120,90,.45)'];
+  if(days>=cut/2)return ['rgba(255,190,80,.15)','rgba(255,190,80,.42)'];
+  return ['rgba(90,200,120,.14)','rgba(90,200,120,.4)'];
+}
+/* THE ROSTER. Animals move on, and a stale template is not the same fact as a departed animal —
+   you can't confirm a fresh visit for a raccoon that stopped coming. Marking someone gone (with
+   the last day you saw them) stops the nightly pass writing that name onto LATER visits, and
+   nothing else: they stay in the cast, stay rankable, stay suggestible, and every visit from
+   before that date is still theirs to be named. */
+function reidDepartedHTML(c){
+  const on=c.departed_on?` ${esc(c.departed_on)}`:'';
+  return `<span class="flag" style="background:rgba(255,255,255,.05);border-color:var(--rule2);opacity:.85"
+    title="${esc(c.name)} is marked as no longer visiting${c.departed_on?`, last here ${esc(c.departed_on)}`:' (no date given, so the nightly pass will never write this name)'}.${c.status_note?' Note: '+esc(c.status_note):''} Visits that started on or before that day can still be named ${esc(c.name)} — by you or by the nightly pass. Later ones cannot: the templates outlive the animal, and a match against them is some other raccoon.">${esc(c.name)} · <b>moved on</b>${on}
+    <button class="gear" style="padding:0 5px;margin-left:4px" title="Put ${esc(c.name)} back on the roster" onclick="reidSetResident(${jarg(c.name)})">↺</button></span>`;
+}
+function reidFreshnessHTML(cast,staleDays){
+  // Departed individuals sort to the END: this list is a priority queue for whose template needs
+  // refreshing, and nobody can refresh a template for an animal that no longer comes.
+  const list=(cast||[]).slice().sort((a,b)=>{
+    const ga=a.status==='departed'?1:0, gb=b.status==='departed'?1:0;
+    if(ga!==gb) return ga-gb;
+    const x=a.days_since_template, y=b.days_since_template;
+    if(x==null&&y==null) return b.n_visits-a.n_visits;
+    if(x==null) return -1; if(y==null) return 1;
+    return y-x;
+  });
+  if(!list.length) return '';
+  const chips=list.map(c=>{
+    if(c.status==='departed') return reidDepartedHTML(c);
+    const d=c.days_since_template, [bg,bd]=reidFreshTone(d,staleDays);
+    const age=d==null?'no usable template':(d<1?'today':Math.round(d)+'d ago');
+    const warn=(d==null||d>=(staleDays||14))?' ⚠':'';
+    const gone=`<button class="gear" style="padding:0 5px;margin-left:4px" title="${esc(c.name)} isn't coming back? Record the last day you saw them. The nightly pass then stops writing this name onto later visits — everything else is unchanged." onclick="reidSetDeparted(${jarg(c.name)},${jarg((c.last_seen||'').slice(0,10))})">moved on?</button>`;
+    return `<span class="flag" style="background:${bg};border-color:${bd}" title="${esc(c.name)}: ${c.n_visits} confirmed visit(s), ${c.n_templates||0} of them usable as templates (solo). Newest template ${d==null?'does not exist':reidWhen(c.newest_template)}. Identification accuracy against a template this old is roughly ${d==null?'nil':(d<1?'0.82':(d<7?'0.7':(d<14?'0.48':'0.22')))} top-1 — confirm a fresh solo visit for ${esc(c.name)} to reset it.">${esc(c.name)} · <b>${age}</b>${warn}<span style="opacity:.6"> · ${c.n_templates||0}/${c.n_visits}</span>${gone}</span>`;
+  }).join(' ');
+  return `<h2 class="sec">Template Freshness <span class="n">who the matcher can still recognise — stalest first</span></h2>
+    <p class="lbl" style="opacity:.75;margin:2px 0 6px">Appearance goes stale fast on this animal: identification is ~0.82 correct against a template from the same night, ~0.48 at a week, ~0.22 at three weeks — barely above guessing the commonest name. The number is days since that individual's newest <b>confirmed solo</b> visit, and the second pair is usable templates / confirmations. If one of them has simply stopped coming, say so — a template outlives the animal, and the nightly pass has no other way to find out.</p>
+    <div class="lede" style="margin-bottom:10px">${chips}</div>`;
+}
+async function reidSetDeparted(name,lastSeen){
+  const d=(prompt(`Last day you saw ${name} (YYYY-MM-DD).\n\nVisits up to and including this day can still be named ${name}; later ones will never be auto-named ${name} again.`,
+                  lastSeen||'')||'').trim();
+  if(!d) return;
+  await postIndivStatus({name, status:'departed', effective_date:d});
+}
+async function reidSetResident(name){
+  if(!confirm(`Put ${name} back on the roster? The nightly pass may name recent visits ${name} again.`)) return;
+  await postIndivStatus({name, status:'resident'});
+}
+async function postIndivStatus(body){
+  const restore=busyBtn();   // dim the clicked roster button while it saves
+  try{
+    const r=await fetch('/api/individual/status',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).then(r=>r.json());
+    if(r.error){ restore(); alert(r.error); return; }
+    loadIndividuals();   // re-renders the panel; the button goes with it
+  }catch(e){ restore(); connFail(); }
+}
+const REID_MODE_LABELS={
+  recent:['recent','the newest visits first — what this panel has always shown'],
+  unreviewed_auto:['auto, unreviewed','visits the nightly pass named that you have neither kept nor rejected. Each is one click from a real template or a tombstone.'],
+  ambiguous:['ambiguous','the appearance match is strong enough to be somebody on file, but too close between two of them for the machine to call. Exactly what the automatic tier refuses — and the most informative click available, because your eye can settle it and it cannot.'],
+  stale:['stale templates','visits whose best candidate is an individual nobody has confirmed lately. Confirming one refreshes the template the next week of matching stands on.'],
+};
+function reidModesHTML(q){
+  const modes=q.modes||['recent'];
+  const tabs=modes.map(m=>{
+    const [label,tip]=REID_MODE_LABELS[m]||[m,''];
+    const on=m===q.mode;
+    return `<button class="gear" onclick="reidSetMode(${jarg(m)})" title="${esc(tip)}" style="${on?'background:rgba(120,200,255,.18);border-color:rgba(120,200,255,.5);font-weight:600':''}">${esc(label)}${on?` · ${q.n_matched}`:''}</button>`;
+  }).join(' ');
+  const from=(q.n_matched?q.offset+1:0), to=Math.min(q.offset+q.limit,q.n_matched);
+  const prev=q.offset>0?`<button class="gear" onclick="reidPage(-1)">← newer</button>`:'';
+  const next=(q.offset+q.limit)<q.n_matched?`<button class="gear" onclick="reidPage(1)">older →</button>`:'';
+  const pager=q.n_matched?`<span class="lbl" style="opacity:.7">${from}–${to} of ${q.n_matched}</span> ${prev} ${next}`:'';
+  return `<div id="reid-modes" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 10px">${tabs}
+    <span style="flex:1"></span>${pager}</div>`;
+}
 function reidQueueHTML(q){
-  if(!q||(!q.queue.length&&!q.bootstrap.length&&!q.refit)) return '';
+  if(!q) return '';
+  q={...q, queue:q.queue||[], bootstrap:q.bootstrap||[]};
+  const hasFunnel=!!(q.funnel&&q.funnel.visits);
+  if(!q.queue.length&&!q.bootstrap.length&&!q.refit&&!hasFunnel) return '';
   REID_VISIT_CLIPS={};
   let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
+  html+=reidFunnelHTML(q.funnel);
   if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops aren't analysed for appearance yet — naming suggestions sharpen once the re-ID step has run (see the README's “Individual re-identification”).</p>`;
   if(q.bootstrap.length){
     html+=`<p class="lbl" style="opacity:.75;margin:4px 0 10px">Nothing confirmed yet, so here are the corpus' look-alike <b>visit groups</b> (each is probably one animal — your eye decides; skip the 2+-animal ones first pass). Naming a group confirms every visit in it.</p>`;
     html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${q.bootstrap.map(reidBootCard).join('')}</div>`;
   }
+  html+=reidFreshnessHTML(q.cast,q.stale_days);
   html+=reidRefitHTML(q.refit);
-  if(q.queue.length){
-    const cast=(q.cast||[]).map(c=>`<span class="flag"${c.n_auto?` title="${c.n_auto} recent visit${c.n_auto>1?'s':''} auto-named ${esc(c.name)} by the nightly pass — ✓/✗ them on the cards below"`:''}>${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}${c.n_auto?` <span style="opacity:.65">+${c.n_auto} auto</span>`:''}</span>`).join(' ');
-    if(cast) html+=`<h2 class="sec">Visit-by-Visit <span class="n">${q.queue.length} recent</span></h2><div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
-    html+=`<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`;
+  const cast=(q.cast||[]).map(c=>`<span class="flag"${c.n_auto?` title="${c.n_auto} recent visit${c.n_auto>1?'s':''} auto-named ${esc(c.name)} by the nightly pass — ✓/✗ them on the cards below"`:''}${c.status==='departed'?' style="opacity:.7"':''}>${esc(c.name)} · ${c.n_visits} visit${c.n_visits>1?'s':''}${c.n_auto?` <span style="opacity:.65">+${c.n_auto} auto</span>`:''}${c.status==='departed'?` <span style="opacity:.65">· moved on${c.departed_on?' '+esc(c.departed_on):''}</span>`:''}</span>`).join(' ');
+  if(cast||q.queue.length){
+    const [label]=REID_MODE_LABELS[q.mode]||['recent'];
+    html+=`<h2 class="sec">Visit-by-Visit <span class="n">${esc(label)}</span></h2>`;
+    if(cast) html+=`<div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
+    html+=reidModesHTML(q);
+    html+=q.queue.length
+      ? `<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`
+      : `<p class="empty">Nothing in this slice${q.offset?' — try the newer page':''}. That is a real answer: it means there is nothing of this kind left to review.</p>`;
   }
   return html;
 }
@@ -1465,6 +1628,17 @@ async function reidConfirm(vid,name,clear,reject){
       body:JSON.stringify({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
     if(r.error){ restore(); alert(r.error); return; }
     loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
+  }catch(e){ restore(); connFail(); }
+}
+/* Undo a "✗ not them". Clearing WITHOUT reject wipes the tombstone (individual_source goes back
+   to NULL), which is what puts the visit back in play for the nightly pass. */
+async function reidUnreject(vid){
+  const restore=busyBtn();
+  try{
+    const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({visit_id:vid,name:null,reject:false})}).then(r=>r.json());
+    if(r.error){ restore(); alert(r.error); return; }
+    loadIndividuals();
   }catch(e){ restore(); connFail(); }
 }
 async function reidNameGroup(i){

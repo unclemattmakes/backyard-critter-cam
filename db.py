@@ -72,7 +72,21 @@ CREATE TABLE IF NOT EXISTS detections (
     -- "How good a shot is this?" Image-derived (sharpness x night-eyeshine boost; see quality.py),
     -- so the dashboard can lead a visit with its CUTEST/sharpest frame, not just the most confident
     -- one. NULL until scored (live at capture time, or backfilled by `python quality.py`).
-    crop_quality        REAL
+    crop_quality        REAL,
+
+    -- WHEN individual_id was last written onto this crop (local ISO 8601 w/ offset). Every OTHER
+    -- timestamp in this schema is an OBSERVATION time -- when the animal was in front of the
+    -- camera -- so before this column there was no way to ask when a LABEL was applied. Two things
+    -- need it: label VELOCITY (grouping individual_source='human' by week otherwise groups by when
+    -- the animal visited, and would move even in a week nobody labelled anything), and any bound on
+    -- the confirmation bias that caps every accuracy number in docs/identity-eval-2026-08-05.md
+    -- (the confirmed corpus was built by a human agreeing with matches the model proposed; sizing
+    -- that needs to know which labels landed after which suggestions).
+    -- Written by every writer of individual_id: label_visit, apply_visit_label, set_individual,
+    -- set_individual_bulk, rename_individual -- including a CLEAR/reject, whose time is exactly what
+    -- a bias measurement wants. Additive and backfilled to NULL: every label written before
+    -- 2026-08-05 has no stamp and NOTHING may assume this is set.
+    labelled_at         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_timestamp  ON detections(timestamp);
@@ -112,7 +126,21 @@ CREATE TABLE IF NOT EXISTS visits (
     ended_at        TEXT    NOT NULL,   -- last detection's timestamp; dwell = ended-started.
     detection_count INTEGER NOT NULL,   -- crops in the visit (a rough "how long / how active").
     max_confidence  REAL,               -- best detector score in the visit.
-    representative_detection_id INTEGER REFERENCES detections(id)   -- the most readable crop.
+    representative_detection_id INTEGER REFERENCES detections(id),  -- the most readable crop.
+
+    -- How decisive the species vote was: (winner - runner-up) / total vote weight, 0..1. 1.0 = every
+    -- crop agreed, ~0 = a coin flip that got silently committed. Species labels GATE the re-ID
+    -- gallery (a raccoon relabelled to opossum can never be matched to Stan), so a near-tie is a
+    -- thing to surface, not to bury. NULL when no crop in the visit carries a species.
+    species_margin  REAL,
+
+    -- 1 when a human live-logged CONFLICTING names over a span overlapping this visit (see
+    -- sighting_conflict_groups): "Clippy", then "Clippy Friend", then "Stan" over the same two
+    -- crops in 33 seconds. Either two animals were present or the human corrected themselves, and
+    -- nothing in the data can tell which -- so the visit is flagged rather than trusted as a
+    -- single-animal template. 1 = conflict, 0 = checked and clean, NULL = never computed (a visit
+    -- written by something other than visits.build_visits, or built before this column existed).
+    sighting_conflict INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_visits_started ON visits(started_at);
 CREATE INDEX IF NOT EXISTS idx_visits_source  ON visits(source);
@@ -217,9 +245,51 @@ CREATE TABLE IF NOT EXISTS live_sightings (
     span_end    TEXT,                        -- last detection of the span.
     names       TEXT    NOT NULL,            -- JSON array of individuals present, e.g. ["Notch","Elliot"].
     stamped     INTEGER NOT NULL DEFAULT 0,  -- crops whose individual_id this set (solo case); 0 for co-presence.
-    note        TEXT                         -- optional free-text remark.
+    note        TEXT,                        -- optional free-text remark.
+
+    -- SUPERSEDE, not duplicate. Re-logging a span that is already logged used to leave BOTH rows
+    -- standing while each solo stamp overwrote the last, so the stored label was simply whatever
+    -- was typed last and nothing recorded that a correction had happened. Now the older row is
+    -- marked here (kept, never deleted -- this is ground truth, and the correction SEQUENCE is
+    -- itself signal) and the newest row is the live one. NULL on every row logged before
+    -- 2026-08-05 and on every row nothing has re-logged: absence of a mark is NOT absence of a
+    -- conflict, which is why sighting_conflict_groups DERIVES conflicts from the spans rather than
+    -- reading these columns.
+    superseded_at TEXT,                      -- when it was superseded (local ISO 8601 w/ offset).
+    superseded_by INTEGER REFERENCES live_sightings(id)   -- the sighting that replaced it.
 );
 CREATE INDEX IF NOT EXISTS idx_live_sightings_observed ON live_sightings(observed_at);
+
+-- THE ROSTER (2026-08-05). Animals move on. One of this yard's raccoons was last photographed on
+-- 2026-06-30 and simply never came back -- but its 46 confirmed templates stayed in the matcher,
+-- and at the operating point the identity evaluation recommends, the auto tier proposed writing
+-- that name onto two visits three days AFTER the animal stopped existing here. Almost certainly a
+-- different raccoon, matched against a dead template set.
+--
+-- No evaluation can catch that class of error: leave-one-visit-out scores against the LABELS, and
+-- a departed animal's labels simply stop, so the probe set contains no example of "you named an
+-- animal that no longer lives here". It is structurally invisible to measurement, which is why it
+-- needs a fact from the human rather than a threshold. (A recency gate on template age WAS tried
+-- and measured: it made the wrong-name rate WORSE, 0.119 -> 0.137, while cutting coverage
+-- 18.0% -> 16.1%. Staleness is not departure.)
+--
+-- There is no `individuals` table -- identity lives as free text in detections.individual_id and
+-- visits.individual_id -- so this is a small side table keyed by that same name, holding only what
+-- a human can actually know. It is INERT for everything except what the machine WRITES: a departed
+-- individual is still ranked, still suggested, still a template, still on every surface. Matt may
+-- well decide an unreviewed June visit is that animal, and he should be able to.
+CREATE TABLE IF NOT EXISTS individual_status (
+    name           TEXT PRIMARY KEY COLLATE NOCASE,  -- matches detections.individual_id (free text).
+    status         TEXT NOT NULL,        -- 'resident' (the default for anyone absent here) | 'departed'.
+    -- The LAST DAY the individual was resident, 'YYYY-MM-DD'. A date, not a boolean, because
+    -- "last seen 2026-06-30" is the fact the human actually holds, and it keeps the guard narrow:
+    -- a visit that STARTED ON OR BEFORE this date may still be auto-named (those visits happened
+    -- while the animal was here), and only later ones are refused. NULL means departed with no date
+    -- known -- read as "fail closed", no auto-name at any time (see auto_assign's `departed` skip).
+    effective_date TEXT,
+    note           TEXT,                 -- optional free text ("last seen 06-30, kits stayed").
+    updated_at     TEXT NOT NULL         -- when this row was last written (local ISO 8601 w/ offset).
+);
 """
 
 
@@ -454,17 +524,26 @@ def clear_visits(conn: sqlite3.Connection) -> None:
 def insert_visit(conn: sqlite3.Connection, *, source: str, species: Optional[str],
                  individual_id: Optional[str], started_at: str, ended_at: str,
                  detection_count: int, max_confidence: Optional[float],
-                 representative_detection_id: Optional[int]) -> int:
-    """Phase 4: write one collapsed visit event; returns its new id."""
+                 representative_detection_id: Optional[int],
+                 species_margin: Optional[float] = None,
+                 sighting_conflict: Optional[bool] = None) -> int:
+    """Phase 4: write one collapsed visit event; returns its new id.
+
+    `species_margin` (how decisive the species vote was) and `sighting_conflict` (a human logged
+    conflicting names over this span) are optional so every existing caller keeps working and a
+    visit written without them is honestly NULL rather than falsely confident."""
     cur = conn.execute(
         """
         INSERT INTO visits (source, species, individual_id, started_at, ended_at,
-                            detection_count, max_confidence, representative_detection_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            detection_count, max_confidence, representative_detection_id,
+                            species_margin, sighting_conflict)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (source, species, individual_id, started_at, ended_at, int(detection_count),
          None if max_confidence is None else float(max_confidence),
-         None if representative_detection_id is None else int(representative_detection_id)),
+         None if representative_detection_id is None else int(representative_detection_id),
+         None if species_margin is None else float(species_margin),
+         None if sighting_conflict is None else int(bool(sighting_conflict))),
     )
     return int(cur.lastrowid)
 
@@ -536,6 +615,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     "AND name='clip_track_embeddings'").fetchone():
         if "rep_crop" not in {r[1] for r in conn.execute("PRAGMA table_info(clip_track_embeddings)")}:
             conn.execute("ALTER TABLE clip_track_embeddings ADD COLUMN rep_crop TEXT")
+    # Label integrity (2026-08-05, docs/identity-eval-2026-08-05.md phase 0 + C3/C5). All FOUR are
+    # nullable adds backfilled to NULL -- no existing row is rewritten and no reader may assume a
+    # value is present (see each column's comment in SCHEMA).
+    if "labelled_at" not in cols:
+        # WHEN a label was applied, as opposed to when the animal was seen. Deliberately NOT
+        # backfilled: there is no honest value for the 21,110 detections labelled before this
+        # existed, and inventing one (e.g. the observation time) would silently produce a
+        # label-velocity curve that is really the visit curve -- the exact confusion the column
+        # exists to end.
+        conn.execute("ALTER TABLE detections ADD COLUMN labelled_at TEXT")
+    v_cols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
+    if v_cols and "species_margin" not in v_cols:
+        conn.execute("ALTER TABLE visits ADD COLUMN species_margin REAL")
+    if v_cols and "sighting_conflict" not in v_cols:
+        conn.execute("ALTER TABLE visits ADD COLUMN sighting_conflict INTEGER")
+    ls_cols = {r[1] for r in conn.execute("PRAGMA table_info(live_sightings)")}
+    if ls_cols and "superseded_at" not in ls_cols:
+        conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_at TEXT")
+    if ls_cols and "superseded_by" not in ls_cols:
+        conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_by INTEGER")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
@@ -671,9 +770,12 @@ def load_embeddings(conn: sqlite3.Connection, model: str, *, species: Optional[s
 
 def set_individual(conn: sqlite3.Connection, detection_id: int,
                    individual_id: Optional[str], source: Optional[str] = "human") -> None:
-    """Phase 3: assign (or clear, with None) the individual a crop belongs to."""
-    conn.execute("UPDATE detections SET individual_id = ?, individual_source = ? WHERE id = ?",
-                 (individual_id, None if individual_id is None else source, int(detection_id)))
+    """Phase 3: assign (or clear, with None) the individual a crop belongs to. Stamps labelled_at
+    (WHEN, as opposed to every other timestamp here, which is a WHEN-SEEN)."""
+    conn.execute("UPDATE detections SET individual_id = ?, individual_source = ?, labelled_at = ? "
+                 "WHERE id = ?",
+                 (individual_id, None if individual_id is None else source, now_local_iso(),
+                  int(detection_id)))
     conn.commit()
 
 
@@ -681,10 +783,13 @@ def set_individual_bulk(conn: sqlite3.Connection, detection_ids: Sequence[int],
                         individual_id: Optional[str], source: Optional[str] = "human") -> int:
     """Assign one individual to many crops at once (naming a whole cluster). Returns the count.
     `source` records who decided: 'human' (a confirmation -- feeds the suggestion templates) or
-    'cluster' (a reid.py look-alike proposal -- never feeds back into suggestions)."""
+    'cluster' (a reid.py look-alike proposal -- never feeds back into suggestions). Stamps
+    labelled_at with the time of the write."""
     src = None if individual_id is None else source
-    conn.executemany("UPDATE detections SET individual_id = ?, individual_source = ? WHERE id = ?",
-                     [(individual_id, src, int(i)) for i in detection_ids])
+    at = now_local_iso()
+    conn.executemany("UPDATE detections SET individual_id = ?, individual_source = ?, "
+                     "labelled_at = ? WHERE id = ?",
+                     [(individual_id, src, at, int(i)) for i in detection_ids])
     conn.commit()
     return len(detection_ids)
 
@@ -694,10 +799,11 @@ def rename_individual(conn: sqlite3.Connection, old: str, new: Optional[str]) ->
     groups the same `new` MERGES them -- that's a feature: several look-alike clusters often turn
     out to be one animal. `new=None` clears the label back to unassigned. Returns rows changed.
     A rename is a human act: the renamed crops become source='human' (a cleared label loses its
-    source too)."""
+    source too) and labelled_at moves to now -- the name on these crops was decided today."""
     cur = conn.execute(
-        "UPDATE detections SET individual_id = ?, individual_source = ? WHERE individual_id = ?",
-        (new, None if new is None else "human", old))
+        "UPDATE detections SET individual_id = ?, individual_source = ?, labelled_at = ? "
+        "WHERE individual_id = ?",
+        (new, None if new is None else "human", now_local_iso(), old))
     conn.commit()
     return cur.rowcount
 
@@ -714,7 +820,10 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     auto-assign) never does. `reject=True` (with individual_id=None) is the human's "leave this
     unnamed" verdict: the id clears but individual_source keeps `source` ('human'), which is the
     tombstone the auto-assign pass respects -- without it, clearing a wrong auto name would just
-    invite the next nightly run to stamp it again."""
+    invite the next nightly run to stamp it again.
+
+    Stamps detections.labelled_at with the time of THIS write -- including a clear/reject, whose
+    time is exactly what a confirmation-bias measurement wants (see the column's SCHEMA comment)."""
     v = conn.execute("SELECT species FROM visits WHERE id = ?", (int(visit_id),)).fetchone()
     if v is None:
         return 0
@@ -722,8 +831,10 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     where = "visit_id = ?" + ("" if sp is None else " AND species = ?")
     params = [int(visit_id)] + ([] if sp is None else [sp])
     cur = conn.execute(
-        f"UPDATE detections SET individual_id = ?, individual_source = ? WHERE {where}",
-        [individual_id, None if (individual_id is None and not reject) else source] + params)
+        f"UPDATE detections SET individual_id = ?, individual_source = ?, labelled_at = ? "
+        f"WHERE {where}",
+        [individual_id, None if (individual_id is None and not reject) else source,
+         now_local_iso()] + params)
     conn.execute("UPDATE visits SET individual_id = ? WHERE id = ?",
                  (individual_id, int(visit_id)))
     conn.commit()
@@ -750,7 +861,9 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
                             (a stray crow crop in a raccoon visit keeps its own identity);
                             name=None clears; omit `name` to leave identity untouched.
 
-    Species is applied first, so naming after a correction scopes to the corrected species. Any
+    Species is applied first, so naming after a correction scopes to the corrected species. Naming
+    also stamps detections.labelled_at (WHEN the label was applied -- record_live_sighting's solo
+    stamp routes through here, so live confirmations are timestamped too). Any
     `visits` rows the detections belong to are synced (species/individual_id) so the queue and the
     Explorer agree. Returns a small summary dict. Operates via WHERE clauses (not id lists) so a
     1000-crop visit never hits SQLite's bound-variable limit."""
@@ -804,12 +917,14 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
             f"GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1", params).fetchone()
         dominant = row[0] if row else None
         src = None if name is None else "human"
+        at = now_local_iso()      # WHEN the label was applied (detections.labelled_at)
         if dominant is None:
-            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ? "
-                         f"WHERE {where}", [name, src] + params)
+            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
+                         f"labelled_at = ? WHERE {where}", [name, src, at] + params)
         else:
-            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ? "
-                         f"WHERE {where} AND species = ?", [name, src] + params + [dominant])
+            conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
+                         f"labelled_at = ? WHERE {where} AND species = ?",
+                         [name, src, at] + params + [dominant])
 
     # Sync the visits-table rows these detections belong to (subquery, no big IN list).
     vsub = f"id IN (SELECT DISTINCT visit_id FROM detections WHERE {where} AND visit_id IS NOT NULL)"
@@ -860,7 +975,136 @@ def rejected_visit_ids(conn: sqlite3.Connection, species: Optional[str] = None) 
         f"SELECT DISTINCT visit_id FROM detections WHERE {where}", params)}
 
 
+# ---------------------------------------------------------------------------
+# THE ROSTER: who still lives here. See the individual_status table comment for why this is a
+# human-entered fact and not something the matcher could ever infer for itself.
+# ---------------------------------------------------------------------------
+
+INDIVIDUAL_STATUSES = ("resident", "departed")
+
+
+def as_date(value) -> Optional[str]:
+    """Normalize a user/API-supplied day to 'YYYY-MM-DD', accepting either a bare date or any of
+    the project's ISO timestamps (whose first 10 characters ARE the local calendar day -- the same
+    slice every day-keyed surface in this codebase uses). None/'' -> None. Raises ValueError on
+    anything else, so a typo becomes a 400 rather than a silently inert guard."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    head = s[:10]
+    try:
+        datetime.strptime(head, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"date must be YYYY-MM-DD, got {value!r}")
+    return head
+
+
+def set_individual_status(conn: sqlite3.Connection, name: str, *, status: str = "departed",
+                          effective_date=None, note: Optional[str] = None,
+                          updated_at: Optional[str] = None) -> dict:
+    """Record what the human knows about an individual's residency: 'departed' (with the last day
+    it was here) or 'resident' (the default state, written back to UNDO a departure).
+
+    The row is kept either way rather than deleted on 'resident' -- updated_at then says when the
+    call was reversed, and an empty table stays honest about meaning "nobody has said anything",
+    not "everyone was checked and is here". Returns the stored row."""
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("name is required")
+    st = str(status or "").strip().lower()
+    if st not in INDIVIDUAL_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(INDIVIDUAL_STATUSES)}")
+    day = as_date(effective_date)
+    note_clean = (str(note).strip() or None) if note else None
+    at = updated_at or now_local_iso()
+    conn.execute(
+        """INSERT INTO individual_status (name, status, effective_date, note, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET status = excluded.status,
+                                           effective_date = excluded.effective_date,
+                                           note = excluded.note,
+                                           updated_at = excluded.updated_at""",
+        (nm, st, day, note_clean, at))
+    conn.commit()
+    return {"name": nm, "status": st, "effective_date": day, "note": note_clean, "updated_at": at}
+
+
+def individual_statuses(conn: sqlite3.Connection) -> dict:
+    """{name: {name, status, effective_date, note, updated_at}} for every individual a human has
+    said something about. Empty dict when the table doesn't exist -- a read-only clone of a DB no
+    writer has migrated must not explode on a reporting surface (same contract as
+    _live_sighting_rows)."""
+    try:
+        rows = conn.execute("SELECT name, status, effective_date, note, updated_at "
+                            "FROM individual_status").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    out = {}
+    for r in rows:
+        nm, st, day, note, at = tuple(r)[:5]
+        out[nm] = {"name": nm, "status": st, "effective_date": day, "note": note,
+                   "updated_at": at}
+    return out
+
+
+def departed_individuals(conn: sqlite3.Connection) -> dict:
+    """{casefolded name: effective_date or None} for the individuals a human has marked departed.
+    Case-folded because the names are free text typed by hand and "notch" is "Notch"; the value is
+    the last day the animal was resident (None = no date given, i.e. always departed)."""
+    return {str(s["name"]).strip().casefold(): s["effective_date"]
+            for s in individual_statuses(conn).values() if s["status"] == "departed"}
+
+
 _MAX_SIGHTING_NAMES = 12   # a "who's here now" log of more than a dozen named animals isn't real.
+
+
+def _sighting_names(names_json) -> list:
+    """Decode a live_sightings.names JSON array, tolerating a corrupt/NULL value (-> [])."""
+    try:
+        return json.loads(names_json) if names_json else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _name_key(names) -> frozenset:
+    """Case-insensitive identity of a name SET -- the unit two sightings are compared on. Order and
+    case are noise ("stan" typed twice is one claim); membership is the claim."""
+    return frozenset(str(n).strip().casefold() for n in (names or []) if str(n).strip())
+
+
+def _live_sighting_rows(conn: sqlite3.Connection, source: Optional[str] = None) -> list:
+    """Every live sighting as a dict, oldest first, with its span resolved by the module's
+    convention (a row with no span falls back to its observed_at instant). Empty list on a DB
+    no writer has migrated yet -- reporting surfaces must not explode on a read-only clone."""
+    where, params = ("WHERE source = ?", [source]) if source else ("", [])
+    base = "SELECT id, source, observed_at, span_start, span_end, names, stamped"
+    rows, has_supersede = None, True
+    for cols, has_supersede in ((base + ", superseded_at, superseded_by", True), (base, False)):
+        try:
+            rows = conn.execute(f"{cols} FROM live_sightings {where} ORDER BY id", params).fetchall()
+            break
+        except sqlite3.OperationalError:
+            # First failure: a READ-ONLY connection to a DB no writer has migrated yet -- the table
+            # exists but the supersede columns don't, and a read-only conn cannot add them. Retry
+            # without them (every row then reads as never-superseded, which is the truth for a DB
+            # that has never run the supersede path). Second failure: no live_sightings at all.
+            rows = None
+    if rows is None:
+        return []
+    out = []
+    for r in rows:
+        t = tuple(r)
+        sid, src, observed, s0, s1, names_json, stamped = t[:7]
+        sup_at, sup_by = (t[7], t[8]) if has_supersede else (None, None)
+        names = _sighting_names(names_json)
+        out.append({"id": sid, "source": src, "observed_at": observed,
+                    "span_start": s0, "span_end": s1, "names": names,
+                    "key": _name_key(names), "stamped": stamped,
+                    "start": s0 or observed, "end": s1 or observed,
+                    "superseded_at": sup_at, "superseded_by": sup_by})
+    return out
 
 
 def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
@@ -874,7 +1118,22 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
     templates grow from it. PAIR (two or more): record the co-presence note ONLY, with NO stamp
     -- one name on two animals mislabels both (the pair gotcha); the names ride here as ground
     truth the un-blend step consumes. De-dupes names case-insensitively, keeping first-seen order.
-    Returns {sighting_id, stamped, multi, names}."""
+
+    RE-LOGGING A SPAN SUPERSEDES IT (2026-08-05). Live sightings are typed in the moment and get
+    corrected in the moment: ids 25/26/27 logged "Clippy", then "Clippy Friend", then "Stan" over
+    the SAME two crops within 33 seconds, each solo stamp overwriting the last, so the stored label
+    was simply whatever was typed last and the DB recorded nothing about the correction. Now every
+    still-live sighting whose span overlaps this one on this source is MARKED superseded (kept, not
+    deleted -- it is ground truth, and the correction sequence is itself signal), and if any of them
+    named someone DIFFERENT the return says so: conflicting names over one span mean either two
+    animals or a human changing their mind, and the data cannot tell which, so the overlapping
+    visits are flagged multi-animal (visits.sighting_conflict, stamped by visits.build_visits)
+    rather than trusted as a single-animal template.
+
+    The stamping asymmetry is deliberately UNCHANGED: the newest solo name still stamps the span
+    (the human's latest word is their best word), and a pair still stamps nothing.
+
+    Returns {sighting_id, stamped, multi, names, superseded: [ids], conflict: bool}."""
     ordered, seen = [], set()
     for n in (names or []):
         s = str(n).strip()
@@ -885,7 +1144,17 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
         if len(ordered) >= _MAX_SIGHTING_NAMES:
             break
     if not ordered:
-        return {"error": "no names", "sighting_id": None, "stamped": 0, "multi": False, "names": []}
+        return {"error": "no names", "sighting_id": None, "stamped": 0, "multi": False,
+                "names": [], "superseded": [], "conflict": False}
+
+    observed = observed_at or now_local_iso()
+    s0, s1 = span_start or observed, span_end or observed
+
+    # Who is this re-logging? Every not-yet-superseded sighting on this source whose span overlaps.
+    prior = [p for p in _live_sighting_rows(conn, source)
+             if p["superseded_at"] is None and _spans_overlap(p["start"], p["end"], s0, s1)]
+    key = _name_key(ordered)
+    conflict = any(p["key"] != key for p in prior)
 
     multi = len(ordered) > 1
     stamped = 0
@@ -895,14 +1164,107 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
                                 name=ordered[0])
         stamped = int(res.get("detections") or 0)
 
-    observed = observed_at or now_local_iso()
     note_clean = (str(note).strip() or None) if note else None
     cur = conn.execute(
         "INSERT INTO live_sightings (source, observed_at, span_start, span_end, names, stamped, note) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (source, observed, span_start, span_end, json.dumps(ordered), int(stamped), note_clean))
+    sid = int(cur.lastrowid)
+    if prior:
+        conn.executemany(
+            "UPDATE live_sightings SET superseded_at = ?, superseded_by = ? WHERE id = ?",
+            [(observed, sid, int(p["id"])) for p in prior])
     conn.commit()
-    return {"sighting_id": cur.lastrowid, "stamped": stamped, "multi": multi, "names": ordered}
+    return {"sighting_id": sid, "stamped": stamped, "multi": multi, "names": ordered,
+            "superseded": [int(p["id"]) for p in prior], "conflict": conflict}
+
+
+def sighting_conflict_groups(conn: sqlite3.Connection, source: Optional[str] = None) -> list:
+    """Groups of live sightings that overlap in time on one source but do NOT agree on who was
+    there -- the DB's noisiest ground truth, made visible.
+
+    DERIVED from the spans on every read, never read off a stored flag, because the known groups in
+    the live DB were all logged before any flag existed. Rows are joined into a group transitively
+    (a overlaps b, b overlaps c => one group) and a group is reported only when its rows carry two
+    or more DISTINCT name sets.
+
+    Measured 2026-08-05 against the live DB: SEVEN groups, not the five
+    docs/identity-eval-2026-08-05.md lists. It finds all five -- (6,7), (8,9,10), (19,20),
+    (25,26,27) with (24) correctly joined to it, (40,41,42) -- plus two the eval's single-name
+    reading skipped, and those two are the dangerous kind: (12,13) logged the pair Stan+Pedro and
+    then stamped 77 crops of that same span solo "Pedro", and (46,47) stamped 8 crops solo "Stan"
+    over the span the human then logged as Stan + three kits (the 2026-07-31 kit mis-stamp). A solo
+    row overlapping a PAIR row is a conflict too: one name went onto crops the human said held two
+    animals.
+
+    This is the gap `individuals.multi_name_sighting_spans` cannot see: it reads rows carrying 2+
+    names, and a conflict arrives as several SINGLE-name rows. Detecting it needs the comparison
+    ACROSS rows, which is what this does.
+
+    Each group: {source, span_start, span_end, sighting_ids, names, name_sets, resolved} --
+    `resolved` is True when every row but the newest carries a supersede mark, i.e. the correction
+    sequence has been recorded rather than left as several equally-live claims (the "5 -> 0
+    unresolved" metric in docs/identity-eval-2026-08-05.md)."""
+    rows = _live_sighting_rows(conn, source)
+    by_source: dict = {}
+    for r in rows:
+        by_source.setdefault(r["source"], []).append(r)
+
+    groups = []
+    for src, items in by_source.items():
+        # Transitive overlap grouping. Sightings are few (tens), so an O(n^2) sweep is the boring
+        # choice; it also stays correct with out-of-order / open-ended spans, which a sort would not.
+        unassigned = list(items)
+        while unassigned:
+            seed = unassigned.pop(0)
+            comp = [seed]
+            changed = True
+            while changed:
+                changed = False
+                for cand in list(unassigned):
+                    if any(_spans_overlap(cand["start"], cand["end"], m["start"], m["end"])
+                           for m in comp):
+                        comp.append(cand)
+                        unassigned.remove(cand)
+                        changed = True
+            keys = {m["key"] for m in comp}
+            if len(keys) < 2:
+                continue                      # everyone agreed -- a re-log, not a conflict
+            comp.sort(key=lambda m: m["id"])
+            # Span of the whole group by INSTANT (parse_local), so ISO strings with different UTC
+            # offsets -- a DST seam inside one evening -- can't reorder them lexically. Unparseable
+            # timestamps are dropped rather than guessed at.
+            starts = [(p, m["start"]) for m in comp if (p := parse_local(m["start"])) is not None]
+            ends = [(p, m["end"]) for m in comp if (p := parse_local(m["end"])) is not None]
+            lo = min(starts)[1] if starts else None
+            hi = max(ends)[1] if ends else None
+            names: list = []
+            seen_n: set = set()
+            for m in comp:
+                for n in m["names"]:
+                    k = str(n).casefold()
+                    if k not in seen_n:
+                        seen_n.add(k)
+                        names.append(n)
+            groups.append({
+                "source": src, "span_start": lo, "span_end": hi,
+                "sighting_ids": [int(m["id"]) for m in comp],
+                "names": names,
+                "name_sets": [sorted(m["key"]) for m in comp],
+                "resolved": all(m["superseded_at"] is not None for m in comp[:-1]),
+            })
+    groups.sort(key=lambda g: (g["source"], g["sighting_ids"][0]))
+    return groups
+
+
+def conflicting_sighting_spans(conn: sqlite3.Connection) -> list:
+    """(source, span_start, span_end) per conflicting sighting GROUP -- deliberately the same shape
+    `individuals.multi_name_sighting_spans` returns, so a caller can concatenate the two lists and
+    treat "the human logged two different names over this span" exactly like "the human logged two
+    names in one row". visits.build_visits uses it to stamp visits.sighting_conflict."""
+    return [(g["source"], g["span_start"], g["span_end"])
+            for g in sighting_conflict_groups(conn)
+            if g["span_start"] and g["span_end"]]
 
 
 def recent_live_sightings(conn: sqlite3.Connection, *, source: Optional[str] = None,
