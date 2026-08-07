@@ -127,17 +127,20 @@ def _shot_score(r) -> float:
 # Pure time math -- no cv2/torch, like the rest of stats.py.
 # ---------------------------------------------------------------------------
 
-def load_clips(conn) -> list:
+def load_clips(conn, include_pruned: bool = False) -> list:
     """Every PLAYABLE clip, parsed once for in-memory time-overlap matching. Each entry carries
     the parsed span (sdt/edt) plus the URL-friendly fields the dashboard needs. Soft-pruned clips
     (video deleted for the disk budget, row kept for its derived tracks/embeddings) are excluded
     -- this feeds watch/play surfaces, and a play button on a missing file is a broken promise.
-    [] if there are no clips."""
+    `include_pruned=True` keeps them, flagged `archived` (backup.py zipped the video before any
+    prune could touch it), so the individual profile can offer the archived copy instead of
+    pretending the visit was never filmed. [] if there are no clips."""
     try:
         rows = conn.execute(
-            "SELECT source, clip_path, started_at, ended_at, fps, width, height, "
-            "frame_count, detection_count, max_confidence FROM clips "
-            "WHERE pruned_at IS NULL ORDER BY started_at"
+            "SELECT id, source, clip_path, started_at, ended_at, fps, width, height, "
+            "frame_count, detection_count, max_confidence, pruned_at FROM clips "
+            + ("" if include_pruned else "WHERE pruned_at IS NULL ")
+            + "ORDER BY started_at"
         ).fetchall()
     except Exception:
         return []          # an old DB without the clips table -> just no clips to link
@@ -152,20 +155,27 @@ def load_clips(conn) -> list:
         else:
             seconds = round((edt - sdt).total_seconds(), 1) if edt else None
         out.append({
-            "source": r["source"], "sdt": sdt, "edt": edt or sdt,
+            "id": r["id"], "source": r["source"], "sdt": sdt, "edt": edt or sdt,
             "clip_path": _web(r["clip_path"]), "start": r["started_at"], "seconds": seconds,
             "dets": r["detection_count"] or 0,
             "conf": round(r["max_confidence"], 3) if r["max_confidence"] is not None else None,
+            "archived": bool(r["pruned_at"]),
         })
     return out
 
 
 def _clip_out(c) -> dict | None:
-    """JSON-able view of a clip (drops the parsed datetimes used only for matching)."""
+    """JSON-able view of a clip (drops the parsed datetimes used only for matching). `archived`
+    (and the id the archive route needs) is only emitted when set, so the everyday payloads --
+    which never contain pruned clips -- don't grow by two fields per clip."""
     if not c:
         return None
-    return {"clip_path": c["clip_path"], "start": c["start"], "seconds": c["seconds"],
-            "dets": c["dets"], "conf": c["conf"]}
+    out = {"clip_path": c["clip_path"], "start": c["start"], "seconds": c["seconds"],
+           "dets": c["dets"], "conf": c["conf"]}
+    if c.get("archived"):
+        out["archived"] = True
+        out["id"] = c.get("id")
+    return out
 
 
 def clips_overlapping(clips, source, start, end) -> list:
@@ -636,10 +646,12 @@ def species_crops(cfg, species: str, limit: int = 160) -> list:
         conn.close()
 
 
-def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limit=60) -> dict:
+def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limit=60,
+               individual=None) -> dict:
     """A filtered, paginated slice of detection crops (newest first) for the explorer drill-down.
     Filters (all optional, AND-combined): day='YYYY-MM-DD', species exact, start/end ISO timestamp
-    bounds. Returns {crops, total, offset, limit} so the UI can show "loaded of total"."""
+    bounds, individual exact (the phase-3 name stamped on the crop). Returns {crops, total,
+    offset, limit} so the UI can show "loaded of total"."""
     limit = max(1, min(int(limit), 200))      # clamp so a negative/huge ?limit can't dump the table
     offset = max(0, int(offset))
     conn = db.connect_readonly(cfg.db_path)
@@ -647,10 +659,11 @@ def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limi
         return {"crops": [], "total": 0, "offset": 0, "limit": limit}
     try:
         where, args = [], []
-        if day:     where.append("timestamp LIKE ?"); args.append(str(day) + "%")
-        if species: where.append("species = ?");      args.append(species)
-        if start:   where.append("timestamp >= ?");   args.append(start)
-        if end:     where.append("timestamp <= ?");   args.append(end)
+        if day:        where.append("timestamp LIKE ?");   args.append(str(day) + "%")
+        if species:    where.append("species = ?");        args.append(species)
+        if start:      where.append("timestamp >= ?");     args.append(start)
+        if end:        where.append("timestamp <= ?");     args.append(end)
+        if individual: where.append("individual_id = ?");  args.append(individual)
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         total = conn.execute(f"SELECT COUNT(*) FROM detections {clause}", args).fetchone()[0]
         rows = conn.execute(
@@ -723,6 +736,138 @@ def visits_page(cfg, day=None, limit=200) -> dict:
                 "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
             })
         return {"visits": out, "total": len(visits), "window": windowed}
+    finally:
+        conn.close()
+
+
+def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
+    """Everything the log holds about ONE named individual: every visit their name is stamped
+    into (via detections.visit_id -> the visits ledger), their photo count for the paged crop
+    grid, the clips that rolled during those visits -- INCLUDING soft-pruned ones, flagged
+    `archived` so the dashboard can offer the backup copy -- plus reference photos (refcam),
+    who they showed up with, and how the stamps got there (human / auto tier / clustering).
+
+    Visit dicts are shaped exactly like visits_page's so the dashboard renders both with the
+    same card. The visit list is capped at `visit_limit` (newest first); `n_visits` is the true
+    total. Crops stamped with the name but not yet filed into a visit (the ledger refreshes on
+    label passes and shutdown, so the newest visit can lag) are counted as `unfiled`."""
+    name = (name or "").strip()
+    conn = db.connect_readonly(cfg.db_path) if name else None
+    if conn is None:
+        return {"found": False, "name": name}
+    try:
+        head = conn.execute(
+            "SELECT COUNT(*) n, MIN(timestamp) first_seen, MAX(timestamp) last_seen "
+            "FROM detections WHERE individual_id = ?", (name,)).fetchone()
+        if not head or not head["n"]:
+            return {"found": False, "name": name}
+
+        species_mix = [{"species": r["sp"], "n": r["n"]} for r in conn.execute(
+            "SELECT COALESCE(species, detection_class) sp, COUNT(*) n FROM detections "
+            "WHERE individual_id = ? GROUP BY sp ORDER BY n DESC", (name,))]
+        stamp_mix = {(r["s"] or "human"): r["n"] for r in conn.execute(
+            "SELECT individual_source s, COUNT(*) n FROM detections "
+            "WHERE individual_id = ? GROUP BY s", (name,))}
+        by_source = [{"source": r["source"], "n": r["n"]} for r in conn.execute(
+            "SELECT source, COUNT(*) n FROM detections WHERE individual_id = ? "
+            "GROUP BY source ORDER BY n DESC", (name,))]
+        unfiled = conn.execute(
+            "SELECT COUNT(*) FROM detections WHERE individual_id = ? AND visit_id IS NULL",
+            (name,)).fetchone()[0]
+
+        # Every crop of every visit the name appears in -- the co-present animals' crops too, so
+        # each visit's classes/companions/span reflect the whole visit, not just this animal.
+        rows = conn.execute(
+            "SELECT id, source, timestamp, detection_class, species, confidence, "
+            "species_confidence, crop_path, crop_quality, individual_id, visit_id, "
+            "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
+            "FROM detections WHERE visit_id IN "
+            "(SELECT DISTINCT visit_id FROM detections WHERE individual_id = ? "
+            " AND visit_id IS NOT NULL) ORDER BY timestamp", (name,)).fetchall()
+        clips = load_clips(conn, include_pruned=True)
+
+        grouped: dict = {}
+        for r in rows:
+            g = grouped.setdefault(r["visit_id"], {
+                "source": r["source"], "start": None, "end": None, "count": 0, "max_conf": 0.0,
+                "classes": Counter(), "individuals": Counter(),
+                "rep_crop": None, "rep_score": None,        # best shot of THIS individual
+                "any_crop": None, "any_score": None,        # fallback: best shot of the visit
+                "n_mine": 0,
+            })
+            dt = _parse(r["timestamp"])
+            if dt is not None:
+                g["start"] = dt if g["start"] is None else min(g["start"], dt)
+                g["end"] = dt if g["end"] is None else max(g["end"], dt)
+            g["count"] += 1
+            g["max_conf"] = max(g["max_conf"], r["confidence"] or 0.0)
+            g["classes"][r["species"] or r["detection_class"]] += 1
+            iid = r["individual_id"]
+            if iid:
+                g["individuals"][iid] += 1
+            score = _shot_score(r)
+            if g["any_score"] is None or score > g["any_score"]:
+                g["any_crop"], g["any_score"] = r["crop_path"], score
+            if iid == name:
+                g["n_mine"] += 1
+                if g["rep_score"] is None or score > g["rep_score"]:
+                    g["rep_crop"], g["rep_score"] = r["crop_path"], score
+
+        companions = Counter()
+        visits = []
+        for vid, g in grouped.items():
+            if g["start"] is None:
+                continue
+            title = g["classes"].most_common(1)[0][0] if g["classes"] else "animal"
+            for other in _named_of(g):
+                if other != name:
+                    companions[other] += 1
+            visits.append({
+                "visit_id": vid, "start": g["start"].isoformat(), "end": g["end"].isoformat(),
+                "source": g["source"], "count": g["count"], "n_mine": g["n_mine"],
+                "minutes": round((g["end"] - g["start"]).total_seconds() / 60.0, 1),
+                "max_conf": round(g["max_conf"], 3), "title": title,
+                "classes": dict(g["classes"].most_common()),
+                "individuals": _named_of(g),
+                "rep_crop": _web(g["rep_crop"] or g["any_crop"]),
+                "clips": [_clip_out(c) for c in
+                          clips_overlapping(clips, g["source"], g["start"], g["end"])],
+            })
+        visits.sort(key=lambda v: v["start"], reverse=True)
+        n_visits = len(visits)
+        visits = visits[:max(1, int(visit_limit))]
+
+        # Reference photos (refcam): the detector crops cut from Matt's phone shots -- served
+        # from reference_crops/; the raw originals live outside the project and are never served.
+        try:
+            refs = [{"crop_path": _web(r["crop_path"]), "captured_at": r["captured_at"],
+                     "kind": r["media_kind"] or "photo", "note": r["note"]}
+                    for r in conn.execute(
+                        "SELECT c.crop_path, r.captured_at, r.media_kind, r.note "
+                        "FROM identity_reference_crops c "
+                        "JOIN identity_references r ON r.id = c.reference_id "
+                        "WHERE r.individual_id = ? "
+                        "ORDER BY (r.captured_at IS NULL), r.captured_at, c.id", (name,))]
+        except Exception:
+            refs = []                       # an older DB without the reference tables
+
+        try:                        # statuses are keyed by the raw typed name; match nocase
+            status = next((s for n, s in db.individual_statuses(conn).items()
+                           if str(n).strip().casefold() == name.casefold()), None)
+        except Exception:
+            status = None
+
+        return {
+            "found": True, "name": name,
+            "species": species_mix[0]["species"] if species_mix else None,
+            "species_mix": species_mix, "stamp_mix": stamp_mix, "by_source": by_source,
+            "n_crops": head["n"], "first_seen": head["first_seen"], "last_seen": head["last_seen"],
+            "n_visits": n_visits, "unfiled": unfiled,
+            "companions": [{"name": k, "n_visits": v} for k, v in companions.most_common()],
+            "visits": visits,
+            "references": refs,
+            "status": status,
+        }
     finally:
         conn.close()
 

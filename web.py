@@ -12,13 +12,17 @@ restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/s
 """
 from __future__ import annotations
 
+import gzip
 import ipaddress
 import json
+import os
+import re
 import shutil
 import subprocess
 import threading
 import time
 import urllib.parse
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -410,6 +414,179 @@ def _web_clip(src: Path, clips_root: Path, cache_root: Path):
             return None
 
 
+# ---------------------------------------------------------------------------
+# API response cache. The dashboard polls /api/stats + /api/species every 6
+# seconds, and compute_stats is a full-table scan + visit clustering (~1.3s of
+# CPU at 130k detections) -- polling was most of what this box spent its day
+# on, on the same machine that runs the detector. Entries are keyed by a cheap
+# DB-content signature (size + mtime of the .db and its -wal), so an idle
+# database serves cached JSON indefinitely and any external write invalidates
+# it; while capture IS writing, the signature churns with every detection, so a
+# hold-down additionally caps rebuilds at one per _API_HOLD_S -- the Live tab
+# lags a busy visit by at most that. Label/name POSTs clear the whole cache
+# (do_POST), so a human correction always shows on the very next fetch.
+# ---------------------------------------------------------------------------
+
+_API_CACHE: dict = {}          # name -> (db_sig, built_at, payload)
+_api_cache_guard = threading.Lock()
+_API_HOLD_S = 10.0
+
+
+def _db_sig(cfg) -> tuple:
+    """(size, mtime_ns) of the database and its WAL -- changes whenever any writer commits
+    (WAL append) or a checkpoint runs. Two stats instead of a query: no connection needed."""
+    sig = []
+    for suffix in ("", "-wal"):
+        try:
+            st = os.stat(f"{cfg.db_path}{suffix}")
+            sig.append((st.st_size, st.st_mtime_ns))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
+def clear_api_cache() -> None:
+    with _api_cache_guard:
+        _API_CACHE.clear()
+
+
+def _cached(cfg, name: str, build, hold_s: float = _API_HOLD_S):
+    """`build()`'s result, rebuilt only when the DB signature changed AND the entry is older
+    than `hold_s`. One build at a time per name (the lock table), so two browsers polling in
+    step can't both pay for the same full-table scan."""
+    sig = _db_sig(cfg)
+
+    def fresh():
+        hit = _API_CACHE.get(name)
+        if hit is None:
+            return None
+        h_sig, built_at, payload = hit
+        return payload if (h_sig == sig or (time.time() - built_at) < hold_s) else None
+
+    with _api_cache_guard:
+        payload = fresh()
+    if payload is not None:
+        return payload
+    with _lock_for("api:" + name):
+        with _api_cache_guard:                     # another thread may have just built it
+            payload = fresh()
+        if payload is not None:
+            return payload
+        payload = build()
+        with _api_cache_guard:
+            if len(_API_CACHE) >= 64:              # bound it (per-individual profile keys)
+                _API_CACHE.pop(next(iter(_API_CACHE)), None)
+            _API_CACHE[name] = (_db_sig(cfg), time.time(), payload)
+        return payload
+
+
+# ---------------------------------------------------------------------------
+# Archived (soft-pruned) clips. backup.py zips each day of clips/ into
+# <backup_dest>/clips/ -- one zip per day (legacy flat layout) or per camera-day
+# (multi-camera layout) -- with members STORED (uncompressed) under arcnames
+# identical to the DB's clip_path. A clip whose video the disk budget pruned
+# (clips.pruned_at set) therefore usually still exists inside that day's zip.
+# These helpers find it, restore it into a small local LRU cache, and let the
+# ordinary clip-serving path (H.264 transcode + range requests) take over --
+# so "in the archive" means playable, not a dead link.
+# ---------------------------------------------------------------------------
+
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ARCHIVE_ROOT = config.ROOT / "archive_cache"   # restored under clips/, transcodes under web/
+_ARCHIVE_CACHE_KEEP = 40                        # restored mp4s kept (LRU); the zips keep the originals
+
+
+def _archive_zip_for(clip_path: str):
+    """(zip filename, member arcname) for a clip_path, or None when the path doesn't follow a
+    known day layout. Mirrors backup.day_dirs' naming exactly:
+        clips/<date>/x.mp4          -> clips-<date>.zip
+        clips/<source>/<date>/x.mp4 -> clips-<source>-<date>.zip"""
+    parts = [p for p in (clip_path or "").replace("\\", "/").split("/") if p]
+    if len(parts) == 3 and parts[0] == "clips" and _DAY_RE.match(parts[1]):
+        return f"clips-{parts[1]}.zip", "/".join(parts)
+    if len(parts) == 4 and parts[0] == "clips" and _DAY_RE.match(parts[2]):
+        return f"clips-{parts[1]}-{parts[2]}.zip", "/".join(parts)
+    return None
+
+
+def _prune_archive_cache(cache_root: Path, keep: int = _ARCHIVE_CACHE_KEEP) -> None:
+    """Cap the restored-clip cache to the `keep` most-recently-used mp4s (restored originals AND
+    their transcodes). Deleting is always safe: the zips still hold the originals, so a re-click
+    just restores again. Per-file try because Windows refuses to unlink a file mid-serve."""
+    try:
+        files = sorted(cache_root.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for p in files[keep:]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _restore_archived_clip(backup_dest, clip_path: str, cache_root: Path):
+    """Copy one pruned clip out of its backup zip into cache_root/<clip_path>. Returns the
+    restored Path, or None (no backup dest configured / zip or member missing / unrecognized
+    layout). Members are stored uncompressed, so this is a straight file copy."""
+    hit = _archive_zip_for(clip_path)
+    if hit is None:
+        return None
+    zip_name, member = hit
+    out = (cache_root / member).resolve()
+    if not _is_within(out, cache_root.resolve()):   # belt & braces; member comes from our own DB
+        return None
+    try:
+        if out.is_file() and out.stat().st_size > 0:
+            out.touch()                             # LRU bump
+            return out
+    except OSError:
+        pass
+    if not backup_dest:
+        return None
+    zpath = Path(backup_dest) / "clips" / zip_name
+    if not zpath.is_file():
+        return None
+    with _lock_for("archive:" + member):            # concurrent range requests restore once
+        try:
+            if out.is_file() and out.stat().st_size > 0:
+                return out
+            with zipfile.ZipFile(zpath) as zf, zf.open(member) as src:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                tmp = out.with_suffix(".tmp.mp4")
+                with open(tmp, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                tmp.replace(out)                    # atomic publish, like the transcode cache
+        except (KeyError, OSError, zipfile.BadZipFile):
+            return None
+    _prune_archive_cache(cache_root)
+    return out
+
+
+def _individual_profile(cfg, name: str) -> dict:
+    """stats.individual_profile + a web-layer annotation: for each archived clip, whether it is
+    actually reachable right now (`archive_ok` -- already restored locally, or its day's zip is
+    present on the backup drive). The dashboard then shows an unreachable prune as gone instead
+    of promising a play that would 404."""
+    prof = stats.individual_profile(cfg, name)
+    if not prof.get("found"):
+        return prof
+    have = None                                     # zip names on the backup drive, listed once
+    for v in prof.get("visits", []):
+        for c in (v.get("clips") or []):
+            if not (c and c.get("archived")):
+                continue
+            if have is None:
+                dest = getattr(cfg, "backup_dest", None)
+                try:
+                    have = {p.name for p in (Path(dest) / "clips").iterdir()} if dest else set()
+                except OSError:
+                    have = set()
+            hit = _archive_zip_for(c.get("clip_path") or "")
+            restored = hit and (_ARCHIVE_ROOT / hit[1]).is_file()
+            c["archive_ok"] = bool(restored or (hit and hit[0] in have))
+    return prof
+
+
 def make_server(cfg, frame_buffers: dict, control_bridges: dict):
     """`frame_buffers` / `control_bridges` are dicts keyed by camera `source` -- one entry per
     live camera. A single-camera rig passes one-entry dicts; the Live tab then shows one pane.
@@ -417,7 +594,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
     /api/camera and /api/live/* with a ?source= query param (defaulting to the primary camera, so
     an old client with no source param still works)."""
     allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir,
-                                          getattr(cfg, "clip_crops_dir", cfg.clips_dir))]
+                                          getattr(cfg, "clip_crops_dir", cfg.clips_dir),
+                                          # refcam's detector crops of the phone reference shots
+                                          # (the individual profile's reference gallery). The raw
+                                          # originals live OUTSIDE the project and stay unserved.
+                                          getattr(cfg, "reference_crops_dir", cfg.crops_dir))]
     stop_event = threading.Event()
 
     # The primary camera (the Live tab's default / "Plate I"): the one matching cfg.source if it's
@@ -449,8 +630,15 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             self.wfile.write(body)
 
         def _json(self, obj, code=200):
-            self._send(code, "application/json",
-                       json.dumps(obj).encode("utf-8"), {"Cache-Control": "no-store"})
+            body = json.dumps(obj).encode("utf-8")
+            extra = {"Cache-Control": "no-store"}
+            # The big payloads (visits ~500 KB, stats ~90 KB) are highly compressible JSON;
+            # gzip cuts them ~10x, which is what a phone on the far side of the house feels.
+            if len(body) > 2048 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                body = gzip.compress(body, 5)
+                extra["Content-Encoding"] = "gzip"
+                extra["Vary"] = "Accept-Encoding"
+            self._send(code, "application/json", body, extra)
 
         def _src(self):
             """The camera `source` this request targets, from a ?source= query param. Falls back
@@ -519,9 +707,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     else:
                         self._send(404, "text/plain", b"dashboard.js missing")
                 elif path == "/api/stats":
-                    self._json(stats.compute_stats(cfg) or {"total_crops": 0})
+                    self._json(_cached(cfg, "stats",
+                                       lambda: stats.compute_stats(cfg) or {"total_crops": 0}))
                 elif path == "/api/species":
-                    self._json(stats.species_overview(cfg) or {"species": [], "total": 0})
+                    self._json(_cached(cfg, "species",
+                                       lambda: stats.species_overview(cfg) or {"species": [], "total": 0}))
                 elif path.startswith("/api/species/"):
                     name = urllib.parse.unquote(path[len("/api/species/"):])
                     self._json(stats.species_crops(cfg, name))
@@ -546,10 +736,20 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                         cfg, day=(q.get("day") or [None])[0], species=(q.get("species") or [None])[0],
                         start=(q.get("start") or [None])[0], end=(q.get("end") or [None])[0],
                         offset=max(0, int((q.get("offset") or [0])[0])),
-                        limit=max(1, min(int((q.get("limit") or [60])[0]), 200))))
+                        limit=max(1, min(int((q.get("limit") or [60])[0]), 200)),
+                        individual=(q.get("individual") or [None])[0]))
+                elif path == "/api/individual/profile":
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    nm = (q.get("name") or [""])[0]
+                    self._json(_cached(cfg, "profile:" + nm,
+                                       lambda: _individual_profile(cfg, nm), hold_s=30))
                 elif path == "/api/visits":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self._json(stats.visits_page(cfg, day=(q.get("day") or [None])[0]))
+                    day = (q.get("day") or [None])[0]
+                    if day:                    # day views are rare one-offs; cache only the default
+                        self._json(stats.visits_page(cfg, day=day))
+                    else:
+                        self._json(_cached(cfg, "visits", lambda: stats.visits_page(cfg)))
                 elif path == "/api/digest":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.period_digest(cfg, edition=(q.get("edition") or ["auto"])[0],
@@ -561,11 +761,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json(reel.reel_status(cfg, edition=(q.get("edition") or ["auto"])[0],
                                                 date=(q.get("date") or [None])[0]))
                 elif path == "/api/behavior":
-                    self._json(behavior.overview(cfg))
+                    self._json(_cached(cfg, "behavior", lambda: behavior.overview(cfg), hold_s=30))
                 elif path == "/api/individuals":
-                    self._json(stats.individuals_overview(cfg))
+                    self._json(_cached(cfg, "individuals", lambda: stats.individuals_overview(cfg)))
                 elif path == "/api/rollcall":
-                    self._json(stats.cast_rollcall(cfg))
+                    self._json(_cached(cfg, "rollcall", lambda: stats.cast_rollcall(cfg), hold_s=30))
                 elif path == "/api/visit/motion":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     try:                        # a bad/missing visit_id => empty shape, not a 500
@@ -578,14 +778,19 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(stats.individual_motion(cfg, (q.get("individual") or [""])[0]))
                 elif path == "/api/review":
-                    self._json(stats.review_queue(cfg))
+                    self._json(_cached(cfg, "review", lambda: stats.review_queue(cfg), hold_s=30))
                 elif path == "/api/reid/queue":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self._json(_reid_queue(
-                        cfg, species=(q.get("species") or [cfg.reid_species])[0],
-                        limit=_qs_int(q, "limit", 30, 1, 100),
-                        offset=_qs_int(q, "offset", 0, 0, 1_000_000),
-                        mode=(q.get("mode") or ["recent"])[0]))
+                    sp = (q.get("species") or [cfg.reid_species])[0]
+                    lim = _qs_int(q, "limit", 30, 1, 100)
+                    off = _qs_int(q, "offset", 0, 0, 1_000_000)
+                    md = (q.get("mode") or ["recent"])[0]
+                    # The heaviest endpoint there is (~10s: a full VisitMatcher rebuild), so it
+                    # leans hardest on the cache. Label POSTs clear it, so the queue is always
+                    # fresh right after a confirm -- the rebuild then happens once, not per open.
+                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}",
+                                       lambda: _reid_queue(cfg, species=sp, limit=lim,
+                                                           offset=off, mode=md), hold_s=60))
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
@@ -609,6 +814,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                         self._send(200, "image/jpeg", frame, {"Cache-Control": "no-store"})
                 elif path == "/stream.mjpg":
                     self._stream(frame_buffers[self._src()])
+                elif path.startswith("/archive/clip/"):
+                    self._archived_clip(path[len("/archive/clip/"):])
                 elif path.startswith("/media/"):
                     self._media(path[len("/media/"):])
                 else:
@@ -644,6 +851,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             try:
                 if path != "/api/camera":
                     stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
+                    clear_api_cache()            # ...and on the next poll of every cached endpoint
                 if path == "/api/camera":
                     control_bridges[self._src()].request(_clean_settings(data))
                     self._json({"ok": True})
@@ -875,6 +1083,52 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                 frame_buffer.client_stopped()
                 stream_slots.release()
 
+        def _archived_clip(self, id_str):
+            """Serve one clip by DB id, wherever its bytes now live: still on disk -> the
+            ordinary path; soft-pruned -> restored out of that day's backup zip into
+            archive_cache/, then transcoded/range-served like any other clip. The URL is
+            stable across the prune, so a saved link keeps working after the disk budget
+            eats the local copy."""
+            try:
+                cid = int(id_str)
+            except (TypeError, ValueError):
+                self._send(400, "text/plain", b"bad clip id")
+                return
+            conn = db.connect_readonly(cfg.db_path)
+            if conn is None:
+                self._send(503, "text/plain", b"no database yet")
+                return
+            try:
+                row = conn.execute("SELECT clip_path FROM clips WHERE id = ?", (cid,)).fetchone()
+            finally:
+                conn.close()
+            if not row or not row["clip_path"]:
+                self._send(404, "text/plain", b"no such clip")
+                return
+            clip_path = row["clip_path"].replace("\\", "/")
+            live = (config.ROOT / clip_path).resolve()
+            clips_root = cfg.clips_dir.resolve()
+            if _is_within(live, clips_root) and live.is_file():
+                self._serve_video(live, clips_root, clips_root.parent / "clips_web")
+                return
+            restored = _restore_archived_clip(getattr(cfg, "backup_dest", None),
+                                              clip_path, _ARCHIVE_ROOT)
+            if restored is None:
+                self._send(404, "text/plain",
+                           b"this clip was pruned and its archive isn't reachable "
+                           b"(backup drive missing, or the clip predates the backups)")
+                return
+            self._serve_video(restored, _ARCHIVE_ROOT / "clips", _ARCHIVE_ROOT / "web")
+
+        def _serve_video(self, target: Path, clips_root: Path, cache_root: Path):
+            """Range-serve a clip, preferring its cached H.264 transcode (mp4v-era clips are
+            browser-undecodable; new clips are H.264 already and pass straight through)."""
+            serve = target
+            web_ver = _web_clip(target, clips_root, cache_root)
+            if web_ver is not None:
+                serve = web_ver
+            self._serve_file(serve, "video/mp4")
+
         def _media(self, rel):
             target = (config.ROOT / urllib.parse.unquote(rel)).resolve()
             if not any(_is_within(target, d) for d in allowed_dirs) or not target.is_file():
@@ -882,13 +1136,14 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                 return
             ctype = _MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream")
             # Clips are recorded as mp4v (browser-undecodable); serve a cached H.264 transcode.
-            serve = target
             if target.suffix.lower() == ".mp4":
                 clips_root = cfg.clips_dir.resolve()
                 if _is_within(target, clips_root):
-                    web_ver = _web_clip(target, clips_root, clips_root.parent / "clips_web")
-                    if web_ver is not None:
-                        serve = web_ver
+                    self._serve_video(target, clips_root, clips_root.parent / "clips_web")
+                    return
+            self._serve_file(target, ctype)
+
+        def _serve_file(self, serve: Path, ctype: str):
             size = serve.stat().st_size
             rng = self.headers.get("Range")
             if not rng:

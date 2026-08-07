@@ -61,6 +61,9 @@ function busyBtn(btn){
    + ‹ › + arrow keys to scrub); or a stitched HIGHLIGHT REEL — one mp4 whose filmstrip cells are
    CHAPTERS (seek points inside the same video) rather than separate files. */
 let __clips=[], __ci=0, __reelMode=false, __chapters=null;
+/* A clip the disk budget pruned plays from the backup archive via its stable id URL (the
+   server restores it out of that day's zip on first view). Everything else streams as before. */
+const clipUrl=c=>c.archived?('/archive/clip/'+encodeURIComponent(c.id)):media(c.clip_path);
 function playClips(clips,i,title){
   clips=(clips||[]).filter(c=>c&&c.clip_path);
   if(!clips.length) return;
@@ -74,7 +77,7 @@ function playClips(clips,i,title){
   strip.innerHTML=__reelMode?__clips.map((c,k)=>`
     <div class="fs" data-i="${k}" onclick="reelGo(${k})">
       <div class="ft" style="background-image:url('${c.thumb?media(c.thumb):''}')"><span class="dur">${fmtDur(c.seconds)}</span></div>
-      <div class="lab">${esc(fmtClock(c.start)||'')}${c.species?' · '+esc(nameOf(c.species)):''}</div>
+      <div class="lab">${esc(fmtClock(c.start)||'')}${c.species?' · '+esc(nameOf(c.species)):''}${c.archived?' <span class="arch">archive</span>':''}</div>
     </div>`).join(''):'';
   const v=$('#clip-video');
   v.ontimeupdate=null;
@@ -135,13 +138,14 @@ function showClip(){
   // Poster = the clip's best frame, shown while the H.264 transcode streams in on first view
   // (a cold clip can take a few seconds; cached instantly after).
   if(c.thumb) v.poster=media(c.thumb); else v.removeAttribute('poster');
-  v.src=media(c.clip_path);
+  v.src=clipUrl(c);
   const pr=v.play(); if(pr&&pr.catch) pr.catch(()=>{});
   $('#clip-cap').innerHTML=`${c.species?`<span class="nm">${esc(nameOf(c.species))}</span>`:''}
     ${c.start?`<span class="mono" style="font-size:12px">${esc(fmtClock(c.start))}</span>`:''}
     ${c.seconds?`<span class="mono" style="font-size:12px">· ${fmtDur(c.seconds)}</span>`:''}
     ${c.dets?`<span class="mono" style="font-size:12px">· ${c.dets} detection${c.dets===1?'':'s'}</span>`:''}
     ${c.conf!=null?`<span class="c mono" style="font-size:12px">· ~${Math.round(c.conf*100)}%</span>`:''}
+    ${c.archived?`<span class="mono" style="font-size:12px;color:var(--gilt)" title="the local copy was pruned for disk space; this plays the backup archive's copy">· from the archive</span>`:''}
     ${__reelMode?`<span class="mono" style="font-size:12px;margin-left:auto;color:var(--faint)">${__ci+1} / ${__clips.length}</span>`:''}`;
   const prev=$('#clip-prev'), next=$('#clip-next');
   prev.style.display=next.style.display=__reelMode?'flex':'none';
@@ -162,9 +166,11 @@ function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='Arro
 /* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
 const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
 
-const VIEWS=['live','dispatch','behavior','indiv','calendar','cat'];
+const VIEWS=['live','visits','dispatch','behavior','indiv','calendar','cat'];
+let __curView='visits';   // the tab currently on screen (explore screens remember it as "back home")
 function show(v, fromHash){
   closeSettings();
+  if(VIEWS.includes(v)) __curView=v;
   VIEWS.concat('explore').forEach(k=>{ const s=$('#view-'+k); if(s) s.classList.toggle('on',v===k); });
   VIEWS.forEach(k=>{ const t=$('#tab-'+k); if(t) t.classList.toggle('on',v===k); });
   // Deep-linkable tabs + a working Back button: the view lives in the URL hash. Programmatic
@@ -172,6 +178,7 @@ function show(v, fromHash){
   if(!fromHash && VIEWS.includes(v) && location.hash!=='#'+v){ __hashQuiet=v; location.hash=v; }
   syncLiveStreams();
   if(v==='cat') loadCatalogue();
+  if(v==='visits') loadVisitsTab();
   if(v==='dispatch') loadDispatch();
   if(v==='behavior') loadBehavior();
   if(v==='indiv') loadIndividuals();
@@ -596,25 +603,30 @@ async function correct(id,species){
 function closeSheet(){ $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
 
 /* ---------- explorer: drill into the field tallies ---------- */
-let exploreStack=[], visitsData=[], obsState=null;
+let exploreStack=[], visitsData=[], obsState=null, __exploreFrom='live';
 function goTally(t){
   if(t==='species'){ show('cat'); return; }   // species => the existing Specimen Catalogue
+  if(t==='visits'){ show('visits'); return; } // visits => their own first-class tab now
   exploreStack=[];
-  explore(t, {}, t==='obs'?'Observations':t==='visits'?'Visits':'Days Afield');
+  explore(t, {}, t==='obs'?'Observations':'Days Afield');
 }
 function explore(screen,params,title,sub){
+  if(!exploreStack.length) __exploreFrom=__curView;   // Back lands on the tab you drilled in from
   exploreStack.push({screen,params:params||{},title:title||'',sub:sub||''});
   renderExplore();
 }
-function exploreBack(){ exploreStack.pop(); exploreStack.length?renderExplore():show('live'); }
+function exploreBack(){ exploreStack.pop(); exploreStack.length?renderExplore():show(__exploreFrom||'live'); }
 function renderExplore(){
   const cur=exploreStack[exploreStack.length-1]; if(!cur)return;
   show('explore');
   $('#explore-title').textContent=cur.title;
   $('#explore-sub').textContent=cur.sub||'';
   const body=$('#explore-body'); body.innerHTML='<p class="empty">Loading…</p>';
-  ({obs:renderObs,visits:renderVisits,days:renderDays,day:renderDay}[cur.screen]||(()=>{}))(cur.params,body);
+  ({obs:renderObs,visits:renderVisits,days:renderDays,day:renderDay,profile:renderProfile}[cur.screen]||(()=>{}))(cur.params,body);
 }
+/* Open one individual's profile — every visit they're stamped into, their photos, their clips
+   (archived ones included). Reachable from any surface that shows a name. */
+function openProfile(name){ if(!name) return; exploreStack=[]; explore('profile',{name},cap1(String(name))); }
 const fmtDateTime=iso=>{ const d=new Date(iso); return isNaN(d)?iso:d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
 const fmtDay=ymd=>{ const d=new Date(ymd+'T12:00:00'); return isNaN(d)?ymd:d.toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric',year:'numeric'}); };
 
@@ -626,14 +638,18 @@ async function renderObs(params,body){
 async function loadMoreObs(){
   const s=obsState; if(!s)return;
   const qs=new URLSearchParams();
-  ['day','species','start','end'].forEach(k=>{ if(s[k]) qs.set(k,s[k]); });
+  ['day','species','start','end','individual'].forEach(k=>{ if(s[k]) qs.set(k,s[k]); });
   qs.set('offset',s.offset); qs.set('limit',60);
   let o; try{ o=await fetch('/api/crops?'+qs).then(r=>r.json()); }catch(e){ const m=$('#obs-more'); if(m) m.innerHTML='<p class="empty">Could not load observations.</p>'; return; }
   s.offset+=o.crops.length;
   const grid=$('#obs-grid'); if(!grid)return;
   grid.insertAdjacentHTML('beforeend', o.crops.map(obsTile).join(''));
   if(!grid.children.length) grid.innerHTML='<p class="empty">No observations here.</p>';
-  $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} total`;
+  // On the profile page the grid is one section of many, so the count goes on its own heading
+  // rather than the explorer's subtitle.
+  const pn=$('#prof-photo-n');
+  if(pn) pn.textContent=`${(o.total||0).toLocaleString()} total`;
+  else $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} total`;
   if(!s.species) grid.querySelectorAll('.crop[data-sp]').forEach(el=>el.onclick=()=>explore('obs',{species:el.dataset.sp},cap1(el.dataset.sp)));
   const more=$('#obs-more'); if(more) more.innerHTML = s.offset<o.total ? `<button class="back" onclick="loadMoreObs()">Load more &middot; ${(o.total-s.offset).toLocaleString()} left</button>` : '';
 }
@@ -656,17 +672,22 @@ async function renderVisits(params,body){
     : `${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
   if(!visitsData.length){ body.innerHTML='<p class="empty">No visits.</p>'; return; }
   body.innerHTML='<div class="cards">'+visitsData.map(visitCard).join('')+'</div>';
-  // A visit with clips plays its video on click (what you asked for); one without falls back to
-  // its crop grid (the old behaviour, for visits before clip recording was on).
-  body.querySelectorAll('[data-vi]').forEach(el=>{ const v=visitsData[+el.dataset.vi];
+  wireVisitCards(body);
+}
+/* A visit with clips plays its video on click (what you asked for); one without falls back to
+   its crop grid (the old behaviour, for visits before clip recording was on). Shared by the
+   Visits tab, the day-filtered explorer, and the individual profile. */
+function wireVisitCards(root){
+  root.querySelectorAll('[data-vi]').forEach(el=>{ const v=visitsData[+el.dataset.vi]; if(!v) return;
     el.onclick=(v.clips&&v.clips.length)
       ? ()=>playClips(v.clips,0,`${cap1(v.title||'animal')} · ${fmtDateTime(v.start)}`)
       : ()=>explore('obs',{start:v.start,end:v.end},`Visit · ${cap1(v.title||'animal')}`,fmtDateTime(v.start)); });
 }
 function visitCard(v,i){
   const nclips=(v.clips||[]).length;
+  const narch=(v.clips||[]).filter(c=>c.archived).length;
   const sp=(v.title&&v.title!=='animal')?v.title:'';
-  const inds=(v.individuals||[]).map(n=>`<span class="vl-ind">${esc(cap1(n))}</span>`).join('');
+  const inds=(v.individuals||[]).map(n=>`<span class="vl-ind clickable" title="open ${esc(cap1(n))}'s profile" onclick="event.stopPropagation();openProfile(${jarg(n)})">${esc(cap1(n))}</span>`).join('');
   // The curation tools (confirm/correct species, name the individual) hide behind the ✎ so the
   // card itself stays a reading surface: who, when, how long, play. stopPropagation keeps the
   // whole label layer from triggering the card's play/drill.
@@ -682,7 +703,7 @@ function visitCard(v,i){
       </div>
     </div>`;
   return `<div class="card vcard" data-vi="${i}">
-    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}</div>
+    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}${narch?`<span class="arch-badge" title="${narch===nclips?'all':narch} of these clips play from the backup archive">archive</span>`:''}</div>
     <div class="body">
       <div class="common">${esc(cap1(v.title||'animal'))} ${inds}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
@@ -690,6 +711,50 @@ function visitCard(v,i){
       ${footer}
     </div></div>`;
 }
+/* ---------- individual profile: one animal's whole record ---------- */
+async function renderProfile(params,body){
+  const name=params.name;
+  let p; try{ p=await fetch('/api/individual/profile?name='+encodeURIComponent(name)).then(r=>r.json()); }
+  catch(e){ body.innerHTML='<p class="empty">Could not load the profile.</p>'; return; }
+  if(!p.found){ body.innerHTML=`<p class="empty">No records for ${esc(cap1(name))} yet.</p>`; return; }
+  $('#explore-sub').textContent=p.species?cap1(p.species):'';
+  // Archived clips whose backup zip is unreachable right now (drive unmounted, or pruned before
+  // the backups began) would be dead play buttons — drop them, but say how many are gone.
+  let lost=0;
+  (p.visits||[]).forEach(v=>{ const n=(v.clips||[]).length;
+    v.clips=(v.clips||[]).filter(c=>!c.archived||c.archive_ok!==false); lost+=n-v.clips.length; });
+  const nclips=p.visits.reduce((a,v)=>a+(v.clips||[]).length,0);
+  const narch=p.visits.reduce((a,v)=>a+(v.clips||[]).filter(c=>c.archived).length,0);
+  const stamps=Object.entries(p.stamp_mix||{}).map(([k,n])=>`${n.toLocaleString()} ${k==='human'?'confirmed':k}`).join(' · ');
+  const depart=(p.status&&p.status.status==='departed')
+    ? `<span class="flag" style="opacity:.85">moved on${p.status.effective_date?' · last resident day '+esc(p.status.effective_date):''}</span>` : '';
+  const comp=(p.companions||[]).map(c=>
+    `<button class="cast-chip" onclick="openProfile(${jarg(c.name)})">${esc(cap1(c.name))}<small>×${c.n_visits}</small></button>`).join('');
+  const refs=(p.references||[]).map(r=>
+    `<img loading="lazy" src="${media(r.crop_path)}" alt="" title="${esc(r.kind==='video_frame'?'phone video frame':'phone photo')}${r.captured_at?' · '+esc(fmtDateTime(r.captured_at)):''}${r.note?' · '+esc(r.note):''}">`).join('');
+  visitsData=p.visits;
+  body.innerHTML=`
+    <div class="profile-head panel">
+      <div class="tallies" style="margin:0">
+        <div class="tally" style="cursor:default"><div class="n">${p.n_visits}</div><div class="k lbl">visits</div></div>
+        <div class="tally" style="cursor:default"><div class="n">${p.n_crops.toLocaleString()}</div><div class="k lbl">photographs</div></div>
+        <div class="tally" style="cursor:default"><div class="n">${nclips}${narch?` <small>${narch} archived</small>`:''}</div><div class="k lbl">clips</div></div>
+      </div>
+      <div class="lbl" style="opacity:.78">first seen ${esc(fmtDateTime(p.first_seen))} · last seen ${esc(fmtDateTime(p.last_seen))}${stamps?` · labels: ${stamps}`:''}${p.unfiled?` · ${p.unfiled} newest photos not yet filed into a visit`:''}</div>
+      ${depart}
+      ${lost?`<div class="lbl" style="opacity:.6">${lost} clip${lost===1?'':'s'} pruned before the backups began (or the backup drive is unreachable) — not shown.</div>`:''}
+      ${comp?`<div class="castrow"><span class="lbl">Seen together with</span>${comp}</div>`:''}
+      ${refs?`<div class="profile-refs"><span class="lbl">Reference shots — phone (identity certified by hand)</span><div class="refstrip">${refs}</div></div>`:''}
+    </div>
+    <h2 class="sec">Visits <span class="n">${p.visits.length<p.n_visits?`the newest ${p.visits.length} of ${p.n_visits}`:'each card plays its clips'}</span></h2>
+    <div class="cards">${p.visits.map(visitCard).join('')}</div>
+    <h2 class="sec">Photographs <span class="n" id="prof-photo-n"></span></h2>
+    <div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>`;
+  wireVisitCards(body);
+  obsState={day:null,species:null,start:null,end:null,individual:name,offset:0};
+  await loadMoreObs();
+}
+
 function _visitTarget(i){ const v=visitsData[i]||{}; return {source:v.source,start:v.start,end:v.end}; }
 function visitSaved(i,msg){ const s=document.getElementById('vst-'+i); if(s){ s.textContent=msg; s.style.color='var(--ok)'; } }
 function explorerName(i){
@@ -737,6 +802,43 @@ async function renderDay(params,body){
   body.querySelectorAll('.chip[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
   obsState={day:date,species:null,start:null,end:null,offset:0};
   await loadMoreObs();
+}
+
+/* ---------- the Visits tab: the default landing view ----------
+   The same visit cards as the old explorer screen, promoted to a first-class tab (it's the
+   "scroll around and see what happened" surface), with the named cast across the top so any
+   individual is one tap from their full profile. */
+async function loadVisitsTab(){
+  const body=$('#visits-body'); if(!body) return;
+  let o; try{ o=await fetch('/api/visits').then(r=>r.json()); connOK(); }
+  catch(e){ connFail(); body.innerHTML='<p class="empty">Could not load visits.</p>'; return; }
+  visitsData=o.visits||[];
+  const note=o.window
+    ? `the latest ${(o.total||0).toLocaleString()} — older ones via the Calendar or Days Afield`
+    : `${(o.total||0).toLocaleString()} visit${o.total===1?'':'s'}`;
+  if(!visitsData.length){
+    body.innerHTML='<p class="empty">No visits yet — cards appear here as animals come and go.</p>';
+    return;
+  }
+  body.innerHTML=`
+    <h2 class="sec">The Visit Log <span class="n">${note}</span></h2>
+    <div class="castrow" id="visits-cast"></div>
+    <div class="cards">${visitsData.map(visitCard).join('')}</div>`;
+  wireVisitCards(body);
+  loadCastStrip();
+}
+/* The named cast (rollcall order: overdue first, then most recently seen). */
+async function loadCastStrip(){
+  const el=$('#visits-cast'); if(!el) return;
+  let d; try{ d=await fetch('/api/rollcall').then(r=>r.json()); }catch(e){ return; }
+  const cast=d.cast||[];
+  if(!cast.length){ el.remove(); return; }
+  el.innerHTML='<span class="lbl">Look up an individual</span>'+cast.map(c=>{
+    const ago=c.days_since==null?'':(c.days_since===0?'today':c.days_since===1?'yesterday':c.days_since+'d ago');
+    return `<button class="cast-chip${c.overdue?' overdue':''}" onclick="openProfile(${jarg(c.id)})"
+      title="${esc(cap1(c.id))} — ${c.n_crops.toLocaleString()} photos over ${c.nights} day${c.nights===1?'':'s'}${c.overdue?' · overdue (past their usual gap)':''}">
+      ${c.crop?`<span class="cc-face" style="background-image:url('${media(c.crop)}')"></span>`:''}${esc(cap1(c.id))}${ago?`<small>${ago}</small>`:''}</button>`;
+  }).join('');
 }
 
 /* ---------- shared: species glyphs (calendar + dispatch) ---------- */
@@ -1847,9 +1949,10 @@ function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el
 
 loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
 // Land on the view in the URL hash when there is one (deep links / refresh keep their tab);
-// else the daily Dispatch ("who visited"). maybeFirstRun still redirects empty rigs to Live.
+// else the Visit Log — the scroll-around-and-see-what-happened surface. maybeFirstRun still
+// redirects a brand-new empty rig to Live.
 { const h=location.hash.replace('#','');
-  if(VIEWS.includes(h) && h!=='dispatch') show(h, true); else loadDispatch(); }
+  show(VIEWS.includes(h)?h:'visits', true); }
 setInterval(refreshLive,6000);
 setInterval(refreshHeader,4000);
 setInterval(refreshNaming,4000);
