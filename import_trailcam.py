@@ -37,6 +37,20 @@ history, it DESTROYS it, so the flag archives (backup.py) before the import and 
 outright if that archive fails. Enforcing a disk budget against the only surviving copy is never
 the right trade.
 
+ONE FULL FRAME PER STILL BURST is kept (2026-08-07, config.trailcam_keep_burst_frame). Until
+now this importer wrote frame_path=NULL on every row -- the card holds the original, so why copy
+it -- and the card is formatted every cycle, so "the card holds it" has an expiry date. That
+gap is what makes the reference-image furniture veto unshippable here: it compares a box's
+pixels to a frame of the same view certified empty, and a reference has to come from the SAME
+SENSOR PATH as the detection (docs/refimg-design-2026-08-07.md sections 5-6). The clips are the
+wrong path -- 1920x1080 video the detector has never run on -- which is why every reference
+policy in that design's race ABSTAINED on all 19 trail-cam furniture evaluations. So the stills
+now leave a frame behind. THE VETO ITSELF IS NOT SHIPPED FOR THIS CAMERA and nothing here judges
+a box against a reference: staticfilter.py is still the whole import-time defence. This is
+retention only, and it is per BURST (the ~5 stills one trigger writes within a few seconds are
+the same picture), so a cycle costs tens of megabytes rather than gigabytes. --no-burst-frames
+turns it off.
+
 STATIC FALSE-FIRES are dropped between the stills and the videos (staticfilter.py, added
 2026-08-05). A detector pointed at a yard fires on furniture: on the 2026-08-04 card a covered
 Weber grill, its chimney starter, a dark gap that read as eyeshine and a shrub lit by the IR
@@ -57,6 +71,7 @@ only 'animal' was the grill. --no-static-filter keeps everything.
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
   python import_trailcam.py D:\DCIM\100MEDIA --backup-first  # archive before anything can prune
   python import_trailcam.py D:\dump --no-static-filter       # keep static false-fires too
+  python import_trailcam.py D:\dump --no-burst-frames        # don't keep a full frame per burst
 
 SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
 ledger is refreshed right away so the Behaviour tab shows the new visits -- unlabeled at first.
@@ -285,8 +300,156 @@ def append_ledger(db_path: Path, source: str, key: str) -> None:
         print(f"  [warn] could not update import ledger for {key}: {e}")
 
 
+# --- Full-frame retention, one per still burst ----------------------------------------------
+# Seconds between two stills before they belong to separate triggers. MEASURED on this project's
+# whole trail-cam corpus (8 cycles, 6,240 crop-producing stills): every gap WITHIN a burst is
+# 0-5 s, and the smallest gap BETWEEN bursts is 28 s. The 5..28 s band is completely empty, so
+# 10 s sits in the middle of a valley rather than on a knife edge -- and the outcome is flat
+# anyway (a 5 s cut and a 30 s cut both give 138 bursts on the last cycle).
+BURST_GAP_S = 10.0
+
+# Hard ceiling on stills per burst. A GUARD, not a threshold: the largest real burst in 1,408 is
+# 10 stills (the mode is 6), so 24 can never split a genuine trigger. It exists for the EXIF-less
+# card, where image_timestamp() falls back to the file mtime and a bulk copy stamps every file
+# with the same second -- without the cap that collapses a whole cycle into one "burst" whose
+# single frame gets hung on hundreds of unrelated detections.
+BURST_MAX_STILLS = 24
+
+
+def _rmdir_if_empty(d: Path) -> None:
+    """Remove a day folder if (and only if) nothing is left in it. rmdir refuses a non-empty
+    directory, which is the entire safety argument; any other error is not worth a word."""
+    try:
+        d.rmdir()
+    except OSError:
+        pass
+
+
+class BurstFrames:
+    """Keeps ONE full frame per still burst and hands its stored path to that burst's detections.
+
+    WHY. See the module docstring: a still detection here has never had a full frame, the SD card
+    is formatted every cycle, and that is the reason the reference-image veto cannot run on this
+    camera. This class is that design's prerequisite #1 and nothing more -- it never judges a box,
+    never suppresses anything, and nothing downstream reads what it writes except as an ordinary
+    frame_path.
+
+    WHICH FRAME. The first still in the burst that produces a saved crop, so the kept frame
+    contains an animal. That is deliberate. What a stills-path reference actually needs is a POOL
+    of same-view frames -- the design's trail-cam recommendation is policy C, a per-pixel median
+    over such a pool, which votes the transient animal out precisely because it is transient --
+    and a frame attached to a real detection is also the only kind you can replay a suppression
+    against later. Taking the first rather than the "best" also means writing the array already in
+    hand, with no second decode of a 2560x1440 JPEG.
+
+    WHAT IT DELIBERATELY DOES NOT KEEP. A burst that produced no saved crop writes no frame
+    (path_for is lazy), and a burst whose only detections the static filter later deleted has its
+    frame removed again by drop_orphans(). No animal, no point: retention is scoped to bursts that
+    left a row to explain. The named cost of that scope is that furniture-only frames -- which
+    would make perfectly good members of a median reference pool -- are not banked; this is the
+    line to change if a future policy-C builder wants them.
+
+    WHERE. frames/<source>/<date>/, beside the live rig's frames/<date>/. The source subdir is the
+    clips/<source>/<date>/ layout, which backup.py's day_dirs() already walks for ANY media root,
+    so these archive per-source-per-day with no change to the archiver, and frames/ is already
+    gitignored (these are pictures of a yard, and this repo is public).
+    """
+
+    def __init__(self, cfg: config.Config, source: str, *, enabled: bool | None = None,
+                 gap_s: float = BURST_GAP_S, max_stills: int = BURST_MAX_STILLS):
+        self.cfg, self.source = cfg, source
+        self.enabled = bool(cfg.trailcam_keep_burst_frame if enabled is None else enabled)
+        self.gap_s, self.max_stills = float(gap_s), int(max_stills)
+        self._last: datetime | None = None
+        self._n_in_burst = 0
+        self._current: str | None = None      # stored path of the OPEN burst's frame, if written
+        self.written: list[Path] = []         # absolute paths written (and still wanted)
+        self.bytes_written = 0
+        self.bursts = 0
+
+    def observe(self, when: datetime) -> bool:
+        """Call once per still about to be ingested, in capture order. Returns True if this still
+        opens a NEW burst -- which is what retires the previous burst's frame and arms the next
+        save. The gap is compared in absolute value: a name-sorted folder is only approximately
+        chronological, and a jump in either direction is equally a different trigger."""
+        new = (self._last is None
+               or abs((when - self._last).total_seconds()) > self.gap_s
+               or self._n_in_burst >= self.max_stills)
+        if new:
+            self._current = None
+            self._n_in_burst = 0
+            self.bursts += 1
+        self._last = when
+        self._n_in_burst += 1
+        return new
+
+    def path_for(self, frame_bgr, when: datetime, stem: str) -> str | None:
+        """The stored (root-relative) frame_path for the burst currently open, writing the frame
+        on this burst's first saved crop. None when retention is off OR the write failed -- a
+        frame we could not keep must never leave a dangling path on a real detection row."""
+        if not self.enabled:
+            return None
+        if self._current is None:
+            self._current = self._save(frame_bgr, when, stem)
+        return self._current
+
+    def _save(self, frame_bgr, when: datetime, stem: str) -> str | None:
+        """Write one full frame. Named like the crops of the same still (capture stamp first, then
+        'src-<orig-stem>') so a frame is traceable to the SD-card file and sorts chronologically.
+        Best-effort by this module's standing rule: a frame we cannot write is a warning, never a
+        failed import."""
+        day_dir = self.cfg.frames_dir / clips._safe_source(self.source) / when.strftime("%Y-%m-%d")
+        stamp = when.strftime(KEY_TS_FMT) + f"-{when.microsecond // 1000:03d}"
+        path = day_dir / f"{stamp}_{SRC_TAG}{stem}.jpg"
+        try:
+            day_dir.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(path), frame_bgr,
+                               [cv2.IMWRITE_JPEG_QUALITY, int(
+                                   self.cfg.trailcam_burst_frame_quality)]):
+                raise OSError("cv2.imwrite returned False")
+        except Exception as e:
+            print(f"  [warn] could not keep this burst's full frame ({stem}): {e}")
+            return None
+        self.written.append(path)
+        try:
+            self.bytes_written += path.stat().st_size
+        except OSError:
+            pass
+        return _rel(path)
+
+    def drop_orphans(self, conn) -> int:
+        """Delete the retained frames no live detection points at any more, and stop counting
+        them. Returns how many went.
+
+        staticfilter.py runs AFTER the still pass and DELETES the rows it judges furniture, so a
+        burst whose only 'animals' were the grill is left holding a frame with nothing pointing at
+        it. Unlike the crops -- which staticfilter deliberately leaves on disk as the evidence for
+        what its manifest says it dropped -- this frame is not evidence of anything: it was kept
+        to serve a detection that no longer exists. The count is printed, never silent.
+        """
+        kept: list[Path] = []
+        dropped = 0
+        for path in self.written:
+            if conn.execute("SELECT 1 FROM detections WHERE source = ? AND frame_path = ? LIMIT 1",
+                            (self.source, _rel(path))).fetchone() is not None:
+                kept.append(path)
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError as e:
+                print(f"  [warn] could not remove the orphaned frame {path.name}: {e}")
+                kept.append(path)
+                continue
+            self.bytes_written -= size
+            dropped += 1
+            _rmdir_if_empty(path.parent)
+        self.written = kept
+        return dropped
+
+
 def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
-                source: str) -> tuple[int, int]:
+                source: str, *, bursts: "BurstFrames | None" = None) -> tuple[int, int]:
     """Import ONE image into the pipeline: load it, run the detector, and for each detection whose
     class is in cfg.save_classes, save a crop (live-rig convention) and write a DB row tagged with
     `source`. Returns (n_detections_reported, n_saved). The frame is loaded with cv2.imread, which
@@ -323,6 +486,10 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
     base_stamp = dt.strftime(KEY_TS_FMT) + f"-{dt.microsecond // 1000:03d}"
     stamp = f"{base_stamp}_{SRC_TAG}{path.stem}"
     h, w = frame.shape[:2]
+    # One retained full frame per burst, written lazily right here -- on the FIRST still of this
+    # trigger that actually produced a crop, from the array already decoded. Every later still of
+    # the same burst gets the same path back.
+    frame_path = bursts.path_for(frame, dt, path.stem) if bursts is not None else None
 
     saved = 0
     for i, det in enumerate(saved_dets):
@@ -340,7 +507,10 @@ def ingest_file(path: Path, detector: Detector, conn, cfg: config.Config,
             frame_w=w,
             frame_h=h,
             crop_path=_rel(crop_path),
-            frame_path=None,   # the SD card already holds the original full frame; don't copy it.
+            # This burst's kept full frame (BurstFrames), or None with retention off / the write
+            # failed. "The SD card already holds the original" was the old reason to store NULL
+            # here, and it expires at the next in-camera format -- which is every cycle.
+            frame_path=frame_path,
             crop_quality=crop_q,   # score trail-cam crops too, so the dashboard can lead with the cutest
             # species / individual_id stay NULL -- classify.py / reid.py fill them later, same as
             # the live rig's crops. The 'source' column is the only thing marking these as trail-cam.
@@ -639,11 +809,16 @@ def _print_next_step(saved: int) -> None:
 
 def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
                   source: str, recursive: bool, processed_dir: Path | None,
-                  skip: set[str]) -> tuple[int, int, int]:
+                  skip: set[str], bursts: "BurstFrames | None" = None) -> tuple[int, int, int]:
     """Import every image in `folder` once. `skip` is the set of skip keys (basename|capture-
     second) already imported (default idempotency); files moved to --processed-dir won't reappear
     anyway. Updates `skip` in place as it goes so a single pass never imports the same file twice.
-    Returns (files_imported, crops_saved, files_skipped)."""
+    Returns (files_imported, crops_saved, files_skipped).
+
+    `bursts` (optional) groups the stills into triggers and keeps one full frame per group. It is
+    fed only the files this pass actually INGESTS: an already-imported file left its own burst's
+    frame behind on the run that imported it, and letting a skipped file advance the burst clock
+    would only smear two real triggers together."""
     images = list_images(folder, recursive)
     if not images:
         print(f"No images ({'/'.join(sorted(IMAGE_EXTS))}) found in {folder}"
@@ -658,16 +833,19 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
         # files we're about to skip. stat() can still race a --watch drainer moving the file out
         # from under us; treat a vanished file like a corrupt one (warn-ish and move on).
         try:
-            ts = image_timestamp(path).strftime(KEY_TS_FMT)
+            captured = image_timestamp(path)
         except OSError:
             print(f"  skip (vanished mid-scan): {path.name}")
             continue
+        ts = captured.strftime(KEY_TS_FMT)
         # The ledger keys on the full filename; the DB-recovery fallback keys on the stem (the
         # extension isn't stored in the crop name) -- accept either so both skip-sources match.
         if skip_key(path.name, ts) in skip or skip_key(path.stem, ts) in skip:
             skipped += 1
             continue
-        n_reported, n_saved = ingest_file(path, detector, conn, cfg, source)
+        if bursts is not None:
+            bursts.observe(captured)
+        n_reported, n_saved = ingest_file(path, detector, conn, cfg, source, bursts=bursts)
         if n_reported < 0:
             continue  # unreadable/corrupt -- already warned, leave it in place to inspect
         skip.add(skip_key(path.name, ts))
@@ -686,7 +864,8 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
 
 def watch_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
                  source: str, recursive: bool, processed_dir: Path | None,
-                 skip: set[str], interval: float) -> int:
+                 skip: set[str], interval: float,
+                 bursts: "BurstFrames | None" = None) -> int:
     """Ongoing drop-folder mode: import the folder, then poll it every `interval`s for newly
     dropped files and import those too, until Ctrl-C. Reuses the one-shot import_folder per pass;
     the `skip` set (seeded from the DB) carries across passes so nothing re-imports. Pairs well
@@ -700,7 +879,12 @@ def watch_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
         while True:
             imported, saved, _ = import_folder(
                 folder, detector, conn, cfg, source=source, recursive=recursive,
-                processed_dir=processed_dir, skip=skip)
+                processed_dir=processed_dir, skip=skip, bursts=bursts)
+            if bursts is not None:
+                # Nothing deletes detection rows in watch mode (the static filter is a one-shot
+                # pass over one card), so a retained frame here can never be orphaned -- there is
+                # nothing to reclaim, only a list not to grow forever.
+                bursts.written.clear()
             total_imported += imported
             total_saved += saved
             if imported:
@@ -768,6 +952,15 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="How long one spot must keep firing before it counts as static.")
     p.add_argument("--static-iou", type=float, default=staticfilter.DEFAULT_IOU,
                    help="How identical two boxes must be to count as the same spot.")
+    p.add_argument("--no-burst-frames", dest="burst_frames", action="store_false",
+                   default=c.trailcam_keep_burst_frame,
+                   help="Do NOT keep one full frame per still burst. Retention exists so the "
+                        "reference-image veto can be built for this camera later (the card holds "
+                        "the only other copy and is formatted every cycle); it does not run any "
+                        "veto now.")
+    p.add_argument("--burst-gap", type=float, default=BURST_GAP_S,
+                   help="Seconds between two stills before they count as separate triggers "
+                        "(i.e. separate bursts, each keeping its own full frame).")
     args = p.parse_args()
 
     cfg = replace(
@@ -832,11 +1025,15 @@ def main() -> int:
     if skip:
         print(f"  {len(skip)} file(s) already imported for source='{args.source}' -- will skip them.")
 
+    # One full frame per still burst (see BurstFrames). Retention only -- no veto runs at import
+    # time in this build; staticfilter.py below is still the entire import-time defence.
+    bursts = BurstFrames(cfg, args.source, enabled=args.burst_frames, gap_s=args.burst_gap)
+
     try:
         if args.watch:
             rc = watch_folder(folder, detector, conn, cfg, source=args.source,
                               recursive=args.recursive, processed_dir=processed_dir,
-                              skip=skip, interval=args.interval)
+                              skip=skip, interval=args.interval, bursts=bursts)
         else:
             # Watermark BEFORE the pass: every detections row above this id is one THIS run wrote,
             # which is what scopes the static filter to a single card -- i.e. to one camera
@@ -845,7 +1042,7 @@ def main() -> int:
                 "SELECT COALESCE(MAX(id), 0) FROM detections").fetchone()[0]
             imported, saved, skipped = import_folder(
                 folder, detector, conn, cfg, source=args.source, recursive=args.recursive,
-                processed_dir=processed_dir, skip=skip)
+                processed_dir=processed_dir, skip=skip, bursts=bursts)
             # Static false-fires go BEFORE the videos, not after: the clip gate keeps a video whose
             # trigger produced an animal crop, so a grill scoring 'animal' would otherwise buy
             # disk space for footage of nothing happening -- and on a card that is the only copy,
@@ -857,6 +1054,9 @@ def main() -> int:
                     min_count=args.static_min_count,
                     min_span_minutes=args.static_min_span_minutes)
                 saved -= dropped_static
+            # Right after the sweep, because the sweep is the only thing that deletes rows: a burst
+            # whose entire trigger was furniture now holds a frame no detection points at.
+            dropped_frames = bursts.drop_orphans(conn) if bursts.written else 0
             # Videos AFTER the stills: the animal gate reads the detections the stills just wrote.
             v_stored = v_already = v_empty = 0
             if args.videos:
@@ -873,6 +1073,16 @@ def main() -> int:
                 print(f"  Static filter dropped {dropped_static} false-fire detection(s) -- "
                       f"listed in "
                       f"{staticfilter.manifest_path(cfg.db_path, args.source).name}.")
+            # Reported whenever this run actually ingested something, even if it kept no frame --
+            # "imported 400 files, kept 0 frames" is how a silently failing write gets noticed.
+            # A pure no-op re-run says nothing.
+            if bursts.enabled and (imported or dropped_frames):
+                orphaned = (f"; removed {dropped_frames} whose only detections the static filter "
+                            f"dropped" if dropped_frames else "")
+                print(f"  Kept {len(bursts.written)} full frame(s), one per still burst, in "
+                      f"{_rel(cfg.frames_dir / clips._safe_source(args.source))} "
+                      f"({bursts.bytes_written / 2**20:.1f} MiB){orphaned}. Retention only -- no "
+                      f"veto runs at import time.")
             if args.videos:
                 v_extra = f", {v_already} already-imported" if v_already else ""
                 print(f"  Clips: stored {v_stored} video(s); skipped {v_empty} with no animal "

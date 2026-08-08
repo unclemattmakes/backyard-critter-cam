@@ -16,7 +16,9 @@
     <span class="lbl" id="naming"></span>
   </div>
   <h1>The Backyard <span class="amp">&amp;</span> Observatory</h1>
-  <div class="sub">A field log of the creatures who visit, <span class="live-chip"><span class="live-dot"></span>observation in progress</span></div>
+  <!-- The chip starts in the idle "monitoring" state; refreshHeader() flips it to
+       "observation in progress" (+ .on for the pulsing dot) while a critter is on-cam. -->
+  <div class="sub">A field log of the creatures who visit, <span class="live-chip" id="livechip"><span class="live-dot"></span><span id="livechip-txt">monitoring in progress</span></span></div>
   <div class="rule"></div>
 </header>
 

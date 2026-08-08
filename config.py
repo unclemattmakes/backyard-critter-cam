@@ -275,6 +275,12 @@ class Config:
     detector_min_interval_s: float = 1.0
     # How long the last drawn boxes persist on the preview between detector runs (seconds).
     box_display_ttl_s: float = 1.0
+    # How recently (seconds) a critter-class detection must have fired for the rig to publish
+    # "a critter is on-cam right now" -- the masthead chip's observation/monitoring flip.
+    # Much wider than detector_min_interval_s because a foraging animal keeps pausing, and
+    # stillness stops the motion gate, so detections arrive in bursts with quiet gaps between.
+    # Kept well under visit_gap_minutes: the chip means "on-cam NOW", not "visit still open".
+    on_cam_window_s: float = 120.0
     # Ignore zones: persistent STATIC false-fire spots, per camera source. A scene can hold a
     # patch the detector reliably misreads as an animal -- on this rig, a dark opening in the
     # retaining wall scored "animal" 0.25-0.7 on every run for a whole dusk (2026-07-20: 170+
@@ -723,6 +729,122 @@ class Config:
     # Produced by datetime.now().astimezone().isoformat(): the wall-clock time you'd read
     # off a window-side clock, but the trailing offset keeps it globally unambiguous and
     # correctly sortable across DST changes. See db.now_local_iso().
+
+    # ---- Same-frame animal counting (tiledetect.py) ------------------------------
+    # MegaDetector v6's yolov10-c head is `end2end`: Ultralytics' NMS short-circuits for it and
+    # applies only a confidence threshold, so NOTHING removes duplicate boxes and the same animal
+    # can be recorded twice. Measured over 33,403 glass-door frames (4,643 same-frame box pairs),
+    # the geometry is sharply bimodal -- 63% of pairs disjoint at IoU 0.000, 34% near-coincident,
+    # ~3% anywhere in between -- so these cuts sit in a wide empty gap rather than on a knife edge.
+    # All three are RATIOS, never pixels or coordinates, because the cameras here get repositioned
+    # on purpose and a hand-measured constant fails silently when they do.
+    #   copresence_iou_max     two boxes at least this alike are one animal (bimodal gap 0.45-0.70)
+    #   copresence_union_min   an "umbrella" box this well explained by the union of the boxes it
+    #                          contains is the detector bracketing a group, not a third animal. It
+    #                          takes TWO OR MORE children to fire, deliberately: a kit standing
+    #                          inside its mother's box is exactly one child and must survive.
+    #   copresence_motion_max  batch/clip only. A box whose pixels change no more than this,
+    #                          relative to the whole frame's own change, is furniture. Measured
+    #                          over 70 clips and 36 hand-audited clusters: furniture 0.98-2.00,
+    #                          animals 2.56-25.6. Persistence must ALSO hold -- position alone is
+    #                          what makes staticfilter.py unsafe on the live rig, where a raccoon
+    #                          feeds at a fixed dish and holds a near-identical box.
+    # Counts from tiledetect are always LOWER bounds: on night frames holding 2-4 raccoons the
+    # detector's recall is about 0.39, and that half is NOT fixable in code. Tiled/sliced inference
+    # and proposal-anchored zoom were both built and measured on 2026-08-06 -- +44% boxes, of which
+    # 24 of 29 were lanterns, the barbecue cover, bare wall and shrubs. See tiledetect.py's
+    # docstring before proposing either again.
+    copresence_iou_max: float = 0.55
+    copresence_union_min: float = 0.75
+    copresence_motion_max: float = 1.35
+
+    # ---- Reference-image veto (refimg.py) ---------------------------------------
+    # "That box is furniture, and here is a picture of the empty yard to prove it." The detector
+    # fires on a tipped watering can, a covered barbecue, a dark gap in the wall; ignore_zones
+    # needs a hand-measured rectangle (which fails SILENTLY when a camera moves) and
+    # staticfilter.py's location rule is unsafe live (the food bowl recurs on 27 days at 0.95 and
+    # every one is a real raccoon). This compares the box's PIXELS to a frame the detector itself
+    # certified empty, at a spot that keeps firing. Full design + race results:
+    # docs/refimg-design-2026-08-07.md.
+    # SHIPS OFF, and even ON it is SHADOW MODE: the veto writes suppression METADATA on the rows it
+    # would have removed (detections.suppressed_at / suppressed_by / suppress_ref_id /
+    # suppress_detail) and NOTHING honours the flag -- not the dashboard, not still_tracklets, not
+    # co-presence, not stats. The point is a week of flagged rows to look at on one contact sheet
+    # (`python refimg.py --review`) before anything acts on them. An erased animal writes no row at
+    # all and is a silent permanent loss; a surviving grill costs one bogus co-presence edge.
+    refimg_enabled: bool = False
+    # Full frames of the yard (not tight animal crops), so they get their own gitignored tree --
+    # never crops/, which backup.py zips per capture day.
+    refimg_store_dir: Path = ROOT / "refimg_store"
+    # CERTIFICATION. A frame becomes the reference only after the DETECTOR RAN ON IT and returned
+    # zero boxes, motion stayed quiet, and that held continuously for this long. The tempting
+    # shortcut -- "no detection row near this frame, so it must be empty" -- was raced and stores a
+    # reference WITH THE SLEEPING RACCOON IN IT (scoring dssim 0.008 against the animal it
+    # contains). A resident animal cannot enter a certified reference, because while it is there
+    # the detector is firing on it, which resets this clock.
+    refimg_certify_hold_s: float = 4.0
+    # COVERAGE HORIZON. Every pixel that motion-blobbed within this window is marked NOT COVERED
+    # and the veto ABSTAINS there. This is the guard against the detector's own recall: the race
+    # produced a properly certified reference with an UNDETECTED raccoon walking the wall in it.
+    # 3600 s comes from the stationarity floor -- 823 s of eye-verified stationary residency and a
+    # 12,657 s merged worst case -- and is why a decaying background model is forbidden here (500
+    # MOG2 frames at 21.6 fps absorbs a still animal in 23 seconds).
+    refimg_no_update_s: float = 3600.0
+    # A reference older than this is refused (ABSTAIN, never a guess): the oldest age bucket whose
+    # empty-vs-empty p95 still sits under the animal thresholds below.
+    refimg_max_age_s: float = 7200.0
+    # PIXEL THRESHOLDS, PER ILLUMINATION STATE ('day' | 'night' | 'ir', derived from the frame
+    # itself, never from a clock). A box must score below ALL THREE to be eligible. These are
+    # measured on THIS AUTHOR'S GLASS DOOR at 320x180 -- the smallest score any verified animal
+    # produced there -- and they are a property of one camera through one pane of glass. Re-measure
+    # before pointing this at another camera, and do NOT copy the trail cam's numbers in here: the
+    # two cameras disagree about which metric even works. In IR, `lum` and `sobel` separate cleanly
+    # while `dssim` at its published threshold erases 7 of 60 real raccoons, the opposite of the
+    # glass door, where structure outlives luminance. (`census` is measured too but is deliberately
+    # not in the conjunction: in the dark it is INVERTED, scoring furniture higher than animals.)
+    # The metric gate is necessary and NOT sufficient -- on its own it erased 131 of 372 confident
+    # raccoon boxes in one visit -- so it is ANDed with the recurrence gate below and never used
+    # alone. Glass-door 'ir' repeats the night row: that camera has no IR illuminator.
+    refimg_metrics: dict = field(default_factory=lambda: {
+        "day":   {"lum": 3.869,  "dssim": 0.1019, "sobel": 0.2218},
+        "night": {"lum": 11.406, "dssim": 0.2346, "sobel": 0.4854},
+        "ir":    {"lum": 11.406, "dssim": 0.2346, "sobel": 0.4854},
+    })
+    # RECURRENCE. The same spot must have fired on this many INDEPENDENT occasions (two hits less
+    # than refimg_recurrence_event_gap_s apart are one occasion), at this IoU, across this many
+    # calendar days. Also necessary and not sufficient -- alone it flags the food bowl -- but in
+    # the race it was the ONLY thing saving 422 of 4,649 animal boxes (9.1%) that had already
+    # passed all three pixel metrics. Neither gate may be dropped, in either order.
+    refimg_recurrence_min_events: int = 5
+    refimg_recurrence_event_gap_s: float = 600.0
+    refimg_recurrence_iou: float = 0.60
+    refimg_recurrence_min_days: int = 2
+
+    # ---- Trail-cam burst full frames (import_trailcam.py) ------------------------
+    # The veto above is NOT shipped for the trail cam, and this is not it. This is the one
+    # prerequisite that makes it possible later (docs/refimg-design-2026-08-07.md section 6): the
+    # importer detects on the card's STILLS and has always saved crops only, so a still detection
+    # has no full frame anywhere -- and a reference has to come from the SAME SENSOR PATH as the
+    # box it judges. The clips are the wrong path (1920x1080 video the detector has never run on),
+    # which is exactly why every policy abstained on all 19 trail-cam furniture evaluations in the
+    # race. No veto runs at import time; staticfilter.py remains the import-time defence.
+    # ON by default, because the cost is one frame per BURST rather than one per still and the
+    # card is formatted every cycle -- the frames it holds are gone for good otherwise. Measured
+    # on this author's corpus: the 2026-08-06/07 cycle's 822 crops came from 714 stills in 138
+    # bursts, so at the quality below that cycle would have cost 91.5 MiB net (114 MiB at its peak,
+    # before the frames the static filter orphaned are reclaimed) -- against 258 MB of crops and
+    # 7.5 GB of clips from the same cycle. They land in frames/<source>/<date>/, which is
+    # gitignored and which backup.py's day_dirs() already archives per-source-per-day.
+    trailcam_keep_burst_frame: bool = True
+    # BOUNDED quality, deliberately below jpeg_quality (95): a full 2560x1440 still costs 0.32
+    # B/px at q95 and 0.19 B/px at q85 (measured two independent ways -- re-encoded trail-cam clip
+    # frames, and the bytes/pixel of real saved crops, which agree to within 2% at q95). q85 is a
+    # 41% saving on a picture that exists to be reduced to a 320x180 grey reference. Note the cost
+    # scales with the CAMERA'S still resolution, not with this number alone: the 2026-07-12 cycle
+    # briefly ran the TC02's interpolated 12288x6912 mode, where one frame is ~16 MB. Frames are
+    # stored at NATIVE resolution on purpose -- detections.bbox is in native still pixels, and a
+    # silently downscaled "full frame" would leave every consumer guessing a scale factor.
+    trailcam_burst_frame_quality: int = 85
 
     def camera_specs(self) -> "list[CameraSpec]":
         """The cameras to run, as a list of CameraSpec -- ALWAYS at least one. With `cameras` set

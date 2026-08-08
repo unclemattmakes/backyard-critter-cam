@@ -42,6 +42,16 @@ import web
 from config import CONFIG
 from detector import CudaUnavailableError, Detection, Detector
 
+# The reference-image veto (refimg.py) is OPTIONAL and ships disabled, so a problem importing it
+# must cost the shadow feature and nothing else -- capturing animals is the job, and this module
+# is the newest code in the tree. The failure is reported once, where it is actionable
+# (RefimgShadow.create), not swallowed.
+try:
+    import refimg
+    _REFIMG_IMPORT_ERROR = None
+except Exception as _refimg_exc:          # pragma: no cover -- deps are shared with the rig itself
+    refimg, _REFIMG_IMPORT_ERROR = None, _refimg_exc
+
 # ---- File logging (so the next post-mortem isn't blind) ----------------------------
 # The overnight deaths left no trace: the start-ed console window vanished with the process,
 # so there was nothing to read the morning after. We now TEE every line of stdout/stderr to a
@@ -693,6 +703,15 @@ class MotionGate:
     with pixel count -- at 1080p a full-res gate alone held the loop to ~6 fps), and blob
     areas are scaled BACK to full-frame px^2 so motion_min_area / the HUD readout keep
     their familiar units at any capture size.
+
+    The cleaned mask itself is KEPT on `self.mask` (post-threshold, post-morphology,
+    pre-contour) rather than thrown away with the rest of the chain. It costs nothing -- the
+    array already exists -- and it is the detector-independent evidence policy E needs: every
+    pixel that has blobbed recently is marked NOT COVERED in the reference image, so a raccoon
+    the DETECTOR missed (measured: a properly certified reference with an undetected raccoon
+    walking the wall in it) costs an abstention instead of an erasure. See refimg.py.
+    `mask` is at the gate's own downscaled resolution, aspect preserved, so a consumer just
+    resizes it to whatever working resolution it uses; the returned AREA is unchanged.
     """
 
     def __init__(self, cfg: config.Config):
@@ -703,6 +722,8 @@ class MotionGate:
             detectShadows=cfg.motion_detect_shadows,
         )
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Last cleaned foreground mask (None until the first update()). Read-only for callers.
+        self.mask = None
 
     def update(self, frame_bgr) -> float:
         src = frame_bgr
@@ -722,6 +743,7 @@ class MotionGate:
         _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.dilate(mask, self.kernel, iterations=2)
+        self.mask = mask                    # retained for refimg's coverage channel (see docstring)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return 0.0
@@ -756,6 +778,261 @@ def drop_ignored(dets, zones, min_iou: float):
     for d in dets:
         (dropped if any(box_iou(d.bbox, z) >= min_iou for z in zones) else kept).append(d)
     return kept, dropped
+
+
+# ---- Detector census (measurement, always on) ---------------------------------------
+class DetectorCensus:
+    """How often does the detector run, and how often does it come back EMPTY?
+
+    This is design section 8, item 1 of docs/refimg-design-2026-08-07.md -- named there as the
+    biggest unknown in the whole reference-image design. A reference image can only be built from
+    a frame the detector RAN on and certified empty, and the offline estimate of how often such a
+    frame exists (6.5%) is a floor derived from clip rows, not a measurement: the DB structurally
+    cannot record a quiet stretch, because a quiet stretch writes nothing. The live rig is the
+    only place the real rate exists, so the loop counts it directly.
+
+    Deliberately NOT gated on cfg.refimg_enabled: this is measurement, not behaviour. It writes
+    no rows, touches no detection and changes no decision -- one log line per hour through the
+    existing print path (which the file tee already timestamps and rotates).
+
+    `longest_empty_s` is the longest UNBROKEN wall-clock stretch of detector verdicts that all
+    came back empty, which is the number that says whether a `refimg_certify_hold_s` window is
+    ever available. It is measured on the monotonic clock (a system clock step must not invent a
+    six-hour empty run) and is capped at the reporting period, so "longest empty run" always
+    means "within this hour".
+    """
+
+    def __init__(self, period_s: float = 3600.0):
+        self.period_s = float(period_s)
+        self.runs = 0                    # detector invocations this period
+        self.empty = 0                   # ... of which returned zero boxes
+        self.longest_empty_s = 0.0       # longest unbroken empty stretch this period
+        self._empty_since: float | None = None
+        self._start: float | None = None
+
+    def note(self, now: float, n_boxes: int) -> None:
+        """Record one detector invocation. `n_boxes` is the RAW detector output count."""
+        if self._start is None:
+            self._start = now
+        self.runs += 1
+        if n_boxes:
+            self._empty_since = None
+            return
+        self.empty += 1
+        if self._empty_since is None:
+            self._empty_since = now
+        else:
+            self.longest_empty_s = max(self.longest_empty_s, now - self._empty_since)
+
+    def line(self, now: float) -> str:
+        span_min = (now - (self._start if self._start is not None else now)) / 60.0
+        pct = (100.0 * self.empty / self.runs) if self.runs else 0.0
+        return (f"detector census: {self.runs} run(s), {self.empty} empty ({pct:.0f}%), "
+                f"longest empty run {self.longest_empty_s:.0f}s, over {span_min:.0f} min")
+
+    def roll(self, now: float) -> str | None:
+        """Returns the hourly line and resets, or None if the period isn't up. Cheap enough to
+        call every frame -- a zero-run hour is itself the finding, so silence must not stand in
+        for it."""
+        if self._start is None:
+            self._start = now
+            return None
+        if now - self._start < self.period_s:
+            return None
+        text = self.line(now)
+        self._start = now
+        self.runs = self.empty = 0
+        self.longest_empty_s = 0.0
+        if self._empty_since is not None:
+            self._empty_since = now      # a run spanning the boundary re-measures from here
+        return text
+
+
+# ---- Reference-image veto, SHADOW MODE (refimg.py) -----------------------------------
+def _short_age(seconds: float) -> str:
+    """A compact age for the HUD: 42s / 7m / 3.1h."""
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{int(s)}s"
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    return f"{s / 3600.0:.1f}h"
+
+
+class RefimgShadow:
+    """One camera's wiring into refimg.py's reference-image veto -- and NOTHING ELSE CHANGES.
+
+    SHADOW MODE IS THE WHOLE POINT. When the veto says a box is furniture, the detection is
+    still saved exactly as it is today: same row, same crop on disk, same clip trigger, same
+    HUD, same species naming. All that happens afterwards is db.record_suppression writing four
+    additive columns (suppressed_at / suppressed_by / suppress_ref_id / suppress_detail) that
+    NOTHING in this codebase reads. The point is a week of flagged rows Matt can look at on one
+    contact sheet (`python refimg.py --review`) before any consumer honours the flag. An erased
+    animal writes no row at all and is a silent permanent loss; a wrongly flagged watering can
+    is a row a human can clear. That asymmetry decides every tie in here, which is why every
+    failure path below abstains, logs, and lets the detection through untouched.
+
+    Wiring, per camera thread:
+      observe(...)  once per frame the DETECTOR RAN on (it is already capped at one call per
+                    second), carrying that frame, the detector's RAW boxes and MotionGate's
+                    retained mask. Passing the raw boxes -- before ignore_zones -- is deliberate:
+                    any box at all must reset certification, so a zone we chose to ignore can
+                    never help a frame qualify as "empty".
+      judge(...)    once per detection that was just written, AFTER its row and crop exist.
+
+    THE PERSISTED REFERENCE IS THE ONE THAT JUDGES. refimg re-certifies on every quiet detector
+    frame, so writing each certification would be a PNG and a row per second. Instead a
+    reference is written at most every PERSIST_EVERY_S and that stored image is what the veto
+    compares against until the next write -- so suppress_ref_id always resolves to the exact
+    picture that produced the decision. Only the COVER mask is taken live between writes:
+    coverage is the safety gate that protects a missed animal, and a stale one would protect
+    nothing.
+    """
+
+    # 10 minutes: ~144 references/day/illumination worst case at 320x180 grey (a few MB), against
+    # a max reference age of 2 h. Small enough that a judged reference is always fresh, large
+    # enough that a quiet night is not a per-second write storm on the capture thread.
+    PERSIST_EVERY_S = 600.0
+
+    def __init__(self, cfg: config.Config, source: str, conn, tag: str = ""):
+        self.cfg, self.source, self.tag = cfg, source, tag
+        # Seed the view epoch from the DB: a restart must not reset the camera's history to 0 and
+        # start writing references under an epoch key that other rows already used.
+        self.epoch = db.current_view_epoch(conn, source)
+        self.view = refimg.ViewWatcher(epoch=self.epoch)
+        self.manager = refimg.ReferenceManager(source=source, view=self.view, cfg=cfg)
+        self.veto = refimg.ShadowVeto(cfg=cfg)
+        # The recurrence ledger persists to a JSON sidecar, NOT the DB -- it updates on every
+        # detection in the capture thread, and this project has already killed the rig once with
+        # "database is locked" from a worker holding the write lock.
+        self.recurrence = refimg.Recurrence(
+            path=refimg.store_dir(cfg) / source / "recurrence.json", cfg=cfg).load()
+        self.obs = None                  # the last prepared frame (an refimg.Observation)
+        self.ref = None                  # the reference the next judge() will use
+        self._pinned: dict = {}          # illumination -> the reference written to the DB
+        self.n_suppressed = 0
+        self.n_judged = 0
+
+    @classmethod
+    def create(cls, cfg: config.Config, source: str, conn, tag: str = "") -> "RefimgShadow | None":
+        """The shadow veto for this camera, or None when it is off or cannot start. None is the
+        no-op path: every call site is `if shadow is not None`, so an unavailable veto is exactly
+        today's rig."""
+        if not getattr(cfg, "refimg_enabled", False):
+            return None
+        if refimg is None:
+            print(f"{tag} refimg: WARNING -- refimg_enabled is on but refimg.py did not import "
+                  f"({_REFIMG_IMPORT_ERROR}); running without the shadow veto.")
+            return None
+        try:
+            shadow = cls(cfg, source, conn, tag)
+        except Exception as e:
+            print(f"{tag} refimg: WARNING -- could not start the shadow veto ({e}); "
+                  "running without it. Detections are unaffected.")
+            return None
+        print(f"{tag} reference-image veto: SHADOW MODE -- flagging suppression metadata only "
+              f"(view epoch {shadow.epoch}). Nothing reads the flag; audit with "
+              f"`python refimg.py --review`.")
+        return shadow
+
+    # -- per-frame bookkeeping -------------------------------------------------------------
+    def observe(self, conn, frame, detections, motion_mask, now: float) -> None:
+        """Feed ONE frame the detector ran on. `detections` is that frame's RAW verdict (a list of
+        Detection, or of bare boxes -- an empty list means "it ran and found nothing", which is
+        what lets a frame certify). `now` is WALL-CLOCK epoch seconds (references are stamped with
+        it and recurrence counts calendar days from it), not the loop's monotonic clock. Never
+        raises: on any failure the frame is simply not usable and the veto abstains.
+        """
+        try:
+            boxes = [getattr(d, "bbox", d) for d in (detections or ())]
+            self.obs = self.manager.observe(frame, detections=boxes,
+                                            motion_mask=motion_mask, now=now)
+            if self.obs.view_epoch != self.epoch:
+                self._note_epoch(conn, self.obs.view_epoch)
+            self.ref = self._reference(conn, self.obs)
+        except Exception as e:
+            self.obs = self.ref = None
+            self._warn("preparing the reference", e)
+
+    def _reference(self, conn, obs):
+        """The reference to judge against: the persisted image, with a live cover mask."""
+        live = self.manager.get(obs.illumination)
+        if live is None:
+            return None
+        pinned = self._pinned.get(obs.illumination)
+        if (pinned is None or pinned.view_epoch != live.view_epoch
+                or live.captured_at - pinned.captured_at >= self.PERSIST_EVERY_S):
+            refimg.save_reference(conn, live, cfg=self.cfg)     # writes the PNGs + row, sets .id
+            self._pinned[obs.illumination] = live
+            return live
+        # Between writes: the image (and id) already on disk, the cover mask as of right now.
+        return replace(pinned, cover=live.cover, detail=live.detail)
+
+    def _note_epoch(self, conn, epoch: int) -> None:
+        """The camera was seen to MOVE. Record it as a first-class event -- this project's
+        standing rule is that a stale hand-measured zone fails SILENTLY, and refimg has already
+        dropped every reference and every remembered box for the old view."""
+        corr = self.view.changes[-1][1] if self.view.changes else None
+        self.epoch = epoch
+        self._pinned.clear()
+        try:
+            recorded = db.bump_view_epoch(conn, self.source, corr=corr)
+        except Exception as e:
+            self._warn("recording the view epoch", e)
+            return
+        print(f"{self.tag} refimg: the camera looks MOVED (edge correlation {corr}) -- view epoch "
+              f"{recorded}; references retired, suppression pauses until a fresh one certifies.")
+        if recorded != epoch:
+            print(f"{self.tag} refimg: NOTE -- the DB allocated epoch {recorded} but this rig "
+                  f"counted {epoch}; something else has been writing view_epochs for "
+                  f"'{self.source}'.")
+
+    # -- per-detection judgement -----------------------------------------------------------
+    def judge(self, conn, detection_id: int, det: Detection):
+        """Judge ONE detection that has ALREADY been written. Returns the refimg.Decision (or
+        None if it could not be evaluated). The row, the crop and every downstream consumer are
+        untouched either way -- a SUPPRESS only adds the four metadata columns."""
+        if self.obs is None:
+            return None
+        try:
+            box = self.obs.to_working(det.bbox)
+            # Recurrence is updated with this box BEFORE the veto reads it (the gate asks "has
+            # this spot kept firing", and this firing counts).
+            self.recurrence.observe(box, self.obs.ts, epoch=self.obs.view_epoch)
+            decision = self.veto.evaluate(box, self.obs, self.ref, self.recurrence)
+            self.n_judged += 1
+            if decision.suppressed:
+                db.record_suppression(conn, detection_id, db.SUPPRESSED_BY_REFIMG_VETO,
+                                      ref_id=decision.ref_id, detail_json=decision.to_json())
+                self.n_suppressed += 1
+                r = decision.recurrence or {}
+                print(f"  {self.tag} shadow veto: detection {detection_id} LOOKS LIKE FURNITURE "
+                      f"(ref {decision.age_s:.0f}s old, {r.get('events', 0)} firings over "
+                      f"{r.get('days', 0)} day(s)) -- flagged only, the row and crop are kept.")
+            self.recurrence.save(self.obs.ts)      # throttled + atomic; a no-op most calls
+            return decision
+        except Exception as e:
+            self._warn("judging a box", e)
+            return None
+
+    # -- presentation / shutdown -----------------------------------------------------------
+    def hud(self) -> str:
+        """One short token for the HUD line: 'ref night 7m', or 'ref --' when there is nothing to
+        judge against (which is the honest, common answer -- the veto abstains)."""
+        ref = self.ref
+        if ref is None:
+            return "ref --"
+        return f"ref {ref.illumination} {_short_age(time.time() - ref.captured_at)}"
+
+    def close(self) -> None:
+        """Flush the recurrence ledger on shutdown so a clean stop keeps its evidence."""
+        try:
+            self.recurrence.save(force=True)
+        except Exception as e:
+            self._warn("saving the recurrence ledger", e)
+
+    def _warn(self, doing: str, err: Exception) -> None:
+        print(f"{self.tag} refimg: error {doing} ({err}) -- abstaining; detections are unaffected.")
 
 
 # ---- Saving ------------------------------------------------------------------------
@@ -812,10 +1089,15 @@ def draw_detections(frame, detections: list[Detection]) -> None:
 
 def draw_hud(frame, *, fps: float, motion_area: float, motion: bool,
              saved: int, source: str, model: str, period: str | None = None,
-             recording: bool = False, warnings: list[str] | None = None) -> None:
+             recording: bool = False, warnings: list[str] | None = None,
+             ref_status: str | None = None) -> None:
+    # ref_status is refimg's one-token state ('ref night 7m' / 'ref --'): whether there is a
+    # certified empty reference for the current illumination and how old it is. None (the
+    # shipped default, and what a disabled veto passes) leaves the line exactly as it was.
     lines = [
         f"{source}  |  {model}" + (f"  |  {period}" if period else ""),
-        f"FPS {fps:4.1f}   motion {int(motion_area):>6} px   saved {saved}",
+        f"FPS {fps:4.1f}   motion {int(motion_area):>6} px   saved {saved}"
+        + (f"   {ref_status}" if ref_status else ""),
         "q: quit",
     ]
     y = 22
@@ -1026,6 +1308,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     conn = db.connect(cfg.db_path)
     cap = None
     recorder = None
+    shadow = None                               # refimg shadow veto; stays None when it's off
     saved = ignored = 0
     try:
         cap = open_capture(spec, cfg)
@@ -1072,7 +1355,11 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             wedge.enabled = False
 
         gate = MotionGate(cfg)
-        last_detect_t = last_dets_t = 0.0
+        # Detector census (measurement, ALWAYS on: design section 8 item 1) + the reference-image
+        # veto in shadow mode (off unless cfg.refimg_enabled; None == exactly today's rig).
+        census = DetectorCensus()
+        shadow = RefimgShadow.create(cfg, spec.source, conn, tag)
+        last_detect_t = last_dets_t = last_animal_t = 0.0
         last_dets: list[Detection] = []
         frame_count = read_fails = fps_n = 0
         fps = 0.0
@@ -1149,6 +1436,12 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     # (see powerguard.py -- these are the "walk over and do something" signals).
                     snap["power"] = powermon.snapshot() if powermon is not None else None
                     snap["wedge"] = wedge.snapshot()
+                    # Masthead live chip: an animal counts as "on-cam now" if a critter-class
+                    # detection fired within the last on_cam_window_s (last_animal_t == 0.0
+                    # means none yet this run, published as age None / active False).
+                    age_s = (now - last_animal_t) if last_animal_t > 0 else None
+                    snap["animal_age_s"] = None if age_s is None else round(age_s, 1)
+                    snap["animal_active"] = age_s is not None and age_s <= cfg.on_cam_window_s
                     snap["network"] = spec.is_url   # the dashboard hides sliders for a network cam
                     # Coarsen the published coords (~10 km) -- a LAN/DNS-rebind client can read this.
                     snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
@@ -1171,6 +1464,12 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             if recorder is not None:
                 recorder.note_frame(frame, now, loop_fps=fps)
 
+            # --- Detector census: one line per hour, whatever the veto is doing (a zero-run hour
+            #     is itself the finding, so this is checked every frame, not only on a run) ---
+            census_line = census.roll(now)
+            if census_line:
+                print(f"{tag} {census_line}")
+
             # --- Detector (only on motion, rate-limited, under the shared-detector lock) ---
             if motion and (now - last_detect_t) >= cfg.detector_min_interval_s:
                 last_detect_t = now
@@ -1180,6 +1479,12 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 except Exception as e:  # never let one bad frame kill the loop
                     print(f"{tag} detector error on a frame (skipping): {e}")
                     dets = []
+                # Count the RAW verdict (pre ignore-zone), and hand the same raw verdict to the
+                # reference manager: a frame can only certify as "empty" if the detector saw
+                # NOTHING in it, and a box we chose to ignore is still a box it saw.
+                census.note(now, len(dets))
+                if shadow is not None:
+                    shadow.observe(conn, frame, dets, gate.mask, time.time())
                 if dets:
                     # Any MegaDetector hit (even a zone-dropped one) vetoes the pegged-motion
                     # wedge rule: real structure in the frame means big motion is an animal or
@@ -1192,6 +1497,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 if dets:
                     last_dets, last_dets_t = dets, now
                     saved_dets = [d for d in dets if d.class_name in cfg.save_classes]
+                    if saved_dets:
+                        last_animal_t = now   # critter on-cam (stamped even if the save path fails)
                     if recorder is not None:
                         clip_dets = [d for d in dets if d.class_name in clip_trigger]
                         if clip_dets:
@@ -1215,7 +1522,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                         # NOT kill the capture thread -- log it and keep watching. Same spirit as
                         # the detector guard above; staying alive beats one detection row.
                         try:
-                            db.insert_detection(
+                            det_id = db.insert_detection(
                                 conn, timestamp=iso, source=spec.source,
                                 detection_class=det.class_name, confidence=det.confidence,
                                 bbox=det.bbox, frame_w=w, frame_h=h,
@@ -1225,6 +1532,10 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                             continue
                         saved += 1
                         print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
+                        # SHADOW VETO, strictly AFTER the row and crop exist: it can only ADD
+                        # suppression metadata to a detection that was saved exactly as before.
+                        if shadow is not None:
+                            shadow.judge(conn, det_id, det)
 
             # --- Annotate for the dashboard feed + the native preview grid (NO cv2 GUI here) ---
             # Presentation only, so it's rate-capped, and the dashboard side runs ONLY while a
@@ -1247,7 +1558,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     warns.append(wedge.message)
                 draw_hud(disp, fps=fps, motion_area=motion_area, motion=motion, saved=saved,
                          source=spec.display_name, model=cfg.model_version, period=active_period,
-                         recording=recorder is not None and recorder.recording, warnings=warns)
+                         recording=recorder is not None and recorder.recording, warnings=warns,
+                         ref_status=shadow.hud() if shadow is not None else None)
                 if want_stream:
                     ok_enc, buf = cv2.imencode(".jpg", disp,
                                                [cv2.IMWRITE_JPEG_QUALITY, cfg.web_jpeg_quality])
@@ -1264,6 +1576,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 recorder.finalize(shutdown=True)    # flush any clip mid-record (writes its DB row)
             except Exception:
                 pass
+        if shadow is not None:
+            shadow.close()                          # flush the recurrence ledger (never raises)
         if cap is not None:
             try:
                 cap.release()
@@ -1274,7 +1588,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         except Exception:
             pass
         results[spec.source] = {"saved": saved, "ignored": ignored,
-                                "clips": recorder.clips_saved if recorder is not None else 0}
+                                "clips": recorder.clips_saved if recorder is not None else 0,
+                                "suppressed": shadow.n_suppressed if shadow is not None else 0}
 
 
 # ---- Native preview window (main thread owns all cv2 GUI) ---------------------------
@@ -1479,10 +1794,15 @@ def run(cfg: config.Config) -> None:
         total_saved = sum(r.get("saved", 0) for r in results.values())
         total_clips = sum(r.get("clips", 0) for r in results.values())
         total_ignored = sum(r.get("ignored", 0) for r in results.values())
+        total_suppressed = sum(r.get("suppressed", 0) for r in results.values())
         clips_note = f"  Recorded {total_clips} clip(s)." if total_clips else ""
         zone_note = (f"  Dropped {total_ignored} ignore-zone false-fire(s)." if total_ignored else "")
+        # Shadow mode: these rows were SAVED and merely flagged -- say so, so the number is never
+        # mistaken for detections that went missing.
+        veto_note = (f"  Flagged {total_suppressed} row(s) as furniture (kept; audit with "
+                     f"`python refimg.py --review`)." if total_suppressed else "")
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}."
-              f"{clips_note}{zone_note}")
+              f"{clips_note}{zone_note}{veto_note}")
 
 
 # ---- CLI ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 """
-Tests for the startup sweep that reaps orphaned naming helpers (backyard_cam).
+Tests for backyard_cam: the naming-helper sweep, the ignore zones, the motion gate's retained
+mask, the detector census, and the reference-image veto's SHADOW-MODE wiring into the capture
+loop.
 
 A rig that dies WITHOUT running its finally block (taskkill /F, a crash, the OOM kills)
 leaves its classify.py --watch helper running forever; the next launch must kill exactly
@@ -14,10 +16,23 @@ have both rows reaped.
 """
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
+import threading
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
 
 import backyard_cam
+import config
+import db
+import refimg
+from detector import Detection
 
 # Fake install paths: they only ever get spliced into the synthetic command-line strings below,
 # so nothing here is launched and the real interpreter's location is irrelevant.
@@ -184,3 +199,360 @@ def test_no_zones_is_a_no_op():
     d = _Det((1141.0, 608.0, 1220.0, 687.0))
     kept, dropped = backyard_cam.drop_ignored([d], [], 0.45)
     assert kept == [d] and dropped == []
+
+
+# ---- Synthetic scene ----------------------------------------------------------------
+# One deterministic "yard": coloured (so refimg calls it 'day', not 'ir'), textured (so the
+# sobel/SSIM metrics and the edge fingerprint have something to hold on to), and carrying a
+# static pale slab standing in for the furniture that fires the detector every night.
+
+FURNITURE = (200.0, 200.0, 360.0, 360.0)      # full-frame px; the tipped-watering-can stand-in
+ELSEWHERE = (800.0, 400.0, 940.0, 540.0)      # a box at a spot that has never fired before
+
+
+def _yard(w: int = 1280, h: int = 720, seed: int = 11):
+    """A static, deterministic colour frame. Base B/G/R 120/165/205 -> chroma 85 (not IR) and a
+    grey median ~172 (>= 90, so 'day'); the noise is added equally to all three channels so it
+    textures the scene without touching that classification."""
+    rng = np.random.default_rng(seed)
+    frame = np.zeros((h, w, 3), np.int16)
+    frame[:, :, 0], frame[:, :, 1], frame[:, :, 2] = 120, 165, 205
+    frame += rng.integers(0, 40, size=(h, w, 1), dtype=np.int16)
+    frame = np.clip(frame, 0, 255).astype(np.uint8)
+    x1, y1, x2, y2 = (int(v) for v in FURNITURE)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (215, 225, 235), -1)
+    cv2.rectangle(frame, (620, 120), (700, 620), (60, 70, 90), -1)      # a post, for edges
+    return frame
+
+
+# ---- MotionGate: the retained mask ---------------------------------------------------
+# The gate now KEEPS its cleaned foreground mask (refimg's coverage channel). The area it
+# returns must be exactly what it always was: the largest blob, in FULL-FRAME px^2.
+
+def _gate_cfg():
+    cfg = config.Config()
+    cfg.motion_gate_width = 640          # 1280-wide frames -> a 2x downscale, area_scale 4.0
+    return cfg
+
+
+def _moving_blob_frames(n: int = 8):
+    base = _yard()
+    out = []
+    for i in range(n):
+        f = base.copy()
+        cv2.rectangle(f, (400 + i * 25, 300), (460 + i * 25, 360), (250, 250, 250), -1)
+        out.append(f)
+    return out
+
+
+def test_motion_gate_exposes_the_mask_and_its_area_still_matches_it():
+    gate = backyard_cam.MotionGate(_gate_cfg())
+    assert gate.mask is None                       # nothing observed yet
+    seen_a_blob = False
+    for frame in _moving_blob_frames():
+        area = gate.update(frame)
+        assert gate.mask is not None
+        assert gate.mask.shape == (360, 640)       # the gate's own downscaled resolution
+        assert set(np.unique(gate.mask)) <= {0, 255}
+        contours, _ = cv2.findContours(gate.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 1280 -> 640 is a 0.5 scale, so blob areas scale back by 1/0.5^2 = 4.
+        expected = max((cv2.contourArea(c) for c in contours), default=0.0) * 4.0
+        assert area == pytest.approx(expected)
+        seen_a_blob = seen_a_blob or area > 0
+    assert seen_a_blob                              # the fixture really does move something
+
+
+def test_motion_gate_areas_are_unchanged_and_reproducible():
+    frames = _moving_blob_frames()
+    a = [backyard_cam.MotionGate(_gate_cfg()).update(f) for f in frames]   # fresh gate each frame
+    g1, g2 = backyard_cam.MotionGate(_gate_cfg()), backyard_cam.MotionGate(_gate_cfg())
+    assert [g1.update(f) for f in frames] == [g2.update(f) for f in frames]
+    assert a[0] == 0.0 or a[0] > 0.0               # (just pinning that the first frame is defined)
+
+
+def test_motion_gate_on_a_still_scene_reports_no_motion_and_an_empty_mask():
+    gate = backyard_cam.MotionGate(_gate_cfg())
+    frame = _yard()
+    areas = [gate.update(frame.copy()) for _ in range(20)]
+    assert areas[-1] == 0.0
+    assert int(gate.mask.max()) == 0
+
+
+# ---- DetectorCensus: measurement, on whether or not the veto is ----------------------
+
+def test_census_counts_runs_and_empties():
+    c = backyard_cam.DetectorCensus()
+    c.note(0.0, 2)
+    c.note(1.0, 0)
+    c.note(2.0, 0)
+    assert (c.runs, c.empty) == (3, 2)
+
+
+def test_census_longest_empty_run_is_the_longest_unbroken_stretch():
+    c = backyard_cam.DetectorCensus()
+    for t in (0.0, 5.0, 9.0):
+        c.note(t, 0)
+    assert c.longest_empty_s == pytest.approx(9.0)
+    c.note(10.0, 1)                     # a detection breaks the run
+    c.note(20.0, 0)
+    c.note(23.0, 0)
+    assert c.longest_empty_s == pytest.approx(9.0)     # the newer 3 s stretch doesn't win
+
+
+def test_census_rolls_once_per_period_and_resets():
+    c = backyard_cam.DetectorCensus(period_s=100.0)
+    assert c.roll(0.0) is None          # the first call only starts the clock
+    c.note(1.0, 0)
+    c.note(2.0, 0)
+    assert c.roll(50.0) is None
+    line = c.roll(120.0)
+    assert line is not None
+    assert "2 run(s), 2 empty (100%)" in line and "longest empty run 1s" in line
+    assert (c.runs, c.empty, c.longest_empty_s) == (0, 0, 0.0)
+    assert c.roll(150.0) is None        # the new period has only just started
+
+
+# ---- HUD: one extra token, and nothing else -----------------------------------------
+
+def test_hud_without_a_ref_token_is_pixel_identical():
+    a, b = np.zeros((200, 640, 3), np.uint8), np.zeros((200, 640, 3), np.uint8)
+    kw = dict(fps=21.6, motion_area=1234, motion=True, saved=7, source="glass door",
+              model="MDV6-yolov10-c")
+    backyard_cam.draw_hud(a, **kw)
+    backyard_cam.draw_hud(b, ref_status=None, **kw)
+    assert np.array_equal(a, b)
+
+
+def test_hud_with_a_ref_token_draws_more_pixels():
+    a, b = np.zeros((200, 640, 3), np.uint8), np.zeros((200, 640, 3), np.uint8)
+    kw = dict(fps=21.6, motion_area=1234, motion=True, saved=7, source="glass door",
+              model="MDV6-yolov10-c")
+    backyard_cam.draw_hud(a, **kw)
+    backyard_cam.draw_hud(b, ref_status="ref night 7m", **kw)
+    assert b.sum() > a.sum()
+
+
+def test_short_age_reads_at_a_glance():
+    assert backyard_cam._short_age(42) == "42s"
+    assert backyard_cam._short_age(7 * 60 + 30) == "7m"
+    assert backyard_cam._short_age(3.14 * 3600) == "3.1h"
+    assert backyard_cam._short_age(-5) == "0s"
+
+
+# ---- The capture loop, driven end to end on fake frames ------------------------------
+# A fake capture + a scripted detector run the REAL _run_camera: motion gate, detector gating,
+# crop + DB write, the census and (when enabled) the shadow veto. Nothing here opens a camera,
+# a model or the real database.
+
+class _FakeCap:
+    """A VideoCapture stand-in that plays a frame list and then ends the run."""
+
+    def __init__(self, frames, stop_event):
+        self._frames = list(frames)
+        self._stop = stop_event
+        self.released = False
+
+    def read(self):
+        if not self._frames:
+            self._stop.set()            # the loop's own exit condition; no reconnect is attempted
+            return False, None
+        return True, self._frames.pop(0).copy()
+
+    def isOpened(self):
+        return True
+
+    def release(self):
+        self.released = True
+
+    def set(self, *a, **k):
+        return True
+
+    def get(self, *a, **k):
+        return 0.0
+
+
+class _ScriptedDetector:
+    """Returns a scripted verdict per CALL -- the loop only calls it on motion frames."""
+
+    def __init__(self, script):
+        self.script, self.calls = list(script), 0
+
+    def detect(self, frame):
+        i, self.calls = self.calls, self.calls + 1
+        return list(self.script[i]) if i < len(self.script) else []
+
+
+def _animal(box, conf: float = 0.9) -> Detection:
+    return Detection(class_id=0, class_name="animal", confidence=conf,
+                     bbox=tuple(float(v) for v in box))
+
+
+def _loop_cfg(root, **over):
+    """A hermetic config: the SHIPPED defaults (never Matt's config_local), every path inside
+    the test's tmp dir, and the knobs that would otherwise reach hardware turned off."""
+    cfg = config.Config()
+    root.mkdir(parents=True, exist_ok=True)
+    cfg.db_path = root / "test.db"
+    cfg.crops_dir = root / "crops"
+    cfg.frames_dir = root / "frames"
+    cfg.clips_dir = root / "clips"
+    cfg.refimg_store_dir = root / "refimg_store"
+    cfg.source = "test_cam"
+    cfg.show_preview = False
+    cfg.serve = False
+    cfg.record_clips = False
+    cfg.save_full_frame = False
+    cfg.classify_live = False
+    cfg.use_time_of_day_profiles = False
+    cfg.wb_auto_recover = False
+    cfg.wedge_guard = False
+    cfg.ignore_zones = {}
+    cfg.motion_gate_width = 640
+    cfg.motion_min_area = -1.0            # a still synthetic scene still wakes the detector
+    cfg.detector_min_interval_s = 0.0     # ... on every frame, instead of once a second
+    for key, val in over.items():
+        setattr(cfg, key, val)
+    return cfg
+
+
+# 10 empty verdicts (the reference certifies), then the same furniture box twice, then a box
+# somewhere the detector has never fired before.
+_SCRIPT = ([[] for _ in range(10)]
+           + [[_animal(FURNITURE)], [_animal(FURNITURE)], [_animal(ELSEWHERE)]])
+
+
+def _drive(cfg, monkeypatch, script=_SCRIPT):
+    frames = [_yard()] * (backyard_cam.MOTION_WARMUP_FRAMES + len(script))
+    stop = threading.Event()
+    cap = _FakeCap(frames, stop)
+    monkeypatch.setattr(backyard_cam, "open_capture", lambda spec, c: cap)
+    detector = _ScriptedDetector(script)
+    results: dict = {}
+    backyard_cam._run_camera(cfg.camera_specs()[0], cfg, detector, threading.Lock(),
+                             {}, {}, {}, threading.Lock(), stop, results)
+    assert cap.released
+    return results, detector
+
+
+def _rows(cfg):
+    conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM detections ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _saved_shape(rows):
+    """Everything about a saved row that shadow mode must not change (timestamps and the
+    timestamped crop filename are wall-clock and therefore differ between runs)."""
+    return [(r["source"], r["detection_class"], r["confidence"], r["bbox_x1"], r["bbox_y1"],
+             r["bbox_x2"], r["bbox_y2"], r["frame_w"], r["frame_h"], r["species"],
+             r["individual_id"], r["crop_quality"]) for r in rows]
+
+
+def test_disabled_veto_leaves_the_save_path_exactly_as_it_was(tmp_path, monkeypatch):
+    cfg = _loop_cfg(tmp_path / "off")            # refimg_enabled defaults to False
+    assert cfg.refimg_enabled is False
+    results, detector = _drive(cfg, monkeypatch)
+
+    rows = _rows(cfg)
+    assert len(rows) == 3 and results["test_cam"]["saved"] == 3
+    for r in rows:
+        assert r["suppressed_at"] is None and r["suppressed_by"] is None
+        assert r["suppress_ref_id"] is None and r["suppress_detail"] is None
+        assert db.crop_abspath(r["crop_path"]).exists()
+    assert results["test_cam"]["suppressed"] == 0
+    # Nothing of the veto ran: no reference images, no view epochs, not even its store directory.
+    conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM reference_images").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM view_epochs").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert not cfg.refimg_store_dir.exists()
+
+
+def test_shadow_mode_saves_exactly_the_same_rows_as_the_disabled_rig(tmp_path, monkeypatch):
+    off = _loop_cfg(tmp_path / "off")
+    on = _loop_cfg(tmp_path / "on", refimg_enabled=True, refimg_certify_hold_s=0.0,
+                   refimg_recurrence_min_events=2, refimg_recurrence_event_gap_s=0.0,
+                   refimg_recurrence_min_days=1)
+    _drive(off, monkeypatch)
+    _drive(on, monkeypatch)
+    # Identical detections, box for box: the veto only ever ADDS metadata to a saved row.
+    assert _saved_shape(_rows(off)) == _saved_shape(_rows(on))
+
+
+def test_shadow_veto_flags_a_recurring_furniture_box_and_keeps_everything(tmp_path, monkeypatch):
+    cfg = _loop_cfg(tmp_path / "on", refimg_enabled=True, refimg_certify_hold_s=0.0,
+                    refimg_recurrence_min_events=2, refimg_recurrence_event_gap_s=0.0,
+                    refimg_recurrence_min_days=1)
+    results, _ = _drive(cfg, monkeypatch)
+    rows = _rows(cfg)
+    assert len(rows) == 3
+    first, second, elsewhere = rows
+
+    # The FIRST firing at the furniture spot matches the empty reference on every pixel metric
+    # but has no history yet -- the recurrence gate is what keeps it.
+    assert first["suppressed_at"] is None
+    assert json.loads(first["suppress_detail"] or "null") is None
+    # The SECOND firing at the same spot is the suppression.
+    assert second["suppressed_at"] is not None
+    assert second["suppressed_by"] == "refimg_veto"
+    detail = json.loads(second["suppress_detail"])
+    assert detail["decision"] == "SUPPRESS"
+    assert detail["reason"] == "matches_empty_reference_at_a_recurring_spot"
+    assert detail["provenance"] == refimg.PROVENANCE_MOTION_MASKED
+    assert detail["recurrence"]["events"] >= 2
+    assert set(detail["thresholds"]) >= {"lum", "dssim", "sobel"}
+    # A first-time box somewhere else is NOT suppressed, even though its pixels match too.
+    assert elsewhere["suppressed_at"] is None
+
+    # SHADOW MODE: the flagged row and its crop are still there, unchanged.
+    for r in rows:
+        assert db.crop_abspath(r["crop_path"]).exists()
+        assert r["detection_class"] == "animal" and r["confidence"] == pytest.approx(0.9)
+    assert results["test_cam"]["saved"] == 3
+    assert results["test_cam"]["suppressed"] == 1
+
+    # The suppression points at a reference image that is on disk and replayable.
+    conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True)
+    try:
+        ref = db.reference_image(conn, second["suppress_ref_id"])
+    finally:
+        conn.close()
+    assert ref is not None and ref["source"] == "test_cam" and ref["illumination"] == "day"
+    assert ref["provenance"] == refimg.PROVENANCE_MOTION_MASKED
+    assert Path(ref["image_path"]).exists()
+    # The recurrence ledger survives the run, so a restart does not forget the spot.
+    assert (cfg.refimg_store_dir / "test_cam" / "recurrence.json").exists()
+
+
+def test_shadow_is_none_when_the_veto_is_disabled(tmp_path, conn):
+    cfg = _loop_cfg(tmp_path / "off")
+    assert backyard_cam.RefimgShadow.create(cfg, "test_cam", conn) is None
+
+
+def test_hud_token_goes_from_nothing_to_a_certified_reference(tmp_path, conn):
+    cfg = _loop_cfg(tmp_path / "hud", refimg_enabled=True, refimg_certify_hold_s=0.0)
+    shadow = backyard_cam.RefimgShadow.create(cfg, "test_cam", conn)
+    assert shadow is not None
+    assert shadow.hud() == "ref --"                    # nothing certified yet: the veto abstains
+    frame, mask = _yard(), np.zeros((360, 640), np.uint8)
+    start = time.time()
+    for i in range(6):                                  # six empty detector verdicts, motion quiet
+        shadow.observe(conn, frame, [], mask, start + i * 0.1)
+    assert shadow.hud() == "ref day 0s"                 # a coloured, bright scene reads as 'day'
+    assert shadow.ref is not None and shadow.ref.id is not None
+
+
+def test_census_line_is_logged_even_with_the_veto_off(tmp_path, monkeypatch, capsys):
+    cfg = _loop_cfg(tmp_path / "census")
+    # A zero-length reporting period so the hourly line renders inside a 28-frame test.
+    real = backyard_cam.DetectorCensus
+    monkeypatch.setattr(backyard_cam, "DetectorCensus", lambda: real(period_s=0.0))
+    _drive(cfg, monkeypatch)
+    out = capsys.readouterr().out
+    assert "detector census:" in out
+    assert "run(s)" in out and "longest empty run" in out

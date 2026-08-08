@@ -86,7 +86,30 @@ CREATE TABLE IF NOT EXISTS detections (
     -- set_individual_bulk, rename_individual -- including a CLEAR/reject, whose time is exactly what
     -- a bias measurement wants. Additive and backfilled to NULL: every label written before
     -- 2026-08-05 has no stamp and NOTHING may assume this is set.
-    labelled_at         TEXT
+    labelled_at         TEXT,
+
+    -- SOFT SUPPRESSION (2026-08-07, docs/refimg-design-2026-08-07.md section 7). A box the
+    -- reference-image veto believes is FURNITURE -- the tipped watering can that MegaDetector calls
+    -- a raccoon 60 times -- is written exactly as before and then FLAGGED here. Nothing is dropped,
+    -- because an erased animal writes no row at all and is a silent permanent loss, while a wrongly
+    -- flagged one is a row somebody can look at and un-flag. Same soft-delete convention as
+    -- clips.pruned_at.
+    --
+    -- NULL suppressed_at == a LIVE row, so every existing query keeps working unchanged until it
+    -- opts in. The feature ships in SHADOW MODE: the veto writes these columns for a week and NO
+    -- consumer honours them -- not the dashboard, not individuals.still_tracklets, not co-presence,
+    -- not stats -- so a week of flagged crops can be audited on one contact sheet before anything
+    -- acts on the flag. When consumers do opt in, the read-side contract is: exclude from
+    -- still_tracklets' cannot-link constraint, co-presence badges and species statistics; keep
+    -- everywhere else, and ALWAYS keep in eval.py, because the only way to learn the veto's
+    -- precision is to keep scoring the boxes it removed.
+    suppressed_at       TEXT,    -- when it was flagged (local ISO 8601 w/ offset). NULL = live row.
+    suppressed_by       TEXT,    -- which mechanism decided: 'refimg_veto' | 'staticfilter' | ...
+    suppress_ref_id     INTEGER, -- reference_images.id the box was compared against (NULL if none).
+    -- The WHOLE decision as JSON, so a bad suppression is diagnosable months later without
+    -- re-running anything: {"decision":"SUPPRESS","reason":...,"provenance":...,"view_corr":...,
+    -- "age_s":...,"scores":{...},"thresholds":{...},"recurrence":{"events":9,"days":3,"n":214}}.
+    suppress_detail     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_timestamp  ON detections(timestamp);
@@ -289,6 +312,60 @@ CREATE TABLE IF NOT EXISTS individual_status (
     effective_date TEXT,
     note           TEXT,                 -- optional free text ("last seen 06-30, kits stayed").
     updated_at     TEXT NOT NULL         -- when this row was last written (local ISO 8601 w/ offset).
+);
+
+-- REFERENCE IMAGES (2026-08-07, docs/refimg-design-2026-08-07.md sections 6-7): "what this camera
+-- looks like with nothing in it", so a suppression can be REPLAYED against the exact image months
+-- later. A reference is a frame the detector ACTUALLY RAN ON and certified empty (zero boxes, motion
+-- quiet, held for a hold period) -- not a rolling background model, which is forbidden here: MOG2
+-- absorbs a stationary object in ~23 s at 21.6 fps, against a measured 823 s of verified animal
+-- residency, so a decaying model would learn the sleeping raccoon and then erase it.
+--
+-- Keyed on (source, illumination, view_epoch), SWITCHED not blended, because the day<->night flip is
+-- the single largest pixel event on this camera (lum 94.3, DSSIM 0.87) and a camera reposition
+-- invalidates everything. Illumination is DERIVED FROM THE FRAME (chroma < 6 => ir; else median < 90
+-- => night; else day), never from a clock.
+--
+-- `cover_path` is load-bearing and not decoration: a certified reference can still CONTAIN an
+-- undetected animal (measured -- a raccoon walked the wall inside a frame the detector certified
+-- empty), so policy E marks every pixel that motion-blobbed in the last 3600 s as NOT COVERED and
+-- the veto ABSTAINS there. An unknown pixel is not evidence of emptiness. NULL means fully covered.
+--
+-- Rows are RETIRED (retired_at set on an epoch change), never deleted: a suppression written last
+-- week must still resolve to the image that justified it.
+CREATE TABLE IF NOT EXISTS reference_images (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT    NOT NULL,   -- matches detections.source.
+    illumination  TEXT    NOT NULL,   -- 'day' | 'night' | 'ir', DERIVED FROM THE FRAME.
+    view_epoch    INTEGER NOT NULL,   -- view_epochs.epoch this reference belongs to.
+    captured_at   TEXT    NOT NULL,   -- local ISO 8601 w/ offset, like detections.timestamp.
+    provenance    TEXT    NOT NULL,   -- 'certified' | 'certified+motion_masked' | 'rank_p50'.
+    image_path    TEXT    NOT NULL,   -- PNG, 320x180 grey (the resolution the thresholds are for).
+    cover_path    TEXT,               -- PNG mask of KNOWN pixels; NULL == fully covered.
+    edge_fp       BLOB,               -- edge fingerprint (float32 bytes) for the view gate.
+    n_frames      INTEGER,            -- 1 for a snapshot, pool size for a rank reference.
+    span_s        REAL,               -- 0 for a snapshot.
+    retired_at    TEXT                -- set on epoch change; the row is NEVER deleted.
+);
+CREATE INDEX IF NOT EXISTS idx_refimg_lookup
+    ON reference_images(source, illumination, view_epoch, captured_at);
+
+-- CAMERA VIEW EPOCHS (2026-08-07): "the camera moved" as a first-class RECORDED event rather than
+-- something inferred after the fact -- the failure mode config.py warns about, where a stale
+-- hand-measured zone fails SILENTLY. The glass door is repositioned about once every 4 days and the
+-- trail cam about once every 1.3 days, so a reference outlives its own validity constantly.
+--
+-- Detected from DAY frames only, by edge-fingerprint correlation: IR frames from 12 days spanning
+-- confirmed repositions all collapse into ONE view cluster, so a night reference can never learn it
+-- has been invalidated by looking at itself. A bump flushes every illumination's reference.
+CREATE TABLE IF NOT EXISTS view_epochs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source       TEXT    NOT NULL,   -- matches detections.source.
+    epoch        INTEGER NOT NULL,   -- monotonic per source; 0 is the implicit epoch before any bump.
+    started_at   TEXT    NOT NULL,   -- when the new view was first believed (local ISO 8601 w/ offset).
+    detected_by  TEXT    NOT NULL,   -- 'edge_fp_corr' (or 'manual' when a human says the cam moved).
+    corr         REAL,               -- the correlation that triggered it (NULL for a manual bump).
+    UNIQUE(source, epoch)
 );
 """
 
@@ -635,6 +712,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_at TEXT")
     if ls_cols and "superseded_by" not in ls_cols:
         conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_by INTEGER")
+    # Soft suppression (2026-08-07, docs/refimg-design-2026-08-07.md section 7). Four nullable adds,
+    # backfilled to NULL, so every row already in the DB reads as LIVE and every existing query keeps
+    # working untouched -- exactly the clips.pruned_at pattern. The columns exist ahead of any
+    # consumer honouring them, on purpose: the veto ships in shadow mode and writes them for a week
+    # before anything reads them. (reference_images / view_epochs need no ALTER path -- they are new
+    # tables, created by SCHEMA's CREATE TABLE IF NOT EXISTS on the same connect.)
+    for col, decl in (("suppressed_at", "TEXT"), ("suppressed_by", "TEXT"),
+                      ("suppress_ref_id", "INTEGER"), ("suppress_detail", "TEXT")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE detections ADD COLUMN {col} {decl}")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
@@ -1340,3 +1427,223 @@ def co_present_sighting_names(conn: sqlite3.Connection, source: str,
                 seen.add(k)
                 names.append(n)
     return {"names": names, "observed_at": observed, "n": len(names)}
+
+
+# ---------------------------------------------------------------------------
+# THE REFERENCE-IMAGE VETO (2026-08-07, docs/refimg-design-2026-08-07.md).
+#
+# A tipped watering can at the glass door fires MegaDetector as `raccoon` sixty times; a static
+# bracket fired as `Anna's hummingbird` four hundred times. Comparing a box's pixels against a
+# reference frame of the same view WITH NOTHING IN IT suppresses 588 of 652 such furniture
+# evaluations while touching 0 of 4,649 animal evaluations -- but only as a CONJUNCTION of gates,
+# every one of which was measured to be load-bearing. The bare pixel test erases raccoons (131 of
+# 372 in one visit), and location recurrence alone flags the FOOD BOWL, where real raccoons have
+# stood for 27 days.
+#
+# This module contributes only the STORAGE, and it is deliberately inert:
+#   * a suppression is a FLAG on a row that was written normally (record_suppression), never a
+#     dropped, hidden or altered detection. An erased animal writes no row at all and is a silent
+#     permanent loss; a wrongly flagged one is a row a human can look at and clear. That asymmetry
+#     is the whole reason these are columns and not a DELETE.
+#   * SHADOW MODE ships first: nothing in this codebase reads suppressed_at yet. A week of flagged
+#     crops goes onto one contact sheet, gets audited, and only then does any consumer opt in.
+# ---------------------------------------------------------------------------
+
+# Known `suppressed_by` values -- WHICH mechanism made the call, so a bad week is attributable to
+# one of them rather than to "something suppressed this".
+SUPPRESSED_BY_REFIMG_VETO = "refimg_veto"     # the reference-image veto (this design).
+SUPPRESSED_BY_STATICFILTER = "staticfilter"   # the self-calibrating static-furniture sweep.
+
+# Illumination is DERIVED FROM THE FRAME (chroma < 6 => ir; else median < 90 => night; else day),
+# never from a clock, and a reference is switched between these -- never blended across them.
+ILLUMINATIONS = ("day", "night", "ir")
+
+
+def _detail_json(detail) -> Optional[str]:
+    """Normalize a gate trace to the TEXT actually stored. A mapping/sequence is dumped; a string is
+    trusted as already-JSON and stored verbatim (so a caller that built it with its own encoder is
+    not double-encoded); None stays None."""
+    if detail is None:
+        return None
+    if isinstance(detail, str):
+        return detail
+    return json.dumps(detail, default=str)
+
+
+def record_suppression(conn: sqlite3.Connection, detection_id: int, by: str,
+                       ref_id: Optional[int] = None, detail_json=None, *,
+                       suppressed_at: Optional[str] = None) -> bool:
+    """Flag one detection as suppressed. The row itself is NOT touched -- box, crop, species,
+    identity and timestamps all stay exactly as written -- so nothing is lost and every existing
+    query keeps returning it until that query opts in.
+
+    `by` says which mechanism decided (SUPPRESSED_BY_*), `ref_id` the reference_images row it was
+    compared against, `detail_json` the WHOLE decision (dict or JSON string): scores, thresholds,
+    provenance, reference age, recurrence counts. That trace is the point -- a suppression that
+    turns out to be a raccoon has to be diagnosable months later without re-running the veto.
+
+    REFUSES TO OVERWRITE an existing suppression: the first mechanism to flag a row owns the
+    explanation, and silently replacing it would destroy the evidence for the decision that
+    actually happened. Returns True if this call flagged the row, False if it was already flagged
+    (or the id doesn't exist) -- never raises for either. Use clear_suppression to un-flag first."""
+    who = str(by or "").strip()
+    if not who:
+        raise ValueError("suppressed_by is required (which mechanism decided)")
+    row = conn.execute("SELECT suppressed_at FROM detections WHERE id = ?",
+                       (int(detection_id),)).fetchone()
+    if row is None or row[0] is not None:
+        return False
+    conn.execute(
+        "UPDATE detections SET suppressed_at = ?, suppressed_by = ?, suppress_ref_id = ?, "
+        "suppress_detail = ? WHERE id = ? AND suppressed_at IS NULL",
+        (suppressed_at or now_local_iso(), who,
+         None if ref_id is None else int(ref_id), _detail_json(detail_json), int(detection_id)))
+    conn.commit()
+    return True
+
+
+def clear_suppression(conn: sqlite3.Connection, detection_id: int) -> bool:
+    """Un-flag a detection: all four suppression columns go back to NULL and the row is live again.
+    This is the human's "that was an animal" verdict from the audit sheet, and it is the reason the
+    veto is allowed to be wrong. Returns True if the row was suppressed and is now clear."""
+    cur = conn.execute(
+        "UPDATE detections SET suppressed_at = NULL, suppressed_by = NULL, "
+        "suppress_ref_id = NULL, suppress_detail = NULL "
+        "WHERE id = ? AND suppressed_at IS NOT NULL", (int(detection_id),))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def save_reference_image(conn: sqlite3.Connection, *, source: str, illumination: str,
+                         view_epoch: int, provenance: str, image_path: str,
+                         captured_at: Optional[str] = None, cover_path: Optional[str] = None,
+                         edge_fp: Optional[bytes] = None, n_frames: Optional[int] = None,
+                         span_s: Optional[float] = None) -> int:
+    """Store one reference image ("this view with nothing in it"); returns its new id.
+
+    `cover_path` is the mask of pixels the reference actually KNOWS -- NULL means fully covered, and
+    anything else means the veto must abstain outside the mask. An unknown pixel is not evidence of
+    emptiness: a detector-certified frame was measured to contain an undetected raccoon walking the
+    wall, and the motion mask is what keeps that miss costing an abstention instead of an erasure.
+
+    `illumination` is validated against ILLUMINATIONS because it is a lookup KEY -- a typo would
+    make latest_reference silently return nothing forever, the stale-guard-fails-silently failure
+    this project has already been bitten by."""
+    illum = str(illumination or "").strip().lower()
+    if illum not in ILLUMINATIONS:
+        raise ValueError(f"illumination must be one of {', '.join(ILLUMINATIONS)}, got {illumination!r}")
+    if not str(source or "").strip():
+        raise ValueError("source is required")
+    if not str(provenance or "").strip():
+        raise ValueError("provenance is required (how this reference was built)")
+    cur = conn.execute(
+        """INSERT INTO reference_images (source, illumination, view_epoch, captured_at, provenance,
+                                         image_path, cover_path, edge_fp, n_frames, span_s)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (source, illum, int(view_epoch), captured_at or now_local_iso(), provenance,
+         image_path, cover_path, edge_fp,
+         None if n_frames is None else int(n_frames),
+         None if span_s is None else float(span_s)))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _reference_row(row) -> dict:
+    """One reference_images row as a plain dict (read positionally, so no row_factory required)."""
+    (rid, source, illumination, view_epoch, captured_at, provenance, image_path,
+     cover_path, edge_fp, n_frames, span_s, retired_at) = tuple(row)[:12]
+    return {"id": rid, "source": source, "illumination": illumination,
+            "view_epoch": view_epoch, "captured_at": captured_at, "provenance": provenance,
+            "image_path": image_path, "cover_path": cover_path, "edge_fp": edge_fp,
+            "n_frames": n_frames, "span_s": span_s, "retired_at": retired_at}
+
+
+_REFIMG_COLS = ("id, source, illumination, view_epoch, captured_at, provenance, image_path, "
+                "cover_path, edge_fp, n_frames, span_s, retired_at")
+
+
+def latest_reference(conn: sqlite3.Connection, source: str, illumination: str,
+                     epoch: int) -> Optional[dict]:
+    """The newest LIVE (not retired) reference for exactly this (source, illumination, view_epoch),
+    as a dict -- or None, which is a perfectly normal answer and means the veto abstains.
+
+    Ordered by id, not by captured_at: the writer inserts in capture order, and ISO timestamps
+    carrying different UTC offsets do not sort by instant (the DST-seam trap this module handles
+    with parse_local everywhere it compares times). The age gate is the caller's job -- captured_at
+    is returned so it can apply the 2 h limit itself.
+
+    Returns None on a DB whose writer has never migrated (the read-only-clone contract shared with
+    individual_statuses / _live_sighting_rows)."""
+    illum = str(illumination or "").strip().lower()
+    try:
+        row = conn.execute(
+            f"SELECT {_REFIMG_COLS} FROM reference_images "
+            f"WHERE source = ? AND illumination = ? AND view_epoch = ? AND retired_at IS NULL "
+            f"ORDER BY id DESC LIMIT 1", (source, illum, int(epoch))).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else _reference_row(row)
+
+
+def reference_image(conn: sqlite3.Connection, ref_id: int) -> Optional[dict]:
+    """One reference by id, RETIRED OR NOT -- the replay path for an audit: a suppression written
+    last week carries suppress_ref_id, and the image that justified it must still be resolvable
+    even though its epoch is long gone. That is why references are retired and never deleted."""
+    try:
+        row = conn.execute(f"SELECT {_REFIMG_COLS} FROM reference_images WHERE id = ?",
+                           (int(ref_id),)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else _reference_row(row)
+
+
+def retire_reference_images(conn: sqlite3.Connection, source: str, before_epoch: int, *,
+                            retired_at: Optional[str] = None) -> int:
+    """Retire every live reference on `source` from an epoch OLDER than `before_epoch` -- what the
+    camera looked like empty before it was moved is not what it looks like empty now. The rows are
+    kept (retired_at set, never deleted) so past suppressions stay replayable. Returns rows retired.
+    Idempotent: a second call finds nothing left to mark."""
+    cur = conn.execute(
+        "UPDATE reference_images SET retired_at = ? "
+        "WHERE source = ? AND view_epoch < ? AND retired_at IS NULL",
+        (retired_at or now_local_iso(), source, int(before_epoch)))
+    conn.commit()
+    return cur.rowcount
+
+
+def current_view_epoch(conn: sqlite3.Connection, source: str) -> int:
+    """Which view epoch `source` is in now. DEFAULTS TO 0 when nothing has been recorded -- epoch 0
+    is the implicit "the camera has not been seen to move" state, so a rig that has never detected a
+    reposition still has a valid, stable reference key. 0 is also the answer on a DB whose writer has
+    never migrated (read-only-clone contract)."""
+    try:
+        row = conn.execute("SELECT MAX(epoch) FROM view_epochs WHERE source = ?",
+                           (source,)).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return 0 if row is None or row[0] is None else int(row[0])
+
+
+def bump_view_epoch(conn: sqlite3.Connection, source: str, detected_by: str = "edge_fp_corr",
+                    corr: Optional[float] = None, *, started_at: Optional[str] = None) -> int:
+    """Record that `source` has moved: allocate the next epoch, write the event, and RETIRE every
+    reference from the older epochs in the same call -- so a stale reference can never be handed out
+    after a reposition. Returns the new epoch (monotonic, starting at 1 over the implicit 0).
+
+    Making the move a recorded event rather than an after-the-fact inference is the point: this
+    project's standing rule is that a stale hand-measured zone fails SILENTLY, and the glass door is
+    repositioned about once every 4 days (the trail cam about once every 1.3). UNIQUE(source, epoch)
+    means a concurrent second writer raises rather than quietly re-using an epoch; the rig is a
+    single writer, and a raise here is the honest outcome."""
+    who = str(detected_by or "").strip()
+    if not who:
+        raise ValueError("detected_by is required (what decided the camera moved)")
+    epoch = current_view_epoch(conn, source) + 1
+    conn.execute(
+        "INSERT INTO view_epochs (source, epoch, started_at, detected_by, corr) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (source, epoch, started_at or now_local_iso(), who,
+         None if corr is None else float(corr)))
+    retire_reference_images(conn, source, epoch, retired_at=started_at)
+    conn.commit()
+    return epoch

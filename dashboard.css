@@ -33,7 +33,10 @@
   .mast h1 .amp{color:var(--gilt); font-style:italic;}
   .mast .sub{font-style:italic; color:var(--dim); margin-bottom:14px;}
   .live-chip{display:inline-flex; align-items:center; gap:7px; color:var(--ink);}
-  .live-dot{width:8px;height:8px;border-radius:50%;background:var(--rust); box-shadow:0 0 0 0 rgba(192,95,62,.6); animation:pulse 2s infinite;}
+  /* Idle = "monitoring": a steady dim ember. A critter on-cam (.on, set by refreshHeader from
+     /api/camera's animal_active) relights the rust pulse. */
+  .live-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);}
+  .live-chip.on .live-dot{background:var(--rust); box-shadow:0 0 0 0 rgba(192,95,62,.6); animation:pulse 2s infinite;}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(192,95,62,.55)}70%{box-shadow:0 0 0 7px rgba(192,95,62,0)}100%{box-shadow:0 0 0 0 rgba(192,95,62,0)}}
 
   /* ---- Nav ---- */

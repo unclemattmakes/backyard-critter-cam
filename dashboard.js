@@ -313,6 +313,15 @@ async function refreshHeader(){
     else if(batt){ warn.textContent='⚠ '+v.power.warning; warn.className='rig-warn'; warn.hidden=false; }
     else warn.hidden=true;
   }
+  /* Masthead chip: "observation in progress" only while a critter is actually on-cam
+     (animal_active = a critter-class detection within cfg.on_cam_window_s, published by the
+     rig); otherwise the rig is watching an empty stage, and the chip says so. */
+  const chip=$('#livechip');
+  if(chip){
+    const on=!!v.animal_active;
+    chip.classList.toggle('on',on);
+    const t=$('#livechip-txt'); if(t) t.textContent = on ? 'observation in progress' : 'monitoring in progress';
+  }
 }
 
 /* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no

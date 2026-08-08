@@ -37,6 +37,13 @@ clip_crops/
 # project touches. The crops/frames are a regenerable cache (re-run `refcam.py --apply --crop`).
 reference/
 reference_crops/
+# REFERENCE IMAGES FOR THE FURNITURE VETO (refimg.py) -- the same reasoning as reference/ above,
+# one step further. These are not tight animal crops: they are FULL FRAMES of the yard, certified
+# empty, which is to say pictures of the house, the door, the fence and whatever was parked in the
+# driveway, several per night. Never commit them -- this repo is public. Regenerable: the rig
+# certifies a fresh one within minutes of starting, and every past one is replayable from the
+# reference_images rows only for as long as the PNGs are kept locally.
+refimg_store/
 # rotating run log (backyard_cam.py tees stdout/stderr here for post-mortems; regenerated)
 logs/
 # eval.py evaluation artifacts (timestamped JSON runs; regenerated on demand, comparable on disk)

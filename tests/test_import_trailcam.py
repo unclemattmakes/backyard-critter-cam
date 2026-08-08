@@ -11,6 +11,12 @@ Two regression guards live here:
     pre-fix bare ledger lines are inert, with the files they recorded still covered by the
     capture stamp that has always led the crop filename.
 
+Plus the burst full-frame retention (2026-08-07): one kept frame per trigger, its path on that
+trigger's rows, nothing kept for a trigger with no surviving detection. That last one is the
+sharp edge -- staticfilter deletes rows AFTER the still pass, so the frames it orphans have to
+go with them. Retention is a prerequisite for the reference-image veto, NOT the veto: nothing in
+the importer judges a box against a reference, and these tests would notice if it started.
+
 No GPU/camera/model here: the detector is a tiny stub that returns one fixed box. The synthetic
 JPEGs carry no EXIF, so image_timestamp() takes its mtime fallback -- tests pin mtimes to pin
 capture times.
@@ -28,6 +34,7 @@ import numpy as np
 import config
 import db
 import import_trailcam
+import staticfilter
 from detector import Detection
 
 
@@ -392,3 +399,206 @@ def test_backup_first_survives_a_crashing_archiver(monkeypatch):
     not an exception that aborts an import the card is waiting on."""
     ok, _ = _patched_backup(monkeypatch, OSError("no such file"))
     assert ok is False
+
+
+# ---- one full frame per still burst (BurstFrames) --------------------------------------------
+# The prerequisite from docs/refimg-design-2026-08-07.md section 6: a still detection on this
+# camera has never had a full frame, so a reference-image veto has nothing of the same sensor path
+# to compare against. Retention ONLY -- no veto runs at import time, and these tests should fail
+# loudly if one ever starts to.
+
+def _burst_cfg(tmp_path, db_path, **over):
+    """A Config pinned entirely inside tmp -- crops, FRAMES, clips and db_path (the last because
+    ledger_path() derives the import ledger from it; see _video_cfg)."""
+    return replace(config.CONFIG, crops_dir=tmp_path / "crops", frames_dir=tmp_path / "frames",
+                   clips_dir=tmp_path / "clips", db_path=db_path, **over)
+
+
+def _kept_frames(cfg) -> list[Path]:
+    """Every retained full frame on disk, sorted -- from the per-source subdir the importer uses."""
+    root = cfg.frames_dir / "trail_cam_sd"
+    return sorted(p for p in root.rglob("*.jpg")) if root.is_dir() else []
+
+
+def _burst_dump(folder: Path, stamps: list[str], *, first=1, size=(120, 160)) -> list[Path]:
+    """One JPEG per capture stamp, named so filename order matches capture order (which is what a
+    real card does, and what import_folder walks in)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i, when in enumerate(stamps, start=first):
+        p = _write_image(folder / f"IMAG{i:04d}.JPG", size=size)
+        _set_mtime(p, when)
+        out.append(p)
+    return out
+
+
+def _import_bursts(folder, conn, cfg, bursts, skip=None):
+    return import_trailcam.import_folder(
+        folder, _StubDetector(), conn, cfg, source="trail_cam_sd", recursive=False,
+        processed_dir=None, skip=set() if skip is None else skip, bursts=bursts)
+
+
+def test_one_frame_per_burst_and_its_path_on_every_row_of_that_burst(conn, db_path, tmp_path):
+    """The whole feature in one test: three triggers of three stills each keep exactly THREE
+    frames (not nine), each frame is the burst's first still, and every detection of a burst
+    carries that burst's frame_path. Bursts are 1 s apart within a trigger and 5 minutes apart
+    between them -- the real card's gaps are 0-5 s and 28 s+, so this is not a marginal split."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    _burst_dump(dump, ["2026-08-06 21:00:00", "2026-08-06 21:00:01", "2026-08-06 21:00:02",
+                       "2026-08-06 21:05:00", "2026-08-06 21:05:01", "2026-08-06 21:05:02",
+                       "2026-08-06 21:10:00", "2026-08-06 21:10:01", "2026-08-06 21:10:02"])
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    imported, saved, _ = _import_bursts(dump, conn, cfg, bursts)
+    assert (imported, saved) == (9, 9)
+
+    frames = _kept_frames(cfg)
+    assert len(frames) == 3 and bursts.bursts == 3        # one per BURST, not one per still
+    # ... and it is the first still of each trigger, written from the array already decoded.
+    assert [f.name.split(import_trailcam.SRC_TAG)[1] for f in frames] == \
+        ["IMAG0001.jpg", "IMAG0004.jpg", "IMAG0007.jpg"]
+    # frames/<source>/<date>/ -- the clips layout, which backup.py's day_dirs() already walks.
+    assert {f.parent for f in frames} == {cfg.frames_dir / "trail_cam_sd" / "2026-08-06"}
+
+    rows = conn.execute("SELECT frame_path FROM detections ORDER BY id").fetchall()
+    assert len(rows) == 9
+    paths = [r["frame_path"] for r in rows]
+    assert all(p for p in paths)                          # no row left without its frame
+    assert [paths[0]] * 3 == paths[0:3]                   # each burst's three rows share one frame
+    assert [paths[3]] * 3 == paths[3:6]
+    assert [paths[6]] * 3 == paths[6:9]
+    assert len(set(paths)) == 3
+    assert {config.ROOT / p for p in set(paths)} == set(frames)
+
+
+def test_burst_frames_off_writes_no_frame_and_no_path(conn, db_path, tmp_path):
+    """The knob (config.trailcam_keep_burst_frame / --no-burst-frames). Off means the importer
+    behaves exactly as it always has: frame_path NULL, and frames/ never even created."""
+    cfg = _burst_cfg(tmp_path, db_path, trailcam_keep_burst_frame=False)
+    dump = tmp_path / "dump"
+    _burst_dump(dump, ["2026-08-06 21:00:00", "2026-08-06 21:00:01"])
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    assert bursts.enabled is False
+    assert _import_bursts(dump, conn, cfg, bursts)[:2] == (2, 2)
+
+    assert not cfg.frames_dir.exists()
+    assert bursts.written == [] and bursts.bytes_written == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM detections WHERE frame_path IS NOT NULL").fetchone()[0] == 0
+
+
+def test_burst_with_no_saveable_detection_keeps_no_frame(conn, db_path, tmp_path):
+    """A trigger the detector found nothing savable in writes no row, so there is nothing for a
+    frame to serve -- and none is written. The save is lazy for exactly this reason: a sun-storm
+    card is mostly empty triggers, and banking a picture of the yard for each is not insurance."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    _burst_dump(dump, ["2026-08-06 13:00:00", "2026-08-06 13:00:01"])
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    imported, saved, _ = import_trailcam.import_folder(
+        dump, _StubDetector(class_name="person", class_id=1), conn, cfg, source="trail_cam_sd",
+        recursive=False, processed_dir=None, skip=set(), bursts=bursts)
+
+    assert (imported, saved) == (2, 0)
+    assert _kept_frames(cfg) == []
+    assert conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 0
+
+
+def test_burst_retention_leaves_reimport_idempotency_alone(conn, db_path, tmp_path):
+    """Retention must not touch the skip keys. The ledger still holds exactly 'name|capture-
+    second' lines and nothing else, a re-run is still a no-op, and it writes no SECOND copy of
+    the burst's frame (which would double the cost of every re-scan of a card)."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    files = _burst_dump(dump, ["2026-08-06 21:00:00", "2026-08-06 21:00:01"])
+    expected_keys = {import_trailcam.skip_key(f.name, _ts(f)) for f in files}
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    assert _import_bursts(dump, conn, cfg, bursts, _seeded_skip(conn, db_path))[:2] == (2, 2)
+    assert import_trailcam.read_ledger(db_path, "trail_cam_sd") == expected_keys
+    first = _kept_frames(cfg)
+    assert len(first) == 1
+
+    # A fresh process: new BurstFrames, skip-set re-seeded from the ledger UNION the DB crops.
+    again = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    imported, saved, skipped = _import_bursts(dump, conn, cfg, again,
+                                              _seeded_skip(conn, db_path))
+    assert (imported, saved, skipped) == (0, 0, 2)
+    assert again.written == [] and again.bursts == 0      # skipped files never open a burst
+    assert _kept_frames(cfg) == first                     # no duplicate frame on disk
+    assert import_trailcam.read_ledger(db_path, "trail_cam_sd") == expected_keys
+    assert conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 2
+
+
+def test_static_filtered_burst_keeps_zero_frames(conn, db_path, tmp_path):
+    """No animal, no point. staticfilter runs AFTER the still pass and DELETES the rows it judges
+    furniture, so a trigger whose only 'animal' was the grill is left holding a frame nothing
+    points at. Here 16 stills hold one identical box across 75 minutes (furniture by the filter's
+    own rule) while a separate 3-still burst carries a different box -- the furniture frames go,
+    the real one stays, and the day folder emptied by the sweep is tidied up too."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    # The static spot: one still every 5 minutes -> 16 separate bursts, 16 retained frames.
+    _burst_dump(dump, [f"2026-08-05 {12 + (i * 5) // 60:02d}:{(i * 5) % 60:02d}:00"
+                       for i in range(16)])
+    # A real trigger the next evening. A different image SIZE means a different box, so the
+    # static filter clusters it apart (IoU ~0.51, under its 0.75 bar) and its count of 3 is
+    # nowhere near the 15 it needs anyway.
+    _burst_dump(dump, ["2026-08-06 20:00:00", "2026-08-06 20:00:01", "2026-08-06 20:00:02"],
+                first=100, size=(90, 130))
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    imported, saved, _ = _import_bursts(dump, conn, cfg, bursts)
+    assert (imported, saved) == (19, 19)
+    assert len(_kept_frames(cfg)) == 17            # 16 furniture bursts + 1 real one
+
+    dropped = staticfilter.sweep_batch(conn, cfg, "trail_cam_sd", min_id=0)
+    assert dropped == 16                           # the 16 identical boxes, and only those
+    assert bursts.drop_orphans(conn) == 16
+
+    frames = _kept_frames(cfg)
+    assert len(frames) == 1
+    assert import_trailcam.SRC_TAG + "IMAG0100" in frames[0].name
+    assert bursts.written == frames                # the survivor is still counted, the rest aren't
+    assert not (cfg.frames_dir / "trail_cam_sd" / "2026-08-05").exists()   # emptied day tidied up
+    # Every surviving detection still points at a frame that exists.
+    for (fp,) in conn.execute("SELECT DISTINCT frame_path FROM detections"):
+        assert (config.ROOT / fp).exists()
+
+
+def test_orphan_drop_is_a_no_op_when_nothing_was_filtered(conn, db_path, tmp_path):
+    """The ordinary case: nothing was deleted, so nothing is reclaimed. Worth pinning because
+    drop_orphans() unlinks files -- an off-by-one here would delete a live burst's only frame."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    _burst_dump(dump, ["2026-08-06 21:00:00", "2026-08-06 21:05:00"])
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    _import_bursts(dump, conn, cfg, bursts)
+    before = _kept_frames(cfg)
+    assert len(before) == 2
+
+    assert bursts.drop_orphans(conn) == 0
+    assert _kept_frames(cfg) == before
+
+
+def test_identical_mtimes_cannot_collapse_a_cycle_into_one_burst(conn, db_path, tmp_path):
+    """The EXIF-less card. image_timestamp() then falls back to the file mtime, and a bulk copy
+    stamps every file with the same second -- which by the gap rule alone is ONE burst, hanging a
+    single frame on hundreds of unrelated detections. BURST_MAX_STILLS caps that; the largest
+    real burst on this corpus is 10 stills, so the cap can never split a genuine trigger."""
+    cfg = _burst_cfg(tmp_path, db_path)
+    dump = tmp_path / "dump"
+    n = import_trailcam.BURST_MAX_STILLS + 6
+    _burst_dump(dump, ["2026-08-06 21:00:00"] * n)
+
+    bursts = import_trailcam.BurstFrames(cfg, "trail_cam_sd")
+    imported, saved, _ = _import_bursts(dump, conn, cfg, bursts)
+    assert (imported, saved) == (n, n)
+    assert bursts.bursts == 2 and len(_kept_frames(cfg)) == 2
+    counts = dict(conn.execute(
+        "SELECT frame_path, COUNT(*) FROM detections GROUP BY frame_path"))
+    assert sorted(counts.values()) == [6, import_trailcam.BURST_MAX_STILLS]
