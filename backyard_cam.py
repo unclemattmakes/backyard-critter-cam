@@ -613,6 +613,20 @@ def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCaptur
             cap.set(_prop, _val)
     for _ in range(cfg.camera_warmup_frames):  # let exposure / auto-WB settle
         cap.read()
+    # Re-assert the resolved auto modes now that frames are FLOWING. Measured 2026-08-07: this
+    # driver drops auto-mode sets issued before the capture graph is running -- the panel's
+    # mid-stream {AUTOFOCUS: 1}/{AUTO_WB: 1} visibly re-focused and re-balanced the image
+    # minutes after open had "asserted" the same thing -- while value props from the same
+    # pre-stream phase (CONTRAST 48) demonstrably stick. Same values as above, config locks
+    # included, so a deliberate manual lock still wins; no-ops on drivers that already obeyed.
+    _ctl = _eff(spec, cfg, "camera_controls") or {}
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, float(_ctl.get("AUTOFOCUS", 1.0)))
+    cap.set(cv2.CAP_PROP_AUTO_WB, float(_ctl.get("AUTO_WB", 1.0)))
+    if exposure is None:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(_ctl.get("AUTO_EXPOSURE", 0.75)))
+    else:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
     return cap
 
 

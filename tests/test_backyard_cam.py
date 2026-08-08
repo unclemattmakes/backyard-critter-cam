@@ -364,6 +364,7 @@ class _RecordingCap:
         return 0.0
 
     def read(self):
+        self.sets.append(("READ", None))   # marks stream start in the set/read timeline
         return True, None            # warmup reads; open_capture ignores the frames
 
     def release(self):
@@ -371,6 +372,10 @@ class _RecordingCap:
 
     def writes(self, prop):
         return [v for p, v in self.sets if p == prop]
+
+    def writes_after_first_read(self, prop):
+        i = self.sets.index(("READ", None))
+        return [v for p, v in self.sets[i:] if p == prop]
 
 
 def _open_recorded(monkeypatch, **over):
@@ -385,9 +390,19 @@ def _open_recorded(monkeypatch, **over):
 
 def test_open_asserts_the_all_auto_baseline(monkeypatch):
     cap = _open_recorded(monkeypatch)
-    assert cap.writes(cv2.CAP_PROP_AUTOFOCUS) == [1.0]
-    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0]
-    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.75]
+    assert cap.writes(cv2.CAP_PROP_AUTOFOCUS) == [1.0, 1.0]     # pre-stream AND mid-stream
+    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0, 1.0]
+    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.75, 0.75]
+
+
+def test_the_auto_baseline_is_reasserted_after_the_stream_starts(monkeypatch):
+    # This driver DROPS auto-mode sets issued before the capture graph runs (2026-08-07: the
+    # panel's mid-stream toggle visibly re-focused the image minutes after open "asserted"
+    # auto). The assert that counts is the one after the first read.
+    cap = _open_recorded(monkeypatch)
+    assert cap.writes_after_first_read(cv2.CAP_PROP_AUTOFOCUS) == [1.0]
+    assert cap.writes_after_first_read(cv2.CAP_PROP_AUTO_WB) == [1.0]
+    assert cap.writes_after_first_read(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.75]
 
 
 def test_a_deliberate_config_lock_beats_the_baseline(monkeypatch):
@@ -395,9 +410,10 @@ def test_a_deliberate_config_lock_beats_the_baseline(monkeypatch):
                          camera_controls={"AUTOFOCUS": 0, "FOCUS": 200})
     af = cap.writes(cv2.CAP_PROP_AUTOFOCUS)
     assert af[0] == 1.0 and af[-1] == 0.0                     # baseline first; the lock wins
-    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.25]   # manual exposure, never auto
+    assert cap.writes_after_first_read(cv2.CAP_PROP_AUTOFOCUS) == [0.0]   # mid-stream too
+    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.25, 0.25]   # manual exposure, never auto
     assert cap.writes(cv2.CAP_PROP_EXPOSURE)[-1] == -6.0
-    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0]          # WB keeps the auto baseline
+    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0, 1.0]     # WB keeps the auto baseline
 
 
 # The dashboard's auto checkboxes show CommandedAutoState, not cap.get(): this driver answers
