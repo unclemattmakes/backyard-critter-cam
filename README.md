@@ -981,11 +981,13 @@ citations and links: **[NOTICE.md](NOTICE.md)**.
   a knot in the fence — saved over and over, then force-named as some improbable species): that
   patch simply *looks* like an animal to MegaDetector, and the motion gate is no defense — it
   only decides *when* the detector runs, and anything else moving (a real visitor, dusk light
-  fading) makes the stateless full-frame detector re-report the patch. List the spot in
-  `ignore_zones` (config_local.py; see config.py for the shape): a detection whose box mostly
-  *is* the zone is dropped before drawing, saving, or clip-triggering, while a real animal
-  passing through carries a much bigger box and is kept. Zones show as faint gray "ignored"
-  outlines on the preview so a stale one is visible.
+  fading) makes the stateless full-frame detector re-report the patch. Open the dashboard's
+  Instrument Panel → **Ignored Spots** and drag a box over the patch (removing one is a click;
+  edits apply on the next frame, no restart — `cfg.ignore_zones` in config_local.py still works
+  as a one-time seed): a detection whose box mostly *is* the zone is dropped before drawing,
+  saving, or clip-triggering, while a real animal passing through carries a much bigger box and
+  is kept. Zones show as faint gray "ignored" outlines on the preview, and the dashboard flags
+  any zone drawn before the camera last moved, so a stale one is visible.
 - **App dies overnight / camera "vanishes" while idle:** a running rig **deliberately keeps the
   machine awake** — on Windows `backyard_cam.py` holds a **Power Request**
   (`PowerRequestExecutionRequired`, which is *Modern-Standby-aware*) plus the legacy

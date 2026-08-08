@@ -367,6 +367,29 @@ CREATE TABLE IF NOT EXISTS view_epochs (
     corr         REAL,               -- the correlation that triggered it (NULL for a manual bump).
     UNIQUE(source, epoch)
 );
+
+-- Ignore zones: persistent static false-fire spots the detector should disregard (a dark wall
+-- opening that scores "animal" on every dusk run). Formerly only a hand-edited dict in
+-- config_local.py; the table is the runtime source of truth so the dashboard can add/remove
+-- zones without a restart. config.ignore_zones still SEEDS this table -- once per exact
+-- rectangle (see seed_ignore_zones) -- so an existing config keeps working the first time this
+-- schema appears. Rows are soft-deleted (deleted_at): the tombstone is what stops the config
+-- seed from resurrecting a rectangle someone deleted in the UI.
+CREATE TABLE IF NOT EXISTS ignore_zones (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source       TEXT    NOT NULL,   -- matches detections.source (a live camera).
+    x1           INTEGER NOT NULL,   -- FULL-RES frame pixels; x1<x2, y1<y2 (add_ignore_zone
+    y1           INTEGER NOT NULL,   -- normalizes before insert).
+    x2           INTEGER NOT NULL,
+    y2           INTEGER NOT NULL,
+    note         TEXT,               -- optional human label ("wall gap").
+    created_by   TEXT    NOT NULL DEFAULT 'web',  -- 'web' (dashboard) | 'config' (seeded).
+    created_at   TEXT    NOT NULL,   -- local ISO 8601 w/ offset; compared against
+                                     -- view_epochs.started_at to flag zones drawn before the
+                                     -- camera last moved.
+    deleted_at   TEXT                -- tombstone; live zones have NULL.
+);
+CREATE INDEX IF NOT EXISTS idx_ignore_zones_source ON ignore_zones(source, deleted_at);
 """
 
 
@@ -1647,3 +1670,102 @@ def bump_view_epoch(conn: sqlite3.Connection, source: str, detected_by: str = "e
     retire_reference_images(conn, source, epoch, retired_at=started_at)
     conn.commit()
     return epoch
+
+
+def view_epoch_started(conn: sqlite3.Connection, source: str) -> Optional[str]:
+    """When the CURRENT view epoch began -- i.e. the last time `source` was seen to move. None in
+    the implicit epoch 0 (never seen to move, or never migrated): there is then no moment to
+    compare a zone's age against, so callers must treat None as 'not stale', not 'unknown'."""
+    try:
+        row = conn.execute("SELECT started_at FROM view_epochs WHERE source = ? "
+                           "ORDER BY epoch DESC LIMIT 1", (source,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else row[0]
+
+
+# ---- Ignore zones (static false-fire spots, dashboard-editable) ---------------------
+def _zone_row(row) -> dict:
+    return {"id": int(row[0]), "source": row[1],
+            "x1": int(row[2]), "y1": int(row[3]), "x2": int(row[4]), "y2": int(row[5]),
+            "note": row[6], "created_by": row[7], "created_at": row[8]}
+
+
+_ZONE_COLS = "id, source, x1, y1, x2, y2, note, created_by, created_at"
+
+
+def list_ignore_zones(conn: sqlite3.Connection, source: Optional[str] = None) -> list:
+    """Live (non-tombstoned) zones, oldest first -- for `source`, or all sources when None."""
+    if source is None:
+        rows = conn.execute(f"SELECT {_ZONE_COLS} FROM ignore_zones "
+                            "WHERE deleted_at IS NULL ORDER BY id")
+    else:
+        rows = conn.execute(f"SELECT {_ZONE_COLS} FROM ignore_zones "
+                            "WHERE source = ? AND deleted_at IS NULL ORDER BY id", (source,))
+    return [_zone_row(r) for r in rows]
+
+
+def add_ignore_zone(conn: sqlite3.Connection, source: str, x1, y1, x2, y2, *,
+                    note: Optional[str] = None, created_by: str = "web") -> dict:
+    """Insert one zone and return its stored row. Coordinates are normalized (ints, corners
+    swapped so x1<x2 / y1<y2, clamped at 0) rather than trusted -- they arrive from a browser
+    drag. A degenerate rectangle (under 4 px a side after normalizing) raises ValueError: it is
+    always a slip of the pointer, and a 2-px zone would silently never match any detection's IoU."""
+    src = str(source or "").strip()
+    if not src:
+        raise ValueError("source is required")
+    ax1, ay1, ax2, ay2 = (max(0, int(round(float(v)))) for v in (x1, y1, x2, y2))
+    ax1, ax2 = min(ax1, ax2), max(ax1, ax2)
+    ay1, ay2 = min(ay1, ay2), max(ay1, ay2)
+    if (ax2 - ax1) < 4 or (ay2 - ay1) < 4:
+        raise ValueError("zone too small (under 4 px a side)")
+    note_clean = (str(note).strip()[:120] or None) if note else None
+    at = now_local_iso()
+    cur = conn.execute(
+        "INSERT INTO ignore_zones (source, x1, y1, x2, y2, note, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (src, ax1, ay1, ax2, ay2, note_clean, created_by, at))
+    conn.commit()
+    return {"id": int(cur.lastrowid), "source": src, "x1": ax1, "y1": ay1, "x2": ax2, "y2": ay2,
+            "note": note_clean, "created_by": created_by, "created_at": at}
+
+
+def remove_ignore_zone(conn: sqlite3.Connection, zone_id) -> Optional[dict]:
+    """Soft-delete one zone (stamp deleted_at). Returns the row it removed, or None if the id is
+    unknown / already deleted. The row STAYS in the table on purpose: the tombstone is what keeps
+    seed_ignore_zones from resurrecting a config rectangle the human deleted in the UI."""
+    row = conn.execute(f"SELECT {_ZONE_COLS} FROM ignore_zones "
+                       "WHERE id = ? AND deleted_at IS NULL", (int(zone_id),)).fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE ignore_zones SET deleted_at = ? WHERE id = ?",
+                 (now_local_iso(), int(zone_id)))
+    conn.commit()
+    return _zone_row(row)
+
+
+def seed_ignore_zones(conn: sqlite3.Connection, zones_by_source) -> int:
+    """Copy config.ignore_zones ({source: [(x1,y1,x2,y2), ...]}) into the table -- ONCE per exact
+    rectangle. Identity is (source, x1, y1, x2, y2) against ALL rows including tombstones, so a
+    zone deleted in the dashboard stays deleted across restarts, while re-measuring a moved camera
+    in config_local.py (new coordinates) still lands as a new row. Returns how many were added."""
+    n = 0
+    for source, rects in (zones_by_source or {}).items():
+        for rect in (rects or ()):
+            try:
+                x1, y1, x2, y2 = (int(v) for v in rect)
+            except (TypeError, ValueError):
+                continue                     # a malformed config rect: skip, don't crash the rig
+            hit = conn.execute("SELECT 1 FROM ignore_zones WHERE source = ? AND x1 = ? "
+                               "AND y1 = ? AND x2 = ? AND y2 = ? LIMIT 1",
+                               (source, x1, y1, x2, y2)).fetchone()
+            if hit is not None:
+                continue
+            conn.execute(
+                "INSERT INTO ignore_zones (source, x1, y1, x2, y2, note, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'config', ?)",
+                (source, x1, y1, x2, y2, None, now_local_iso()))
+            n += 1
+    if n:
+        conn.commit()
+    return n

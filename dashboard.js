@@ -296,7 +296,7 @@ function selectCamera(source){
   LIVE.sel=source; touchedAt={};   // a fresh camera's read-back shouldn't be suppressed by the last one's edits
   document.querySelectorAll('.live-pane').forEach(p=>p.classList.toggle('sel',p.dataset.source===source));
   refreshWhoshere();               // re-scope "who's here" to the newly selected camera
-  if(!$('#settings').hidden) refreshControls();
+  if(!$('#settings').hidden){ refreshControls(); loadZones(); }
 }
 function camName(source){ const c=(LIVE.cams||[]).find(x=>x.source===source); return c?(c.name||c.source):source; }
 
@@ -1918,8 +1918,118 @@ function renderCalendar(){
   body.querySelectorAll('[data-day]').forEach(el=>el.onclick=()=>explore('day',{date:el.dataset.day},fmtDay(el.dataset.day)));
 }
 
+/* ---------- ignore zones (drawn on a snapshot; the rig applies edits on its next frame) ----------
+   The editor lives in the Instrument Panel: a fresh /snapshot.jpg (a STILL, so the scene holds
+   still under the pointer), existing zones overlaid on it, drag-to-draw for a new one. The
+   snapshot is the full frame at native size, so a drag maps to frame pixels by plain
+   proportion; /api/zones' frame dims (the capture thread's own measurement) are preferred over
+   the image's naturalWidth only because the latter is 0 until the JPEG decodes. */
+let ZONES={ list:[], frame:null, src:null };
+function zoneFrameDims(){
+  if(ZONES.frame && ZONES.frame.w && ZONES.frame.h) return [ZONES.frame.w, ZONES.frame.h];
+  const img=$('#zone-img');
+  if(img && img.naturalWidth) return [img.naturalWidth, img.naturalHeight];
+  return null;
+}
+async function loadZones(){
+  const src=LIVE.sel; if(!src || !$('#zones-sec')) return;
+  ZONES.src=src;
+  const img=$('#zone-img'), stage=$('#zone-stage');
+  img.onload =()=>{ stage.classList.remove('dead'); $('#zone-nofeed').hidden=true;  renderZones(); };
+  img.onerror=()=>{ stage.classList.add('dead');    $('#zone-nofeed').hidden=false; };
+  img.src='/snapshot.jpg?source='+encodeURIComponent(src)+'&t='+Date.now();
+  let d;
+  try{
+    const r=await fetch('/api/zones?source='+encodeURIComponent(src));
+    if(r.status===404){ zoneMsg('The rig is running an older build — restart it to enable zone editing.'); return; }
+    d=await r.json();
+  }catch(e){ zoneMsg('Could not reach the rig.'); return; }
+  ZONES.list=d.zones||[]; ZONES.frame=d.frame||null;
+  renderZones();
+}
+function zoneMsg(t){ const el=$('#zone-msg'); if(!el) return; el.textContent=t||''; el.hidden=!t; }
+function renderZones(){
+  const stage=$('#zone-stage'), list=$('#zone-list'); if(!stage||!list) return;
+  zoneMsg('');
+  $('#zones-n').textContent = ZONES.list.length ? String(ZONES.list.length) : '';
+  stage.querySelectorAll('.zone-rect').forEach(el=>el.remove());
+  const fd=zoneFrameDims();
+  if(fd){
+    const [fw,fh]=fd;
+    ZONES.list.forEach(z=>{
+      const el=document.createElement('div');
+      el.className='zone-rect'+(z.stale?' stale':'');
+      el.style.left  =(100*z.x1/fw)+'%';        el.style.top   =(100*z.y1/fh)+'%';
+      el.style.width =(100*(z.x2-z.x1)/fw)+'%'; el.style.height=(100*(z.y2-z.y1)/fh)+'%';
+      el.innerHTML=`<button class="zone-x" type="button" title="Stop ignoring this spot" onclick="zoneDel(${z.id|0})">&#10005;</button>`;
+      stage.appendChild(el);
+    });
+  }
+  list.innerHTML = ZONES.list.map(z=>`
+    <div class="zone-row">
+      <span class="dim">${(z.x2-z.x1)}&times;${(z.y2-z.y1)}</span>
+      <span class="znote">${esc(z.note||(z.created_by==='config'?'from config':''))}</span>
+      ${z.stale?'<span class="zone-stale-b" title="The camera has been seen to move since this spot was drawn — it may no longer cover the right scenery. Remove it and draw it again.">&#9888; cam moved</span>':''}
+      <span class="zage">${esc((z.created_at||'').slice(0,10))}</span>
+      <button class="gear" type="button" onclick="zoneDel(${z.id|0})">remove</button>
+    </div>`).join('') || '<p class="zone-empty">No ignored spots on this camera.</p>';
+}
+async function zoneDel(id){
+  try{
+    const r=await fetch('/api/zones/delete?source='+encodeURIComponent(ZONES.src||''),
+      {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    if(!r.ok){ const d=await r.json().catch(()=>({})); zoneMsg(d.error||'Could not remove that spot.'); return; }
+  }catch(e){ zoneMsg('Could not reach the rig.'); return; }
+  loadZones();
+}
+async function zoneAdd(x1,y1,x2,y2){
+  const note=($('#zone-note')&&$('#zone-note').value.trim())||null;
+  try{
+    const r=await fetch('/api/zones?source='+encodeURIComponent(ZONES.src||''),
+      {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x1,y1,x2,y2,note})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ zoneMsg(d.error||'Could not add the spot.'); return; }
+    if($('#zone-note')) $('#zone-note').value='';
+  }catch(e){ zoneMsg('Could not reach the rig.'); return; }
+  loadZones();
+}
+/* Drag-to-draw. Pointer events cover mouse + touch; capture keeps the band tracking even when
+   the pointer leaves the stage mid-drag. A sub-6-px (frame-space) box is a slip, not a zone. */
+(function(){
+  const stage=$('#zone-stage'); if(!stage) return;
+  const band=$('#zone-band');
+  let drag=null;
+  const pos=e=>{ const r=stage.getBoundingClientRect();
+    return [Math.min(Math.max(e.clientX-r.left,0),r.width), Math.min(Math.max(e.clientY-r.top,0),r.height), r]; };
+  stage.addEventListener('pointerdown',e=>{
+    if(e.target.closest('.zone-x')) return;              // that press is a delete, not a draw
+    if(!zoneFrameDims()) return;                         // nothing decoded to draw on yet
+    const [x,y]=pos(e); drag=[x,y];
+    try{ stage.setPointerCapture(e.pointerId); }catch(_){/* capture is a nicety; the drag still works */}
+    band.hidden=false; band.style.left=x+'px'; band.style.top=y+'px'; band.style.width='0'; band.style.height='0';
+    e.preventDefault();
+  });
+  stage.addEventListener('pointermove',e=>{
+    if(!drag) return;
+    const [x,y]=pos(e);
+    band.style.left  =Math.min(drag[0],x)+'px'; band.style.top   =Math.min(drag[1],y)+'px';
+    band.style.width =Math.abs(x-drag[0])+'px'; band.style.height=Math.abs(y-drag[1])+'px';
+  });
+  stage.addEventListener('pointerup',e=>{
+    if(!drag) return;
+    const [x,y,r]=pos(e), [x0,y0]=drag; drag=null; band.hidden=true;
+    const fd=zoneFrameDims(); if(!fd || !r.width || !r.height) return;
+    const [fw,fh]=fd, sx=fw/r.width, sy=fh/r.height;
+    const x1=Math.round(Math.min(x0,x)*sx), x2=Math.round(Math.max(x0,x)*sx);
+    const y1=Math.round(Math.min(y0,y)*sy), y2=Math.round(Math.max(y0,y)*sy);
+    if((x2-x1)<6 || (y2-y1)<6) return;
+    zoneAdd(x1,y1,x2,y2);
+  });
+  stage.addEventListener('pointercancel',()=>{ drag=null; band.hidden=true; });
+})();
+
 /* ---------- settings popout (scoped to the selected camera) ---------- */
-function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); }
+function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); loadZones(); }
 function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
 

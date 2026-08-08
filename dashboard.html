@@ -156,6 +156,22 @@
     <p class="hint">Adjust the camera in real time. If the picture is soft, try toggling <em>Autofocus</em>. Controls your camera can&rsquo;t change are shown locked.</p>
     <p class="hint" id="instr-net" hidden>This is a networked camera &mdash; its exposure, focus and white balance are set on the camera itself (its own app or web page), not here.</p>
     <div id="controls"></div>
+
+    <!-- Ignore zones: static bits of scenery the detector keeps mistaking for an animal.
+         Drawn on a fresh snapshot (a still image, so the scene holds still under the pointer);
+         the rig applies an edit on its very next frame. Built by loadZones(). -->
+    <div class="zones" id="zones-sec">
+      <h4>Ignored Spots <span class="lbl" id="zones-n"></span></h4>
+      <p class="hint">Fixed scenery the detector keeps mistaking for an animal &mdash; a dark gap in a wall, a grill cover. Drag a box over the spot below and the rig will disregard detections that sit on it. An animal walking <em>through</em> is still kept.</p>
+      <input id="zone-note" class="zone-note-in" placeholder="label the next spot (optional, e.g. &ldquo;wall gap&rdquo;)&hellip;" maxlength="120" autocomplete="off" spellcheck="false">
+      <div class="zone-stage" id="zone-stage">
+        <img id="zone-img" alt="camera snapshot" draggable="false">
+        <div class="zone-band" id="zone-band" hidden></div>
+      </div>
+      <p class="hint" id="zone-nofeed" hidden>No snapshot right now (is this camera running?) &mdash; existing spots are listed below and can still be removed.</p>
+      <div class="zone-list" id="zone-list"></div>
+      <div class="zone-msg" id="zone-msg" hidden></div>
+    </div>
   </div>
 </div>
 

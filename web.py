@@ -6,6 +6,8 @@ Serves the live MJPEG stream, stats + species JSON, crop images, AND now:
     thread applies them, since OpenCV VideoCapture is single-thread -- see CameraControlBridge)
   * per-species browsing    -- GET /api/species, /api/species/<name>
   * ID verification         -- POST /api/detection/<id>  {action: verify|reject|correct, species}
+  * ignore zones            -- GET/POST /api/zones, POST /api/zones/delete (dashboard-drawn
+    static false-fire spots; IgnoreZoneStore hands edits to the capture threads live)
 
 The page itself lives in dashboard.html (read from disk so the design can iterate without a
 restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/stats.
@@ -117,6 +119,81 @@ class CameraControlBridge:
     def snapshot(self) -> dict:                        # web reads
         with self._lock:
             return dict(self._current)
+
+
+class IgnoreZoneStore:
+    """The live copy of the ignore_zones table (static false-fire spots the detector should
+    disregard), shared between web threads and capture threads the same way CameraControlBridge
+    is. The DB row is the durable truth -- it survives restarts and holds the tombstones that
+    keep a deleted config zone deleted -- while this object is what the capture loop actually
+    reads, so a dashboard edit reaches the detector on the next frame with no DB traffic on the
+    capture path (this rig has been bitten by 'database is locked' in that loop before).
+
+    Mutations write the DB first, then swap the in-memory tuple for that source, so a crash
+    between the two can only lose the in-memory copy -- which the next startup reloads from the
+    table anyway."""
+
+    def __init__(self, db_path):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._by_source: dict = {}   # source -> ((x1, y1, x2, y2), ...) LIVE zones only
+
+    @classmethod
+    def load(cls, cfg) -> "IgnoreZoneStore":
+        """Build the store at startup: seed config.ignore_zones into the table (once per exact
+        rectangle -- see db.seed_ignore_zones for why deletions stick), then cache the live rows."""
+        store = cls(cfg.db_path)
+        conn = db.connect(cfg.db_path)
+        try:
+            db.seed_ignore_zones(conn, getattr(cfg, "ignore_zones", None) or {})
+            for row in db.list_ignore_zones(conn):
+                cur = store._by_source.get(row["source"]) or ()
+                store._by_source[row["source"]] = cur + ((row["x1"], row["y1"],
+                                                          row["x2"], row["y2"]),)
+        finally:
+            conn.close()
+        return store
+
+    def rects(self, source) -> tuple:
+        """The hot-path read: this camera's zones as an immutable tuple of (x1, y1, x2, y2).
+        Called every capture-loop iteration, so it must stay a lock + attribute fetch."""
+        with self._lock:
+            return self._by_source.get(source) or ()
+
+    def counts(self) -> dict:
+        """{source: live zone count}, sources with zones only -- for the rig's startup banner."""
+        with self._lock:
+            return {s: len(t) for s, t in self._by_source.items() if t}
+
+    def _reload_source(self, conn, source) -> None:
+        """Re-read one source's live zones from the DB and swap them in wholesale -- after any
+        mutation, memory is whatever the table says, not an incremental guess."""
+        fresh = tuple((r["x1"], r["y1"], r["x2"], r["y2"])
+                      for r in db.list_ignore_zones(conn, source))
+        with self._lock:
+            self._by_source[source] = fresh
+
+    def add(self, source, x1, y1, x2, y2, note=None) -> dict:
+        """Validate + insert one zone (see db.add_ignore_zone), refresh the cache, return the
+        stored row. Raises ValueError on a degenerate rectangle."""
+        conn = db.connect(self._db_path)
+        try:
+            row = db.add_ignore_zone(conn, source, x1, y1, x2, y2, note=note)
+            self._reload_source(conn, source)
+        finally:
+            conn.close()
+        return row
+
+    def remove(self, zone_id) -> bool:
+        """Soft-delete one zone by id; True if a live zone was removed."""
+        conn = db.connect(self._db_path)
+        try:
+            row = db.remove_ignore_zone(conn, zone_id)
+            if row is not None:
+                self._reload_source(conn, row["source"])
+        finally:
+            conn.close()
+        return row is not None
 
 
 # A few controls have small, platform-stable valid sets; clamp those so a LAN/DNS-rebind client
@@ -294,6 +371,9 @@ _RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never re
 _MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
 _MAX_STREAMS = 6                 # base cap on concurrent MJPEG viewers (one LAN client can't exhaust
                                  # threads); make_server scales it up with the number of cameras.
+_MAX_ZONES_PER_CAMERA = 50       # every live zone costs an IoU per detection and a rectangle per
+                                 # streamed frame; a runaway client must not be able to stack up
+                                 # thousands. 50 is far past any real yard's furniture count.
 
 
 def _parse_range(header: str, size: int):
@@ -587,12 +667,41 @@ def _individual_profile(cfg, name: str) -> dict:
     return prof
 
 
-def make_server(cfg, frame_buffers: dict, control_bridges: dict):
+def _zones_payload(cfg, source: str, bridge_snap: dict) -> dict:
+    """GET /api/zones: this camera's live ignore zones, plus what the editor needs -- the true
+    frame size when the capture thread has published one (the drawing surface maps 1:1 to the
+    snapshot, so this is informational), and per-zone `stale`: True when the camera has been seen
+    to move (view_epochs) since the zone was drawn. Stale is the whole failure mode of a
+    hand-measured rectangle -- it keeps 'ignoring' a patch of scene that is no longer there --
+    and it fails silently, so the one place a human looks at zones must say it out loud."""
+    conn = db.connect(cfg.db_path)
+    try:
+        rows = db.list_ignore_zones(conn, source)
+        moved_at = db.view_epoch_started(conn, source)
+    finally:
+        conn.close()
+    moved = db.parse_local(moved_at) if moved_at else None
+    for r in rows:
+        created = db.parse_local(r["created_at"])
+        r["stale"] = bool(moved and created and created < moved)
+    fw, fh = bridge_snap.get("frame_w"), bridge_snap.get("frame_h")
+    return {"source": source, "zones": rows,
+            "frame": {"w": fw, "h": fh} if fw and fh else None,
+            "iou": getattr(cfg, "ignore_zone_iou", 0.45)}
+
+
+def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None):
     """`frame_buffers` / `control_bridges` are dicts keyed by camera `source` -- one entry per
     live camera. A single-camera rig passes one-entry dicts; the Live tab then shows one pane.
     The dashboard discovers the cameras via /api/cameras and routes /stream.mjpg, /snapshot.jpg,
     /api/camera and /api/live/* with a ?source= query param (defaulting to the primary camera, so
-    an old client with no source param still works)."""
+    an old client with no source param still works).
+
+    `zone_store` is the rig's shared IgnoreZoneStore (the capture threads read the same instance,
+    so a zone edit takes effect on the next frame). None -- tests, or any caller without a rig --
+    builds a private one from the DB; edits then persist but nothing live is watching them."""
+    if zone_store is None:
+        zone_store = IgnoreZoneStore.load(cfg)
     allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir,
                                           getattr(cfg, "clip_crops_dir", cfg.clips_dir),
                                           # refcam's detector crops of the phone reference shots
@@ -726,6 +835,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                 elif path == "/api/cameras":
                     # The live cameras, for the dashboard to build one feed pane per camera.
                     self._json({"cameras": cameras_meta, "primary": primary})
+                elif path == "/api/zones":
+                    src = self._src()
+                    self._json(_zones_payload(cfg, src, control_bridges[src].snapshot()))
                 elif path == "/api/naming":
                     self._json(_naming_status())
                 elif path == "/api/live/now":
@@ -849,12 +961,16 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
             except Exception:
                 data = {}
             try:
-                if path != "/api/camera":
+                if path not in ("/api/camera", "/api/zones", "/api/zones/delete"):
                     stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
                     clear_api_cache()            # ...and on the next poll of every cached endpoint
                 if path == "/api/camera":
                     control_bridges[self._src()].request(_clean_settings(data))
                     self._json({"ok": True})
+                elif path == "/api/zones":
+                    self._zone_add(data)
+                elif path == "/api/zones/delete":
+                    self._zone_delete(data)
                 elif path == "/api/individual/status":
                     self._individual_status(data)
                 elif path == "/api/individual":
@@ -882,6 +998,46 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict):
                     self._json({"error": "internal error"}, code=500)
                 except Exception:
                     pass
+
+        def _zone_add(self, data):
+            """Add an ignore zone for the ?source= camera: {"x1","y1","x2","y2", "note"?} in
+            FULL-RES frame pixels (the snapshot the dashboard draws on IS the full frame, so its
+            naturalWidth maps 1:1). The shared store makes it live on the next captured frame."""
+            src = self._src()
+            if len(zone_store.rects(src)) >= _MAX_ZONES_PER_CAMERA:
+                self._json({"error": f"too many zones (limit {_MAX_ZONES_PER_CAMERA}); "
+                                     "remove one first"}, code=400)
+                return
+            try:
+                x1, y1, x2, y2 = (float(data[k]) for k in ("x1", "y1", "x2", "y2"))
+            except (KeyError, TypeError, ValueError):
+                self._json({"error": "x1, y1, x2, y2 (numbers) are required"}, code=400)
+                return
+            # Clamp to the frame when the capture thread has told us its true size; a drag can
+            # end a few px past the image edge and should land ON the edge, not 400.
+            snap = control_bridges[src].snapshot()
+            fw, fh = snap.get("frame_w"), snap.get("frame_h")
+            if fw and fh:
+                x1, x2 = (min(max(v, 0), fw) for v in (x1, x2))
+                y1, y2 = (min(max(v, 0), fh) for v in (y1, y2))
+            try:
+                row = zone_store.add(src, x1, y1, x2, y2, note=data.get("note"))
+            except ValueError as e:
+                self._json({"error": str(e)}, code=400)
+                return
+            self._json({"ok": True, "zone": row})
+
+        def _zone_delete(self, data):
+            """Soft-delete one zone: {"id": n}. The tombstoned row keeps the config seed from
+            resurrecting it on the next restart (see db.remove_ignore_zone)."""
+            try:
+                zid = int(data.get("id"))
+            except (TypeError, ValueError):
+                self._json({"error": "id (integer) is required"}, code=400)
+                return
+            removed = zone_store.remove(zid)
+            self._json({"ok": removed} if removed
+                       else {"ok": False, "error": "no such zone"}, code=200 if removed else 404)
 
         def _unblend_label(self, data):
             """Assign an individual to an un-blend cluster: {"track_ids": [...], "name": "Notch"}
@@ -1717,8 +1873,8 @@ def _prewarm(cfg):
         print(f"[web] prewarm skipped: {e}")
 
 
-def start(cfg, frame_buffers: dict, control_bridges: dict):
-    server = make_server(cfg, frame_buffers, control_bridges)
+def start(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None):
+    server = make_server(cfg, frame_buffers, control_bridges, zone_store)
     threading.Thread(target=server.serve_forever, name="webdash", daemon=True).start()
     threading.Thread(target=_prewarm, args=(cfg,), name="web-prewarm", daemon=True).start()
     return server

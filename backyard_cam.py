@@ -821,7 +821,8 @@ def box_iou(a, b) -> float:
 
 
 def drop_ignored(dets, zones, min_iou: float):
-    """Split detections into (kept, dropped) against cfg.ignore_zones for this camera.
+    """Split detections into (kept, dropped) against this camera's ignore zones (the
+    dashboard-editable IgnoreZoneStore; config.ignore_zones seeds it).
 
     A detection is dropped only when its box mostly IS a zone (IoU >= min_iou) -- the
     static-false-fire signature. The IoU gate keeps this surgical: a real animal walking
@@ -1341,7 +1342,8 @@ def _stop_naming(proc, tag: str | None = None) -> None:
 
 # ---- Per-camera capture worker -----------------------------------------------------
 def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
-                latest_frames, latest_lock, stop_event, results, powermon=None, healer=None):
+                latest_frames, latest_lock, stop_event, results, powermon=None, healer=None,
+                zone_store=None):
     """One camera's whole capture pipeline, run in its own thread:
         read -> MOG2 motion gate -> (shared) MegaDetector on motion -> save crop + DB row + clip,
         then publish an annotated frame to this camera's web FrameBuffer and the preview grid.
@@ -1357,9 +1359,10 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     eff_profiles = _eff(spec, cfg, "camera_profiles") or {}
     record = _eff(spec, cfg, "record_clips")
     clip_trigger = cfg.clip_classes or cfg.save_classes
-    # Static false-fire spots for THIS camera (config.ignore_zones): a detection boxed ~on one
-    # is dropped before drawing, saving, and clip-triggering. Framing-specific by design.
-    ignore_zones = list((cfg.ignore_zones or {}).get(spec.source) or ())
+    # Static false-fire spots for THIS camera: a detection boxed ~on one is dropped before
+    # drawing, saving, and clip-triggering. Framing-specific by design. These now come from the
+    # shared IgnoreZoneStore (DB-backed, dashboard-editable; config.ignore_zones just seeds it),
+    # re-read every loop pass below so an edit takes effect on the next frame without a restart.
 
     conn = db.connect(cfg.db_path)
     cap = None
@@ -1458,6 +1461,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 continue
             read_fails = 0
             frame_count += 1
+            # A lock + tuple fetch per frame: the price of dashboard zone edits landing live.
+            ignore_zones = zone_store.rects(spec.source) if zone_store is not None else ()
 
             # --- FPS (rolling, ~ once per second) ---
             fps_n += 1
@@ -1512,6 +1517,9 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     snap["animal_age_s"] = None if age_s is None else round(age_s, 1)
                     snap["animal_active"] = age_s is not None and age_s <= cfg.on_cam_window_s
                     snap["network"] = spec.is_url   # the dashboard hides sliders for a network cam
+                    # The TRUE frame size (what ignore-zone pixel coords are measured in) -- the
+                    # zones editor clamps against this rather than trusting a browser's numbers.
+                    snap["frame_w"], snap["frame_h"] = int(frame.shape[1]), int(frame.shape[0])
                     # Coarsen the published coords (~10 km) -- a LAN/DNS-rebind client can read this.
                     snap["lat"] = round(cfg.latitude, 1) if cfg.latitude is not None else None
                     snap["lon"] = round(cfg.longitude, 1) if cfg.longitude is not None else None
@@ -1787,6 +1795,16 @@ def run(cfg: config.Config) -> None:
             print(f"  behaviour clips: ON -- short videos to {_rel(cfg.clips_dir)}/<source>/ "
                   f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, cap {cfg.clip_max_s:g}s).")
 
+        # Ignore zones (static false-fire spots): DB-backed and dashboard-editable, one store
+        # shared by the web server and every capture thread. config.ignore_zones seeds the table
+        # the first time each rectangle is seen; a zone deleted in the UI stays deleted (see
+        # db.seed_ignore_zones). Built even with the dashboard off -- the capture threads read it.
+        zone_store = web.IgnoreZoneStore.load(cfg)
+        zc = zone_store.counts()
+        if zc:
+            print("  ignore zones: " + ", ".join(f"{n} on {s}" for s, n in sorted(zc.items()))
+                  + "  (edit in the dashboard's Instrument Panel)")
+
         # Optional local web dashboard: one FrameBuffer + control bridge PER camera, so the Live tab
         # can show a grid of feeds and control each camera independently.
         if cfg.serve:
@@ -1794,7 +1812,7 @@ def run(cfg: config.Config) -> None:
                 frame_buffers[s.source] = web.FrameBuffer()
                 control_bridges[s.source] = web.CameraControlBridge()
             try:
-                server = web.start(cfg, frame_buffers, control_bridges)
+                server = web.start(cfg, frame_buffers, control_bridges, zone_store)
                 print(f"  dashboard: http://{cfg.web_host}:{cfg.web_port}  (open in a browser)\n")
             except OSError as e:
                 print(f"  [web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
@@ -1827,7 +1845,8 @@ def run(cfg: config.Config) -> None:
             t = threading.Thread(
                 target=_run_camera, name=f"cam-{s.source}",
                 args=(s, cfg, detector, det_lock, frame_buffers, control_bridges,
-                      latest_frames, latest_lock, stop_event, results, powermon, healer),
+                      latest_frames, latest_lock, stop_event, results, powermon, healer,
+                      zone_store),
                 daemon=True)
             t.start()
             threads.append(t)

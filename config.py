@@ -290,14 +290,20 @@ class Config:
     # retaining wall scored "animal" 0.25-0.7 on every run for a whole dusk (2026-07-20: 170+
     # junk rows, later force-named as birds by the species step). The motion gate is no defense:
     # it only decides WHEN the detector runs, and anything else moving (a real visitor, dusk
-    # light-fade) makes the stateless full-frame detector re-report the patch. List such spots
-    # here -- {source: [(x1, y1, x2, y2), ...]} in FULL-RES frame pixels -- and any detection
-    # whose box mostly overlaps one (IoU >= ignore_zone_iou) is dropped before drawing, saving,
-    # and clip-triggering. The IoU gate keeps it surgical: a real animal passing THROUGH a zone
-    # has a much bigger box (IoU stays tiny) and is kept; only a zone-sized box sitting ON the
-    # zone is dropped. Zones are framing-specific: set them in config_local.py and re-measure
-    # after physically moving a camera (zones are drawn as faint gray boxes on the preview so a
-    # stale one is visible). None/{} = no zones.
+    # light-fade) makes the stateless full-frame detector re-report the patch. A detection whose
+    # box mostly overlaps a zone (IoU >= ignore_zone_iou) is dropped before drawing, saving, and
+    # clip-triggering. The IoU gate keeps it surgical: a real animal passing THROUGH a zone has a
+    # much bigger box (IoU stays tiny) and is kept; only a zone-sized box sitting ON the zone is
+    # dropped.
+    #
+    # WHERE ZONES LIVE NOW: the ignore_zones DB table, edited from the dashboard (Instrument
+    # Panel -> Ignored Spots -- drag a box on the snapshot; changes apply on the next frame, no
+    # restart). This field only SEEDS that table: each {source: [(x1, y1, x2, y2), ...]} rectangle
+    # (FULL-RES frame pixels) is inserted the first time the rig sees it, and never again -- a
+    # zone deleted in the dashboard stays deleted even if it is still listed here (see
+    # db.seed_ignore_zones). Zones are framing-specific: re-draw after physically moving a camera
+    # (they render as faint gray boxes on the preview, and the dashboard flags zones drawn before
+    # the camera last moved). None/{} = seed nothing.
     ignore_zones: dict | None = None
     ignore_zone_iou: float = 0.45
 

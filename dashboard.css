@@ -87,6 +87,44 @@
   .panel.instr{padding:16px 16px 18px;}
   .instr h3{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500; font-size:17px;}
   .instr .hint{color:var(--faint); font-style:italic; font-size:13px; margin:0 0 14px;}
+  /* The instrument modal is wider than the base 380px card: the ignore-zone editor inside it is
+     a drawing surface, and drag precision scales with pixels. */
+  .modal-card.instr{width:min(520px,94vw);}
+
+  /* ---- ignore zones (inside the instrument panel) ---- */
+  .zones{margin-top:20px; padding-top:14px; border-top:1px solid var(--rule);}
+  .zones h4{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500;
+    font-size:15px; display:flex; justify-content:space-between; align-items:baseline;}
+  .zone-note-in{display:block; width:100%; margin:2px 0 8px; padding:7px 10px;
+    background:var(--panel2); border:1px solid var(--rule2); border-radius:4px; color:var(--ink);
+    font:inherit; font-size:13px;}
+  .zone-note-in::placeholder{color:var(--faint); font-style:italic;}
+  /* touch-action:none = a finger-drag draws a box instead of scrolling the modal. */
+  .zone-stage{position:relative; background:#000; border:1px solid var(--rule2);
+    overflow:hidden; cursor:crosshair; user-select:none; -webkit-user-select:none; touch-action:none;}
+  .zone-stage img{display:block; width:100%; height:auto; -webkit-user-drag:none; pointer-events:none;}
+  .zone-stage.dead{display:none;}          /* no snapshot: the list below still works */
+  .zone-rect{position:absolute; border:1px dashed var(--rust); background:rgba(192,95,62,.13);}
+  .zone-rect.stale{border-style:dotted; border-color:var(--gilt);}
+  .zone-x{position:absolute; top:0; right:0; transform:translate(40%,-40%); width:18px; height:18px;
+    border-radius:50%; border:1px solid var(--rule2); background:var(--panel); color:var(--dim);
+    font-family:var(--mono); font-size:11px; line-height:1; cursor:pointer; padding:0;}
+  .zone-x:hover{border-color:var(--rust); color:var(--ink);}
+  .zone-band{position:absolute; border:1px dashed var(--gilt); background:rgba(201,162,75,.15);
+    pointer-events:none;}
+  .zone-list{margin-top:8px;}
+  .zone-row{display:flex; gap:10px; align-items:center; padding:6px 2px;
+    border-bottom:1px solid var(--rule); font-size:13px;}
+  .zone-row:last-child{border-bottom:0;}
+  .zone-row .dim{font-family:var(--mono); font-size:11.5px; color:var(--gilt); white-space:nowrap;}
+  .zone-row .znote{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    color:var(--dim); font-style:italic;}
+  .zone-row .zage{font-family:var(--mono); font-size:10.5px; color:var(--faint); white-space:nowrap;}
+  .zone-stale-b{font-family:var(--mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--gilt); border:1px solid var(--rule2); border-radius:2px; padding:1px 5px; white-space:nowrap;}
+  .zone-row .gear{flex:none;}
+  .zone-msg{margin-top:8px; font-size:13px; font-style:italic; color:var(--rust);}
+  .zone-empty{padding:6px 2px; color:var(--faint); font-style:italic; font-size:13px;}
   .ctrl{margin:13px 0;}
   .ctrl .row{display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;}
   .ctrl .row .name{color:var(--dim);}

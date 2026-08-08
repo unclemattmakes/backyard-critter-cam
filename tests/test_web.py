@@ -645,3 +645,122 @@ def test_individual_status_endpoint_round_trip(corpus, db_path):
         server.shutdown()
         server.server_close()
         t.join(timeout=5)
+
+
+# ---- ignore zones: the DB semantics the dashboard editor rests on --------------------
+def test_zone_add_normalizes_corners_and_lists(conn):
+    # A browser drag can end anywhere: floats, swapped corners, a start past the end.
+    row = db.add_ignore_zone(conn, "cam", 200.6, 300.2, 100.0, 250.0, note="  wall gap  ")
+    assert (row["x1"], row["y1"], row["x2"], row["y2"]) == (100, 250, 201, 300)
+    assert row["note"] == "wall gap"
+    zones = db.list_ignore_zones(conn, "cam")
+    assert [z["id"] for z in zones] == [row["id"]]
+    assert db.list_ignore_zones(conn, "other_cam") == []
+
+
+def test_zone_add_rejects_a_slip_of_the_pointer(conn):
+    with pytest.raises(ValueError):
+        db.add_ignore_zone(conn, "cam", 100, 100, 103, 200)   # 3 px wide: a click, not a zone
+    with pytest.raises(ValueError):
+        db.add_ignore_zone(conn, "", 0, 0, 50, 50)            # no source
+
+
+def test_zone_delete_tombstone_outlives_the_config_seed(conn):
+    """The restart story: a zone deleted in the dashboard must STAY deleted even though
+    config_local.py still lists it -- the soft-delete tombstone is what blocks the re-seed."""
+    seeded = db.seed_ignore_zones(conn, {"cam": [(10, 10, 60, 60)]})
+    assert seeded == 1
+    zid = db.list_ignore_zones(conn, "cam")[0]["id"]
+    assert db.remove_ignore_zone(conn, zid)["id"] == zid
+    assert db.list_ignore_zones(conn, "cam") == []
+    # The same config runs again at next startup -- and must not resurrect the rectangle...
+    assert db.seed_ignore_zones(conn, {"cam": [(10, 10, 60, 60)]}) == 0
+    assert db.list_ignore_zones(conn, "cam") == []
+    # ...while a RE-MEASURED rectangle (the camera moved) is genuinely new and lands.
+    assert db.seed_ignore_zones(conn, {"cam": [(20, 20, 70, 70)]}) == 1
+    # Removing an unknown / already-dead id reports None rather than inventing work.
+    assert db.remove_ignore_zone(conn, zid) is None
+    assert db.remove_ignore_zone(conn, 99999) is None
+
+
+def test_zone_seed_skips_malformed_rects_rather_than_crashing_the_rig(conn):
+    n = db.seed_ignore_zones(conn, {"cam": [(1, 2, 3), "junk", None, (5, 5, 55, 55)]})
+    assert n == 1
+    assert [(z["x1"], z["y1"], z["x2"], z["y2"]) for z in db.list_ignore_zones(conn, "cam")] \
+        == [(5, 5, 55, 55)]
+
+
+# ---- IgnoreZoneStore: what the capture threads actually read -------------------------
+def test_zone_store_seeds_from_config_and_serves_the_hot_path(db_path):
+    cfg = _rq_cfg(db_path)
+    cfg = replace(cfg, ignore_zones={"glass_door_cam": [(1127, 595, 1234, 701)]})
+    store = web.IgnoreZoneStore.load(cfg)
+    assert store.rects("glass_door_cam") == ((1127, 595, 1234, 701),)
+    assert store.rects("some_other_cam") == ()
+    assert store.counts() == {"glass_door_cam": 1}
+
+    row = store.add("glass_door_cam", 10, 10, 90, 90, note="grill")
+    assert store.rects("glass_door_cam") == ((1127, 595, 1234, 701), (10, 10, 90, 90))
+    assert store.remove(row["id"]) is True
+    assert store.remove(row["id"]) is False               # already gone
+    assert store.rects("glass_door_cam") == ((1127, 595, 1234, 701),)
+
+    # Durability: a fresh store (= next rig start) reloads the same state from the table.
+    again = web.IgnoreZoneStore.load(cfg)
+    assert again.rects("glass_door_cam") == ((1127, 595, 1234, 701),)
+
+
+# ---- the zone endpoints, over a real socket ------------------------------------------
+def test_zone_endpoints_round_trip_and_reach_the_shared_store(db_path):
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    store = web.IgnoreZoneStore.load(cfg)
+    buffers = {cfg.source: web.FrameBuffer()}
+    bridge = web.CameraControlBridge()
+    bridge.publish({"frame_w": 1920, "frame_h": 1080})    # what the capture thread publishes
+    server = web.make_server(cfg, buffers, {cfg.source: bridge}, store)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, body = _get(port, "/api/zones")
+        assert status == 200
+        assert body["zones"] == [] and body["source"] == cfg.source
+        assert body["frame"] == {"w": 1920, "h": 1080}
+
+        # Add: a drag that ran off the right edge clamps to the frame instead of 400ing.
+        status, body = _post(port, "/api/zones",
+                             {"x1": 1800, "y1": 500, "x2": 2400, "y2": 700, "note": "wall gap"})
+        assert status == 200 and body["ok"]
+        z = body["zone"]
+        assert (z["x1"], z["y1"], z["x2"], z["y2"]) == (1800, 500, 1920, 700)
+        # The endpoint's whole point: the capture threads' shared store sees it immediately.
+        assert store.rects(cfg.source) == ((1800, 500, 1920, 700),)
+
+        status, body = _get(port, "/api/zones")
+        assert [w["id"] for w in body["zones"]] == [z["id"]]
+        assert body["zones"][0]["note"] == "wall gap"
+        assert body["zones"][0]["stale"] is False          # camera never seen to move
+
+        # A zone drawn BEFORE the camera last moved gets flagged.
+        conn2 = db.connect(db_path)
+        try:
+            db.bump_view_epoch(conn2, cfg.source, detected_by="manual")
+        finally:
+            conn2.close()
+        assert _get(port, "/api/zones")[1]["zones"][0]["stale"] is True
+
+        # Garbage coordinates are a 400, not a 500 (and not a row).
+        assert _post(port, "/api/zones", {"x1": "a", "y1": 0, "x2": 50, "y2": 50})[0] == 400
+        assert _post(port, "/api/zones", {"x1": 0, "y1": 0, "x2": 2, "y2": 2})[0] == 400
+        assert len(_get(port, "/api/zones")[1]["zones"]) == 1
+
+        # Delete round trip; a second delete of the same id is a 404, not a silent ok.
+        assert _post(port, "/api/zones/delete", {"id": z["id"]})[0] == 200
+        assert store.rects(cfg.source) == ()
+        assert _get(port, "/api/zones")[1]["zones"] == []
+        assert _post(port, "/api/zones/delete", {"id": z["id"]})[0] == 404
+        assert _post(port, "/api/zones/delete", {"id": "junk"})[0] == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)

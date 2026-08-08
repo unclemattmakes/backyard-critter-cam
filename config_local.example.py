@@ -61,10 +61,12 @@ def apply(cfg):
     # cfg.reid_species = "raccoon"   # the species the dashboard's Individuals tab works on
 
     # A STATIC spot the detector keeps misreading as an animal (a hard shadow, a dark opening)?
-    # List it per camera: a detection boxed ~exactly there is dropped before saving or
-    # clip-triggering, while a real animal walking through the spot has a much bigger box and is
-    # kept. Boxes are (x1, y1, x2, y2) in full-resolution frame pixels -- read them off the
-    # repeated rows in the DB, or the preview. Full story at `ignore_zones` in config.py.
+    # The easy way: open the dashboard's Instrument Panel -> "Ignored Spots" and drag a box over
+    # it -- no config edit, no restart. A detection boxed ~exactly there is dropped before saving
+    # or clip-triggering, while a real animal walking through the spot has a much bigger box and
+    # is kept. This config field still works but only SEEDS the dashboard's table (once per exact
+    # rectangle; a spot deleted in the dashboard stays deleted). Boxes are (x1, y1, x2, y2) in
+    # full-resolution frame pixels. Full story at `ignore_zones` in config.py.
     # cfg.ignore_zones = {"glass_door_cam": [(1127, 595, 1234, 701)]}
 
     # Running a SECOND source (a trail cam's SD card, another rig)? Give it its own slice of the
