@@ -339,6 +339,98 @@ def test_short_age_reads_at_a_glance():
     assert backyard_cam._short_age(-5) == "0s"
 
 
+# ---- open_capture: the all-auto baseline ---------------------------------------------
+# UVC webcams remember manual focus/WB/exposure IN HARDWARE across sessions, so a manual
+# nudge in one session (a dashboard slider, a tune.py experiment) used to leave every later
+# session silently starting in manual mode -- on this cam, the broken red-starved manual-WB
+# state the watchdog exists for, and unfocusable glass at night. open_capture now asserts
+# auto focus / WB / exposure on every open; deliberate locks (cfg.exposure, camera_controls)
+# are applied afterwards, so they still win.
+
+class _RecordingCap:
+    """A VideoCapture stand-in that opens, records every set() in order, and 'reads' frames."""
+
+    def __init__(self, *args):
+        self.sets = []
+
+    def isOpened(self):
+        return True
+
+    def set(self, prop, val):
+        self.sets.append((prop, float(val)))
+        return True
+
+    def get(self, prop):
+        return 0.0
+
+    def read(self):
+        return True, None            # warmup reads; open_capture ignores the frames
+
+    def release(self):
+        pass
+
+    def writes(self, prop):
+        return [v for p, v in self.sets if p == prop]
+
+
+def _open_recorded(monkeypatch, **over):
+    cap = _RecordingCap()
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: cap)
+    cfg = config.Config()
+    for key, val in over.items():
+        setattr(cfg, key, val)
+    assert backyard_cam.open_capture(cfg.camera_specs()[0], cfg) is cap
+    return cap
+
+
+def test_open_asserts_the_all_auto_baseline(monkeypatch):
+    cap = _open_recorded(monkeypatch)
+    assert cap.writes(cv2.CAP_PROP_AUTOFOCUS) == [1.0]
+    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0]
+    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.75]
+
+
+def test_a_deliberate_config_lock_beats_the_baseline(monkeypatch):
+    cap = _open_recorded(monkeypatch, exposure=-6.0,
+                         camera_controls={"AUTOFOCUS": 0, "FOCUS": 200})
+    af = cap.writes(cv2.CAP_PROP_AUTOFOCUS)
+    assert af[0] == 1.0 and af[-1] == 0.0                     # baseline first; the lock wins
+    assert cap.writes(cv2.CAP_PROP_AUTO_EXPOSURE) == [0.25]   # manual exposure, never auto
+    assert cap.writes(cv2.CAP_PROP_EXPOSURE)[-1] == -6.0
+    assert cap.writes(cv2.CAP_PROP_AUTO_WB) == [1.0]          # WB keeps the auto baseline
+
+
+# The dashboard's auto checkboxes show CommandedAutoState, not cap.get(): this driver answers
+# -1.0 / 0.0 for the auto props whatever the real mode is (measured 2026-08-07 -- the panel
+# showed manual while the frame's R/G ratio proved auto-WB was live). The rig is the only
+# writer of these modes, so the last write is the state.
+
+def test_commanded_auto_state_tracks_every_writer():
+    cfg = config.Config()
+    a = backyard_cam.CommandedAutoState(cfg.camera_specs()[0], cfg)
+    assert a.state == {"autofocus": 1.0, "auto_wb": 1.0, "auto_exposure": 0.75}
+    a.note({"AUTO_WB": 0, "WB_TEMPERATURE": 4600})   # dashboard WB slider -> manual
+    assert a.state["auto_wb"] == 0.0
+    a.note({"AUTO_WB": 1})                           # WB watchdog recovery
+    assert a.state["auto_wb"] == 1.0
+    a.note({"exposure": -7.0})                       # a profile locks exposure ...
+    assert a.state["auto_exposure"] == 0.25
+    a.note({"exposure": None})                       # ... and the other flips it back to auto
+    assert a.state["auto_exposure"] == 0.75
+    a.note({"AUTOFOCUS": 0, "FOCUS": 300})           # dashboard focus slider -> manual
+    assert a.state["autofocus"] == 0.0
+    a.note({"BACKLIGHT": 0})                         # unrelated settings change nothing
+    assert a.state == {"autofocus": 0.0, "auto_wb": 1.0, "auto_exposure": 0.75}
+
+
+def test_commanded_auto_state_seeds_from_the_config_locks():
+    cfg = config.Config()
+    cfg.exposure = -6.0
+    cfg.camera_controls = {"AUTOFOCUS": 0, "FOCUS": 200}
+    a = backyard_cam.CommandedAutoState(cfg.camera_specs()[0], cfg)
+    assert a.state == {"autofocus": 0.0, "auto_wb": 1.0, "auto_exposure": 0.25}
+
+
 # ---- The capture loop, driven end to end on fake frames ------------------------------
 # A fake capture + a scripted detector run the REAL _run_camera: motion gate, detector gating,
 # crop + DB write, the census and (when enabled) the shadow veto. Nothing here opens a camera,

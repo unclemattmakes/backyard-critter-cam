@@ -125,6 +125,10 @@ class Config:
     # Tuning (tune.py, 2026-06-08) found backlight-compensation OFF gives slightly crisper,
     # less-washed daytime frames through the glass -- a small but free win. Add more as you
     # find them, e.g. {"BACKLIGHT": 0, "CONTRAST": 40}. Empty {} = leave the camera's defaults.
+    # Note UVC cams REMEMBER manual focus/WB/exposure across sessions, so every open first
+    # asserts an all-auto baseline (AUTOFOCUS=1, AUTO_WB=1, auto-expose) before these apply --
+    # a persisted manual nudge from a past session can't haunt the rig. To deliberately lock a
+    # control, set it HERE (e.g. {"AUTOFOCUS": 0, "FOCUS": 200}): this dict wins over the baseline.
     camera_controls: dict = field(default_factory=lambda: {"BACKLIGHT": 0})
     reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).

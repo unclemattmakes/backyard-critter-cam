@@ -388,6 +388,36 @@ def probe_writable_controls(cap) -> dict:
     return out
 
 
+class CommandedAutoState:
+    """The three auto-mode toggles as the rig LAST COMMANDED them -- published to the dashboard
+    in place of cap.get(), which is not a truth source for these on this hardware: the glass-door
+    cam's driver answers -1.0 for get(AUTOFOCUS)/get(AUTO_EXPOSURE) and 0.0 for get(AUTO_WB)
+    whatever the real mode is (measured 2026-08-07: both panel boxes showed manual minutes after
+    open_capture asserted auto and with the frame's R/G ratio proving auto-WB was live), and the
+    2026-06 cam lied the other way (AUTOFOCUS read 1.0 forever after we set 0). The rig is the
+    ONLY writer of these modes -- the driver never flips them on its own -- so the last write IS
+    the state. Seeded from open_capture's all-auto baseline resolved against the config locks;
+    note() every settings dict that reaches apply_camera_settings (profiles, dashboard posts)
+    and the WB watchdog's recoveries, and it stays the state's single honest ledger."""
+
+    def __init__(self, spec: config.CameraSpec, cfg: config.Config):
+        exposure = _eff(spec, cfg, "exposure")
+        self.state = {"autofocus": 1.0, "auto_wb": 1.0,
+                      "auto_exposure": 0.75 if exposure is None else 0.25}
+        self.note(_eff(spec, cfg, "camera_controls") or {})
+
+    def note(self, settings: dict) -> None:
+        """Record the auto-mode consequences of a settings dict bound for apply_camera_settings."""
+        if not settings:
+            return
+        if "exposure" in settings:      # the profile/dashboard idiom: None = auto, number = lock
+            self.state["auto_exposure"] = 0.75 if settings["exposure"] is None else 0.25
+        for prop, ours in (("AUTO_EXPOSURE", "auto_exposure"), ("AUTOFOCUS", "autofocus"),
+                           ("AUTO_WB", "auto_wb")):
+            if settings.get(prop) is not None:
+                self.state[ours] = float(settings[prop])
+
+
 class WhiteBalanceWatchdog:
     """Put a camera back into AUTO white balance when its colour goes red-starved.
 
@@ -559,8 +589,20 @@ def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCaptur
     if not spec.is_network and cfg.camera_request_fps:
         cap.set(cv2.CAP_PROP_FPS, float(cfg.camera_request_fps))
     _ask_fourcc()
+    # UVC webcams PERSIST control state in hardware across sessions: one manual nudge -- the
+    # dashboard's Focus/WB slider (which posts {AUTOFOCUS: 0} / {AUTO_WB: 0} by design), a
+    # tune.py experiment, any other app -- and every LATER session silently starts in manual
+    # focus / manual white balance. On this cam manual WB is the broken red-starved state the
+    # WhiteBalanceWatchdog exists for, and manual focus has no watchdog at all. So every open
+    # starts from the known baseline: everything auto. A deliberate lock still wins -- exposure/
+    # gain and camera_controls are applied AFTER this, so camera_controls={"AUTOFOCUS": 0}
+    # keeps meaning what it says. On a network stream these are the usual harmless no-ops.
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1.0)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1.0)
     exposure, gain = _eff(spec, cfg, "exposure"), _eff(spec, cfg, "gain")
-    if exposure is not None:   # lock manual exposure (0.25 = manual on most UVC/DSHOW cams)
+    if exposure is None:       # assert auto-expose (don't inherit a persisted manual lock)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)   # 0.75 = auto on most UVC/DSHOW cams
+    else:                      # lock manual exposure (0.25 = manual on most UVC/DSHOW cams)
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
     if gain is not None:
@@ -1333,9 +1375,13 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                        and cfg.latitude is not None and cfg.longitude is not None)
         active_period = None
         last_profile_check = 0.0
+        # The auto modes as last commanded -- the dashboard's truth source, because this
+        # driver's get() lies about them (see CommandedAutoState).
+        auto_cmd = CommandedAutoState(spec, cfg)
         if profiles_on:
             active_period = daynight.current_period(cfg.latitude, cfg.longitude)
             apply_camera_settings(cap, eff_profiles.get(active_period, {}))
+            auto_cmd.note(eff_profiles.get(active_period, {}))
             print(f"{tag} camera profile: '{active_period}'")
 
         # Probe writable sliders once (local cams only; a network cam has none we can set).
@@ -1385,6 +1431,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                         break                       # only None when we're shutting down
                     active_period = None            # re-apply the profile after a reconnect
                     last_profile_check = 0.0
+                    # open_capture just re-asserted the all-auto baseline on the fresh device.
+                    auto_cmd = CommandedAutoState(spec, cfg)
                     # Fresh capture, fresh background model: after a standby wake (or a heal's
                     # device reset) the scene lighting has usually changed, and the OLD model
                     # would read the whole frame as one giant motion blob for a minute -- which
@@ -1411,20 +1459,27 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 if period != active_period:
                     active_period = period
                     apply_camera_settings(cap, eff_profiles.get(period, {}))
+                    auto_cmd.note(eff_profiles.get(period, {}))
                     print(f"{tag} sun crossed -- switched to '{period}' profile")
 
             # --- White-balance watchdog (self-rate-limited; see WhiteBalanceWatchdog) ---
+            wb_rec = wb_guard.recoveries
             wb_guard.check(cap, frame, now)
+            if wb_guard.recoveries != wb_rec:
+                auto_cmd.note({"AUTO_WB": 1})   # the watchdog put white balance back to auto
 
             # --- Live camera controls from the dashboard (web thread -> this capture thread) ---
             if bridge is not None:
                 pending = bridge.take_pending()
                 if pending and not spec.is_url:
                     apply_camera_settings(cap, pending)
+                    auto_cmd.note(pending)
                     wb_guard.note_settings(pending)   # honour a deliberate manual-WB choice
                 if now - last_ctrl_pub >= 1.0:
                     last_ctrl_pub = now
                     snap = {} if spec.is_url else read_camera_controls(cap)
+                    if not spec.is_url:
+                        snap.update(auto_cmd.state)   # commanded truth beats the driver's guess
                     snap["period"] = active_period
                     snap["writable"] = writable
                     # Colour health, so a cyan-cast session is visible instead of just looking

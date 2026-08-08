@@ -216,16 +216,19 @@ const CONTROLS=[
   {key:'wb',label:'White balance',min:2000,max:8000,step:100,auto:'auto_wb'},
 ];
 function buildControls(){
+  // Auto checkboxes start CHECKED (slider disabled): the rig asserts auto focus/WB/exposure at
+  // every camera open, so before any read-back arrives, "auto" IS the camera's state. A camera
+  // genuinely in manual (a deliberate config lock) unchecks them on the first refresh.
   $('#controls').innerHTML=CONTROLS.map(c=>`
     <div class="ctrl" data-k="${c.key}">
       <div class="row">
         <span class="name">${c.label}</span>
         <span style="display:flex;gap:10px;align-items:center">
-          ${c.auto?`<label class="auto"><input type="checkbox" data-auto="${c.auto}"> auto</label>`:''}
+          ${c.auto?`<label class="auto"><input type="checkbox" data-auto="${c.auto}" checked> auto</label>`:''}
           <span class="val" data-val>—</span>
         </span>
       </div>
-      <input type="range" min="${c.min}" max="${c.max}" step="${c.step}" data-slider>
+      <input type="range" min="${c.min}" max="${c.max}" step="${c.step}" data-slider ${c.auto?'disabled':''}>
     </div>`).join('');
   $('#controls').querySelectorAll('.ctrl').forEach(el=>{
     const key=el.dataset.k, sl=el.querySelector('[data-slider]'), val=el.querySelector('[data-val]');
@@ -343,10 +346,12 @@ async function refreshControls(){
     el.classList.toggle('locked', locked);
     el.title = locked ? `${c.label} can't be set on this camera (the driver rejects it).` : '';
     if(au){
-      // Mirror the camera's auto/manual state only UNTIL the user takes control of this control;
-      // afterwards the checkbox is user-owned and the camera read-back never touches it again.
-      // (This webcam keeps reporting AUTOFOCUS=1.0 even after we set it to 0 -- the old code
-      // re-checked the box and disabled the Focus slider a few seconds after the user went manual.)
+      // Mirror the rig's auto/manual state only UNTIL the user takes control of this control;
+      // afterwards the checkbox is user-owned and the read-back never touches it again (it can
+      // briefly lag the change we just POSTed). For the auto keys the rig publishes what it
+      // last COMMANDED, not the driver's raw get() -- every cam we've had lies there (one
+      // reported AUTOFOCUS=1.0 forever after we set 0; the current one answers -1/0 for the
+      // auto props no matter the real mode) -- so the mirrored value is trustworthy.
       const a=v[c.auto];
       if(!touchedAt[c.key] && a!=null && document.activeElement!==au){
         au.checked = c.auto==='auto_exposure' ? !(Math.abs(a-0.25)<0.05) : (a>=0.5);
