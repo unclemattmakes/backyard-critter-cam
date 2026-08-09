@@ -18,17 +18,32 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# TWO JOBS, deliberately -- upload and deploy used to sit in one job, and on 2026-08-09 that
+# raced: the artifact finalized, deploy-pages queried the API 0.3 s later and was told "Found 0
+# artifact(s)", and the deploy failed with the site's content sitting perfectly good in storage.
+# Worse, the obvious fix makes it permanent: re-running that job uploads a SECOND artifact into
+# the same run, and deploy then refuses with "Multiple artifacts named github-pages ... count is
+# 2", so the run can never succeed and only a fresh run recovers.
+# Splitting build from deploy is the pattern GitHub's own starter workflow uses, and it fixes
+# both halves: `needs: build` means the artifact is fully committed (plus runner-scheduling
+# latency) before deploy asks for it, and a `--failed` re-run repeats only `deploy`, which
+# uploads nothing and so can never duplicate the artifact.
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: making-of
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
