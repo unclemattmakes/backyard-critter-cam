@@ -486,8 +486,15 @@ finished.
   is computed and returned), the digest's species roll and the individual profiles still speak in
   clock hours, and the histogram itself is still clock-binned — only the summary line is
   sun-relative.
-- **Behaviour tags are per visit, never totalled.** "Stan: 84% feeding visits; the cat: 91%
-  transit" is one `GROUP BY` away and would say more about an animal than any single visit does.
+- ~~**Behaviour tags are per visit, never totalled.**~~ **Shipped 2026-08-09**:
+  `stats.behaviour_profile` totals the tag per individual and per species, on the profile page.
+  Raccoons 55% lingered / 35% fed here / 9% passed through over 332 readable visits; the squirrel
+  59/17/25. Two things the build had to learn: it must count **pruned** clips (the prune is soft —
+  filtering them left Stan with 0 tagged visits out of 64), and about **half of all visits have no
+  clip overlapping them**, so the surface prints how many it could not read and refuses a
+  percentage below three tagged visits. It is also NOT built on `clip_tracks.individual_id`, which
+  is still 0-of-897 populated — so `stats.individual_motion`, which reads that column, still
+  returns nothing for everybody. That one is the remaining half.
 - **`labeled_by` now records who, but nothing reads it.** No per-labeller view, no agreement rate,
   no review tier — see §5.1. (Fixed on 2026-08-09: the column was shipped the day before with
   *nothing* writing to it, operator confirms included.)
