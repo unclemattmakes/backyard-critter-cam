@@ -679,6 +679,80 @@ def individual_motion(cfg, individual_id) -> dict:
         conn.close()
 
 
+def behaviour_profile(cfg, individual_id=None, species=None, *, min_visits: int = 3) -> dict:
+    """What this animal mostly DOES, across every visit -- "Stan: 84% fed here" rather than one
+    visit's word.
+
+    The tag has been computed per visit since the coarse behaviour pass shipped and then thrown
+    away every time; totalling it is the entire feature, and it says more about an animal than any
+    single visit does. A `GROUP BY` in spirit, done in Python because the visit/clip relation is a
+    TIME OVERLAP rather than a foreign key (stats.py's standing convention).
+
+    Deliberately NOT built on `clip_tracks.individual_id`: that column is 0-of-897 populated, so
+    `individual_motion` -- which reads it -- returns nothing for everybody. This walks the
+    individual's VISITS instead, which is where their name actually lives.
+
+    Returns {n_visits, n_tagged, tags: {tag: n}, share: {tag: fraction}, dominant, thin}. `thin`
+    is True below `min_visits` tagged visits, and the caller must not print a percentage then --
+    "100% fed here" off one visit is a sentence about arithmetic, not about a raccoon.
+    """
+    out = {"n_visits": 0, "n_tagged": 0, "tags": {}, "share": {}, "dominant": None, "thin": True,
+           "individual_id": individual_id, "species": species}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return out
+    try:
+        if individual_id:
+            visits = conn.execute(
+                """SELECT DISTINCT v.id, v.source, v.started_at, v.ended_at FROM visits v
+                   JOIN detections d ON d.visit_id = v.id
+                   WHERE d.individual_id = ?""", (individual_id,)).fetchall()
+        elif species:
+            visits = conn.execute(
+                "SELECT id, source, started_at, ended_at FROM visits WHERE species = ?",
+                (species,)).fetchall()
+        else:
+            return out
+        out["n_visits"] = len(visits)
+        if not visits:
+            return out
+        # include_pruned=True, and it is the difference between a feature and an empty dict. The
+        # prune is SOFT: the video file goes, the derived clip_tracks stay. Playback has to filter
+        # pruned clips; ANALYTICS must not, or every total silently becomes "the last two weeks".
+        # Measured: filtering them left Stan with 0 tagged visits out of 64.
+        clips = load_clips(conn, include_pruned=True)
+        tracks: dict = defaultdict(list)
+        for r in conn.execute(
+                "SELECT clip_id, straightness, moving_frac FROM clip_tracks"):
+            tracks[r["clip_id"]].append((r["straightness"], r["moving_frac"]))
+        tally: Counter = Counter()
+        for v in visits:
+            start, end = _parse(v["started_at"]), _parse(v["ended_at"])
+            if start is None or end is None:
+                continue
+            rs = [t for c in clips_overlapping(clips, v["source"], start, end)
+                  for t in tracks.get(c["id"], ())]
+            if not rs:
+                continue
+            mf = [m for _s, m in rs if m is not None]
+            st = [s for s, _m in rs if s is not None]
+            tag = _behaviour_tag((end - start).total_seconds() / 60.0,
+                                 sum(mf) / len(mf) if mf else None,
+                                 sum(st) / len(st) if st else None)
+            if tag:
+                tally[tag] += 1
+        n = sum(tally.values())
+        out["n_tagged"] = n
+        out["tags"] = dict(tally.most_common())
+        out["thin"] = n < int(min_visits)
+        if n:
+            out["share"] = {k: round(c / n, 3) for k, c in tally.most_common()}
+            out["dominant"] = tally.most_common(1)[0][0]
+        return out
+    finally:
+        conn.close()
+
+
 _REVIEW_SUSPECT = {"brown rat", "domestic dog"}   # real-ish but error-prone labels (per the analysis)
 # Clearly day-active species: one detected at deep night is almost certainly a nocturnal mammal
 # mislabeled. Used ONLY to prioritize the review queue -- never to relabel anything.
@@ -976,6 +1050,9 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
             "visits": visits,
             "references": refs,
             "status": status,
+            # What they mostly DO, totalled over every visit. The per-visit tag has been computed
+            # and discarded since the coarse behaviour pass shipped; this is the total.
+            "behaviour": behaviour_profile(cfg, individual_id=name),
         }
     finally:
         conn.close()

@@ -956,6 +956,21 @@ async function renderProfile(params,body){
     ? `<span class="flag" style="opacity:.85">moved on${p.status.effective_date?' · last resident day '+esc(p.status.effective_date):''}</span>` : '';
   const comp=(p.companions||[]).map(c=>
     `<button class="cast-chip" onclick="openProfile(${jarg(c.name)})">${esc(cap1(c.name))}<small>×${c.n_visits}</small></button>`).join('');
+  /* WHAT THEY MOSTLY DO. The per-visit tag has been computed since the coarse behaviour pass and
+     discarded every time; this is the total. Two honesty rules baked in: it prints how many
+     visits it could NOT tag (a visit with no overlapping clip has no motion features, and on this
+     corpus that is about half of them), and below three tagged visits it shows counts instead of
+     percentages -- "100% fed here" off one visit is a sentence about arithmetic. */
+  const bh=p.behaviour;
+  const bhRow=(bh&&bh.n_tagged)?(()=>{
+    const parts=Object.entries(bh.share||{}).map(([k,v])=>
+      bh.thin?`${bh.tags[k]}× ${esc(k)}`:`${Math.round(v*100)}% ${esc(k)}`);
+    const why=`From ${bh.n_tagged} of ${bh.n_visits} visits — the rest had no clip overlapping them, so no motion to read. `+
+      (bh.thin?`Too few to quote a percentage, so these are counts.`:``)+
+      ` The tag is a coarse reading of three motion features, not a verdict.`;
+    return `<div class="lbl" style="opacity:.78" title="${esc(why)}">Mostly: ${parts.join(' · ')}`+
+      `<span style="opacity:.6"> · ${bh.n_tagged}/${bh.n_visits} visits readable</span>${infoDot(why)}</div>`;
+  })():'';
   const refs=(p.references||[]).map(r=>
     `<img loading="lazy" src="${media(r.crop_path)}" alt="reference photo" title="${esc(r.kind==='video_frame'?'phone video frame':'phone photo')}${r.captured_at?' · '+esc(fmtDateTime(r.captured_at)):''}${r.note?' · '+esc(r.note):''}">`).join('');
   visitsData=p.visits;
@@ -968,6 +983,7 @@ async function renderProfile(params,body){
       </div>
       <div class="lbl" style="opacity:.78">first seen ${esc(fmtDateTime(p.first_seen))} · last seen ${esc(fmtDateTime(p.last_seen))}${stamps?` · labels: ${stamps}`:''}${p.unfiled?` · ${p.unfiled} newest photos not yet filed into a visit`:''}</div>
       ${depart}
+      ${bhRow}
       ${lost?`<div class="lbl" style="opacity:.6">${lost} clip${lost===1?'':'s'} pruned before the backups began (or the backup drive is unreachable) — not shown.</div>`:''}
       ${comp?`<div class="castrow"><span class="lbl">Seen together with</span>${comp}</div>`:''}
       ${refs?`<div class="profile-refs"><span class="lbl">Reference shots — phone (identity certified by hand)</span><div class="refstrip">${refs}</div></div>`:''}
