@@ -22,8 +22,22 @@ def apply(cfg):
     # The individual names you've given the humans in your household. Name yourself in the
     # dashboard and the re-ID queue stops offering you up as a new raccoon -- but that name is
     # then a label like any other, so list it here and makingof_export.py will never publish a
-    # crop carrying it. Belongs in this untracked file, not in config.py.
+    # crop carrying it. Belongs in this untracked file, not in config.py. These names are also
+    # folded into the non-critter denylist automatically, so you never show up as a rare species.
     # cfg.privacy_deny_names = ("yourname", "housemate")
+
+    # Your yard's own additions to the non-critter denylist -- correction labels for YOUR
+    # furniture and false triggers, in your own words or language ("bin", "wheelbarrow",
+    # "la scopa"). They extend the built-in set (never replace it) and disappear from every
+    # insight surface: species counts, Rarely Seen, the Behaviour notes, calendar glyphs.
+    # cfg.non_critter_labels = ("bin", "wheelbarrow")
+
+    # Household viewing vs curating (OFF unless set). With a token, devices that haven't entered
+    # it (dashboard footer, once per browser) become VIEWERS: they read and play everything and
+    # can log "who's here" as reviewable testimony, but every label/settings write is refused by
+    # the server. Localhost is always the operator. Without this line, every device on your
+    # Wi-Fi can edit labels -- fine alone, risky with houseguests' phones on the network.
+    # cfg.operator_token = "pick-a-phrase"
 
     # Power-user option (the default 'auto' already uses the GPU when it works, else CPU). Set
     # 'cuda' to REQUIRE a working NVIDIA GPU and fail loud if a wrong torch build can't use it,

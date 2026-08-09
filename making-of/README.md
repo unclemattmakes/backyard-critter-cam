@@ -54,6 +54,12 @@ making-of/
 
 ## Deploying
 
-It's fully static — drop the `making-of/` folder on GitHub Pages, Netlify, or any static host.
-`data/` and `media/` are generated artifacts; commit them if you want the host to serve the frozen
-slice as-is.
+**This repo already deploys it.** Every push touching `making-of/**` republishes the site via
+`.github/workflows/pages.yml`; the live copy is
+**<https://unclemattmakes.github.io/backyard-critter-cam/>**. The rig also serves it on the LAN
+at `/making-of/` (a static route in `web.py`), so household visitors get the explainer without
+the public URL.
+
+Running your own fork? It's fully static — the same folder drops onto GitHub Pages, Netlify, or
+any static host. `data/` and `media/` are generated artifacts; commit them if you want the host
+to serve the frozen slice as-is.

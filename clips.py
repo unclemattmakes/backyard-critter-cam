@@ -231,8 +231,14 @@ def convert_legacy_to_h264(clips_dir: Path, *, verbose: bool = True) -> dict:
         tmp = p.with_suffix(".h264.tmp.mp4")
         before = p.stat().st_size
         try:
+            # -c:a aac, not -an: this swap REPLACES the source file, so stripping audio here
+            # destroys it forever -- and a trail-cam MP4's microphone track (growls, kit chitter)
+            # is the only copy that sound will ever have. The rig's own clips carry no audio
+            # track, so for them nothing changes. AAC re-encode because trail-cam PCM/ADPCM
+            # won't play in a browser anyway.
             subprocess.run(
-                [_FFMPEG, "-y", "-loglevel", "error", "-i", str(p), "-an", "-c:v", "libx264",
+                [_FFMPEG, "-y", "-loglevel", "error", "-i", str(p),
+                 "-c:a", "aac", "-b:a", "96k", "-c:v", "libx264",
                  "-preset", _X264_PRESET, "-crf", _X264_CRF, "-pix_fmt", "yuv420p",
                  "-movflags", "+faststart", str(tmp)],
                 check=True, timeout=600, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

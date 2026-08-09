@@ -376,6 +376,15 @@ class Config:
     # or a snapshot was just requested) -- an unwatched rig spends nothing on encoding. This
     # never throttles capture itself: detection, crops and clips run at full camera rate.
     display_max_fps: float = 12.0
+    # OPERATOR/VIEWER SPLIT (opt-in). Unset (None) = today's behaviour: every LAN client is a
+    # full operator. Set a token string (config_local.py) and un-tokened clients become VIEWERS:
+    # they can read everything, play everything, and log "who's here" as ATTRIBUTED testimony
+    # (recorded, reviewable, never stamped as ground truth) -- but every other write is refused
+    # server-side. A device becomes operator by entering the token once in the dashboard footer
+    # (kept in that browser's localStorage; localhost is always operator). This closes the
+    # documented "anyone on your Wi-Fi has full access, INCLUDING label edits" caveat for
+    # households that want it closed, without adding accounts or passwords for anyone else.
+    operator_token: str | None = None
     # When the dashboard is bound to the network (web_host = "0.0.0.0", the LAN launcher), accept
     # connections ONLY from your local network -- loopback + private ranges (192.168.x, 10.x,
     # 172.16-31.x, link-local). A DIRECT request from a public internet address is refused (HTTP
@@ -697,6 +706,17 @@ class Config:
     # detector mislabelled, so still review exported crops by eye.
     privacy_deny_names: tuple = ()
 
+    # YOUR yard's additions to the non-critter denylist (stats._NON_CRITTER): correction labels
+    # that name furniture, false triggers, or household members in your own words -- or your own
+    # language. These EXTEND the built-in set (never replace it) and hide those labels from every
+    # insight surface: the digest's roll and species counts, Rarely Seen, the Behaviour field
+    # notes, calendar glyphs. Before this existed the instruction was "edit the set in stats.py",
+    # which is library source; now it is a config_local.py line like species_labels already was.
+    # privacy_deny_names is folded in automatically -- a household member named as an individual
+    # is by definition not a yard visitor, and 2026-08-08 the owner's own label sat in the
+    # "Rarely Seen" panel at ~100% confidence for want of exactly this line.
+    non_critter_labels: tuple = ()
+
     # ---- Non-animal prefilter (general CLIP, runs BEFORE BioCLIP) ----------------
     # BioCLIP is organism-only: it can't say "that's not an animal", so MegaDetector's coarse
     # 'animal' false-fires (a plate of food, a pet bowl, bare ground at the glass door) get forced
@@ -891,3 +911,20 @@ except ModuleNotFoundError as exc:
         raise
 else:
     config_local.apply(CONFIG)
+
+# Fold the yard's own labels into the shared non-critter denylist, ONCE, after config_local has
+# spoken. stats._NON_CRITTER is the single set object every consumer holds (behavior, twoaxis,
+# eval, the /api/denylist endpoint all bind the same set), so an in-place update here reaches all
+# of them -- and stats keeps its deliberate "db + stdlib only" import diet, because the dependency
+# points this way. privacy_deny_names rides along: a household member named as an individual is
+# not a yard visitor. Guarded, not load-bearing: with stats unimportable the built-in set still
+# applies everywhere it can.
+if CONFIG.non_critter_labels or CONFIG.privacy_deny_names:
+    try:
+        import stats as _stats
+        _stats._NON_CRITTER |= {
+            str(x).strip().casefold()
+            for x in tuple(CONFIG.non_critter_labels) + tuple(CONFIG.privacy_deny_names)
+            if str(x).strip()}
+    except Exception:
+        pass

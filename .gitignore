@@ -77,6 +77,11 @@ config_local.py
 .naming_status.json
 .naming_status.tmp
 
+# ===== What setup actually resolved on THIS machine (torch build, ultralytics, ...) =====
+# Machine-specific provenance for the numbers this machine computes; backup.py archives it
+# with the weekly meta snapshot, so it doesn't belong in a shared repo.
+environment.lock.txt
+
 # ===== Local tooling / editor / OS =====
 # .claude/ holds a machine-specific launch.json (absolute venv path)
 .claude/

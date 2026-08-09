@@ -18,7 +18,7 @@
   <div class="sub">How a webcam at a sliding door learned to name the raccoons</div>
   <div class="live-chip"><span class="live-dot"></span> a field journal for the backyard</div>
   <p class="dek">A USB camera points through a patio door. It watches for movement, wakes a wildlife
-  detector, and — over <b id="dek-days">18</b> nights — taught itself to recognise the regulars.
+  detector, and — over <b id="dek-days">many</b> nights — taught itself to recognise the regulars.
   Here is how every piece works, with <b>eight things you can play with</b>. Everything below runs
   on <b>real data</b> from the yard.</p>
 </header>
@@ -303,7 +303,15 @@
   <a href="https://huggingface.co/BVRA/MegaDescriptor-L-384">MegaDescriptor</a>.
   Made with too many late nights and a patient raccoon named Stan.</p>
   <p><a href="https://github.com/unclemattmakes/backyard-critter-cam" target="_blank" rel="noopener">Source</a>
-  &middot; <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">AGPL-3.0</a></p>
+  &middot; <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">AGPL-3.0</a><span
+  class="muted" id="rig-link" hidden> &middot; this copy is served by a live rig — its dashboard is
+  at <a href="/">/</a></span></p>
+  <script>
+  /* The dashboard pointer only makes sense when THE RIG serves this page (web.py's /making-of/
+     route). Probe the one endpoint every rig answers; on GitHub Pages / file:// / a plain
+     http.server the fetch 404s or throws and the pointer stays hidden. */
+  fetch('/api/naming').then(r=>{ if(r.ok) document.getElementById('rig-link').hidden=false; }).catch(()=>{});
+  </script>
 </footer>
 
 <script src="makingof.js"></script>

@@ -43,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -51,9 +52,10 @@ import sqlite3
 import sys
 import time
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
+import db
 from config import CONFIG, ROOT
 
 log = logging.getLogger("backup")
@@ -283,6 +285,193 @@ def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
     log.info("created %s  (%d files, %.1f MB)", out_zip.name, n, out_zip.stat().st_size / 2**20)
 
 
+def snapshot_weights(out_dir: Path, dry_run: bool) -> None:
+    """A ONE-TIME weights archive (never rebuilt, like the clips zips): the MDv6 .pt plus the
+    Hugging Face caches of MegaDescriptor / BioCLIP / the CLIP gate. backup.py's founding
+    assumption -- 'weights re-download themselves' -- is true for MDv6 (Zenodo is archival, DOI'd)
+    and FALSE for the three HF models: repos get pulled, gated and re-licensed routinely, and if
+    hf-hub:BVRA/MegaDescriptor-L-384 vanishes, every stored 1536-d vector survives but the
+    embedding space can never be extended -- the whole cross-time identity archive freezes. ~1.3 GB
+    of Drive space, exactly once, closes that. Local archival of already-downloaded weights for
+    continuity, not redistribution (NOTICE.md's licensing posture; MegaDescriptor is CC-BY-NC)."""
+    out_zip = out_dir / "weights-archive.zip"
+    if out_zip.exists():
+        log.debug("weights archive already exists (never rebuilt): %s", out_zip.name)
+        return
+    sources: list[Path] = []
+    wdir = ROOT / "weights"
+    if wdir.is_dir():
+        sources.append(wdir)
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    if hub.is_dir():
+        keywords = ("megadescriptor", "bioclip", "clip-vit-b-32")
+        for p in sorted(hub.iterdir()):
+            if p.is_dir() and any(k in p.name.lower() for k in keywords):
+                sources.append(p)
+    if not sources:
+        log.info("weights archive: nothing to archive yet (no weights/ or HF cache)")
+        return
+    total = sum(f.stat().st_size for s in sources for f in ([s] if s.is_file() else s.rglob("*"))
+                if f.is_file())
+    if dry_run:
+        log.info("would create %s from %d source(s), %.1f GB",
+                 out_zip.name, len(sources), total / 2**30)
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_zip.with_name(out_zip.name + ".tmp")
+    n = 0
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:   # weights don't deflate
+        for src in sources:
+            base = src.parent
+            for p in sorted(src.rglob("*")):
+                if p.is_file() and not p.is_symlink():
+                    try:
+                        zf.write(p, Path(src.name) / p.relative_to(src))
+                        n += 1
+                    except (FileNotFoundError, OSError) as e:
+                        log.warning("skipping %s: %s", p, e)
+        zf.comment = (f"one-time weights archive, {date.today().isoformat()}; "
+                      f"immutable -- restore by extracting weights/ into the project and "
+                      f"models--* dirs into ~/.cache/huggingface/hub/").encode()
+    os.replace(tmp, out_zip)
+    log.info("created %s  (%d files, %.1f GB, one time only)", out_zip.name, n,
+             out_zip.stat().st_size / 2**30)
+
+
+def export_labels(out_dir: Path, today: date, dry_run: bool) -> None:
+    """The human-label LEDGER: every human verdict as one dated, append-only JSONL, diffed
+    against the previous export. The label set is the project's only irreplaceable asset, and
+    until now its durability was welded to full-DB snapshots and its integrity had no monitor --
+    a mass-mislabel event (the one-click refit hazard the identity eval warns about) would have
+    been silent. Now it is a LOUD line: rows changed/removed since last week get logged, and the
+    labels stay restorable and greppable without a DB restore."""
+    out_jsonl = out_dir / f"labels-{today.isoformat()}.jsonl"
+    conn = db.connect_readonly(CONFIG.db_path)
+    if conn is None:
+        log.info("label ledger: no database yet")
+        return
+    try:
+        # Column list built from PRAGMA, not assumed: a read-only connection never migrates, so
+        # this must work against a DB no new-code writer has touched yet (labeled_by landed
+        # 2026-08-08 and appears only after the first read-write connect).
+        have = {r[1] for r in conn.execute("PRAGMA table_info(detections)")}
+        cols = [c for c in ("id", "timestamp", "species", "species_verified", "species_source",
+                            "individual_id", "individual_source", "labelled_at", "labeled_by")
+                if c in have]
+        rows = []
+        for r in conn.execute(
+                f"SELECT {', '.join(cols)} FROM detections "
+                "WHERE species_source = 'human' OR species_verified IS NOT NULL "
+                "   OR individual_source IS NOT NULL"):
+            rows.append({"kind": "detection", **{k: r[k] for k in r.keys()}})
+        for table, kind in (("live_sightings", "sighting"), ("individual_status", "status"),
+                            ("life_events", "event")):
+            try:
+                for r in conn.execute(f"SELECT * FROM {table}"):
+                    rows.append({"kind": kind, **{k: r[k] for k in r.keys()}})
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    if dry_run:
+        log.info("would write %s (%d rows)", out_jsonl.name, len(rows))
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Diff against the previous ledger BEFORE writing this one. Keyed by (kind, id/name);
+    # a changed row counts once. Removals are the alarm class.
+    prev = sorted(out_dir.glob("labels-*.jsonl"))
+    prev = prev[-1] if prev else None
+    lines = [json.dumps(r, sort_keys=True, default=str) for r in rows]
+    out_jsonl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    if prev is not None and prev != out_jsonl:
+        old = set(prev.read_text(encoding="utf-8").splitlines())
+        new = set(lines)
+        added, removed = len(new - old), len(old - new)
+        if removed > 50:
+            log.warning("LABEL LEDGER: %d row(s) changed or VANISHED since %s (+%d new) -- a "
+                        "mass label change; if you didn't do this on purpose, the previous "
+                        "ledger is the restore point", removed, prev.name, added)
+        else:
+            log.info("label ledger: +%d / ~%d vs %s (%d rows total)",
+                     added, removed, prev.name, len(lines))
+    else:
+        log.info("label ledger: first export, %d rows", len(lines))
+    # Keep the ledger family bounded but deep: it is small text and gzips well in the cloud.
+    for old_file in sorted(out_dir.glob("labels-*.jsonl"))[:-12]:
+        old_file.unlink(missing_ok=True)
+
+
+def write_status(dest: Path, failures: int, dry_run: bool) -> None:
+    """STATUS.txt -- the heartbeat that reaches the owner. The project has no notification
+    channel of any kind; this file, rewritten by every weekly run into the Drive-synced folder,
+    is the cheapest one that already exists: its CONTENTS say how the rig is, and its absence
+    or staleness (mtime on the phone's Drive app) IS the alarm. Everything here is read-only
+    and best-effort -- a status writer that can crash the backup would be a bad joke."""
+    if dry_run:
+        log.info("would write STATUS.txt")
+        return
+    lines = [f"Backyard Critter Cam -- weekly status, {datetime.now().astimezone().isoformat()}",
+             f"backup: {'FAILED (' + str(failures) + ' failure(s))' if failures else 'ok'}"]
+    try:
+        log_p = ROOT / "logs" / "backyard_cam.log"
+        if log_p.exists():
+            age_h = (time.time() - log_p.stat().st_mtime) / 3600
+            lines.append(f"rig log last wrote: {age_h:.1f} h ago"
+                         + ("  <-- the rig may be DOWN" if age_h > 6 else ""))
+        else:
+            lines.append("rig log: none found")
+    except OSError:
+        pass
+    conn = db.connect_readonly(CONFIG.db_path)
+    if conn is not None:
+        try:
+            last = conn.execute("SELECT MAX(timestamp) FROM detections").fetchone()[0]
+            lines.append(f"newest detection: {last or 'none'}")
+            last_label = conn.execute(
+                "SELECT MAX(labelled_at) FROM detections WHERE individual_source = 'human'"
+            ).fetchone()[0]
+            lines.append(f"newest human identity label: {last_label or 'none recorded'}"
+                         + ("  <-- past the ~14-day decay horizon; the matcher is going blind"
+                            if _older_than_days(last_label, 14) else ""))
+            try:
+                n7 = conn.execute(
+                    "SELECT COUNT(*) FROM detections WHERE suppressed_at IS NOT NULL "
+                    "AND suppressed_at >= datetime('now', '-7 day', 'localtime')").fetchone()[0]
+                lines.append(f"refimg shadow flags, last 7 days: {n7}"
+                             + ("  -- review with: python refimg.py --review" if n7 else ""))
+            except Exception:
+                pass
+        finally:
+            conn.close()
+    try:
+        led = sorted(ROOT.glob("*.imported-*.txt"), key=lambda p: p.stat().st_mtime)
+        if led:
+            age_d = (time.time() - led[-1].stat().st_mtime) / 86400
+            lines.append(f"trail-cam last import: {age_d:.1f} days ago"
+                         + ("  <-- the card may be filling" if age_d > 5 else ""))
+    except OSError:
+        pass
+    try:
+        rep = sorted((ROOT / "reports").glob("eval_*.json"))
+        lines.append(f"newest eval artifact: {rep[-1].name if rep else 'none -- the gate has never run'}")
+    except OSError:
+        pass
+    try:
+        free = shutil.disk_usage(ROOT).free / 2**30
+        lines.append(f"disk free on the rig: {free:.0f} GB")
+    except OSError:
+        pass
+    (dest / "STATUS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log.info("wrote STATUS.txt (%d line(s))", len(lines))
+
+
+def _older_than_days(iso_ts, days: int) -> bool:
+    t = db.parse_local(iso_ts) if iso_ts else None
+    if t is None:
+        return False
+    return (datetime.now().astimezone() - t).days > days
+
+
 README = """Backyard Critter Cam -- content backups
 =========================================
 
@@ -295,6 +484,16 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
   crops/      one zip per calendar day of detection crops (JPEGs)
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config
+              weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging
+                                        Face checkpoints); never rebuilt -- insurance for
+                                        the day a hub repo disappears
+              labels-<date>.jsonl     = every human verdict as an append-only ledger,
+                                        diffed weekly (a mass label change logs LOUDLY)
+              export-<date>.zip       = the observation record as plain CSV + DATA.md --
+                                        readable on any stack, forever, no venv required
+  STATUS.txt  the weekly heartbeat: rig freshness, newest labels, shadow-review flags,
+              disk headroom. If this file goes stale on your phone's Drive app, the
+              backup task itself has stopped -- that staleness IS the alarm.
   backup.log  what happened on every run
 
 RESTORE onto a fresh machine:
@@ -367,6 +566,31 @@ def main() -> int:
     except Exception:
         log.exception("meta snapshot failed")
         failures += 1
+    try:
+        snapshot_weights(dest / "snapshots", args.dry_run)
+    except Exception:
+        log.exception("weights archive failed")
+        failures += 1
+    try:
+        export_labels(dest / "snapshots", today, args.dry_run)
+    except Exception:
+        log.exception("label ledger failed")
+        failures += 1
+    try:
+        import export as _export
+        _export.export_bundle(dest / "snapshots", dry_run=args.dry_run)
+        # One export per run; keep the newest few (the DB snapshots hold the deep history).
+        if not args.dry_run:
+            for old_file in sorted((dest / "snapshots").glob("export-*.zip"))[:-4]:
+                old_file.unlink(missing_ok=True)
+    except Exception:
+        log.exception("CSV export failed")
+        failures += 1
+
+    try:
+        write_status(dest, failures, args.dry_run)
+    except Exception:
+        log.exception("status write failed")     # never let the heartbeat sink the backup
 
     if not args.dry_run:
         (dest / "README.txt").write_text(README, encoding="utf-8")

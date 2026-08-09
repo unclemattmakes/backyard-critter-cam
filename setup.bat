@@ -39,11 +39,29 @@ if not exist ".venv" (
 set "VPY=.venv\Scripts\python.exe"
 "%VPY%" -m pip install --upgrade pip >nul
 
-REM 3) Install torch. NVIDIA GPU present -> CUDA 12.8+ (cu130) build; otherwise the CPU build.
+REM 3) Install torch, matched to the GPU GENERATION, not just GPU-or-not. CUDA wheels drop
+REM    kernels for old generations and gain them late for new ones, and both mistakes are
+REM    SILENT (torch.cuda.is_available() lies, then either the first op dies or --device auto
+REM    quietly runs the CPU forever). Ask the driver for the card's compute capability:
+REM      >= 12.0 (Blackwell, RTX 50)         -> cu130 is REQUIRED (cu126 has no sm_120 kernels)
+REM      7.5 - 8.9 (Turing/Ampere/Ada)       -> cu130 fine (cu126 also fine)
+REM      <  7.5 (Maxwell/Pascal/Volta)       -> cu126: cu130 dropped these; installing it would
+REM                                             silently cost this machine its GPU
+REM    Unreadable capability (odd driver) -> cu130, the pre-2026-08 behaviour.
 where nvidia-smi >nul 2>nul
 if %errorlevel%==0 (
-  echo NVIDIA GPU detected -- installing the CUDA ^(cu130^) torch build ...
-  "%VPY%" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130 || (echo [ERROR] torch install failed. & pause & exit /b 1)
+  set "CC="
+  for /f "usebackq tokens=1 delims=." %%c in (`nvidia-smi --query-gpu=compute_cap --format=csv^,noheader 2^>nul`) do if not defined CC set "CC=%%c"
+  if not defined CC set "CC=99"
+  if !CC! LSS 7 (
+    echo NVIDIA GPU detected ^(compute capability !CC!.x -- Maxwell/Pascal/Volta era^).
+    echo The newest CUDA wheels dropped this generation, so installing the cu126 build
+    echo -- with cu130 this card would silently go unused.
+    "%VPY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 || (echo [ERROR] torch install failed. & pause & exit /b 1)
+  ) else (
+    echo NVIDIA GPU detected ^(compute capability !CC!.x^) -- installing the CUDA ^(cu130^) torch build ...
+    "%VPY%" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130 || (echo [ERROR] torch install failed. & pause & exit /b 1)
+  )
 ) else (
   echo No NVIDIA GPU detected -- installing the CPU torch build ^(slower, but it works^) ...
   "%VPY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu || (echo [ERROR] torch install failed. & pause & exit /b 1)
@@ -52,6 +70,14 @@ if %errorlevel%==0 (
 REM 4) The rest of the dependencies.
 echo Installing the remaining requirements ...
 "%VPY%" -m pip install -r requirements.txt || (echo [ERROR] requirements install failed. & pause & exit /b 1)
+
+REM 4b) Record what this machine actually resolved. "Setup chooses a build per machine" must not
+REM     mean "nobody knows which build produced these numbers" -- the eval artifacts and the
+REM     stored embeddings were computed by SOME torch/ultralytics, and this file says which.
+REM     Machine-specific (gitignored); backup.py carries it in the weekly meta snapshot.
+echo # resolved by setup.bat on %date% %time% > environment.lock.txt
+"%VPY%" -m pip freeze | findstr /i "torch ultralytics numpy opencv open_clip open-clip timm" >> environment.lock.txt
+echo Recorded the resolved versions to environment.lock.txt
 
 REM 5) ffmpeg is not a Python dependency, so pip can't install it -- but the rig quietly loses
 REM    two features without it: clips fall back to the mp4v codec no browser will play, and the

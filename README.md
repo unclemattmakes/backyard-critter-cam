@@ -20,23 +20,27 @@ and reads their **behaviour** off short video clips, all surfaced in a local web
 **dashboard** you can leave open in a browser tab. The design philosophy and the rest of the
 roadmap live in [the plan](docs/plan.md).
 
-**No camera handy? Start with the [making-of site](making-of/).** It's a static, camera-free
-walk-through of the whole system — eight interactive demos built on a frozen slice of this
-rig's real database (real crops, real embeddings, real mistakes). No GPU, no install:
+**No camera handy? Start with the making-of site, live at
+[unclemattmakes.github.io/backyard-critter-cam](https://unclemattmakes.github.io/backyard-critter-cam/).**
+It's a static, camera-free walk-through of the whole system — eight interactive demos built on a
+frozen slice of this rig's real database (real crops, real embeddings, real mistakes). No GPU, no
+install, no clone — it's a web page. (Offline, or hacking on it? It's the [making-of/](making-of/)
+folder; serve it locally with `python -m http.server 8011 --directory making-of` and open
+`http://localhost:8011` — it fetches its data, so the GitHub file viewer can't run it.)
 
-```bash
-python -m http.server 8011 --directory making-of
-```
-
-then open `http://localhost:8011`.
+**Have a folder of photos from any camera?** You don't need the live rig to try the pipeline —
+see [Try it on footage you already have](#try-it-on-footage-you-already-have).
 
 ---
 
 ## Contents
 
 - [How it works](#how-it-works) — the pipeline, one box at a time
-- [The making-of site](making-of/README.md) — the system explained through eight interactive
-  demos; **no hardware needed**
+- [The making-of site](https://unclemattmakes.github.io/backyard-critter-cam/) — the system
+  explained through eight interactive demos; **no hardware needed** (its source and export
+  workflow: [making-of/README.md](making-of/README.md))
+- [Try it on footage you already have](#try-it-on-footage-you-already-have) — a folder of
+  photos from any camera or phone, straight to a populated dashboard
 - [Notes on the detector](#notes-on-the-detector) — why Ultralytics directly, not PytorchWildlife
 - [Requirements](#requirements) · [Setup](#setup) · [Running](#running) — including
   [several cameras at once](#multiple-cameras-usb--networked) and the
@@ -137,15 +141,25 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
   brew install ffmpeg            # macOS
   ```
 
-> **Blackwell / RTX 50-series note (important).** Any RTX 50-series card (Blackwell — this was
-> built on a 5050) is compute capability **sm_120**. A stock `pip install torch` (a CUDA 12.6
-> build) *appears* to work (`torch.cuda.is_available()` returns `True`) but then dies at the
-> first real GPU op with `CUDA error: no kernel image is available for execution on the device`.
-> You need a **CUDA 12.8+ build of torch**. `setup.bat` installs the right **cu130** wheels for
-> you when it detects an NVIDIA GPU. The app verifies this at startup by running a real GPU op: with
-> `--device cuda` a wrong build fails loudly and early; with the default `--device auto` it falls
-> back to the CPU instead (never stuck — just slower). If you'd rather not chase CUDA wheels at
-> all, a CPU-only install works everywhere; it's only slower per detector wake.
+> **Which torch build fits which GPU (important — two silent traps).** CUDA wheels drop kernels
+> for old GPU generations and don't yet have them for the newest, and both failure modes are
+> quiet: `torch.cuda.is_available()` says `True` and then either the first real op dies
+> (`no kernel image is available`) or — worse — `--device auto` silently runs the CPU forever
+> while you believe the GPU is working. The setup scripts read your card's compute capability
+> (`nvidia-smi --query-gpu=compute_cap`) and pick the right index for you; this table is the
+> same decision on paper:
+>
+> | Your NVIDIA GPU | Compute capability | torch build to install |
+> |---|---|---|
+> | RTX 50-series (Blackwell — this rig's 5050) | sm_120 | **cu130** (a stock cu126 dies at the first real op) |
+> | RTX 20/30/40-series, GTX 16 (Turing→Ada) | sm_75–sm_89 | cu126 **or** cu130 — both carry kernels |
+> | GTX 9/10-series, Titan V (Maxwell/Pascal/Volta) | sm_50–sm_70 | **cu126** — cu130 has NO kernels for these; installing it silently costs you the GPU |
+> | none / AMD / Intel | — | CPU wheels (`--index-url .../whl/cpu`); macOS uses the default wheel (MPS/CPU) |
+>
+> The app verifies the build at startup by running a real GPU op: with `--device cuda` a wrong
+> build fails loudly and early; with the default `--device auto` it falls back to the CPU
+> instead (never stuck — just slower, so check the startup line if you expected the GPU). If
+> you'd rather not chase CUDA wheels at all, a CPU-only install works everywhere.
 
 ---
 
@@ -184,6 +198,21 @@ py -m venv .venv
 
 The MegaDetector v6 weights (~tens of MB) download automatically from Zenodo the first time
 you run a detection.
+
+**The full first-run download budget.** The detector's weights are small, but the naming helper
+starts with the rig by default and the re-ID pass runs nightly — and their models are
+*gigabytes*, fetched once from Hugging Face. On a slow or metered connection the first run can
+look like a hang while a checkpoint streams down; it isn't. Sizes are approximate:
+
+| Model | ~Size | Downloads when | From | Integrity |
+|---|---|---|---|---|
+| MegaDetector v6 (yolov10-c) | tens of MB | first detection | Zenodo (archival, DOI) | SHA-256-pinned |
+| BioCLIP 2 (species names) | ~2 GB | first crop the naming helper labels (it starts with the rig) | Hugging Face | unpinned — see SECURITY.md |
+| general CLIP ViT-B-32 (is-it-an-animal gate) | ~0.6 GB | alongside BioCLIP | Hugging Face | unpinned |
+| MegaDescriptor-L-384 (re-ID appearance) | ~1 GB | first `embed.py` run (the nightly batch) | Hugging Face | unpinned |
+
+Each is one-time; they land in the Hugging Face cache (`~/.cache/huggingface`) and the
+`weights/` folder. Don't want the big ones yet? `--no-classify` runs capture + detection only.
 
 > **Running without an NVIDIA GPU (CPU / Linux box).** Skip the cu130 step above and install a
 > CPU-only torch instead:
@@ -300,6 +329,33 @@ only override what differs. Each camera needs a **unique `source`**.
 Clips from each camera are written under `clips/<source>/<date>/`. Single-camera mode is just the
 N=1 case — if you don't set `cfg.cameras`, nothing changes.
 
+### No yard camera yet? Two zero-hardware test drives
+
+Both fall straight out of `src` being "anything `VideoCapture` accepts":
+
+- **Your phone is a working yard camera tonight.** Any free IP-webcam app that serves MJPEG over
+  HTTP turns a spare phone into a camera the rig treats like any other:
+
+  ```python
+  cfg.cameras = [CameraSpec("phone", "http://192.168.1.23:8080/video", name="Phone on the sill",
+                            frame_width=1280, frame_height=720)]
+  ```
+
+  (Match `motion_min_area` to the resolution — it's pixels of the largest motion blob.)
+
+- **A downloaded video is a full pipeline demo.** A plain **local file path** works as a source,
+  so you can point the rig at any wildlife video and watch the whole thing run — motion gate,
+  boxes, crops, species names — before owning hardware:
+
+  ```python
+  cfg.cameras = [CameraSpec("test", r"C:/downloads/raccoon_visit.mp4", name="Canned test")]
+  ```
+
+  The rig reads the file like a camera — end-of-file looks like a dropped feed, so the
+  reconnect logic reopens it and the video **replays on a loop** until you quit (fine for a
+  demo; just expect duplicate visits per lap). Crops and visits land in the DB exactly as live
+  ones would (delete the DB after, or keep it — it's just rows with that `source`).
+
 ### Checking what it's caught
 
 `python backyard_cam.py --stats` prints a read-only summary (safe to run while the rig is
@@ -381,13 +437,43 @@ glass-door shot without restarting (a live companion to `tune.py`).
 
 ---
 
+## Try it on footage you already have
+
+`import_trailcam.py` is named for this rig's trail cam, but it is really a **generic
+batch importer**: point it at any folder of JPG/PNG photos — an old trail-cam dump, a phone's
+camera roll from the garden, doorbell-cam exports — and it runs the same detector over them and
+writes the same crops, visits and database rows the live rig would. Then serve the dashboard
+over the result. No camera, no GPU required (CPU just takes longer), and your first populated
+Dispatch/Calendar/Catalogue is on **your own animals**:
+
+```bash
+python import_trailcam.py my_folder --source my_yard
+python classify.py
+python backyard_cam.py --serve-only
+```
+
+then open `http://localhost:8000`. Three honest caveats:
+
+- **Photos are the input that matters.** Detection runs on stills; MP4s alongside them ride in
+  as playable behaviour clips (paired to nearby animal photos), but a videos-only folder
+  populates nothing.
+- **Timestamps come from EXIF** (`DateTimeOriginal`), falling back to file modification time —
+  so import from the original files, not copies whose mtimes were rewritten by the copy.
+- **Name the `--source`** and keep using the same name for the same camera: everything
+  downstream — visits, re-ID template scoping, prune budgets — keys off it.
+
+---
+
 ## Species identification (phase 2)
 
 Every saved crop gets a **species** name, not just the coarse `animal` label — zero-shot, via
 **[BioCLIP 2](https://pypi.org/project/pybioclip/)** (`classify.py`). Because it's zero-shot,
 **editing the candidate-species list is free**: the list in `classify.py` (`SPECIES_LABELS`, a
 Pacific-Northwest backyard starter set) is just text — tweak it for your yard and re-run, no
-retraining. It's resumable and re-runnable; by default only crops without a species are named.
+retraining. Not in the PNW? **[docs/species-lists.md](docs/species-lists.md)** has ready-made
+starter lists (US NE/SE/SW, UK & Ireland, Central Europe, Australia east coast) plus the
+phrasing rules that make labels resolve well — set yours via `cfg.species_labels` in
+`config_local.py`, no source edit. It's resumable and re-runnable; by default only crops without a species are named.
 Whenever it writes labels it also refreshes the **visit ledger**, so each visit's dominant
 species tracks the new labels with no manual `visits.py` step.
 
@@ -818,10 +904,15 @@ The camera's best settings differ with the light, so two pieces handle it:
 
 ## Security & privacy
 
-**There is no authentication.** None — no user, no password, no read-only mode. Anyone who can
-reach the dashboard's port sees the live feed, browses every crop and clip, and can edit species
-labels and individual names. That is a deliberate trade for a single-household tool, and it is the
-one thing to keep in mind before the page leaves the machine it runs on.
+**There is no login.** No accounts, no passwords. By default anyone who can reach the
+dashboard's port sees the live feed, browses every crop and clip, and can edit species labels
+and individual names — a deliberate trade for a single-household tool, and the one thing to
+keep in mind before the page leaves the machine it runs on. The one optional split:
+**`operator_token`** in `config_local.py` turns un-tokened devices into **viewers** — they read
+and play everything and can log "who's here" as reviewable testimony, but every label/settings
+write is refused server-side until the token is entered once in that browser (dashboard
+footer). Localhost is always the operator; leaving the token unset keeps the historical
+everyone-operates behaviour.
 
 - **Localhost by default.** The server binds `127.0.0.1:8000`, so nothing off the machine can
   reach it.
@@ -919,7 +1010,9 @@ Full plan and design philosophy: **[docs/plan.md](docs/plan.md)**. The short ver
   `source='trail_cam_sd'`. EXIF timestamps, idempotent re-runs, `--watch` a drop folder. Same
   pipeline downstream (species ID, re-ID, behaviour all key off the `source` column): the rig's
   naming helper labels the new crops if it's running (else run `python classify.py`), and the
-  visit ledger refreshes itself again when the labels land.
+  visit ledger refreshes itself again when the labels land. Running a card whose contents get
+  **formatted away each cycle**? Read **[the import runbook](docs/runbook-trailcam-import.md)**
+  first — it is the budget-and-backup sequence that keeps a prune from eating the only copy.
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —
 augment the critter-knower, don't replace them. And: boring and robust over clever; most of

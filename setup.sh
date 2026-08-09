@@ -32,10 +32,26 @@ fi
 VPY=".venv/bin/python"
 "$VPY" -m pip install --upgrade pip >/dev/null
 
-# 3) Install torch matched to the hardware.
+# 3) Install torch matched to the GPU GENERATION, not just GPU-or-not. CUDA wheels drop kernels
+#    for old generations and gain them late for new ones, and both mistakes are SILENT
+#    (torch.cuda.is_available() lies, then either the first op dies or --device auto quietly
+#    runs the CPU forever). Ask the driver for the card's compute capability:
+#      >= 12.0 (Blackwell, RTX 50)      -> cu130 REQUIRED (cu126 has no sm_120 kernels)
+#      7.5 - 8.9 (Turing/Ampere/Ada)    -> cu130 fine
+#      <  7.5 (Maxwell/Pascal/Volta)    -> cu126: cu130 dropped these; installing it would
+#                                          silently cost this machine its GPU
 if command -v nvidia-smi >/dev/null 2>&1; then
-  echo "NVIDIA GPU detected -- installing the CUDA (cu130) torch build ..."
-  "$VPY" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+  CC_MAJOR="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+              | head -n1 | cut -d. -f1 | tr -dc '0-9')"
+  if [ -n "$CC_MAJOR" ] && [ "$CC_MAJOR" -lt 7 ]; then
+    echo "NVIDIA GPU detected (compute capability ${CC_MAJOR}.x -- Maxwell/Pascal/Volta era)."
+    echo "The newest CUDA wheels dropped this generation, so installing the cu126 build"
+    echo "-- with cu130 this card would silently go unused."
+    "$VPY" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+  else
+    echo "NVIDIA GPU detected (compute capability ${CC_MAJOR:-unknown}.x) -- installing the CUDA (cu130) torch build ..."
+    "$VPY" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+  fi
 elif [ "$(uname -s)" = "Darwin" ]; then
   echo "macOS detected -- installing the default torch build (CPU/MPS) ..."
   "$VPY" -m pip install torch torchvision
@@ -47,6 +63,16 @@ fi
 # 4) The rest of the dependencies.
 echo "Installing the remaining requirements ..."
 "$VPY" -m pip install -r requirements.txt
+
+# 4b) Record what this machine actually resolved. "Setup chooses a build per machine" must not
+#     mean "nobody knows which build produced these numbers" -- the eval artifacts and stored
+#     embeddings were computed by SOME torch/ultralytics, and this file says which.
+#     Machine-specific (gitignored); backup.py carries it in the weekly meta snapshot.
+{
+  echo "# resolved by setup.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "$VPY" -m pip freeze | grep -iE 'torch|ultralytics|numpy|opencv|open._?clip|timm' || true
+} > environment.lock.txt
+echo "Recorded the resolved versions to environment.lock.txt"
 
 # 5) ffmpeg is not a Python dependency, so pip can't install it -- but the rig quietly loses
 #    two features without it: clips fall back to the mp4v codec no browser will play, and the
