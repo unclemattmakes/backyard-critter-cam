@@ -163,7 +163,22 @@ to distrust — treat it as a prompt, never as a default.
 
 ## 3. Identity: the designs, as corrected by review
 
-### 3.1 Chain-of-eras identity — embrace the decay curve
+### ~~3.1 Chain-of-eras identity~~ — **replayed 2026-08-09, refuted, and that was the plan**
+The replay was written and the arms were run. `evalmetrics.forward_chain_replay` ships (with
+`adjacency_propagation` beside it as the calendar baseline) — no DB writes, no column, no UI, as
+specified. Against the design's own bar of **≥ 2× auto-named coverage at zero observed wrong
+names**, the best coverage ratio anywhere on the grid is **1.27×, and it adds wrong names**.
+Numbers, the two documented rejections re-run as baselines, and the methodological trap the
+specified experiment would have walked into: [Killed, with reasons](#killed-with-reasons).
+
+The tool stays, because it is the first thing this project has ever had for asking *does identity
+propagate forward?* — and it caught something the design pass could not: the experiment as
+specified is structurally unable to show a gain. Everything below is kept as the record of what
+was proposed and why it looked right.
+
+<details><summary>The design as it stood before the replay</summary>
+
+#### Chain-of-eras identity — embrace the decay curve
 **The idea.** The embargo curve is not only a limitation, it is a design spec: links are strong at
 short range (0.708 top-1 at 1 day, 0.628 at 3 days) and worthless long (0.222 at 21 days, against
 0.348 chance). Today `rank_templates` is age-blind — a 41-day-old template competes as an equal
@@ -221,6 +236,11 @@ fresh template for them and chaining changes nothing; the arms diverge only for 
 42-day gap and for Elliot/CutiePie, who have too few templates to measure. If that is what comes
 back, the design dies for the cost of a replay — and the replay itself is the first tool this
 project has ever had for asking "does identity propagate forward?"
+
+*(Measured: the prediction was right, and the median gap to the same animal's last confirmed
+visit is **0.90 days**.)*
+
+</details>
 
 ### 3.2 Say "this identity has lapsed" wherever a name is used — the quick one
 Carved out of the chain design by review as **worth shipping regardless of whether the chain ever
@@ -488,6 +508,45 @@ so the family-era questions ("did all four show tonight?", per-litter growth) ne
 instrument — the human eye via the live-sighting log today, and mass if a load cell ever lands.
 It also flags a real casualty worth remembering: **the camera swap invalidated the depth
 calibration**, so any future pixel-size reasoning has to be refit per camera era.
+
+### Chain-of-eras identity — killed by its own replay (§3.1), at 1.27× against a 2× bar
+`evalmetrics.forward_chain_replay`, run 2026-08-09 over the 139 confirmed-solo raccoon visits
+(2026-06-07 → 08-06, 6 individuals) on a snapshot.
+
+**First, the trap the specified experiment was walking into.** The plan said to reuse `eval.py`'s
+corpus builder, which yields *labelled* units. On an all-labelled corpus **an anchor can never
+reach anywhere a human template does not already reach** — the anchor's own visit is a labelled
+unit sitting in the same past, with the same similarity — so chaining is redundant by construction
+and can only add a wrong candidate. Run that way it loses at **0 of 28 operating points**, which
+reads like a result and is really a property of the corpus. A fair test has to withhold labels, so
+the replay takes an `unlabelled` set: those visits become "nobody has named this", stay scorable
+against their true label, and may become anchors. In reality **79% of this yard's 657 raccoon
+visits are unnamed**, so 75% withheld is the realistic corner.
+
+| withheld | operating point | direct named / wrong | chained @7d named / wrong | contaminated |
+|---|---|---|---|---|
+| 25% | 0.76 / 0.12 | 8.0 / 1.0 | 7.8 / 1.0 | 0.0 |
+| 50% | 0.76 / 0.12 | 18.4 / 3.6 | 18.6 / 3.8 | 0.0 |
+| **75%** | **0.76 / 0.12** | **24.6 / 4.8** | **28.8 / 7.0** | **1.0** |
+| 75% | 0.88 / 0.02 | 8.2 / 1.0 | 10.4 / 1.2 | 0.4 |
+
+(mean of 5 random withholding seeds, scored only on the withheld visits — the population
+auto-assign actually faces.) **Best coverage ratio anywhere on the grid: 1.27×, and it buys that
+by adding wrong names.** The design's bar was ≥ 2× at zero wrong. It is not close, and the
+contamination column is the compensating control the design said was mandatory, doing its job:
+names standing on ground a previous mistake laid.
+
+**Why, measured:** the median gap to the same animal's last confirmed visit is **0.90 days**
+(p90 3.26), and **88.2% of probes already have a human template within 3 days**. There is nothing
+for a fresh anchor to add — exactly the refutation the design pass predicted.
+
+**The two documented rejections, re-run as baselines on the same corpus.** The pure recency gate
+(a filter, not an addition) costs coverage as it always did: 0.257 / 0.386 / 0.429 at 3 / 7 / 14
+days against 0.429 age-blind. Pure adjacency propagation — "name it after whoever came last, no
+appearance test" — names 136 of 139 at a **39.7% wrong-name rate**, against the direct appearance
+arm's 19.5% at a quarter of the coverage. Appearance halves the error rate of the calendar. That
+is a real margin and a thin one, and it is the honest size of what the embedding contributes in
+forward mode.
 
 ### An operating point for the un-blend thresholds — killed by its own sweep (§2.2)
 Measured 2026-08-09 against a **snapshot** of the live DB, over 151 human-confirmed solo raccoon

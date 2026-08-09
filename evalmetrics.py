@@ -658,6 +658,209 @@ def point_fold_spread(probes: Sequence[dict], threshold: float, margin: float, *
 
 
 # ---------------------------------------------------------------------------
+# Forward-chronological replay: "does identity PROPAGATE forward?"
+# ---------------------------------------------------------------------------
+
+def forward_chain_replay(units: Sequence, similarity: Callable[[Hashable, Hashable], float], *,
+                         threshold: float, margin: float, horizon_days: float | None = None,
+                         recency_days: float | None = None, session_blocked: bool = True,
+                         anchor_labels: Sequence | None = None,
+                         unlabelled: Sequence | None = None,
+                         allow: Callable[[LooUnit, LooUnit], bool] | None = None,
+                         aggregate: str = "max") -> dict:
+    """Walk the corpus FORWARD IN TIME and ask whether a name, once written, carries to the next
+    visit. The shape leave_one_visit_out cannot have.
+
+    LOO is an embargo protocol: it hides one unit and lets every other unit -- past AND future --
+    be its template. That is the right question for "how separable are these animals" and the
+    WRONG one for "does identity propagate", because propagation is causal. Here a probe sees only
+    what existed before it, and an assignment the replay makes can itself become a template. That
+    is the only way to measure the thing the chain-of-eras design claims and the only way to
+    measure what it risks: a wrong name teaching the matcher its own mistake.
+
+    THE ARMS, which is why `horizon_days` doubles as the switch:
+      horizon_days=None  DIRECT. Templates are the human labels of earlier visits, age-blind.
+      horizon_days=d     CHAINED. The same age-blind human pool, PLUS anchors -- visits this
+                         replay named itself -- within `d` days of the probe. ADDITIVE, never a
+                         filter: a pure recency gate was already measured and REJECTED (wrong-name
+                         rate 0.119 -> 0.137 while coverage FELL 18.0% -> 16.1%,
+                         docs/identity-eval-2026-08-05.md part 5), and `recency_days` exists only
+                         so that rejected arm can be re-run as a baseline beside this one.
+
+    `unlabelled` IS WHAT MAKES THE COMPARISON MEAN ANYTHING, and it is not optional dressing. On a
+    corpus where every unit carries a human label, an anchor can NEVER reach somewhere a human
+    template does not already reach -- the anchor's own visit is a labelled unit sitting in the
+    same past, with the same similarity. Chaining is then redundant by construction and can only
+    add a WRONG candidate where the human label was right. Pass the keys of visits whose human
+    label is to be withheld (real unnamed visits, or a held-out slice of named ones) and the chain
+    finally has somewhere to go: those units are still probes, still scored against their true
+    label, and may still become anchors.
+
+    AN ANCHOR IS A MACHINE TEMPLATE, and this is where the design's own compensating control gets
+    measured rather than asserted: every anchor carries the DEPTH of the chain holding it up and a
+    TAINT flag set when any assignment in that chain was wrong. `descendant_contamination` counts
+    the assignments standing on tainted ground -- names that look confident and are downstream of
+    a mistake. `anchor_labels` scopes which identities may anchor at all (the design says Stan /
+    Notch / Pedro; the kits, with zero labels, must never be propagated onto).
+
+    Causality is enforced on the HUMAN pool too: a visit's human label becomes available only from
+    its own timestamp onward. Letting a label confirmed next month vouch for a probe today would
+    be the same leak session blocking exists to stop, wearing a different hat.
+
+    Returns the leave_one_visit_out bundle shape -- `probes` records carry key/truth/top/s1/s2/
+    lead/correct/novel_probe, so evaluate_point and the sweep functions read them unchanged -- plus
+    the chain-specific counters. NOTE that unlike LOO, the ranking here DEPENDS on (threshold,
+    margin): what gets assigned decides what becomes a template. A sweep must therefore re-run the
+    replay per point rather than re-scoring one set of probes.
+    """
+    if aggregate not in ("max", "mean"):
+        raise ValueError("aggregate must be 'max' or 'mean'")
+    us = [_as_unit(u) for u in units if _as_unit(u).when is not None]
+    us.sort(key=lambda u: (u.when, _sort_key(u.key)))
+    if len({u.key for u in us}) != len(us):
+        raise ValueError("unit keys must be unique")
+    anchor_ok = None if anchor_labels is None else set(anchor_labels)
+    hidden = set() if unlabelled is None else set(unlabelled)
+    horizon_s = None if horizon_days is None else float(horizon_days) * 86400.0
+    recency_s = None if recency_days is None else float(recency_days) * 86400.0
+
+    seen: list = []          # human templates: (unit, ) of visits already in the past
+    anchors: list = []       # machine templates: dicts with key/label/when/night/depth/tainted
+    probes, chain_rows = [], []
+    per_individual: dict = defaultdict(lambda: {"n": 0, "top1_correct": 0})
+
+    for p in us:
+        cands: list = []     # (label, score, via_key, depth, tainted)
+        for t in seen:
+            if t.key in hidden:
+                continue                 # nobody named this visit: it is not a human template
+            if session_blocked and t.label == p.label and p.night is not None and \
+                    t.night is not None and t.night == p.night:
+                continue
+            if recency_s is not None and (p.when - t.when).total_seconds() > recency_s:
+                continue
+            if allow is not None and not allow(p, t):
+                continue
+            cands.append((t.label, float(similarity(p.key, t.key)), t.key, 0, False))
+        if horizon_s is not None:
+            for a in anchors:
+                if (p.when - a["when"]).total_seconds() > horizon_s:
+                    continue
+                if session_blocked and a["label"] == p.label and p.night is not None and \
+                        a["night"] is not None and a["night"] == p.night:
+                    continue
+                cands.append((a["label"], float(similarity(p.key, a["key"])), a["key"],
+                              a["depth"], a["tainted"]))
+
+        by_label: dict = defaultdict(list)
+        for lab, s, via, depth, tainted in cands:
+            by_label[lab].append((s, via, depth, tainted))
+        ranked = []
+        for lab, rows in by_label.items():
+            if aggregate == "max":
+                s, via, depth, tainted = max(rows, key=lambda r: r[0])
+            else:
+                s = float(np.mean([r[0] for r in rows]))
+                via, depth, tainted = rows[0][1], min(r[2] for r in rows), all(r[3] for r in rows)
+            ranked.append((lab, s, via, depth, tainted))
+        ranked.sort(key=lambda r: (-r[1], _sort_key(r[0])))
+
+        top = ranked[0] if ranked else None
+        s1 = top[1] if top else 0.0
+        s2 = ranked[1][1] if len(ranked) > 1 else 0.0
+        truth_available = any(lab == p.label for lab, *_ in ranked)
+        correct = bool(top) and top[0] == p.label
+        assigned = bool(top) and s1 >= threshold and (s1 - s2) >= margin
+        per_individual[p.label]["n"] += 1
+        per_individual[p.label]["top1_correct"] += int(correct)
+        probes.append({
+            "key": p.key, "truth": p.label, "night": p.night,
+            "top": top[0] if top else None, "s1": s1, "s2": s2, "lead": s1 - s2,
+            "via": top[2] if top else None,
+            "correct": correct, "truth_available": truth_available,
+            "novel_probe": not truth_available,
+            "n_candidate_labels": len(ranked),
+        })
+        chain_rows.append({
+            "key": p.key, "assigned": assigned,
+            "assigned_name": top[0] if (assigned and top) else None,
+            "assigned_wrong": bool(assigned and top and top[0] != p.label),
+            "anchor_depth": top[3] if (assigned and top) else None,
+            "on_tainted_chain": bool(assigned and top and top[4]),
+        })
+
+        # The probe joins the past. Its HUMAN label is a template from now on; if the replay named
+        # it and that name is allowed to anchor, it also becomes a machine template -- carrying the
+        # depth and the taint of whatever vouched for it.
+        seen.append(p)
+        if assigned and horizon_s is not None and (anchor_ok is None or top[0] in anchor_ok):
+            anchors.append({"key": p.key, "label": top[0], "when": p.when, "night": p.night,
+                            "depth": top[3] + 1, "tainted": bool(top[4] or top[0] != p.label)})
+
+    n = len(probes)
+    named = [c for c in chain_rows if c["assigned"]]
+    wrong = [c for c in named if c["assigned_wrong"]]
+    tainted = [c for c in named if c["on_tainted_chain"]]
+    depths = [c["anchor_depth"] for c in named if c["anchor_depth"] is not None]
+    scorable = [p for p in probes if p["truth_available"]]
+    n_correct = sum(1 for p in probes if p["correct"])
+    for v in per_individual.values():
+        v["accuracy"] = (v["top1_correct"] / v["n"]) if v["n"] else None
+    return {
+        "protocol": {
+            "arm": "direct" if horizon_s is None else f"chained@{horizon_days:g}d",
+            "threshold": threshold, "margin": margin,
+            "horizon_days": horizon_days, "recency_days": recency_days,
+            "session_blocked": session_blocked, "aggregate": aggregate,
+            "anchor_labels": None if anchor_ok is None else sorted(anchor_ok, key=_sort_key),
+            "n_unlabelled": len(hidden & {u.key for u in us}),
+            "n_units": len(us),
+            "note": "forward-chronological: a probe sees only what existed before it",
+        },
+        "n_probes": n,
+        "assigned": len(named),
+        "wrong": len(wrong),
+        "coverage": (len(named) / n) if n else None,
+        "wrong_name_rate": (len(wrong) / len(named)) if named else None,
+        "n_anchors": len([c for c in named if c["assigned_name"] is not None])
+                     if horizon_s is not None else 0,
+        "anchor_depth_max": max(depths) if depths else 0,
+        "anchor_depth_mean": (sum(depths) / len(depths)) if depths else 0.0,
+        "descendant_contamination": len(tainted),
+        "top1_correct": n_correct,
+        "top1_accuracy": (n_correct / n) if n else None,
+        "top1_accuracy_scorable": (sum(1 for p in scorable if p["correct"]) / len(scorable))
+                                  if scorable else None,
+        "chance": majority_baseline([p["truth"] for p in probes]),
+        "per_individual": {k: dict(v) for k, v in sorted(per_individual.items(),
+                                                         key=lambda kv: _sort_key(kv[0]))},
+        "probes": probes,
+        "chain": chain_rows,
+    }
+
+
+def adjacency_propagation(units: Sequence, *, horizon_days: float = 7.0) -> dict:
+    """The OTHER documented rejection, as a baseline: name each visit after the most recent visit
+    within the horizon, with no appearance test at all. "The same animal usually comes back
+    tomorrow" is a real prior in this yard, and any chained arm that cannot beat it is measuring
+    the calendar rather than the animal."""
+    us = [_as_unit(u) for u in units if _as_unit(u).when is not None]
+    us.sort(key=lambda u: (u.when, _sort_key(u.key)))
+    horizon_s = float(horizon_days) * 86400.0
+    named = wrong = 0
+    prev = None
+    for p in us:
+        if prev is not None and (p.when - prev.when).total_seconds() <= horizon_s:
+            named += 1
+            if prev.label != p.label:
+                wrong += 1
+        prev = p
+    return {"arm": f"adjacency@{horizon_days:g}d", "n_probes": len(us), "assigned": named,
+            "wrong": wrong, "coverage": (named / len(us)) if us else None,
+            "wrong_name_rate": (wrong / named) if named else None}
+
+
+# ---------------------------------------------------------------------------
 # small internals
 # ---------------------------------------------------------------------------
 
