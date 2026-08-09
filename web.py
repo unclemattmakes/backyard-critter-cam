@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -685,9 +686,31 @@ def _individual_profile(cfg, name: str) -> dict:
     if conn is not None:
         try:
             prof["events"] = db.life_events(conn, name)
+            prof["lapse"] = _profile_lapse(conn, cfg, prof, name)
         finally:
             conn.close()
     return prof
+
+
+def _profile_lapse(conn, cfg, prof, name) -> dict:
+    """The LAPSE state for one individual's own page -- from individuals.lapse_by_name, which is
+    the same definition the Individuals tab's matcher uses, computed WITHOUT loading a single
+    embedding vector (a profile view must not pay for its species' whole matrix).
+
+    One definition matters here more than it looks: the first cut of this used "human-confirmed
+    solo visit" and skipped the requirement that the visit have enough embedded crops to BE a
+    template. On real data that made this page call Notch 'fresh, confirmed 0.7 days ago' while
+    the Individuals tab called the same animal 'lapsed, 45.6 days' -- both from a confirmation the
+    nightly embed pass had not reached yet. Returns the `none` state on any failure, which is the
+    loud direction."""
+    import individuals
+    try:
+        species = (prof.get("species_mix") or [{}])[0].get("species")
+        table = individuals.lapse_by_name(conn, species, cfg=cfg, names=[name])
+        return (table.get(str(name).strip().casefold())
+                or individuals.identity_lapse(None, 0, cfg=cfg))
+    except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError):
+        return individuals.identity_lapse(None, 0, cfg=cfg)
 
 
 def _zones_payload(cfg, source: str, bridge_snap: dict) -> dict:
@@ -1553,23 +1576,12 @@ def _days_since(ts, now=None):
     return round((ref - t).total_seconds() / 86400.0, 1)
 
 
-def _template_freshness(matcher, now=None) -> dict:
-    """{name: {n_templates, newest_template, days_since_template}} over each individual's
-    CONFIRMED SOLO visits -- exactly the set `templates()` hands the matcher.
-
-    This is the priority list, not a decoration: measured on this corpus, leave-one-visit-out
-    top-1 falls 0.818 -> 0.482 -> 0.222 as the newest usable template ages 0 -> 7 -> 21 days.
-    An individual whose freshest template is a month old effectively cannot be recognised."""
-    out: dict = {}
-    for name, vid, _proto in matcher.templates():
-        started = matcher.visit_started.get(vid)
-        e = out.setdefault(name, {"n_templates": 0, "newest_template": None})
-        e["n_templates"] += 1
-        if started and (e["newest_template"] is None or started > e["newest_template"]):
-            e["newest_template"] = started
-    for e in out.values():
-        e["days_since_template"] = _days_since(e["newest_template"], now)
-    return out
+def _template_freshness(matcher, now=None, cfg=None) -> dict:
+    """Freshness + the LAPSE state per individual. The computation lives in individuals.py, next
+    to the matcher whose templates it describes, so the profile page, the suggestion payload and
+    the roll call all read one definition instead of three that drift."""
+    import individuals
+    return individuals.template_freshness(matcher, now=now, cfg=cfg)
 
 
 def _appearance_rank(matcher, vid):
@@ -1809,7 +1821,13 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
                 "clips": vclips, "crops": vcrops,
                 "confirmed_as": s["confirmed_as"], "auto_as": s["auto_as"],
                 "rejected": v["id"] in matcher.rejected,
-                "candidates": s["candidates"],
+                # Every candidate carries the LAPSE state of the name it proposes. A suggestion is
+                # only as good as the freshest template behind it, and a two-week-old one is at or
+                # below "just say the commonest name" -- so the card can stop presenting those two
+                # cases as though they were the same offer. It is a LABEL, never a filter: gating
+                # on template age was measured and rejected (coverage fell, wrong names rose).
+                "candidates": [dict(c, lapse=(freshness.get(c.get("name")) or {}).get("lapse"))
+                               for c in s["candidates"]],
                 "clip_candidates": s["clip_candidates"],
                 "novel": s["novel"], "multi": s["multi"],
                 "cross_source": cross_source,
@@ -1849,6 +1867,7 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
             c["n_templates"] = f.get("n_templates", 0)
             c["newest_template"] = f.get("newest_template")
             c["days_since_template"] = f.get("days_since_template")
+            c["lapse"] = f.get("lapse") or individuals.identity_lapse(None, 0, cfg=cfg)
             st = by_key.get(str(name).strip().casefold()) or {}
             c["status"] = st.get("status") or "resident"
             c["departed_on"] = st.get("effective_date")

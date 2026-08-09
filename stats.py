@@ -447,6 +447,23 @@ def seasons_overview(cfg) -> dict:
     return {"weeks": weeks, "species": species, "accumulation": accumulation}
 
 
+def _annotate_lapse(conn, cfg, cast) -> None:
+    """Attach `lapse` to each roll-call entry, in place. Never raises: a roll call that fails to
+    load because of an identity annotation would be a worse outcome than a missing badge, so any
+    problem degrades to the `none` state (which is the LOUD state, not the quiet one)."""
+    import individuals
+    try:
+        table = individuals.lapse_by_name(conn, cfg=cfg)
+        for c in cast:
+            c["lapse"] = (table.get(str(c["id"]).strip().casefold())
+                          or individuals.identity_lapse(None, 0, cfg=cfg))
+    except Exception:                       # noqa: BLE001 -- see the docstring
+        for c in cast:
+            c.setdefault("lapse", {"state": "none", "days": None, "expected_top1": None,
+                                   "beats_guessing": False,
+                                   "why": "template freshness could not be read."})
+
+
 def cast_rollcall(cfg, now=None) -> dict:
     """The named cast with last-seen + an 'overdue' flag -- the daily "who's back / who hasn't
     shown" roll for the Dispatch and Individuals tab. Placeholder clusters (raccoon_c01) are
@@ -510,6 +527,13 @@ def cast_rollcall(cfg, now=None) -> dict:
                 base["via_group"] = c["id"]
                 base["overdue"] = bool(base["regular"] and base["typical_gap_days"]
                                        and base["days_since"] > max(2, 2 * base["typical_gap_days"]))
+        # HAS THE MATCHER LOST THIS ANIMAL? Different question from "overdue", and the roll is the
+        # one place both belong: overdue is about the RACCOON (it hasn't come), lapsed is about US
+        # (nothing has confirmed it lately, so the matcher can no longer vouch for the name). An
+        # animal can be here every night and lapsed, which is precisely the state that quietly
+        # rots the label set. Computed from human-confirmed, non-group, non-co-present visits --
+        # the same set templates() would use, without loading a single embedding.
+        _annotate_lapse(conn, cfg, cast)
         cast.sort(key=lambda c: (not c["overdue"],
                                  c["days_since"] if c["days_since"] is not None else 1e9))
         return {"cast": cast, "as_of": now.isoformat()}

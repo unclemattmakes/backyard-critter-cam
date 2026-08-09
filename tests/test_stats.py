@@ -107,6 +107,21 @@ def test_cast_rollcall_recent_regular_not_overdue(conn, db_path):
     assert c["regular"] is True and c["overdue"] is False and c["days_since"] == 0
 
 
+def test_cast_rollcall_reports_the_lapse_state_beside_overdue(conn, db_path):
+    """Two different facts, and the roll is where both belong. "Overdue" is about the RACCOON --
+    it has not come. "Lapsed" is about US -- nothing has confirmed it lately, so the matcher can
+    no longer vouch for the name. An animal that is here every night and lapsed is exactly the
+    state that quietly rots the label set, and it was invisible until this."""
+    for d in (2, 1, 0):
+        _add_named(conn, "Stan", days_ago=d)
+    by = {c["id"]: c for c in stats.cast_rollcall(_cfg(db_path))["cast"]}
+    # Present every night, but nothing here is a human-confirmed SOLO VISIT -- so there is no
+    # template at all, which is the loud state, not the quiet one.
+    assert by["Stan"]["overdue"] is False
+    assert by["Stan"]["lapse"]["state"] == "none"
+    assert by["Stan"]["lapse"]["beats_guessing"] is False
+
+
 # ---- review_queue: the prioritized "most likely mislabeled" pass --------------------
 def test_review_queue_empty_db(conn, db_path):
     rq = stats.review_queue(_cfg(db_path))
