@@ -10,7 +10,7 @@ phase-3 individual IDs).
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 import math
 import time as _time
 
@@ -1008,23 +1008,42 @@ def _local_now() -> datetime:
 
 
 def _sun(cfg, d):
-    """(dawn, dusk) tz-aware datetimes for calendar date `d`. Uses daynight.sun_times when
-    lat/lon (and astral) are available, else a fixed 06:00/18:00 local fallback."""
+    """(dawn, dusk) tz-aware datetimes for calendar date `d` AT THE CAMERA, from
+    daynight.sun_times when lat/lon (and astral) are available, else a 06:00/18:00 fallback.
+
+    The reference frame is the YARD's, derived from longitude -- never the server's clock. That
+    distinction is not pedantry: astral returns "the dawn/dusk falling on this calendar date IN
+    THIS TIMEZONE", so asking in the machine's zone splits the pair across two local days as soon
+    as the machine disagrees with the camera. Measured at this yard (lat 47.5, lon -122.2) from a
+    UTC machine: dawn 2026-08-07T12:19Z but dusk 2026-08-07T04:10Z -- dusk BEFORE dawn, a negative
+    day length, and every period boundary, moon bucket and sun-anchored arrival built on top of it
+    quietly wrong. It never showed here because this rig's clock happens to match its own yard.
+    It stops being hypothetical the moment an archive is read somewhere else, which --serve-only
+    now invites, and it is the same principle as the rest of the project: derive from the camera,
+    not from incidental machine state.
+
+    round(lon / 15) is the yard's solar offset to the nearest hour. It is deliberately NOT the
+    civil timezone (no DST, no political boundaries) because nothing here needs one: it exists
+    only to name the local DAY the sun times belong to, and at this latitude it returns instants
+    identical to the correct local-zone answer."""
     lat, lon = getattr(cfg, "latitude", None), getattr(cfg, "longitude", None)
     key = (d.toordinal(), lat, lon)
     if key in _SUN_CACHE:
         return _SUN_CACHE[key]
-    base = datetime.combine(d, time(12, 0)).astimezone()
+    tz = (timezone(timedelta(hours=round(lon / 15))) if lon is not None
+          else datetime.now().astimezone().tzinfo)   # no location -> the clock is all there is
+    base = datetime.combine(d, time(12, 0), tzinfo=tz)
     res = None
     if lat is not None and lon is not None:
         try:
             import daynight
             st = daynight.sun_times(lat, lon, base)
             res = (st["dawn"], st["dusk"])
+            if res[1] <= res[0]:        # never hand back a negative day (polar dates, odd tz)
+                res = None
         except Exception:
             res = None
     if res is None:
-        tz = base.tzinfo
         res = (datetime.combine(d, time(6, 0), tzinfo=tz),
                datetime.combine(d, time(18, 0), tzinfo=tz))
     _SUN_CACHE[key] = res

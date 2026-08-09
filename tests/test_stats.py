@@ -385,3 +385,30 @@ def test_seasons_overview_weekly_grid_and_accumulation(conn, db_path):
     # The accumulation curve is one point per species DEBUT, in chronological order.
     assert [a["species"] for a in s["accumulation"]] == ["raccoon", "American crow"]
     assert [a["n_species"] for a in s["accumulation"]] == [1, 2]
+
+
+# ---- _sun answers in the YARD's frame, not the server's (2026-08-09) ------------------
+# astral returns "the dawn/dusk on this calendar date IN THIS TIMEZONE", so asking in the
+# machine's zone splits the pair across two local days once the machine disagrees with the
+# camera. Measured from a UTC machine at lat 47.5 / lon -122.2: dawn 12:19Z, dusk 04:10Z --
+# dusk BEFORE dawn. Every period boundary, moon bucket and sun-anchored arrival sits on this.
+
+def test_sun_returns_a_positive_day_and_ignores_the_machine_clock():
+    from datetime import date, timezone as _tz
+    cfg = replace(config.CONFIG, latitude=47.5, longitude=-122.2)
+    stats._SUN_CACHE.clear()
+    dawn, dusk = stats._sun(cfg, date(2026, 8, 7))
+    assert dawn < dusk, "dusk before dawn means the pair came from two different local days"
+    assert timedelta(hours=8) < (dusk - dawn) < timedelta(hours=20)   # a plausible August day
+    # The instants are the yard's, whatever zone this test happens to run in.
+    assert dawn.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M") == "2026-08-07T12:19"
+    assert dusk.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M") == "2026-08-08T04:08"
+
+
+def test_sun_without_a_location_still_gives_a_positive_day():
+    from datetime import date
+    cfg = replace(config.CONFIG, latitude=None, longitude=None)
+    stats._SUN_CACHE.clear()
+    dawn, dusk = stats._sun(cfg, date(2026, 8, 7))
+    assert dawn < dusk and (dusk - dawn) == timedelta(hours=12)       # the 06:00/18:00 fallback
+    stats._SUN_CACHE.clear()
