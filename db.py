@@ -314,6 +314,38 @@ CREATE TABLE IF NOT EXISTS individual_status (
     updated_at     TEXT NOT NULL         -- when this row was last written (local ISO 8601 w/ offset).
 );
 
+-- COVERAGE (2026-08-08): when each camera was actually WATCHING -- the effort ledger every
+-- absence claim silently needs. The rig has documented multi-hour blind spells (Modern-Standby
+-- deaths, USB wedges, the trail cam's midnight-to-noon video gap), and without this table
+-- "first raccoon in 3 days" and "no robin this night" treat a dark camera as an empty yard.
+-- Append-only events, written at the RARE transitions (open / read-failure / reconnect / stop),
+-- never per frame; a reader pairs up->down spans. History before the table existed is honestly
+-- unknowable and left unwritten.
+CREATE TABLE IF NOT EXISTS coverage_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source  TEXT NOT NULL,                -- which camera (matches detections.source).
+    event   TEXT NOT NULL,                -- 'up' (frames flowing) | 'down' (lost/stopped).
+    at      TEXT NOT NULL,                -- local ISO 8601 w/ offset.
+    reason  TEXT                          -- 'opened' | 'read-failed' | 'reconnected' | 'stopped' ...
+);
+
+-- LIFE EVENTS (2026-08-08): the cast's STORY as data -- dated, append-only free text per
+-- individual ("kits first emerged", "limping on the left front paw", "presumed dispersed").
+-- Distinct from individual_status on purpose: that table is one row of CURRENT residency per
+-- name (a state), this is a ledger (a history). Three litters were the biggest biological story
+-- this yard ever produced and they existed only as group-stamp strings plus the owner's memory;
+-- when a kit vanishes, or next spring's litter debuts a week earlier than this one, the
+-- comparison lives here or nowhere. Purely additive: nothing machine-side reads it -- it is
+-- provenance and narrative for the humans (profile timeline), exported with the label ledger.
+CREATE TABLE IF NOT EXISTS life_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL COLLATE NOCASE,  -- matches detections.individual_id (free text).
+    event_date TEXT,                          -- 'YYYY-MM-DD' the event happened (NULL = undated note).
+    note       TEXT NOT NULL,                 -- the event, in the human's words.
+    labeled_by TEXT,                          -- who recorded it (attribution; NULL = the operator).
+    created_at TEXT NOT NULL                  -- when the row was written (local ISO 8601 w/ offset).
+);
+
 -- REFERENCE IMAGES (2026-08-07, docs/refimg-design-2026-08-07.md sections 6-7): "what this camera
 -- looks like with nothing in it", so a suppression can be REPLAYED against the exact image months
 -- later. A reference is a frame the detector ACTUALLY RAN ON and certified empty (zero boxes, motion
@@ -735,6 +767,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_at TEXT")
     if ls_cols and "superseded_by" not in ls_cols:
         conn.execute("ALTER TABLE live_sightings ADD COLUMN superseded_by INTEGER")
+    # Label attribution (2026-08-08). WHO applied a human verdict, not just that one was applied.
+    # Nullable and never backfilled: every existing label was the operator's, but writing a name
+    # onto 21k historical rows would fake a provenance trail that was never recorded -- NULL reads
+    # as "the operator, before attribution existed". This single column is what lets the household
+    # become a second label supply someday (a viewer's verdicts arrive attributed and reviewable,
+    # never anonymously mixed into ground truth); without it that whole design space is closed.
+    if "labeled_by" not in cols:
+        conn.execute("ALTER TABLE detections ADD COLUMN labeled_by TEXT")
+    if ls_cols and "labeled_by" not in ls_cols:
+        conn.execute("ALTER TABLE live_sightings ADD COLUMN labeled_by TEXT")
     # Soft suppression (2026-08-07, docs/refimg-design-2026-08-07.md section 7). Four nullable adds,
     # backfilled to NULL, so every row already in the DB reads as LIVE and every existing query keeps
     # working untouched -- exactly the clips.pruned_at pattern. The columns exist ahead of any
@@ -918,8 +960,27 @@ def rename_individual(conn: sqlite3.Connection, old: str, new: Optional[str]) ->
     return cur.rowcount
 
 
+def is_group_label(name) -> bool:
+    """True when an individual label names a GROUP rather than one animal -- the family-stamp
+    convention ("Stan + Kits"): one archive label deliberately written across a span that held
+    several bodies. The marker is a literal " + " in the name, the same separator the labels were
+    typed with.
+
+    A group label is a real identity everywhere a HUMAN reads (the cast strip, profiles, the visit
+    log) and is NEVER single-animal evidence anywhere a MATCHER learns: templates, ranking, the
+    auto-assign floor and the eval corpus all refuse it, because the prototype of a mom-with-kits
+    span is a blend of several animals that matches none of them (measured 2026-08-08: 4 of the 9
+    then-confirmed group visits carried 0-1 co-present frames, i.e. the stills alone would have
+    certified them solo, and 3 cleared the prototype gates -- one nightly embed away from a
+    "Pedro + Kits" pseudo-individual competing in rank_templates). Mirrors refcam's
+    identity_scope='group' for reference media, as a naming convention rather than a column,
+    because these labels already exist in the archive and a convention needs no migration."""
+    return " + " in str(name or "")
+
+
 def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional[str],
-                source: str = "human", *, reject: bool = False) -> int:
+                source: str = "human", *, reject: bool = False,
+                labeled_by: Optional[str] = None) -> int:
     """Confirm WHO a visit was: stamp `individual_id` onto the visit's detections that match the
     visit's dominant species (a stray mid-visit crow crop keeps its own identity), and mirror it
     onto the visits row. The visit is the labelling unit -- one solo animal per visit, so one
@@ -941,10 +1002,10 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     where = "visit_id = ?" + ("" if sp is None else " AND species = ?")
     params = [int(visit_id)] + ([] if sp is None else [sp])
     cur = conn.execute(
-        f"UPDATE detections SET individual_id = ?, individual_source = ?, labelled_at = ? "
-        f"WHERE {where}",
+        f"UPDATE detections SET individual_id = ?, individual_source = ?, labelled_at = ?, "
+        f"labeled_by = ? WHERE {where}",
         [individual_id, None if (individual_id is None and not reject) else source,
-         now_local_iso()] + params)
+         now_local_iso(), labeled_by] + params)
     conn.execute("UPDATE visits SET individual_id = ? WHERE id = ?",
                  (individual_id, int(visit_id)))
     conn.commit()
@@ -957,7 +1018,7 @@ _UNSET = object()   # sentinel: "argument not provided" (distinct from None = "c
 def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = None,
                       source: Optional[str] = None, start: Optional[str] = None,
                       end: Optional[str] = None, name=_UNSET, species: Optional[str] = None,
-                      verify: bool = False) -> dict:
+                      verify: bool = False, labeled_by: Optional[str] = None) -> dict:
     """Confirm/correct a whole visit's SPECIES and/or assign its INDIVIDUAL, in one shot. The
     visit is identified EITHER by `visit_id` (the Individuals queue, which has it) OR by a
     (`source`, `start`, `end`) time span (the Explorer computes visits on the fly and has no
@@ -1030,11 +1091,12 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
         at = now_local_iso()      # WHEN the label was applied (detections.labelled_at)
         if dominant is None:
             conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
-                         f"labelled_at = ? WHERE {where}", [name, src, at] + params)
+                         f"labelled_at = ?, labeled_by = ? WHERE {where}",
+                         [name, src, at, labeled_by] + params)
         else:
             conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
-                         f"labelled_at = ? WHERE {where} AND species = ?",
-                         [name, src, at] + params + [dominant])
+                         f"labelled_at = ?, labeled_by = ? WHERE {where} AND species = ?",
+                         [name, src, at, labeled_by] + params + [dominant])
 
     # Sync the visits-table rows these detections belong to (subquery, no big IN list).
     vsub = f"id IN (SELECT DISTINCT visit_id FROM detections WHERE {where} AND visit_id IS NOT NULL)"
@@ -1159,6 +1221,96 @@ def individual_statuses(conn: sqlite3.Connection) -> dict:
     return out
 
 
+def record_coverage(db_path, source: str, event: str, reason: Optional[str] = None) -> None:
+    """Append one coverage transition ('up'/'down') for `source`. Called from the CAPTURE THREAD
+    at its rare transitions, so it must never hurt the rig: its own short-lived connection, and
+    every failure -- locked DB, missing table, anything -- is swallowed. Losing one coverage row
+    is a rounding error; stalling a capture thread on the WAL lock is a documented incident
+    class (2026-06-30)."""
+    try:
+        conn = connect(db_path)
+        try:
+            conn.execute("INSERT INTO coverage_events (source, event, at, reason) "
+                         "VALUES (?, ?, ?, ?)",
+                         (source, "up" if event == "up" else "down", now_local_iso(), reason))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def coverage_dark_seconds(conn: sqlite3.Connection, source: str, start, end) -> Optional[float]:
+    """Seconds within [start, end] (tz-aware datetimes) this camera was NOT watching, from the
+    coverage ledger. None when the ledger has no events at or before the window -- 'unknown' and
+    'fully covered' must never be conflated (the whole point of the table is honest absence).
+    A trailing 'down' with no later 'up' counts as dark through the window's end; a crash that
+    never wrote 'down' therefore reads as covered, which is the accepted error direction (the
+    ledger flags known gaps; it cannot conjure unknown ones)."""
+    try:
+        rows = conn.execute(
+            "SELECT event, at FROM coverage_events WHERE source = ? ORDER BY at", (source,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    events = [(r[0], parse_local(r[1])) for r in rows]
+    events = [(e, t) for e, t in events if t is not None]
+    if not events or events[0][1] > start:
+        return None                       # nothing at or before the window opens -> unknown
+    state, dark, cursor = None, 0.0, start
+    for e, t in events:
+        if t <= start:
+            state = e
+            continue
+        if t > end:
+            break
+        if state == "down":
+            dark += max(0.0, (min(t, end) - cursor).total_seconds())
+        cursor = max(cursor, t)
+        state = e
+    if state == "down":
+        dark += max(0.0, (end - cursor).total_seconds())
+    return dark
+
+
+def add_life_event(conn: sqlite3.Connection, name: str, note: str, *,
+                   event_date=None, labeled_by: Optional[str] = None) -> dict:
+    """Append one dated event to an individual's story (the life_events ledger). Free text is
+    the point -- 'Stan's kits first emerged', 'favouring the left front paw'. Append-only by
+    design; a wrong note is corrected by another note, the way a field notebook is."""
+    nm = str(name or "").strip()
+    note_clean = str(note or "").strip()
+    if not nm or not note_clean:
+        raise ValueError("name and note are required")
+    day = as_date(event_date)
+    at = now_local_iso()
+    cur = conn.execute(
+        "INSERT INTO life_events (name, event_date, note, labeled_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?)", (nm, day, note_clean[:500], labeled_by, at))
+    conn.commit()
+    return {"id": int(cur.lastrowid), "name": nm, "event_date": day, "note": note_clean[:500],
+            "labeled_by": labeled_by, "created_at": at}
+
+
+def life_events(conn: sqlite3.Connection, name: Optional[str] = None) -> list:
+    """The event ledger, newest-dated first (undated notes sort by created_at). One name or all.
+    Empty on a DB no writer has migrated yet -- the read-only-clone contract."""
+    try:
+        if name:
+            rows = conn.execute(
+                "SELECT id, name, event_date, note, labeled_by, created_at FROM life_events "
+                "WHERE name = ? ORDER BY COALESCE(event_date, substr(created_at,1,10)) DESC, id DESC",
+                (str(name).strip(),)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, name, event_date, note, labeled_by, created_at FROM life_events "
+                "ORDER BY COALESCE(event_date, substr(created_at,1,10)) DESC, id DESC").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"id": r[0], "name": r[1], "event_date": r[2], "note": r[3],
+             "labeled_by": r[4], "created_at": r[5]} for r in rows]
+
+
 def departed_individuals(conn: sqlite3.Connection) -> dict:
     """{casefolded name: effective_date or None} for the individuals a human has marked departed.
     Case-folded because the names are free text typed by hand and "notch" is "Notch"; the value is
@@ -1219,7 +1371,8 @@ def _live_sighting_rows(conn: sqlite3.Connection, source: Optional[str] = None) 
 
 def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
                          span_start: Optional[str] = None, span_end: Optional[str] = None,
-                         note: Optional[str] = None, observed_at: Optional[str] = None) -> dict:
+                         note: Optional[str] = None, observed_at: Optional[str] = None,
+                         stamp: bool = True, labeled_by: Optional[str] = None) -> dict:
     """Log a human's real-time identification of who is visiting NOW (the dashboard Live tab).
     `names` is the list of individuals present over [span_start, span_end] on `source`.
 
@@ -1243,7 +1396,20 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
     The stamping asymmetry is deliberately UNCHANGED: the newest solo name still stamps the span
     (the human's latest word is their best word), and a pair still stamps nothing.
 
-    Returns {sighting_id, stamped, multi, names, superseded: [ids], conflict: bool}."""
+    GROUP STRING (2026-08-08): one name that is itself a group label ("Stan + Kits" --
+    is_group_label) both STAMPS and counts as MULTI. The stamp is the family convention: the whole
+    span belongs to that household on the archive, and per-kit names don't exist to type. But the
+    span held several bodies, so the sighting must feed every multi-animal signal
+    (individuals.multi_name_sighting_spans, embed --co-present, the is_multi badge) exactly as a
+    two-name log does -- before this, a family night's sighting read as SOLO here, and its blended
+    prototype was one nightly embed away from becoming a "Pedro + Kits" template.
+
+    `stamp=False` records the sighting as testimony WITHOUT the solo stamp -- the viewer tier's
+    path (web.py's operator/viewer split): a family member's "that's Stan!" lands attributed
+    (`labeled_by`) and reviewable, and never writes ground truth or feeds a template until the
+    operator promotes it. `labeled_by` rides on the sighting row either way.
+
+    Returns {sighting_id, stamped, multi, group, names, superseded: [ids], conflict: bool}."""
     ordered, seen = [], set()
     for n in (names or []):
         s = str(n).strip()
@@ -1267,25 +1433,31 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
     conflict = any(p["key"] != key for p in prior)
 
     multi = len(ordered) > 1
+    group = (not multi) and is_group_label(ordered[0])
     stamped = 0
     # Solo => stamp the span (feeds re-ID). Pair => never stamp a single name across two animals.
-    if not multi and span_start and span_end:
+    # A GROUP string is the solo path's stamp with the pair path's meaning: it stamps (the family
+    # convention) AND reports multi below (several bodies -- the sighting must feed is_multi).
+    # A viewer's log (stamp=False) records testimony only.
+    if stamp and not multi and span_start and span_end:
         res = apply_visit_label(conn, source=source, start=span_start, end=span_end,
-                                name=ordered[0])
+                                name=ordered[0], labeled_by=labeled_by)
         stamped = int(res.get("detections") or 0)
 
     note_clean = (str(note).strip() or None) if note else None
     cur = conn.execute(
-        "INSERT INTO live_sightings (source, observed_at, span_start, span_end, names, stamped, note) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (source, observed, span_start, span_end, json.dumps(ordered), int(stamped), note_clean))
+        "INSERT INTO live_sightings (source, observed_at, span_start, span_end, names, stamped, "
+        "note, labeled_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (source, observed, span_start, span_end, json.dumps(ordered), int(stamped), note_clean,
+         labeled_by))
     sid = int(cur.lastrowid)
     if prior:
         conn.executemany(
             "UPDATE live_sightings SET superseded_at = ?, superseded_by = ? WHERE id = ?",
             [(observed, sid, int(p["id"])) for p in prior])
     conn.commit()
-    return {"sighting_id": sid, "stamped": stamped, "multi": multi, "names": ordered,
+    return {"sighting_id": sid, "stamped": stamped, "multi": multi or group, "group": group,
+            "names": ordered,
             "superseded": [int(p["id"]) for p in prior], "conflict": conflict}
 
 

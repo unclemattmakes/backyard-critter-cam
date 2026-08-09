@@ -747,10 +747,12 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
     matcher = VisitMatcher(conn, species, cfg)
     confirmed = matcher.confirmed                      # {visit_id: individual_name}
 
-    solo, excluded_multi, excluded_thin = {}, {}, {}
+    solo, excluded_multi, excluded_thin, excluded_group = {}, {}, {}, {}
     for vid, name in confirmed.items():
         if vid not in matcher.protos:
             excluded_thin[vid] = name                  # too few embedded crops for a prototype
+        elif db.is_group_label(name):
+            excluded_group[vid] = name                 # "Stan + Kits": several animals, one label
         elif matcher.is_multi(vid):
             excluded_multi[vid] = name                 # blended two-animal prototype -> exclude
         else:
@@ -817,6 +819,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
             "total": len(confirmed),
             "solo_with_prototype": len(solo),
             "excluded_multi_animal": len(excluded_multi),
+            "excluded_group_label": len(excluded_group),
             "excluded_too_thin": len(excluded_thin),
             "solo_by_individual": dict(counts),
             "distinct_nights": len({n for n in nights.values() if n is not None}),

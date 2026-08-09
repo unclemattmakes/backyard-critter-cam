@@ -16,10 +16,23 @@ REM                                tracklet splitter is blind without it
 REM   3) clipembed.py           -- appearance vectors for new sustained tracklets
 REM   4) clipmotion.py --link   -- attach solo-clip tracks to their HUMAN-named
 REM                                individual (auto names don't ground behaviour)
-REM   5) individuals.py --auto-assign -- name the unambiguous new solo visits
+REM   5) eval.py --baseline latest -- the REGRESSION GATE, run nightly so a
+REM                                metric slide is noticed the day it happens
+REM                                (the 0.81 -> 0.635 AUC drift accumulated for
+REM                                weeks because this step was a docstring, not
+REM                                a scheduler line). Read-only over the DB, no
+REM                                GPU: it scores the embeddings already stored.
+REM   6) individuals.py --auto-assign -- name the unambiguous new solo visits
 REM                                (bars from eval.py's sweep; auto names never
 REM                                feed the suggestion templates; review ✓/✗ in
-REM                                the dashboard queue)
+REM                                the dashboard queue). SKIPPED when the gate
+REM                                just reported a regression: a matcher that
+REM                                measurably got worse today should not spend
+REM                                tonight writing names.
+REM   7) warm the dashboard's re-ID queue cache -- the first Individuals-tab
+REM                                visit after a big night otherwise eats the
+REM                                full rebuild at the browser (measured 24s on
+REM                                2026-08-08). Rig down = curl fails = fine.
 REM Every step is RESUMABLE (only new/untouched rows are processed), so a missed
 REM night just catches up the next day.
 REM ---------------------------------------------------------------------------
@@ -33,6 +46,22 @@ echo [%date% %time%] appearance embeddings for new clip tracklets...
 ".venv\Scripts\python.exe" clipembed.py --device auto
 echo [%date% %time%] linking solo tracks to named individuals...
 ".venv\Scripts\python.exe" clipmotion.py --link
-echo [%date% %time%] auto-naming unambiguous visits...
-".venv\Scripts\python.exe" individuals.py --auto-assign
+echo [%date% %time%] nightly eval + regression gate...
+set EVAL_REGRESSED=0
+if exist "reports\eval_*.json" (
+    ".venv\Scripts\python.exe" eval.py --baseline latest --tolerance 0.02
+    if errorlevel 1 set EVAL_REGRESSED=1
+) else (
+    REM First run on this machine: nothing to diff against yet; this run WRITES the baseline.
+    ".venv\Scripts\python.exe" eval.py
+)
+if "%EVAL_REGRESSED%"=="1" (
+    echo [%date% %time%] *** EVAL REGRESSION -- auto-assign SKIPPED tonight. See the diff above
+    echo [%date% %time%] *** and the newest reports\eval_*.json; the dashboard shows the verdict.
+) else (
+    echo [%date% %time%] auto-naming unambiguous visits...
+    ".venv\Scripts\python.exe" individuals.py --auto-assign
+)
+echo [%date% %time%] warming the dashboard re-ID queue cache...
+curl -s -o NUL --max-time 180 "http://127.0.0.1:8000/api/reid/queue?mode=recent&offset=0&limit=30"
 echo [%date% %time%] done.

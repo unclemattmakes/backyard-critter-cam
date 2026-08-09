@@ -11,6 +11,7 @@ controlled timestamps, columns read by name (sqlite3.Row).
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -356,6 +357,109 @@ def test_multi_animal_visit_is_flagged_and_excluded_from_templates(conn, cfg):
     assert m.is_multi(pair_visit)
     assert m.suggest(pair_visit)["multi"]
     assert m.templates() == []                       # ...but its blended prototype never teaches
+
+
+# ---------------------------------------------------------------------------
+# Group labels ("Stan + Kits"): one archive name over several bodies. The stamp is wanted; the
+# template is poison. 2026-08-08: before this plumbing, a family night logged as one group string
+# read as SOLO everywhere -- 4 of the live DB's 9 group visits carried 0-1 co-present frames and
+# were one nightly embed away from becoming blended pseudo-individual templates.
+# ---------------------------------------------------------------------------
+
+def test_is_group_label_convention():
+    assert db.is_group_label("Stan + Kits")
+    assert db.is_group_label("CutiePie + Kits")
+    assert not db.is_group_label("Stan")
+    assert not db.is_group_label("The Dude")        # spaces alone are not the marker
+    assert not db.is_group_label("Stan+Kits")       # the separator is " + ", as typed
+    assert not db.is_group_label(None)
+    assert not db.is_group_label("")
+
+
+def test_record_live_sighting_group_string_stamps_and_counts_multi(conn):
+    """A single group-string name does BOTH: stamps the span (the family convention -- the
+    archive label is wanted) and reports multi (several bodies -- must feed is_multi)."""
+    d1, d2 = _det(conn, minutes=0), _det(conn, minutes=0.5)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan + Kits"],
+                                span_start=_ts(0), span_end=_ts(1))
+    assert r["stamped"] == 2                        # the stamp happened...
+    assert r["multi"] is True and r["group"] is True   # ...and it counts as several animals
+    ind = {x["id"]: x["individual_id"]
+           for x in conn.execute("SELECT id, individual_id FROM detections")}
+    assert ind[d1] == "Stan + Kits" and ind[d2] == "Stan + Kits"
+    # The sighting registers as a multi-animal span for every consumer of the sighting arm.
+    spans = individuals.multi_name_sighting_spans(conn)
+    assert len(spans) == 1 and spans[0][0] == db.SOURCE_GLASS_DOOR_CAM
+
+
+def test_viewer_sighting_records_testimony_without_stamping(conn):
+    """stamp=False (the viewer tier): the sighting lands attributed in live_sightings and no
+    crop is written -- a guest's enthusiasm can never contaminate a template."""
+    d1 = _det(conn, minutes=0)
+    r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan"],
+                                span_start=_ts(0), span_end=_ts(1),
+                                stamp=False, labeled_by="niece")
+    assert r["stamped"] == 0 and r["sighting_id"] is not None
+    ind = conn.execute("SELECT individual_id FROM detections WHERE id = ?", (d1,)).fetchone()[0]
+    assert ind is None                                   # nothing stamped
+    row = conn.execute("SELECT names, labeled_by, stamped FROM live_sightings").fetchone()
+    assert json.loads(row[0]) == ["Stan"] and row[1] == "niece" and row[2] == 0
+
+
+def test_operator_stamp_carries_attribution_onto_crops(conn):
+    d1 = _det(conn, minutes=0)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan"],
+                            span_start=_ts(0), span_end=_ts(1), labeled_by="matt")
+    row = conn.execute("SELECT individual_id, labeled_by FROM detections WHERE id = ?",
+                       (d1,)).fetchone()
+    assert row[0] == "Stan" and row[1] == "matt"
+
+
+def test_plain_solo_sighting_is_not_a_multi_span(conn):
+    _det(conn, minutes=0)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Stan"],
+                            span_start=_ts(0), span_end=_ts(1))
+    assert individuals.multi_name_sighting_spans(conn) == []
+
+
+def test_group_labelled_visit_never_templates_even_without_co_presence(conn, cfg):
+    """The dangerous case measured on the live DB: a family span whose sparse stills caught one
+    body at a time (zero co-present frames, so is_multi's detector arms stay silent) but whose
+    NAME says several animals. The name alone must keep it out of the template pool."""
+    family = _three_crop_visit(conn, [1, 0, 0], start_min=0)         # looks solo to the stills
+    probe = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)
+    db.label_visit(conn, family, "Pedro + Kits")
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert m.templates() == []                       # the blend teaches nothing
+    assert m.suggest(probe)["candidates"] == []      # and nothing ranks against it
+    # The identity still exists for every human surface -- the label was not touched.
+    assert m.confirmed[family] == "Pedro + Kits"
+
+
+def test_group_sighting_flags_overlapping_visit_multi(conn, cfg):
+    """A group live-sighting over a visit trips is_multi via the sighting arm, exactly as a
+    two-name sighting does -- so the queue badge and embed --co-present both see the family."""
+    family = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["CutiePie + Kits"],
+                            span_start=_ts(0), span_end=_ts(1))
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert m.sighting_multi(family) and m.is_multi(family)
+    assert family in individuals.co_present_visit_ids(conn)
+
+
+def test_auto_assign_never_writes_a_group_name(conn, cfg):
+    """With only a group-labelled 'template' on file, the auto tier has nothing to rank against
+    -- a family name can never be auto-written onto a solo visit."""
+    cfg.reid_auto_threshold, cfg.reid_auto_margin, cfg.reid_auto_min_templates = 0.5, 0.0, 1
+    family = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    lookalike = _three_crop_visit(conn, [1, 0.02, 0], start_min=60)  # would match, if allowed
+    db.label_visit(conn, family, "Stan + Kits")
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    out = m.auto_assign(conn, dry_run=True)
+    assert out["assigned"] == []
+    assert out["skipped"].get("no_templates") == len(m.protos)
 
 
 def _clip_with_tracks(conn, *, start_min, end_min, n_sustained, n_fragments=0,

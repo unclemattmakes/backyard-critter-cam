@@ -332,6 +332,38 @@ def test_apply_visit_label_stamps_labelled_at(conn):
                         (a,)).fetchone()["labelled_at"] is not None
 
 
+def test_coverage_dark_seconds_pairs_transitions_and_admits_ignorance(conn):
+    """The effort ledger: up/down transitions pair into dark spans; a window the ledger can't
+    speak for (no event at or before its start) reads None -- unknown and fully-covered must
+    never be conflated."""
+    from datetime import datetime, timedelta
+    tz = datetime.now().astimezone().tzinfo
+    base = datetime(2026, 8, 7, 21, 0, 0, tzinfo=tz)
+    src = db.SOURCE_GLASS_DOOR_CAM
+
+    def ev(event, minutes, reason=None):
+        conn.execute("INSERT INTO coverage_events (source, event, at, reason) VALUES (?, ?, ?, ?)",
+                     (src, event, (base + timedelta(minutes=minutes)).isoformat(), reason))
+    # Watching from 21:00; down 22:00-22:30 (a wedge); watching again until the window ends.
+    ev("up", 0, "opened"); ev("down", 60, "read-failed"); ev("up", 90, "reconnected")
+    conn.commit()
+
+    win = (base, base + timedelta(hours=8))
+    dark = db.coverage_dark_seconds(conn, src, *win)
+    assert dark == 30 * 60                                   # exactly the wedge half-hour
+
+    # A trailing 'down' with no later 'up' counts dark through the end of the window.
+    ev("down", 300, "stopped"); conn.commit()
+    dark2 = db.coverage_dark_seconds(conn, src, *win)
+    assert dark2 == 30 * 60 + (8 * 60 - 300) * 60            # wedge + the tail
+
+    # A window that opens before any event is honestly unknowable.
+    early = (base - timedelta(hours=2), base - timedelta(hours=1))
+    assert db.coverage_dark_seconds(conn, src, *early) is None
+    # Another source's ledger says nothing about this one.
+    assert db.coverage_dark_seconds(conn, "other_cam", *win) is None
+
+
 def test_species_writes_do_not_stamp_labelled_at(conn):
     """labelled_at means 'when individual_id was written'. A species correction is a different
     label and must not fake an identity-labelling event."""

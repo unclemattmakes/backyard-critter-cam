@@ -709,11 +709,14 @@ def clip_co_presence_by_visit(conn, species: str) -> dict:
 
 
 def multi_name_sighting_spans(conn) -> list:
-    """(source, span_start, span_end) for every live sighting that logged 2+ names -- direct
-    human testimony that a span held multiple animals, the third multi-visit signal beside the
-    stills badge and clip co-presence. A kit convoy can enter the sparse stills one animal at a
-    time (zero same-instant frames) and still be four animals; the 2026-07-31 "Stan + 3 kits"
-    span did exactly that. A sighting with no span falls back to its observed_at instant (the
+    """(source, span_start, span_end) for every live sighting whose names testify to multiple
+    animals -- direct human testimony that a span held several bodies, the third multi-visit
+    signal beside the stills badge and clip co-presence. A kit convoy can enter the sparse stills
+    one animal at a time (zero same-instant frames) and still be four animals; the 2026-07-31
+    "Stan + 3 kits" span did exactly that. Two forms count: 2+ names logged together, and ONE
+    name that is itself a group label ("Stan + Kits", db.is_group_label) -- the family-stamp
+    convention, which before 2026-08-08 read as solo here and let a whole family night masquerade
+    as one animal. A sighting with no span falls back to its observed_at instant (the
     db.co_present_sighting_names convention). Empty on a DB no writer has migrated yet."""
     try:
         rows = conn.execute(
@@ -728,7 +731,7 @@ def multi_name_sighting_spans(conn) -> list:
             names = json.loads(names_json) if names_json else []
         except ValueError:
             names = []
-        if len(names) >= 2:
+        if len(names) >= 2 or any(db.is_group_label(n) for n in names):
             out.append((src, s0 or observed, s1 or observed))
     return out
 
@@ -845,7 +848,10 @@ class VisitMatcher:
         self._sighting_cache: dict = {}
         # CLIP-space templates: an individual's labelled tracklets, the only way a never-solo pair
         # member (Elliot) gets matched. Built from confirmed SOLO visits + explicit un-blend labels.
-        solo = {vid: nm for vid, nm in self.confirmed.items() if not self.is_multi(vid)}
+        # Group labels ("Stan + Kits") are refused here for the same reason templates() refuses
+        # them: the tracklets of a family visit belong to several animals under one name.
+        solo = {vid: nm for vid, nm in self.confirmed.items()
+                if not self.is_multi(vid) and not db.is_group_label(nm)}
         _clip_groups = _clip_template_vectors(conn, solo)
         # The all-source fold stays as the public attribute (web.py's un-blend elimination pool);
         # matching a still prototype uses the per-source fold via clip_templates_for().
@@ -917,7 +923,12 @@ class VisitMatcher:
 
     def templates(self, source=_ALL_SOURCES) -> list:
         """(name, visit_id, prototype) for every confirmed SOLO visit with a usable prototype.
-        Multi-animal visits are excluded -- their prototype blends two animals.
+        Multi-animal visits are excluded -- their prototype blends two animals. GROUP-labelled
+        visits ("Stan + Kits", db.is_group_label) are excluded BY NAME as well as by evidence:
+        a family span whose stills happened to catch one body at a time carries no co-presence
+        badge, but the human's own label says several animals -- and a blended family prototype
+        competing as a pseudo-individual is exactly the contamination the 5-template auto floor
+        would then be counting toward.
 
         THE SOURCE GUARD. Pass a `source` and only that camera's confirmed visits come back; the
         default returns every source, which is the corpus-wide view ("does ANY template exist?",
@@ -929,7 +940,8 @@ class VisitMatcher:
         survives Matt moving a camera: no geometry, no per-source thresholds, no camera list.
         `source=None` means "visits whose source is unknown" (fail closed), not "any"."""
         rows = [(name, vid, self.protos[vid]) for vid, name in self.confirmed.items()
-                if vid in self.protos and not self.is_multi(vid)]
+                if vid in self.protos and not self.is_multi(vid)
+                and not db.is_group_label(name)]
         if source is _ALL_SOURCES:
             return rows
         return [t for t in rows if self.visit_source.get(t[1]) == source]
