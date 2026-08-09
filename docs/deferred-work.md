@@ -432,6 +432,32 @@ are too thin to draw. They are not; the segmenter was wrong. Use daylight frames
 cannot see a reposition), a small rolling per-pixel median, and break on the fingerprint
 correlation falling below the existing threshold.
 
+**The method is now measured on the trail cam, and it works — 2026-08-09.** 284 daylight
+trail-cam clip frames, 2026-07-23 → 08-07, against unusually good ground truth (the card is
+formatted and the camera dismounted every import cycle, so 07-22 / 07-27 / 07-30 / 08-02 / 08-05
+are all real repositions):
+
+| pairs | n | p05 | median | p95 |
+|---|---|---|---|---|
+| same DAY (same mount, hours apart) | 3,745 | 0.441 | **0.815** | 0.973 |
+| across a known remount | 30,168 | 0.101 | **0.260** | 0.529 |
+
+At the shipped `VIEW_CORR_MIN` = 0.55 that is 8.7% false "it moved" against 4.3% missed, and the
+**best balanced accuracy at any threshold is 0.936 at corr 0.536** — the shipped number is already
+within noise of optimal. Daylight change costs real correlation but not enough to matter here:
+same-day pairs run 0.917 at an hour apart, 0.712 at 4–8 h.
+
+**Two corrections that came out of measuring it.** First, mine: grouping "same mount" by *import
+cycle* gave a much gloomier 0.799, because Matt evidently repositions the trail cam **within** a
+cycle too (07-30 and 07-31 are visibly different framings) — so the epoch count will exceed the
+cycle count, and "same cycle" is not a control. Second, do not carry the glass door's result over:
+there the same fingerprint runs 0.075–0.68 across one provably stationary day
+([refimg review](refimg-review-2026-08-09.md) §4), because that camera shoots through glass and
+its floodlit evening frames classify as `day`. **This signal is camera-specific.** It is sound on
+the trail cam, which is the camera §5.3 is about.
+
+So the first step below is de-risked, not blocked: build the reporter.
+
 Three constraints when it comes time to persist: epochs must be allocated **chronologically and
 idempotently** (bumping an epoch also retires that source's reference images — free today at zero
 trail-cam references, not free later); the ~2,764 detections that predate the first daylight clip
