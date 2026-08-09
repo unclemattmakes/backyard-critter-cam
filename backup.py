@@ -82,6 +82,11 @@ META_ITEMS: tuple[Path, ...] = (
     ROOT / "logs",
     ROOT / "reports",
     ROOT / "config_local.py",
+    # What torch/ultralytics build this machine actually resolved (written by setup.bat/setup.sh).
+    # Gitignored, so this snapshot is its only copy -- and it is the provenance for every number
+    # in reports/ and every stored embedding: "setup picks a build per machine" must not mean
+    # "nobody knows which build produced these".
+    ROOT / "environment.lock.txt",
 )
 
 

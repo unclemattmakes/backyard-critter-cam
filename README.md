@@ -377,7 +377,7 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
 
 `python backyard_cam.py --serve` runs the same capture loop **and** a local web page (open
 `http://127.0.0.1:8000`) — a field journal for the yard you can leave open in a browser tab. It
-has grown from a single live feed into **six tabs**:
+has grown from a single live feed into **eight tabs**:
 
 - **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
   how-long-ago, confidence, a ▶ badge to play its clip, and a live *off-pattern* flag if it
@@ -387,7 +387,10 @@ has grown from a single live feed into **six tabs**:
   individual (a live solo confirm that feeds the [re-ID](#individual-re-identification-phase-3)
   templates), two or more record who came *together* (co-presence, without mislabelling both
   animals as one). A short *recently logged* list shows your notes landing.
-- **The Dispatch** — the landing page: a newspaper-style **period digest** (☾ Night / ☀ Day,
+- **Visit Log** — *the landing page*: the yard's comings and goings as scrollable cards (species
+  mix, any named individuals, dwell, ▶ its clips), with the named cast across the top so any
+  individual is one tap from their profile. The "scroll around and see what happened" surface.
+- **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day,
   with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
   reel** — the period's best moments auto-cut into one short stitched video (~1 minute for a
   busy night, built by `reel.py` from motion tracks + shot quality, one beat per species /
@@ -399,7 +402,13 @@ has grown from a single live feed into **six tabs**:
   full species roll with per-hour activity clocks. The full every-clip playlist is still one
   click away ("watch every clip").
 - **Behaviour** — per-species field notes (visits/day, median dwell, typical arrival window,
-  hourly chart), **off-pattern** alerts, and **seen-together** co-occurrence pairs.
+  hourly chart, and the **sun-anchored** arrival — "~1h48 after dusk", which stays true as the
+  season walks sunset around), **off-pattern** alerts, **seen-together** co-occurrence pairs,
+  **yard politics** (who avoids whom, who yields the yard — observational, with sample floors),
+  and a **moonlight** scatter of nocturnal traffic against illumination.
+- **Seasons** — the longitudinal view the calendar can't give: per-species weekly sparklines,
+  first/last dates, and the yard's **species-accumulation curve** (is it still introducing
+  itself, or is the cast known?).
 - **Individuals** — the "name the cast" workspace (see
   [phase 3](#individual-re-identification-phase-3)): a *Who is this?* review queue with
   one-click confirm / correct / clear, bulk **Fit to the Cast**, per-individual **Poses** and
@@ -801,6 +810,24 @@ then:
 - **Idempotent** — run it as often as you like; finished days are skipped in seconds. Restore
   instructions land in a `README.txt` beside the archives (short version: unzip everything
   into the project root).
+- **Four things beyond the media**, because "the weights re-download themselves" is only true
+  for some of them and a database is not the same thing as a readable record:
+  - `weights-archive.zip` — a **one-time** mirror of the model weights (MegaDetector plus the
+    Hugging Face checkpoints), never rebuilt. MegaDetector comes from Zenodo, which is
+    archival; MegaDescriptor, BioCLIP and the CLIP gate come from a hub where repos get pulled,
+    gated or re-licensed. If MegaDescriptor vanished, every stored vector would survive and the
+    embedding space could never be extended again — the whole cross-time identity archive would
+    freeze. Local archival for continuity, not redistribution (see [NOTICE.md](NOTICE.md)).
+  - `labels-<date>.jsonl` — every **human verdict** as an append-only ledger, diffed against
+    last week's. The label set is the one irreplaceable asset here, and a mass relabel now logs
+    loudly instead of silently.
+  - `export-<date>.zip` — the observation record as **plain CSV plus a `DATA.md` dictionary**
+    (`export.py`). Data longevity shouldn't equal codebase longevity: this opens in a
+    spreadsheet in ten years with no Python at all.
+  - `STATUS.txt` — a weekly heartbeat: rig freshness, newest human label against the decay
+    horizon, shadow-review flag count, trail-card import age, disk headroom. Its **absence or
+    staleness** in your cloud app is itself the alarm, which is the only notification channel
+    this project has.
 
 Schedule it weekly with Windows Task Scheduler (runs as you, no admin needed):
 
@@ -836,9 +863,12 @@ read off a window-side clock, but globally unambiguous and sortable.
 | `model_species` | The classifier's **original** prediction, snapshotted at classify time so a later human correction to `species` no longer destroys what the model actually said. |
 | `model_species_confidence` | The model's own score for `model_species` (unlike `species_confidence`, a human correction doesn't force this to 1.0). |
 | `model_species_source` | Which model made that call (`bioclip` / `clip-filter`). Read by `eval.py` to grade the classifier against human verdicts. |
-| `individual_id` | Phase 3 (re-ID): set when you confirm a visit or hand-label a cluster. NULL until then. |
-| `individual_source` | How `individual_id` was set (e.g. `human`, `refit`). |
+| `individual_id` | Phase 3 (re-ID): set when you confirm a visit or hand-label a cluster. NULL until then. A name containing `" + "` (e.g. `Stan + Kits`) is a **group** label — one archive name over several animals; it is never treated as single-animal ground truth (`db.is_group_label`). |
+| `individual_source` | How `individual_id` was set: `human` (the only kind that becomes a template), `auto` (the nightly assigner), `cluster` (a look-alike proposal). |
+| `labelled_at` | *When* a label was applied, as opposed to when the animal was seen. Deliberately not backfilled — there is no honest value for rows labelled before the column existed. |
+| `labeled_by` | *Which human*. NULL = the operator, before attribution existed. What lets a household eventually supply attributed, reviewable labels. |
 | `visit_id` | Phase 4: which `visits` row this crop belongs to (stamped by `visits.py`). |
+| `suppressed_at`, `suppressed_by`, `suppress_ref_id`, `suppress_detail` | The furniture veto (`refimg.py`), **shadow mode**: rows it *would* remove are flagged, never deleted, and nothing reads these yet. NULL = live, so every existing query is unchanged. |
 
 A second table, **`detection_embeddings`** (keyed to `detections.id`), holds the phase-3
 appearance vectors: `embed.py` writes one L2-normalized MegaDescriptor embedding per readable
@@ -860,6 +890,18 @@ features can be re-derived later without re-running the detector. **`clip_track_
 (`clipembed.py`) holds one MegaDescriptor appearance vector per tracklet, in the *same* vector
 space as `detection_embeddings` — that shared space is what lets a pair visit be split into its
 two animals and a never-solo individual finally get a clean template.
+
+Smaller tables, each one a fact the code could not otherwise know:
+
+| Table | What it records |
+|-------|-----------------|
+| `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
+| `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
+| `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
+| `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
+| `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
+| `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |
+| `identity_references` | Hand-certified photographs of a known individual (`refcam.py`) — identity evidence that does not decay, and that never becomes a matcher template. |
 
 Example queries:
 
@@ -954,9 +996,17 @@ It's a camera pointed at the outdoors, which makes a few things worth saying pla
 - **Recording people is a different question from recording raccoons.** Depending on where you
   live, a camera that covers a neighbour's property or a public way can raise consent obligations
   and sometimes signage or registration ones. Check your local rules before a camera covers
-  anywhere a person would reasonably expect privacy; nothing here is legal advice. (One category
-  you're out of by construction: nothing in this project records **audio** — clips are video only,
-  and audio is where the rules are usually strictest.)
+  anywhere a person would reasonably expect privacy; nothing here is legal advice.
+- **Audio: know which of your cameras has a microphone.** This project never *captures* audio
+  itself — the live rig pipes bare video frames, so glass-door clips are silent. But a
+  **trail-cam MP4 imported off an SD card arrives whole, microphone track included**, and since
+  the clip transcode stopped stripping it that audio now *plays* in the dashboard. (This README
+  previously claimed the project recorded no audio at all. That stopped being true when the
+  video importer landed in July 2026, and it is corrected here rather than quietly.) Audio is
+  where the rules are usually strictest — several jurisdictions require *all-party* consent for
+  recording conversation, with no outdoors exception — so if your camera has a mic, decide
+  deliberately: switch it off in the camera's own settings, or know that you are keeping voices.
+  Deleting a clip deletes its audio with it; there is no separate audio store to purge.
 - **Clips record whole frames.** Person *crops* are filtered by default (`save_classes` is animals
   only, so a person at the glass is drawn in the preview but never written to `crops/`) — but a
   clip is video of the **entire frame**. Anyone who walks through an animal-triggered clip is

@@ -40,16 +40,19 @@ VPY=".venv/bin/python"
 #      7.5 - 8.9 (Turing/Ampere/Ada)    -> cu130 fine
 #      <  7.5 (Maxwell/Pascal/Volta)    -> cu126: cu130 dropped these; installing it would
 #                                          silently cost this machine its GPU
+#    The cut is 7.5, and it MUST compare the minor version too: Volta is sm_70 and Turing is
+#    sm_75, so a major-only test (the first version of this, 2026-08-08) sent every Volta card
+#    to cu130 -- precisely the silent GPU loss the check exists to prevent.
 if command -v nvidia-smi >/dev/null 2>&1; then
-  CC_MAJOR="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
-              | head -n1 | cut -d. -f1 | tr -dc '0-9')"
-  if [ -n "$CC_MAJOR" ] && [ "$CC_MAJOR" -lt 7 ]; then
-    echo "NVIDIA GPU detected (compute capability ${CC_MAJOR}.x -- Maxwell/Pascal/Volta era)."
+  CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  CC10="$(printf '%s' "$CC" | awk -F. 'NF{printf "%d", $1*10 + ($2=="" ? 0 : $2)}')"
+  if [ -n "$CC10" ] && [ "$CC10" -lt 75 ]; then
+    echo "NVIDIA GPU detected (compute capability ${CC} -- Maxwell/Pascal/Volta era)."
     echo "The newest CUDA wheels dropped this generation, so installing the cu126 build"
     echo "-- with cu130 this card would silently go unused."
     "$VPY" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
   else
-    echo "NVIDIA GPU detected (compute capability ${CC_MAJOR:-unknown}.x) -- installing the CUDA (cu130) torch build ..."
+    echo "NVIDIA GPU detected (compute capability ${CC:-unknown}) -- installing the CUDA (cu130) torch build ..."
     "$VPY" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
   fi
 elif [ "$(uname -s)" = "Darwin" ]; then

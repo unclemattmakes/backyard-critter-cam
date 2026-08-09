@@ -849,3 +849,69 @@ def test_zone_endpoints_round_trip_and_reach_the_shared_store(db_path):
         server.shutdown()
         server.server_close()
         t.join(timeout=5)
+
+
+# ---- label attribution: WHO recorded a verdict (2026-08-09) --------------------------
+# The column shipped 2026-08-08 and nothing wrote it: no client sent `logged_by`, and the
+# operator's own confirm path didn't pass it either, so every verdict recorded nobody.
+# Attribution cannot be back-filled honestly, so the write paths are pinned here.
+
+def test_labeler_reads_and_caps_the_self_reported_name():
+    assert web._labeler({"logged_by": "matt"}) == "matt"
+    assert web._labeler({"logged_by": "  matt  "}) == "matt"
+    assert web._labeler({"logged_by": "x" * 200}) == "x" * 40      # capped
+    assert web._labeler({"logged_by": "   "}) is None              # blank is nobody
+    assert web._labeler({}) is None and web._labeler(None) is None
+
+
+def test_confirming_a_visit_records_who_did_it(corpus, db_path):
+    """POST /api/reid/confirm with logged_by stamps labeled_by onto the visit's crops."""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = db.connect(db_path)
+        vid = conn.execute("SELECT id FROM visits WHERE species = 'raccoon' "
+                           "ORDER BY id LIMIT 1").fetchone()[0]
+        conn.close()
+        status, body = _post(port, "/api/reid/confirm",
+                             {"visit_id": vid, "name": "Stan", "logged_by": "the niece"})
+        assert status == 200 and body.get("ok")
+        conn = db.connect_readonly(db_path)
+        rows = conn.execute("SELECT DISTINCT labeled_by FROM detections "
+                            "WHERE visit_id = ? AND individual_id = 'Stan'", (vid,)).fetchall()
+        conn.close()
+        assert [r[0] for r in rows] == ["the niece"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_path):
+    """No logged_by -> labeled_by stays NULL, which reads as 'the operator, before attribution'.
+    It must never be filled with a placeholder."""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = db.connect(db_path)
+        vid = conn.execute("SELECT id FROM visits WHERE species = 'raccoon' "
+                           "ORDER BY id LIMIT 1").fetchone()[0]
+        conn.close()
+        _post(port, "/api/reid/confirm", {"visit_id": vid, "name": "Stan"})
+        conn = db.connect_readonly(db_path)
+        got = conn.execute("SELECT labeled_by FROM detections WHERE visit_id = ? "
+                           "AND individual_id = 'Stan' LIMIT 1", (vid,)).fetchone()[0]
+        conn.close()
+        assert got is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)

@@ -175,3 +175,130 @@ def test_co_occurrence_empty_when_no_stamped_detections(conn):
     )
     conn.commit()
     assert behavior.co_occurrence(conn) == {}
+
+
+# --- sun_anchor: the season-proof arrival clock (2026-08-08) -----------------------------
+# Clock hours smear as sunset walks the season; "N minutes after dusk" does not. The two
+# load-bearing rules are the GUILD split (a junco anchored to dusk is meaningless) and the
+# PREVIOUS-EVENING anchor for post-midnight arrivals -- subtracting same-date dusk from a 4 AM
+# opossum yields a nonsense negative offset, which is the bug this test exists to prevent.
+
+class _Cfg:
+    """Minimal config stand-in: stats._sun only reads latitude/longitude."""
+    latitude = 47.5
+    longitude = -122.2
+
+
+def test_sun_anchor_needs_a_location():
+    """Without lat/lon stats._sun falls back to a fixed 06:00/18:00, which would fake precision."""
+    class NoWhere:
+        latitude = None
+        longitude = None
+    from datetime import datetime
+    tz = datetime.now().astimezone().tzinfo
+    starts = [datetime(2026, 8, 7, 22, 0, tzinfo=tz)]
+    assert behavior.sun_anchor(starts, NoWhere()) is None
+    assert behavior.sun_anchor([], _Cfg()) is None
+
+
+def test_sun_anchor_nocturnal_uses_previous_dusk_after_midnight():
+    """A 1 AM arrival belongs to the PREVIOUS evening's dusk. Anchored to the same calendar
+    date's dusk it would read as roughly -20 hours; anchored correctly it is a small positive
+    offset. The whole guild is nocturnal here, so the anchor must be dusk."""
+    from datetime import datetime
+    tz = datetime.now().astimezone().tzinfo
+    starts = [datetime(2026, 8, 7, 22, 30, tzinfo=tz),   # before midnight
+              datetime(2026, 8, 8, 1, 0, tzinfo=tz),     # after midnight, same night
+              datetime(2026, 8, 9, 0, 30, tzinfo=tz)]
+    out = behavior.sun_anchor(starts, _Cfg())
+    assert out is not None
+    assert out["anchor"] == "dusk"
+    assert out["n"] == 3
+    # Every offset is positive (after dusk) and inside one night, never ~-20 h.
+    assert 0 < out["median_offset_min"] < 12 * 60
+
+
+def test_sun_anchor_diurnal_guild_anchors_to_dawn():
+    """Minutes-after-dusk is meaningless for a junco: a daytime species anchors to dawn."""
+    from datetime import datetime
+    tz = datetime.now().astimezone().tzinfo
+    starts = [datetime(2026, 8, 7, h, 0, tzinfo=tz) for h in (8, 9, 10, 11)]
+    out = behavior.sun_anchor(starts, _Cfg())
+    assert out is not None and out["anchor"] == "dawn"
+    assert 0 < out["median_offset_min"] < 12 * 60
+
+
+def test_sun_anchor_weekly_drift_needs_a_floor():
+    """The weekly drift line only reports weeks with enough arrivals to mean anything."""
+    from datetime import datetime, timedelta
+    tz = datetime.now().astimezone().tzinfo
+    base = datetime(2026, 8, 3, 22, 0, tzinfo=tz)          # a Monday
+    starts = [base + timedelta(days=d) for d in range(6)]  # 6 in one ISO week
+    starts.append(base + timedelta(days=8))                # 1 lonely one the next week
+    out = behavior.sun_anchor(starts, _Cfg())
+    weeks = {w["week"]: w for w in out["weekly"]}
+    assert len(weeks) == 1, "the 1-visit week must not draw a drift point"
+    assert next(iter(weeks.values()))["n"] == 6
+
+
+# --- yard_politics: the guild gate ------------------------------------------------------
+
+def test_yard_politics_refuses_cross_guild_pairs(conn):
+    """Without the guild gate every 'suppression' was a diurnal bird 'avoiding' a nocturnal
+    mammal -- i.e. avoiding the night. A nocturnal/diurnal pair must never be compared."""
+    from datetime import datetime, timedelta
+    tz = datetime.now().astimezone().tzinfo
+    day0 = datetime(2026, 7, 1, tzinfo=tz)
+    for d in range(14):                       # a strictly nocturnal raccoon
+        s = day0 + timedelta(days=d, hours=23)
+        _visit(conn, species="raccoon", started_at=s.isoformat(),
+               ended_at=(s + timedelta(minutes=5)).isoformat())
+    for d in range(14):                       # a strictly diurnal sparrow
+        s = day0 + timedelta(days=d, hours=9)
+        _visit(conn, species="song sparrow", started_at=s.isoformat(),
+               ended_at=(s + timedelta(minutes=2)).isoformat())
+    conn.commit()
+    out = behavior.yard_politics(conn)
+    pairs = {(x["a"], x["b"]) for x in out["suppression"]} | {(x["a"], x["b"]) for x in out["yields"]}
+    assert ("raccoon", "song sparrow") not in pairs
+    assert ("song sparrow", "raccoon") not in pairs
+    assert out["note"], "the observational caveat must ride with the payload"
+
+
+def test_yard_politics_honours_the_sample_floor(conn):
+    """Two overlapping-hour species with only a couple of encounters report nothing."""
+    from datetime import datetime, timedelta
+    tz = datetime.now().astimezone().tzinfo
+    base = datetime(2026, 7, 1, 22, 0, tzinfo=tz)
+    for d in range(2):
+        _visit(conn, species="raccoon", started_at=(base + timedelta(days=d)).isoformat(),
+               ended_at=(base + timedelta(days=d, minutes=5)).isoformat())
+        _visit(conn, species="Virginia opossum",
+               started_at=(base + timedelta(days=d, hours=1)).isoformat(),
+               ended_at=(base + timedelta(days=d, hours=1, minutes=5)).isoformat())
+    conn.commit()
+    out = behavior.yard_politics(conn)
+    assert out["suppression"] == [] and out["yields"] == []
+
+
+# --- moon_activity ----------------------------------------------------------------------
+
+def test_moon_activity_buckets_nocturnal_visits_by_night(conn):
+    """A post-midnight visit belongs to the PREVIOUS day's night, the same convention the
+    digest uses; daytime visits are not counted at all."""
+    from datetime import datetime
+    tz = datetime.now().astimezone().tzinfo
+    _visit(conn, species="raccoon", started_at="2026-07-01T23:00:00-07:00",
+           ended_at="2026-07-01T23:05:00-07:00")
+    _visit(conn, species="raccoon", started_at="2026-07-02T01:00:00-07:00",   # same night
+           ended_at="2026-07-02T01:05:00-07:00")
+    _visit(conn, species="American crow", started_at="2026-07-02T12:00:00-07:00",  # daytime
+           ended_at="2026-07-02T12:05:00-07:00")
+    conn.commit()
+    out = behavior.moon_activity(conn, _Cfg())
+    assert out is not None
+    by_night = {r["night"]: r for r in out["nights"]}
+    assert by_night["2026-07-01"]["n_visits"] == 2      # both nocturnal ones, one night
+    assert "2026-07-02" not in by_night                 # the noon crow is not nocturnal traffic
+    assert by_night["2026-07-01"]["illum_pct"] is not None
+    assert out["note"]                                  # the yard-lighting caveat rides along

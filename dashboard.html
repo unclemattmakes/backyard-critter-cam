@@ -156,6 +156,9 @@
 <!-- Operator/viewer split (only shown when the rig has an operator_token configured): the one
      place a household device turns itself into an operator. refreshRole() fills it in. -->
 <span id="role-link" hidden style="cursor:pointer;text-decoration:underline;margin-left:6px" onclick="roleToggle()"></span>
+<!-- Who is typing. Free text, this browser only — attribution for the verdicts this device
+     records, because it cannot be added after the fact. refreshLabeler() fills it in. -->
+&middot; <span id="labeler-link" style="cursor:pointer;text-decoration:underline" onclick="labelerEdit()"></span>
 <span id="role-entry" hidden style="margin-left:6px"><input type="password" placeholder="operator token…" style="padding:2px 6px;background:rgba(0,0,0,.3);border:1px solid var(--rule2);border-radius:3px;color:inherit;font:inherit;width:130px" onkeydown="if(event.key==='Enter')roleSave()"><button class="fr-x" style="margin:0 0 0 4px;padding:3px 8px" onclick="roleSave()">unlock</button></span></div>
 
 <!-- Camera settings (popped out from the Live plate's Settings button) -->

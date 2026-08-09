@@ -33,8 +33,36 @@ window.fetch=function(url,opts){
     opts=opts||{};
     opts.headers=Object.assign({},opts.headers,{'X-Operator-Token':tok});
   }
+  // WHO is typing rides on every human verdict. The server reads `logged_by` on the label /
+  // confirm / sighting / life-event paths; injecting it here means no call site can forget it,
+  // and attribution is the one thing that CANNOT be added later — a verdict recorded anonymously
+  // is anonymous forever (db.py refuses to invent provenance after the fact).
+  const who=localStorage.getItem('cc-labeler');
+  if(who && opts && String(opts.method||'').toUpperCase()==='POST' && typeof opts.body==='string'){
+    try{ const b=JSON.parse(opts.body);
+      if(b && typeof b==='object' && !Array.isArray(b) && b.logged_by===undefined){
+        b.logged_by=who; opts=Object.assign({},opts,{body:JSON.stringify(b)});
+      }
+    }catch(e){ /* not JSON — leave it exactly as the caller built it */ }
+  }
   return __origFetch(url,opts);
 };
+/* The name tag itself: free text, this browser only, no account. Shown in the footer beside the
+   operator control so a household can tell whose call a label was. */
+function labelerName(){ return localStorage.getItem('cc-labeler')||''; }
+function refreshLabeler(){
+  const el=document.getElementById('labeler-link'); if(!el) return;
+  const who=labelerName();
+  el.textContent = who ? `labelling as ${who}` : 'sign your labels';
+  el.title = who ? 'Your verdicts are recorded under this name. Click to change it.'
+                 : 'Optional: put a name on the labels you confirm, so a household can tell whose call was whose.';
+}
+function labelerEdit(){
+  const who=(prompt('Label as (a first name is plenty; blank to clear):', labelerName())||'').trim();
+  if(who) localStorage.setItem('cc-labeler', who.slice(0,40));
+  else localStorage.removeItem('cc-labeler');
+  refreshLabeler();
+}
 async function refreshRole(){
   let r; try{ r=await fetch('/api/role').then(x=>x.json()); }catch(e){ return; }
   window.__role=r;
@@ -2486,7 +2514,7 @@ function maybeFirstRun(s){
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); refreshEvalStatus(); refreshRole();
+loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); refreshEvalStatus(); refreshRole(); refreshLabeler();
 // Land wherever the URL hash points — a tab, a profile, a day, a species sheet, a dated
 // dispatch (deep links and refresh keep their place); else the Visit Log — the
 // scroll-around-and-see-what-happened surface. maybeFirstRun still redirects a brand-new

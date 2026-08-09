@@ -317,3 +317,71 @@ def test_individual_motion_null_area_trend_counts_in_tracks_only(conn, db_path):
     assert m["tracks"] == 2
     assert (m["approach"], m["retreat"], m["steady"]) == (1, 0, 0)
     assert m["approach"] + m["retreat"] + m["steady"] == 1              # the NULL one counts to none
+
+
+# ---- the family group link on the roll call (2026-08-08) ----------------------------
+# "Stan + Kits" is evidence of STAN. Before this, a mother stamped with her family YESTERDAY
+# still read "overdue -- 8 days", because the group string is a separate individual_id.
+
+def test_rollcall_group_label_refreshes_its_base_name(conn, db_path):
+    for d in (12, 11, 10):                          # Stan is a regular, last SOLO 10 days ago
+        _add_named(conn, "Stan", days_ago=d)
+    _add_named(conn, "Stan + Kits", days_ago=0)     # ...but she was here last night with the kits
+    by = {c["id"]: c for c in stats.cast_rollcall(_cfg(db_path))["cast"]}
+    assert by["Stan"]["days_since"] == 0, "the family sighting is a sighting of Stan"
+    assert by["Stan"]["overdue"] is False
+    assert by["Stan"]["via_group"] == "Stan + Kits", "the card must say how it knows"
+    # The group keeps its own identity and its own crops; nothing is merged.
+    assert by["Stan"]["n_crops"] == 3 and by["Stan + Kits"]["n_crops"] == 1
+
+
+def test_rollcall_group_label_does_not_touch_a_stranger(conn, db_path):
+    _add_named(conn, "Pedro", days_ago=9)
+    _add_named(conn, "Stan + Kits", days_ago=0)
+    by = {c["id"]: c for c in stats.cast_rollcall(_cfg(db_path))["cast"]}
+    assert by["Pedro"]["days_since"] == 9 and "via_group" not in by["Pedro"]
+
+
+# ---- behaviour tags: the what-they-DID word ------------------------------------------
+
+def test_behaviour_tag_reads_the_three_cases():
+    # Long stay, barely moving: eating at the dish (corpus median moving_frac is 0.185).
+    assert stats._behaviour_tag(minutes=8.0, moving_frac=0.12, straightness=0.3) == "fed here"
+    # Brief and direct: crossing the frame.
+    assert stats._behaviour_tag(minutes=0.5, moving_frac=0.8, straightness=0.9) == "passed through"
+    assert stats._behaviour_tag(minutes=0.4, moving_frac=0.2, straightness=0.85) == "passed through"
+    # Neither: present a while, moving about.
+    assert stats._behaviour_tag(minutes=4.0, moving_frac=0.6, straightness=0.4) == "lingered"
+    # No motion data at all -> no claim.
+    assert stats._behaviour_tag(minutes=8.0, moving_frac=None, straightness=None) is None
+
+
+# ---- seasons_overview: the longitudinal view -----------------------------------------
+
+def test_seasons_overview_empty_db(conn, db_path):
+    s = stats.seasons_overview(_cfg(db_path))
+    assert s["species"] == [] and s["weeks"] == [] and s["accumulation"] == []
+
+
+def test_seasons_overview_weekly_grid_and_accumulation(conn, db_path):
+    def _v(species, iso):
+        db.insert_visit(conn, source="glass_door_cam", species=species, individual_id=None,
+                        started_at=iso, ended_at=iso, detection_count=1, max_confidence=0.9,
+                        representative_detection_id=None)
+    _v("raccoon", "2026-07-06T21:00:00-07:00")        # ISO week 28
+    _v("raccoon", "2026-07-07T21:00:00-07:00")        # week 28
+    _v("raccoon", "2026-07-13T21:00:00-07:00")        # week 29
+    _v("American crow", "2026-07-14T09:00:00-07:00")  # week 29, a new species
+    _v("door", "2026-07-14T09:30:00-07:00")           # denylisted furniture -> never a species
+    conn.commit()
+
+    s = stats.seasons_overview(_cfg(db_path))
+    assert s["weeks"] == ["2026-W28", "2026-W29"]
+    by = {x["species"]: x for x in s["species"]}
+    assert "door" not in by, "the non-critter denylist applies to the seasons grid too"
+    assert by["raccoon"]["weekly"] == [2, 1]          # one bar per week, in week order
+    assert by["American crow"]["weekly"] == [0, 1]    # absent weeks are zero, not missing
+    assert by["raccoon"]["first"] == "2026-07-06" and by["raccoon"]["last"] == "2026-07-13"
+    # The accumulation curve is one point per species DEBUT, in chronological order.
+    assert [a["species"] for a in s["accumulation"]] == ["raccoon", "American crow"]
+    assert [a["n_species"] for a in s["accumulation"]] == [1, 2]

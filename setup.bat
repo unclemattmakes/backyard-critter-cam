@@ -48,18 +48,23 @@ REM      7.5 - 8.9 (Turing/Ampere/Ada)       -> cu130 fine (cu126 also fine)
 REM      <  7.5 (Maxwell/Pascal/Volta)       -> cu126: cu130 dropped these; installing it would
 REM                                             silently cost this machine its GPU
 REM    Unreadable capability (odd driver) -> cu130, the pre-2026-08 behaviour.
+REM    The cut is 7.5, and it MUST compare the minor version too: Volta is sm_70 and Turing is
+REM    sm_75, so a major-only test (the first version of this, 2026-08-08) sent every Volta card
+REM    to cu130 -- precisely the silent GPU loss the check exists to prevent.
 where nvidia-smi >nul 2>nul
 if %errorlevel%==0 (
-  set "CC="
-  for /f "usebackq tokens=1 delims=." %%c in (`nvidia-smi --query-gpu=compute_cap --format=csv^,noheader 2^>nul`) do if not defined CC set "CC=%%c"
-  if not defined CC set "CC=99"
-  if !CC! LSS 7 (
-    echo NVIDIA GPU detected ^(compute capability !CC!.x -- Maxwell/Pascal/Volta era^).
+  set "CCMAJ=" & set "CCMIN="
+  for /f "usebackq tokens=1,2 delims=." %%a in (`nvidia-smi --query-gpu=compute_cap --format=csv^,noheader 2^>nul`) do if not defined CCMAJ (set "CCMAJ=%%a" & set "CCMIN=%%b")
+  if not defined CCMAJ (set "CCMAJ=99" & set "CCMIN=0")
+  if not defined CCMIN set "CCMIN=0"
+  set /a CC10=CCMAJ*10+CCMIN
+  if !CC10! LSS 75 (
+    echo NVIDIA GPU detected ^(compute capability !CCMAJ!.!CCMIN! -- Maxwell/Pascal/Volta era^).
     echo The newest CUDA wheels dropped this generation, so installing the cu126 build
     echo -- with cu130 this card would silently go unused.
     "%VPY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 || (echo [ERROR] torch install failed. & pause & exit /b 1)
   ) else (
-    echo NVIDIA GPU detected ^(compute capability !CC!.x^) -- installing the CUDA ^(cu130^) torch build ...
+    echo NVIDIA GPU detected ^(compute capability !CCMAJ!.!CCMIN!^) -- installing the CUDA ^(cu130^) torch build ...
     "%VPY%" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130 || (echo [ERROR] torch install failed. & pause & exit /b 1)
   )
 ) else (

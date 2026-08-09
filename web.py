@@ -1040,7 +1040,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                             row = db.add_life_event(
                                 conn, data.get("name"), data.get("note"),
                                 event_date=data.get("date") or None,
-                                labeled_by=(str(data.get("logged_by") or "").strip()[:40] or None))
+                                labeled_by=_labeler(data))
                         finally:
                             conn.close()
                         self._json({"ok": True, "event": row})
@@ -1163,6 +1163,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 kw["species"] = str(data["species"]).strip()
             if data.get("verify"):
                 kw["verify"] = True
+            kw["labeled_by"] = _labeler(data)
             conn = db.connect(cfg.db_path)
             try:
                 self._json({"ok": True, **db.apply_visit_label(conn, **kw)})
@@ -1191,7 +1192,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             # (optional, self-reported, length-capped); a VIEWER's log additionally records with
             # stamp=False -- testimony in live_sightings, nothing written onto crops.
             operator = self._is_operator()
-            logged_by = (str(data.get("logged_by") or "").strip()[:40] or None)
+            logged_by = _labeler(data)
             conn = db.connect(cfg.db_path)
             try:
                 res = db.record_live_sighting(
@@ -1223,7 +1224,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             reject = bool(data.get("reject")) and name is None
             conn = db.connect(cfg.db_path)
             try:
-                n = db.label_visit(conn, vid, name, reject=reject)
+                n = db.label_visit(conn, vid, name, reject=reject,
+                                   labeled_by=_labeler(data))
                 self._json({"ok": True, "visit_id": vid, "name": name, "stamped": n,
                             "rejected": reject})
             finally:
@@ -1453,6 +1455,16 @@ def _naming_status() -> dict:
         return data
     except Exception:
         return {"state": "off"}
+
+
+def _labeler(data) -> str | None:
+    """Who is typing, self-reported by the browser (`logged_by`), length-capped. Free text and
+    unverified on purpose -- this is a household name tag, not an account: it answers "whose
+    verdict was that?" when several people label, and it is what a per-labeller agreement rate
+    would key on later. NULL means the operator, before attribution existed. Attribution cannot
+    be back-filled honestly (db.py refuses to invent provenance), so every write path that takes
+    a human verdict passes through here."""
+    return str((data or {}).get("logged_by") or "").strip()[:40] or None
 
 
 def _operator_decision(token_cfg, peer_host, sent_token) -> bool:
