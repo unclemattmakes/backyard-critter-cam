@@ -139,11 +139,25 @@ top-1 before a single pixel is blanked. Keep it a scratch script that writes to 
 the decay result stands as an animal fact. Well above chance → a large share of what has been
 called identity is scene memory, and the next move is capture geometry, not a better backbone.
 
-### 2.2 The un-blend threshold sweep (`reid_track_match_threshold = 0.55`)
-Shipped without its specificity sweep. The measurement is **free and needs no new labels**: on
-confirmed **solo** visits the splitter must produce exactly one cluster, so the over-split rate
-per threshold falls straight out of data already on disk. Do this before 1.2, so the D1 session
-is not fighting a badly-cut threshold.
+### 2.2 The un-blend threshold sweep — **run 2026-08-09; there is no operating point**
+Both halves are done and both came back negative, which is the useful kind of answer: **the D1
+session (§1.2) is not being held up by a badly-cut threshold, so go and do it.** Numbers and the
+reason they are two different questions are in [Killed, with reasons](#killed-with-reasons); the
+short version:
+
+- This entry conflated two numbers. Over-split is decided by the **clustering distance**
+  (`unblend_visit_stills(distance=0.45)`); `reid_track_match_threshold` gates whether a cluster
+  gets a name **suggestion** and cannot change how many clusters there are.
+- Sweeping the distance 0.20 → 0.70 moves solo over-split only 72.2% → 54.3%, against a
+  **structural floor of 46%** that no threshold can touch: 56 visits contain a tracklet with no
+  embedding at all (its own group by construction) and 13 contain a same-frame cannot-link. The
+  lever is embedding coverage — 22.0% of still-tracklets carry no vector — not the cut.
+- Sweeping the suggestion threshold on its own terms: at the shipped 0.55 it names the **wrong
+  animal 46.9% of the time**. Written into `config.py` next to the number.
+
+What it changes downstream: over-splitting a solo visit costs the D1 labeller extra clicks, not
+correctness (every group is the same animal and gets the same name). The *suggestion* is the part
+to distrust — treat it as a prompt, never as a default.
 
 ---
 
@@ -474,6 +488,41 @@ so the family-era questions ("did all four show tonight?", per-litter growth) ne
 instrument — the human eye via the live-sighting log today, and mass if a load cell ever lands.
 It also flags a real casualty worth remembering: **the camera swap invalidated the depth
 calibration**, so any future pixel-size reasoning has to be refit per camera era.
+
+### An operating point for the un-blend thresholds — killed by its own sweep (§2.2)
+Measured 2026-08-09 against a **snapshot** of the live DB, over 151 human-confirmed solo raccoon
+visits (487 still-tracklets, 341 groups, 139 templates across 6 names).
+
+**Snapshot, not the live DB, and that is a finding in itself.** The first run of this sweep was
+void: `visits.refresh` DELETEs and re-INSERTs the whole visits table, so every visit id changes
+each time the rig collapses detections into visits. Ids climbed past the corpus mid-sweep and later
+passes silently read "no such visit" — producing a clean-looking table in which the *tracklet*
+count moved with the *clustering* parameter, which is impossible. Anything measuring this database
+across more than one pass must snapshot first, or key on something that is not a visit id.
+
+**Half one — the clustering distance, which is what "over-split" actually tests.** On a confirmed
+solo visit the splitter must return exactly one group:
+
+| distance | 0.20 | 0.35 | **0.45** | 0.55 | 0.70 |
+|---|---|---|---|---|---|
+| solo visits over-split | 72.2% | 70.9% | **68.9%** | 64.2% | 54.3% |
+| multi visits under-split | 11.4% | 11.4% | **11.4%** | 14.3% | 14.3% |
+
+Eighteen points of over-split across the whole usable range, three of under-split. There is no
+knee. And 69 of the 111 fragmenting solo visits have a **structural floor** of ≥ 2 groups that no
+distance can move: 56 contain a tracklet with no embedding at all (vectorless tracklets are their
+own group by construction) and 13 contain a same-frame cannot-link. Of the 42 where the distance
+genuinely decides, 35 still over-split at the shipped value. **The lever is embedding coverage —
+22.0% of still-tracklets carry no MegaDescriptor vector — not the cut.**
+
+**Half two — `reid_track_match_threshold`, which gates the name suggestion.** Leave-one-visit-out
+with a same-day embargo: shown 56.3 / 46.9 / 40.5 / 34.3 / 18.2% and right 45.3 / 53.1 / 60.1 /
+63.2 / 72.6% at 0.40 / 0.55 / 0.65 / 0.70 / 0.80. Accuracy is bought one-for-one with coverage all
+the way up, and the shipped 0.55 sits at 53.1% against a ~34.5% most-frequent-name baseline. The
+confusion is corpus-wide rather than one bad pair (Notch→Stan 25, Stan→Notch 12, Stan→Pedro 8,
+Pedro→Notch 8), which is the **2026-08-05 identity decay showing up in still-tracklet space** —
+where prototypes average 5–30 crops from one session and are thinner than the visit prototypes the
+eval measured. Nothing here is fixable by choosing a better number.
 
 ### Lowering `COVER_MIN_FRACTION` to unblock the refimg veto — killed by the replay
 The obvious reading of §1.4's first draft: coverage abstains on 94.9% of boxes, so lower the bar.

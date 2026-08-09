@@ -516,8 +516,24 @@ class Config:
     # A still-tracklet cluster's centroid vs the confirmed-visit templates: suggestions show at or
     # above this cosine. Its own regime, like the clip threshold: a tracklet averages 5-30 crops
     # from ONE session, so it sits between crop-level noise (~0.5 ceiling) and full visit
-    # prototypes (0.83+). 0.55 is a provisional cut pending an eval.py sweep -- suggestions are
-    # human-confirmed, so a loose value costs a click, not contamination.
+    # prototypes (0.83+).
+    # SWEPT 2026-08-09 (n=151 confirmed-solo raccoon visits, 341 groups, 139 templates over 6
+    # names; leave-one-visit-out with a same-DAY embargo, because session leakage is what the
+    # 2026-08-05 identity eval measured at top-1 0.818 -> 0.482). On a confirmed-solo visit every
+    # cluster is that one animal, so any other name is wrong:
+    #     thr   0.40   0.55   0.65   0.70   0.80
+    #     shown 56.3%  46.9%  40.5%  34.3%  18.2%
+    #     right 45.3%  53.1%  60.1%  63.2%  72.6%
+    # THERE IS NO OPERATING POINT. At the shipped cut the suggestion names the wrong animal
+    # 46.9% of the time, against a most-frequent-name baseline of ~34.5%; buying accuracy costs
+    # coverage roughly one-for-one all the way up. The confusion is not a single bad pair --
+    # Notch->Stan 25, Stan->Notch 12, Stan->Pedro 8, Pedro->Notch 8 -- it is the corpus-wide
+    # identity decay showing up in still-tracklet space, where prototypes are thinner than the
+    # visit prototypes the eval measured. The comment this replaces claimed "a loose value costs
+    # a click, not contamination"; at 53% that is optimistic, because a wrong suggestion sitting
+    # next to a cluster invites a wrong click into ground truth. Changing the number is an
+    # operating-point decision (see docs/deferred-work.md 1.3 for why those are the operator's),
+    # so it stays at 0.55 with the measurement written down instead.
     reid_track_match_threshold: float = 0.55
     # AUTO-ASSIGN (the "review by exception" tier): the nightly batch (run_clipmotion.bat ->
     # individuals.py --auto-assign) names a solo visit AUTOMATICALLY when its best match clears
