@@ -98,8 +98,64 @@ def _profile(conn, where_sql, params, label):
     }
 
 
-def species_profile(conn, species: str):
-    return _profile(conn, "species = ?", [species], species)
+def sun_anchor(starts, cfg):
+    """Arrival times re-expressed as MINUTES AFTER the sun event that actually paces the animal
+    -- the season-proof version of the clock-hour histogram. Clock hours smear as sunset walks
+    (~45 min across this corpus already, accelerating into autumn): a raccoon that faithfully
+    tracks dusk looks like it "drifts". Anchored, it just reads "~40 min after dusk" all year.
+
+    Guild first: arrivals are NOCTURNAL when most of them fall outside [dawn..dusk] of their own
+    day. The nocturnal guild anchors to DUSK -- and a post-midnight arrival to the PREVIOUS
+    evening's dusk (the digest's own night convention: the night of day d runs dusk(d) ->
+    dawn(d+1); subtracting same-date dusk from a 4 AM opossum yields nonsense negatives). The
+    diurnal guild anchors to DAWN of its own day; minutes-after-sunset is meaningless for a
+    junco. Events are stats._sun's CIVIL dawn/dusk (that's what the cache holds), so every label
+    says "dusk", not "sunset" -- they differ by ~25-35 min at this latitude and the label must
+    not lie. Returns None without lat/lon (stats._sun falls back to fixed 06:00/18:00, which
+    would silently fake precision here).
+
+    `weekly` carries the per-ISO-week median offset for weeks with >= 5 arrivals -- the drift
+    line. Expect it to become legible over autumn; the headline median is useful today."""
+    if getattr(cfg, "latitude", None) is None or getattr(cfg, "longitude", None) is None:
+        return None
+    from stats import _sun   # lazy: stats imports only db+stdlib, so no cycle; reuse its cache
+    from datetime import timedelta
+    if not starts:
+        return None
+    offs = []                                   # (start_dt, offset_minutes)
+    nocturnal_votes = 0
+    for s in starts:
+        dawn, dusk = _sun(cfg, s.date())
+        if s < dawn or s >= dusk:
+            nocturnal_votes += 1
+    nocturnal = nocturnal_votes > len(starts) / 2
+    for s in starts:
+        dawn, dusk = _sun(cfg, s.date())
+        if nocturnal:
+            anchor = _sun(cfg, s.date() - timedelta(days=1))[1] if s < dawn else dusk
+        else:
+            anchor = dawn
+        offs.append((s, round((s - anchor).total_seconds() / 60.0)))
+    offs.sort(key=lambda x: x[1])
+    med = offs[len(offs) // 2][1]
+    weekly = Counter()
+    by_week = {}
+    for s, o in offs:
+        wk = s.strftime("%G-W%V")
+        by_week.setdefault(wk, []).append(o)
+    weekly = [{"week": wk, "median_offset_min": sorted(v)[len(v) // 2], "n": len(v)}
+              for wk, v in sorted(by_week.items()) if len(v) >= 5]
+    return {"anchor": "dusk" if nocturnal else "dawn", "median_offset_min": med,
+            "n": len(offs), "weekly": weekly}
+
+
+def species_profile(conn, species: str, cfg=None):
+    p = _profile(conn, "species = ?", [species], species)
+    if p and cfg is not None:
+        starts = [s for s in (_parse(r["started_at"]) for r in conn.execute(
+            "SELECT started_at FROM visits WHERE species = ?", [species])) if s]
+        p["sun_anchor"] = sun_anchor(starts, cfg)
+    return p
 
 
 def individual_profile(conn, individual_id: str):
@@ -126,6 +182,145 @@ def co_occurrence(conn):
             for j in range(i + 1, len(sl)):
                 pairs[(sl[i], sl[j])] += 1
     return pairs
+
+
+def yard_politics(conn, *, min_events: int = 8, horizon_h: float = 24.0):
+    """Directional interaction between species -- the question 'seen together' can't answer,
+    from data already in the visits table. Two measurements, both with sample floors so a thin
+    pair never headlines:
+
+      SUPPRESSION: after an A visit ends, how long until the next B arrival on the same camera,
+      vs B's own baseline gap between visits? A factor well above 1 reads 'B stays away longer
+      after A has been' (does the cat suppress the opossum?). Medians, same-source only, capped
+      at `horizon_h` so an overnight absence doesn't drown the signal.
+
+      YIELDING: B is mid-visit when A arrives -- does B's visit END within three minutes of A's
+      arrival? The rate over all such encounters is who-gives-up-the-yard-to-whom.
+
+    Both are DESCRIPTIVE (observation, not experiment: a shared cause -- dawn, rain, the dish
+    refilled -- can move both species). The payload says so."""
+    rows = conn.execute(
+        "SELECT source, species, started_at, ended_at FROM visits "
+        "WHERE species IS NOT NULL ORDER BY started_at").fetchall()
+    by_src = {}
+    for r in rows:
+        sp = (r["species"] or "").lower()
+        if sp in _NON_CRITTER:
+            continue
+        a, b = _parse(r["started_at"]), _parse(r["ended_at"])
+        if a is None or b is None:
+            continue
+        by_src.setdefault(r["source"], []).append((a, b, r["species"]))
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if xs else None
+
+    # GUILD GATE. Without it the top 'suppressions' were all nocturnal-vs-diurnal pairs at 30x+
+    # -- a sparrow does not avoid a raccoon, it avoids the night; the day/night cycle IS the
+    # shared cause the caveat warns about, so filter it out structurally: only compare species
+    # whose active hours genuinely overlap (>= 2 shared hours, each holding >= 5% of that
+    # species' arrivals). Cat-vs-opossum survives; raccoon-vs-goldfinch never fires.
+    active_hours = {}
+    for vs in by_src.values():
+        for a, _b, sp in vs:
+            active_hours.setdefault(sp, Counter())[a.hour] += 1
+    def hours_of(sp):
+        c = active_hours.get(sp, Counter())
+        total = sum(c.values()) or 1
+        return {h for h, n in c.items() if n / total >= 0.05}
+    def share_hours(A, B):
+        return len(hours_of(A) & hours_of(B)) >= 2
+
+    # Baseline inter-arrival gap per species (minutes, capped at the horizon), per source pooled.
+    base_gaps = Counter()
+    gaps_by_sp = {}
+    for src, vs in by_src.items():
+        per_sp = {}
+        for a, b, sp in vs:
+            per_sp.setdefault(sp, []).append(a)
+        for sp, starts in per_sp.items():
+            for i in range(1, len(starts)):
+                g = (starts[i] - starts[i - 1]).total_seconds() / 60.0
+                if g <= horizon_h * 60:
+                    gaps_by_sp.setdefault(sp, []).append(g)
+
+    suppression, yields = [], []
+    species = sorted({sp for vs in by_src.values() for _a, _b, sp in vs})
+    for A in species:
+        for B in species:
+            if A == B or not share_hours(A, B):
+                continue
+            after, n_enc, n_yield = [], 0, 0
+            for src, vs in by_src.items():
+                b_starts = sorted(a for a, _b, sp in vs if sp == B)
+                for a0, a1, sp in vs:
+                    if sp != A:
+                        continue
+                    # SUPPRESSION: next B arrival after this A visit ends.
+                    nxt = next((s for s in b_starts if s > a1), None)
+                    if nxt is not None:
+                        g = (nxt - a1).total_seconds() / 60.0
+                        if g <= horizon_h * 60:
+                            after.append(g)
+                    # YIELDING: B mid-visit when A arrives; does B leave within 3 minutes?
+                    for b0, b1, spB in vs:
+                        if spB != B or not (b0 <= a0 <= b1):
+                            continue
+                        n_enc += 1
+                        if (b1 - a0).total_seconds() <= 180:
+                            n_yield += 1
+            base = median(gaps_by_sp.get(B, []))
+            aft = median(after)
+            if base and aft and len(after) >= min_events:
+                factor = aft / base
+                if factor >= 1.5:
+                    suppression.append({"a": A, "b": B, "n": len(after),
+                                        "baseline_min": round(base), "after_min": round(aft),
+                                        "factor": round(factor, 1)})
+            if n_enc >= min_events and n_yield / n_enc >= 0.5:
+                yields.append({"a": A, "b": B, "n_encounters": n_enc, "n_yield": n_yield,
+                               "rate": round(n_yield / n_enc, 2)})
+    suppression.sort(key=lambda x: -x["factor"])
+    yields.sort(key=lambda x: -x["rate"])
+    return {"suppression": suppression[:8], "yields": yields[:8],
+            "note": "observational, not causal -- dawn, rain, or a refilled dish moves two "
+                    "species at once; read as 'the pattern holds', never 'A causes B'"}
+
+
+def moon_activity(conn, cfg, nights: int = 90):
+    """Per-night nocturnal visit counts beside the moon's illumination -- the chart that turns
+    the digest's decorative moon glyph into a question with an answer either way ('urban
+    raccoons ignore the moon in a lit yard' is itself a finding). A night is the digest's own
+    convention: dusk of day d to dawn of d+1 (stats._sun; fixed 18:00/06:00 without lat/lon).
+    The payload carries its caveat -- yard lighting may dominate any lunar signal."""
+    from stats import _sun, _moon
+    from datetime import timedelta
+    rows = conn.execute(
+        "SELECT started_at, species FROM visits WHERE species IS NOT NULL").fetchall()
+    per_night = Counter()
+    for r in rows:
+        if (r["species"] or "").lower() in _NON_CRITTER:
+            continue
+        s = _parse(r["started_at"])
+        if s is None:
+            continue
+        dawn, dusk = _sun(cfg, s.date())
+        if s >= dusk:
+            per_night[s.date()] += 1
+        elif s < dawn:
+            per_night[s.date() - timedelta(days=1)] += 1
+    if not per_night:
+        return None
+    recent = sorted(per_night)[-nights:]
+    out = []
+    for d in recent:
+        m = _moon(d)
+        out.append({"night": d.isoformat(), "n_visits": per_night[d],
+                    "illum_pct": (m or {}).get("illum_pct")})
+    return {"nights": out,
+            "note": "nocturnal visits per night vs moon illumination; this yard has artificial "
+                    "light, which may dominate any lunar signal"}
 
 
 def _critter_species(conn):
@@ -170,7 +365,7 @@ def overview(cfg, recent: int = 40) -> dict:
                     "need_rebuild": True}
         species = []
         for sp in _critter_species(conn):
-            p = species_profile(conn, sp)
+            p = species_profile(conn, sp, cfg)
             if not p:
                 continue
             species.append({
@@ -178,6 +373,7 @@ def overview(cfg, recent: int = 40) -> dict:
                 "dwell_median_s": p["dwell_median_s"], "peak_hour": p["peak_hour"],
                 "typical_window": p["typical_window"], "arrival_hours": p["arrival_hours"],
                 "crops_per_visit": p["crops_per_visit"],
+                "sun_anchor": p.get("sun_anchor"),
             })
         species.sort(key=lambda s: -s["n_visits"])
         co = [{"a": a, "b": b, "n": n} for (a, b), n in co_occurrence(conn).most_common(12)]
@@ -201,7 +397,8 @@ def overview(cfg, recent: int = 40) -> dict:
                 "verdict": verdict, "notes": notes,
             })
         total = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
-        return {"visits": total, "species": species, "co_occurrence": co, "flags": flags}
+        return {"visits": total, "species": species, "co_occurrence": co, "flags": flags,
+                "moon": moon_activity(conn, cfg), "politics": yard_politics(conn)}
     finally:
         conn.close()
 

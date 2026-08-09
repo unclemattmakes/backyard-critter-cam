@@ -400,6 +400,53 @@ def individuals_overview(cfg, thumbs: int = 6) -> dict:
         conn.close()
 
 
+def seasons_overview(cfg) -> dict:
+    """The longitudinal view the Calendar's day cells can't give: per-species WEEKLY visit
+    counts (the sparkline grid), first-ever and last-seen dates, and the yard's
+    species-accumulation curve. This is where "the crows collapsed after mid-July" and "raccoon
+    traffic doubled when the kits emerged" become visible instead of remembered -- and where
+    next year's "same week last year" comparison will live, so building it now starts the clock
+    on the yard's first annual cycle. Visits, not crops (one lingering critter fires hundreds of
+    detections); denylist applied; read-only."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"species": [], "weeks": [], "accumulation": []}
+    try:
+        rows = conn.execute(
+            "SELECT started_at, species FROM visits WHERE species IS NOT NULL "
+            "ORDER BY started_at").fetchall()
+    finally:
+        conn.close()
+    per = defaultdict(lambda: {"weeks": Counter(), "first": None, "last": None, "n": 0})
+    weeks_seen = set()
+    accumulation = []
+    seen_species = set()
+    for r in rows:
+        sp = r["species"]
+        if (sp or "").lower() in _NON_CRITTER:
+            continue
+        dt = _parse(r["started_at"])
+        if dt is None:
+            continue
+        wk = dt.strftime("%G-W%V")
+        weeks_seen.add(wk)
+        p = per[sp]
+        p["weeks"][wk] += 1
+        p["n"] += 1
+        if p["first"] is None:
+            p["first"] = dt.date().isoformat()
+        p["last"] = dt.date().isoformat()
+        if sp not in seen_species:
+            seen_species.add(sp)
+            accumulation.append({"date": dt.date().isoformat(), "n_species": len(seen_species),
+                                 "species": sp})
+    weeks = sorted(weeks_seen)
+    species = [{"species": sp, "n_visits": p["n"], "first": p["first"], "last": p["last"],
+                "weekly": [p["weeks"].get(w, 0) for w in weeks]}
+               for sp, p in sorted(per.items(), key=lambda kv: -kv[1]["n"])]
+    return {"weeks": weeks, "species": species, "accumulation": accumulation}
+
+
 def cast_rollcall(cfg, now=None) -> dict:
     """The named cast with last-seen + an 'overdue' flag -- the daily "who's back / who hasn't
     shown" roll for the Dispatch and Individuals tab. Placeholder clusters (raccoon_c01) are
@@ -444,6 +491,25 @@ def cast_rollcall(cfg, now=None) -> dict:
                 "typical_gap_days": med_gap, "regular": regular, "overdue": overdue,
                 "crop": (crop["crop_path"].replace("\\", "/") if crop and crop["crop_path"] else None),
             })
+        # FAMILY LINK (2026-08-08): "Stan + Kits" is evidence of STAN. Before this, the solo
+        # identity read "overdue -- 8 days" while her family group was stamped YESTERDAY: the
+        # roll was calling a present animal missing, because the group string is a separate
+        # individual_id to the DB. A group label's recency now updates its BASE name's
+        # last_seen/days_since/overdue (never its counts -- the group's crops stay the
+        # group's), and the card says how it knows (`via_group`).
+        solos = {c["id"].casefold(): c for c in cast if not db.is_group_label(c["id"])}
+        for c in cast:
+            if not db.is_group_label(c["id"]):
+                continue
+            base = solos.get(c["id"].split(" + ", 1)[0].strip().casefold())
+            if base is None or c["days_since"] is None:
+                continue
+            if base["days_since"] is None or c["days_since"] < base["days_since"]:
+                base["days_since"] = c["days_since"]
+                base["last_seen"] = c["last_seen"]
+                base["via_group"] = c["id"]
+                base["overdue"] = bool(base["regular"] and base["typical_gap_days"]
+                                       and base["days_since"] > max(2, 2 * base["typical_gap_days"]))
         cast.sort(key=lambda c: (not c["overdue"],
                                  c["days_since"] if c["days_since"] is not None else 1e9))
         return {"cast": cast, "as_of": now.isoformat()}
@@ -460,6 +526,22 @@ def cast_rollcall(cfg, now=None) -> dict:
 # a nearer or larger animal reads "faster" for the same real motion. Treat as descriptive, not
 # authoritative (matches the documented re-ID caveat -- motion is unvalidated as an ID/metric).
 # ---------------------------------------------------------------------------
+
+def _behaviour_tag(minutes, moving_frac, straightness):
+    """A coarse what-they-DID word from the stored motion features -- 'fed here' / 'passed
+    through' / 'lingered'. The corpus median moving_frac is 0.185 (animals at this dish are
+    mostly stationary, i.e. eating), yet no surface ever said so. This is the cheapest possible
+    behaviour classification: three features that survived measurement (gait is dead at this
+    frame rate -- 27 of 25,041 tracks resolve a stride), thresholds set by eyeball against real
+    clips, worded as a reading, never a verdict."""
+    if moving_frac is None:
+        return None
+    if minutes >= 3 and moving_frac <= 0.30:
+        return "fed here"
+    if minutes < 1.5 and (moving_frac >= 0.5 or (straightness or 0) >= 0.7):
+        return "passed through"
+    return "lingered"
+
 
 def _approach_label(mean_area_trend) -> str:
     """area_trend is end/start box-area: >1.15 the animal grew in frame (approached), <0.85 it
@@ -512,14 +594,17 @@ def visit_motion(cfg, visit_id) -> dict:
 
         peaks = [r["peak_speed"] for r in tracks if r["peak_speed"] is not None]
         area = _mean("area_trend")
+        mins = (end - start).total_seconds() / 60.0
+        mfm, stm = _mean("moving_frac"), _mean("straightness")
         return {
             "tracks": len(tracks),
             "avg_speed": _mean("avg_speed"),
             "peak_speed": round(max(peaks), 4) if peaks else None,
-            "straightness": _mean("straightness"),
-            "moving_frac": _mean("moving_frac"),
+            "straightness": stm,
+            "moving_frac": mfm,
             "area_trend": area,
             "approach": _approach_label(area),
+            "tag": _behaviour_tag(mins, mfm, stm),
         }
     finally:
         conn.close()
@@ -1100,7 +1185,7 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         return {"empty": True, "edition": edition, "reason": "no database yet"}
     raw = conn.execute(
         "SELECT id, timestamp, source, detection_class, species, confidence, species_confidence, "
-        "crop_path, crop_quality, individual_id, "
+        "species_verified, crop_path, crop_quality, individual_id, "
         "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
         "FROM detections ORDER BY timestamp").fetchall()
     clips = load_clips(conn)
@@ -1114,6 +1199,7 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             "id": r["id"], "dt": dt, "timestamp": r["timestamp"], "source": r["source"],
             "detection_class": r["detection_class"], "species": r["species"],
             "confidence": r["confidence"] or 0.0, "species_confidence": r["species_confidence"],
+            "verified": r["species_verified"],
             "crop_path": r["crop_path"], "label": r["species"] or r["detection_class"],
             "crop_quality": r["crop_quality"], "individual_id": r["individual_id"],
             "bbox_x1": r["bbox_x1"], "bbox_y1": r["bbox_y1"], "bbox_x2": r["bbox_x2"],
@@ -1179,6 +1265,12 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             ((start - timedelta(minutes=5)).isoformat(), end.isoformat())).fetchall()
     except Exception:
         period_tracks = []                       # an older DB without clip_tracks
+    # EFFORT: was the primary camera even watching this period? (coverage_events ledger --
+    # written by the rig at open/read-fail/reconnect/stop since 2026-08-08.) None = unknown
+    # (the ledger predates this period), and unknown stays silent: absence of evidence must
+    # never render as evidence of coverage. With a known dark stretch, the Dispatch says so
+    # beside its absence claims -- a dark camera is not an empty yard.
+    dark_s = db.coverage_dark_seconds(conn, cfg.source, start, end)
     conn.close()
 
     # --- visits over the period, attributed to every species they contain ---
@@ -1209,11 +1301,15 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             mf = [t[2] for t in vtracks if t[2] is not None]
             st = [t[3] for t in vtracks if t[3] is not None]
             tr = [t[4] for t in vtracks if t[4] is not None]
+            mins = (v["end"] - v["start"]).total_seconds() / 60.0
+            mfm = round(sum(mf) / len(mf), 2) if mf else None
+            stm = round(sum(st) / len(st), 2) if st else None
             motion = {
                 "tracks": len(vtracks),
                 "approach": _approach_label(sum(tr) / len(tr) if tr else None),
-                "straightness": round(sum(st) / len(st), 2) if st else None,
-                "moving_frac": round(sum(mf) / len(mf), 2) if mf else None,
+                "straightness": stm,
+                "moving_frac": mfm,
+                "tag": _behaviour_tag(mins, mfm, stm),
             }
         visit_log.append({
             "start": v["start"].isoformat(), "end": v["end"].isoformat(),
@@ -1273,9 +1369,51 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             "clip": _clip_out(clip_at(clips, rep["source"], rep["dt"])),
         })
 
+    # --- SURPRISING SIGHTINGS: the temporal prior turned back onto the label (2026-08-08) ---
+    # A night roll listing goldfinches at 2 AM is almost never a goldfinch -- it is a kit-melee
+    # crop the classifier forced onto the nearest species, and counting it made one family
+    # night read "27 species". The Off-Pattern panel already KNEW ("usually 6am-10am" printed
+    # beside a midnight sighting) but the knowledge was display-only; this feeds it back into
+    # what the digest asserts. Test: the share of a species' REFERENCE activity that falls in
+    # this edition's hours -- the reference being its human-VERIFIED crops when at least a
+    # dozen verdicts exist, else all its crops. Verified-first is what breaks the circularity:
+    # the all-time histogram of a polluted label is polluted too (this DB's "Anna's hummingbird,
+    # usually 16-01h"), but the verified subset is the human's own eyes. Under 15% => flagged
+    # `surprising`: still listed (its crops are exactly the ones worth a ✎), sorted last,
+    # excluded from the headline species count and from novelty -- listed as a question, not
+    # asserted as fauna. A verified crop IN this period clears the flag outright.
+    period_hours = set()
+    _cur = start
+    while _cur < end:
+        period_hours.add(_cur.hour)
+        _cur += timedelta(hours=1)
+    n_surprising = 0
+    for s in species_roll:
+        sp = s["species"]
+        if sp == "animal":
+            continue
+        srs = [r for r in pr if r["label"] == sp]
+        if any(r.get("verified") == 1 for r in srs):
+            continue                                   # the human has seen one this period: real
+        ref = [r for r in sp_all[sp] if r.get("verified") == 1]
+        if len(ref) < 12:
+            ref = sp_all[sp]
+        if not ref:
+            continue
+        in_band = sum(1 for r in ref if r["dt"].hour in period_hours)
+        frac = in_band / len(ref)
+        if frac < 0.15:
+            s["surprising"] = True
+            s["surprise_note"] = (f"only {round(frac * 100)}% of this species' "
+                                  f"{'verified ' if len(ref) != len(sp_all[sp]) else ''}record falls "
+                                  f"in {label} hours -- likely a mislabeled crop; worth a ✎")
+            n_surprising += 1
+    species_roll.sort(key=lambda s: bool(s.get("surprising")))   # stable: questions sink last
+
     # --- headline novelty (first-ever, then rarest first) + quiet regulars ---
     alltime = {sp: len(rs) for sp, rs in sp_all.items()}
     novel_cands = [s for s in species_roll if s["species"] != "animal"
+                   and not s.get("surprising")
                    and (s["novelty"]["first_ever"] or (s["novelty"]["days_since"] or 0) >= novelty_days)]
     novel_cands.sort(key=lambda s: (not s["novelty"]["first_ever"], alltime.get(s["species"], 0)))
     novel = [s["species"] for s in novel_cands[:6]]
@@ -1324,8 +1462,13 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         for x in reel:
             x.pop("_score", None)
 
+    period_s = max(1.0, (end - start).total_seconds())
     out.update({
         "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
+        "n_surprising": n_surprising,
+        "coverage": (None if dark_s is None else
+                     {"source": cfg.source, "dark_minutes": round(dark_s / 60),
+                      "frac_dark": round(dark_s / period_s, 2)}),
         "novel": novel, "quiet": quiet[:4], "reel": reel, "visit_log": visit_log,
         "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
                   "conf": round(plate["species_confidence"] or plate["confidence"] or 0.0, 3),
