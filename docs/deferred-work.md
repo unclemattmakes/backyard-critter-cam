@@ -108,11 +108,40 @@ now that there is a week of flags and an hourly census line to read beside them.
 Both are cheap, both are one-off scripts rather than shipped features, and both change what is
 worth building next. This is the project's own order of operations: measure, then believe.
 
-### 2.1 The background-identity diagnostic (the eval's most consequential unrun test)
-**The question:** does the *background* identify the animal? Embed crops with the animal blanked
-and run the identical session-blocked leave-one-visit-out. If background alone scores well above
-chance, then every AUC and the whole decay interpretation is partly a story about where an animal
-stood, and the priority shifts from modelling to **capture**.
+### 2.1 The background-identity diagnostic — **RUN 2026-08-09. It is scene memory.**
+**The question was:** does the *background* identify the animal? **The answer is yes, and it is
+most of the signal.** Session-blocked leave-one-visit-out over the same 139 confirmed-solo raccoon
+visits, same protocol, same corpus — the only difference is which pixels the embedder sees:
+
+| arm | blocked top-1 | at a 7-day embargo | at 21 days |
+|---|---|---|---|
+| **intact** (reproduces the published number) | **0.741** | 0.482 | 0.122 |
+| **background** (the detector's box blanked out) | **0.597** | **0.489** | 0.094 |
+| chance (majority baseline) | 0.345 | 0.345 | 0.345 |
+
+With the animal *removed from its own photograph*, the matcher still names it right 60% of the
+time. Above chance, the background carries **64% of the intact signal** (0.252 of 0.396) — and at
+a 7-day embargo it carries **all of it**: 0.489 background against 0.482 intact, a difference well
+inside the noise of 139 probes. Past a week there is essentially no animal left in the number.
+
+The crop is the detector's box plus `crop_padding` 0.15 on each side, so the blanked arm still
+holds **41% of each crop as real yard** (the box is 1/1.3² of the crop's area) plus a flat patch
+of the ring's median colour. That is what "background" means here, and it is exactly the thing a
+re-ID model was never supposed to be reading.
+
+**What it changes.** The doc's own decision rule: *well above chance → a large share of what has
+been called identity is scene memory, and the next move is capture geometry, not a better
+backbone.* So: a tighter, more consistent framing of the animal at the dish; more pixels on the
+body and fewer on the wall behind it; and every future identity number reported against this
+background baseline rather than against 0.345, because 0.345 is not the floor — **0.597 is.**
+
+Two honest limits. The `animal` control arm (the complement: ring blanked, box kept) is what rules
+out "MegaDescriptor embeds mutilated images to mush", and it matters far less for a HIGH score
+than it would for a low one — mutilation cannot manufacture accuracy. And this does not separate
+*scene structure* from *scene colour*: the flat fill is the ring's median colour, so a constant-grey
+fill arm would split those. Neither changes the direction of the result.
+
+<details><summary>The plan as written, and the shortcut that did not exist</summary>
 
 **The "nearly free" shortcut does not exist — checked, 2026-08-09.** The plan was to cut patches
 from `refimg`'s certified-empty frames at the exact bbox positions instead of inpainting. Four
@@ -138,6 +167,8 @@ top-1 before a single pixel is blanked. Keep it a scratch script that writes to 
 **Read the outcome honestly, both ways.** Near chance → the embeddings are about the animal and
 the decay result stands as an animal fact. Well above chance → a large share of what has been
 called identity is scene memory, and the next move is capture geometry, not a better backbone.
+
+</details>
 
 ### 2.2 The un-blend threshold sweep — **run 2026-08-09; there is no operating point**
 Both halves are done and both came back negative, which is the useful kind of answer: **the D1
