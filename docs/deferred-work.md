@@ -113,33 +113,38 @@ worth building next. This is the project's own order of operations: measure, the
 most of the signal.** Session-blocked leave-one-visit-out over the same 139 confirmed-solo raccoon
 visits, same protocol, same corpus — the only difference is which pixels the embedder sees:
 
-| arm | blocked top-1 | at a 7-day embargo | at 21 days |
-|---|---|---|---|
-| **intact** (reproduces the published number) | **0.741** | 0.482 | 0.122 |
-| **background** (the detector's box blanked out) | **0.597** | **0.489** | 0.094 |
-| chance (majority baseline) | 0.345 | 0.345 | 0.345 |
+Full write-up, with the harness validation and the paired statistics:
+[the background-identity diagnostic](background-identity-2026-08-09.md).
 
-With the animal *removed from its own photograph*, the matcher still names it right 60% of the
-time. Above chance, the background carries **64% of the intact signal** (0.252 of 0.396) — and at
-a 7-day embargo it carries **all of it**: 0.489 background against 0.482 intact, a difference well
-inside the noise of 139 probes. Past a week there is essentially no animal left in the number.
+| arm | what the embedder sees | blocked | 7-day embargo | 21 days |
+|---|---|---|---|---|
+| **intact** (reproduces the published number) | the crop as saved | **0.741** | 0.482 | 0.122 |
+| **animal** (control: ring blanked, box kept) | 59% of the crop | **0.727** | 0.489 | 0.108 |
+| **background** (the detector's box blanked) | 41% of the crop | **0.597** | **0.489** | 0.094 |
+| chance | — | 0.345 | 0.345 | 0.345 |
 
-The crop is the detector's box plus `crop_padding` 0.15 on each side, so the blanked arm still
-holds **41% of each crop as real yard** (the box is 1/1.3² of the crop's area) plus a flat patch
-of the ring's median colour. That is what "background" means here, and it is exactly the thing a
-re-ID model was never supposed to be reading.
+**The control passed**, which is what makes the rest readable: blanking 41% of every crop costs
+nothing measurable (intact vs animal, 7 probes one way and 5 the other, exact binomial p = 0.77),
+so MegaDescriptor is not embedding mutilated images to mush and 0.597 is information rather than
+vandalism.
 
-**What it changes.** The doc's own decision rule: *well above chance → a large share of what has
-been called identity is scene memory, and the next move is capture geometry, not a better
-backbone.* So: a tighter, more consistent framing of the animal at the dish; more pixels on the
-body and fewer on the wall behind it; and every future identity number reported against this
-background baseline rather than against 0.345, because 0.345 is not the floor — **0.597 is.**
+**With the animal removed from its own photograph the matcher still names it right 60% of the
+time.** The animal does carry more (25 vs 5 discordant, p = 0.0003) — but the two channels are
+**redundant, not additive**: 78 of the background's 83 correct answers are ones the animal also
+gets, and only 5 probes are background-right where the animal is wrong. Who an animal is and where
+it was photographed are confounded in this corpus.
 
-Two honest limits. The `animal` control arm (the complement: ring blanked, box kept) is what rules
-out "MegaDescriptor embeds mutilated images to mush", and it matters far less for a HIGH score
-than it would for a low one — mutilation cannot manufacture accuracy. And this does not separate
-*scene structure* from *scene colour*: the flat fill is the ring's median colour, so a constant-grey
-fill arm would split those. Neither changes the direction of the result.
+**And at a week they are the same number.** The animal's margin over pure scene matching is +0.144
+same-week and **0.000 at a 7-day embargo** (0.482 vs 0.489, one probe). Whatever survives seven
+days in this embedding is not animal-specific.
+
+**What it changes.** The doc's own decision rule fires the second way: the next move is capture
+geometry, not a better backbone — a backbone swap cannot separate two channels carrying the same
+information. It also raises the value of the era-invariant signals already on this list (the ear
+notch §3.4, mass §4.1) for a second reason: they cannot be confounded with the yard. And the null
+is wrong — "better than chance" has meant better than 0.345, when the honest floor is the
+background arm at the same embargo. **`eval.py` should carry a background arm**, because the number
+that matters is the margin and it is currently uncomputed and unwatched.
 
 <details><summary>The plan as written, and the shortcut that did not exist</summary>
 
