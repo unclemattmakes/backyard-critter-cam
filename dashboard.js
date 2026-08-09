@@ -21,6 +21,55 @@ const LATIN={'raccoon':'Procyon lotor','american crow':'Corvus brachyrhynchos','
 const latinOf=n=>LATIN[(n||'').toLowerCase().replace(/'/g,'’')]||'';
 const fmtDur=s=>{ s=Math.round(s||0); return s>=60?`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`:`${s}s`; };
 
+/* ---------- operator/viewer split (server-enforced; see web.py _is_operator) ----------
+   When the rig has an operator_token configured, this browser is a VIEWER until the token is
+   entered once (footer link). The token rides on every POST via this one wrapper — the ~16
+   fetch POST call sites stay untouched. No token configured on the rig = everyone operates,
+   exactly as before. */
+const __origFetch=window.fetch.bind(window);
+window.fetch=function(url,opts){
+  const tok=localStorage.getItem('cc-operator-token');
+  if(tok){   // every request, not just POSTs: GET /api/role must see it to report truthfully
+    opts=opts||{};
+    opts.headers=Object.assign({},opts.headers,{'X-Operator-Token':tok});
+  }
+  return __origFetch(url,opts);
+};
+async function refreshRole(){
+  let r; try{ r=await fetch('/api/role').then(x=>x.json()); }catch(e){ return; }
+  window.__role=r;
+  document.body.classList.toggle('viewer', r.split && !r.operator);
+  const el=document.getElementById('role-link');
+  if(el){
+    if(!r.split){ el.hidden=true; }
+    else{
+      el.hidden=false;
+      el.textContent=r.operator?'operator ✓':'viewing — unlock';
+      el.title=r.operator?'This browser holds the operator token. Click to forget it.'
+                         :'Reading and playing everything; edits are off. Enter the operator token to curate from this device.';
+    }
+  }
+}
+function roleToggle(){
+  const r=window.__role||{};
+  if(r.operator&&localStorage.getItem('cc-operator-token')){
+    localStorage.removeItem('cc-operator-token'); refreshRole(); return;
+  }
+  const box=document.getElementById('role-entry'); if(!box) return;
+  box.hidden=!box.hidden;
+  if(!box.hidden) box.querySelector('input').focus();
+}
+async function roleSave(){
+  const inp=document.querySelector('#role-entry input'); if(!inp) return;
+  const tok=(inp.value||'').trim(); if(!tok){ inp.focus(); return; }
+  localStorage.setItem('cc-operator-token',tok);
+  inp.value='';
+  document.getElementById('role-entry').hidden=true;
+  await refreshRole();
+  const r=window.__role||{};
+  if(r.split&&!r.operator){ localStorage.removeItem('cc-operator-token'); alert('That token was not accepted — still viewing.'); refreshRole(); }
+}
+
 /* ---------- live-connection indicator ----------
    The recurring live polls (stats, live/now, cameras, header, naming) shouldn't shout on every
    transient blip. Instead they call connFail() on a failed fetch and connOK() on a good one; a
@@ -43,6 +92,17 @@ function __connPill(){
 }
 function connFail(){ __connDown++; const el=__connPill(); if(el) el.hidden=false; }
 function connOK(){ if(__connDown===0) return; __connDown=0; const el=document.getElementById('connpill'); if(el) el.hidden=true; }
+/* One JSON fetch that THROWS on HTTP failure too, so "the server is down" can never render as a
+   designed empty state — "every label has been checked" over a network blip is a lie, and it's
+   exactly the wrong lie for a family member checking remotely. Pair with errEmpty for a retry. */
+async function fetchJSON(url){
+  const r=await fetch(url);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+function errEmpty(retryExpr){
+  return `<p class="empty">Could not reach the observatory — <span style="text-decoration:underline;cursor:pointer" onclick="${retryExpr}">retry</span>.</p>`;
+}
 
 /* Fire-and-forget POST feedback: dim+disable the just-clicked button while its request is in
    flight, restore it after. Pass a DOM node, or nothing to grab the current inline-handler's
@@ -166,7 +226,7 @@ function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='Arro
 /* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
 const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
 
-const VIEWS=['live','visits','dispatch','behavior','indiv','calendar','cat'];
+const VIEWS=['live','visits','dispatch','behavior','indiv','calendar','seasons','cat'];
 let __curView='visits';   // the tab currently on screen (explore screens remember it as "back home")
 function show(v, fromHash){
   closeSettings();
@@ -174,8 +234,10 @@ function show(v, fromHash){
   VIEWS.concat('explore').forEach(k=>{ const s=$('#view-'+k); if(s) s.classList.toggle('on',v===k); });
   VIEWS.forEach(k=>{ const t=$('#tab-'+k); if(t) t.classList.toggle('on',v===k); });
   // Deep-linkable tabs + a working Back button: the view lives in the URL hash. Programmatic
-  // hash writes echo a hashchange we must NOT re-show (it would double-load the view).
-  if(!fromHash && VIEWS.includes(v) && location.hash!=='#'+v){ __hashQuiet=v; location.hash=v; }
+  // hash writes echo a hashchange we must NOT re-show (it would double-load the view). A hash
+  // already DEEPER inside this view (#dispatch/2026-08-07/night when showing 'dispatch') is
+  // kept — the caller wrote it on purpose just before showing the tab.
+  if(!fromHash && VIEWS.includes(v) && !(location.hash||'').startsWith('#'+v+'/')) setHash('#'+v);
   syncLiveStreams();
   if(v==='cat') loadCatalogue();
   if(v==='visits') loadVisitsTab();
@@ -183,13 +245,55 @@ function show(v, fromHash){
   if(v==='behavior') loadBehavior();
   if(v==='indiv') loadIndividuals();
   if(v==='calendar') loadCalendar();
+  if(v==='seasons') loadSeasons();
   if(v==='live') refreshWhoshere();
 }
+/* ---------- the hash router ----------
+   Tabs were always deep-linkable; since 2026-08-08 the SHAREABLE drill-downs are too:
+     #profile/<name>        one animal's whole record        (#profile/Stan)
+     #day/<YYYY-MM-DD>      one day's summary                (#day/2026-08-07)
+     #species/<name>        one species' catalogue sheet     (#species/raccoon)
+     #dispatch/<date>/<ed>  a dated dispatch                 (#dispatch/2026-08-07/night)
+   That makes "look at Stan" a URL you can text (LAN reach applies — see the README's security
+   section), a refresh stop eating your drill-down, and the browser Back button walk your real
+   trail instead of teleporting to the previous tab. The remaining explorer screens (obs
+   windows, day-filtered visit lists, Days Afield) stay memory-only: Back from those lands on
+   the nearest URL-addressed ancestor, which is where you drilled in from.
+   Programmatic writes mark __hashQuiet (the FULL hash string, not just a view name) so their
+   own hashchange echo doesn't double-render. */
 let __hashQuiet=null;
+function setHash(h){
+  if(location.hash===h) return;
+  __hashQuiet=h.replace(/^#/,'');
+  location.hash=h;
+}
+function parseHash(h){
+  const parts=(h||'').replace(/^#/,'').split('/');
+  const kind=parts[0];
+  if(!kind) return null;
+  if(VIEWS.includes(kind)&&parts.length===1) return {kind:'view', view:kind};
+  if(kind==='profile'&&parts[1]) return {kind:'profile', name:decodeURIComponent(parts[1])};
+  if(kind==='day'&&/^\d{4}-\d{2}-\d{2}$/.test(parts[1]||'')) return {kind:'day', date:parts[1]};
+  if(kind==='species'&&parts[1]) return {kind:'species', name:decodeURIComponent(parts[1])};
+  if(kind==='dispatch'&&/^\d{4}-\d{2}-\d{2}$/.test(parts[1]||''))
+    return {kind:'dispatch', date:parts[1],
+            edition:['day','night','auto'].includes(parts[2])?parts[2]:'auto'};
+  return null;
+}
+function applyHash(h){
+  const p=parseHash(h);
+  if(!p) return false;
+  if(p.kind==='view'){ show(p.view, true); return true; }
+  if(p.kind==='profile'){ exploreStack=[]; explore('profile',{name:p.name},cap1(p.name),'',true); return true; }
+  if(p.kind==='day'){ exploreStack=[]; explore('day',{date:p.date},fmtDay(p.date),'',true); return true; }
+  if(p.kind==='species'){ show('cat', true); openSheet(p.name, true); return true; }
+  if(p.kind==='dispatch'){ DSP={edition:p.edition, date:p.date}; show('dispatch', true); return true; }
+  return false;
+}
 window.addEventListener('hashchange',()=>{
-  const v=location.hash.replace('#','');
-  if(__hashQuiet===v){ __hashQuiet=null; return; }
-  if(VIEWS.includes(v)) show(v, true);
+  const h=location.hash.replace('#','');
+  if(__hashQuiet===h){ __hashQuiet=null; return; }
+  applyHash(location.hash);
 });
 /* The MJPEG live streams are open-ended HTTP responses -- left attached while another tab is
    on screen they stream (and decode) forever for nobody, which on a phone is real battery and
@@ -306,14 +410,23 @@ async function refreshHeader(){
   let v; try{ v=await fetch('/api/camera?source='+encodeURIComponent(src)).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   if(v.period){ window.__period=v.period; $('#period').textContent=v.period; $('#cap-period').textContent=v.period; }
   if(v.lat!=null && v.lon!=null){ const f=(x,p,n)=>`${Math.abs(x).toFixed(3)}° ${x>=0?p:n}`; $('#coords').textContent=`${f(v.lat,'N','S')} · ${f(v.lon,'E','W')}`; }
+  // First-run checklist state: frames flowing (frame_w publishes with the first real frame) + geo.
+  window.__frCamera = v.frame_w ? true : (v.frame_w===undefined ? false : null);
+  window.__frGeo = (v.lat!=null && v.lon!=null);
   /* Rig warning strip: a wedged camera outranks a battery warning (it already IS the
      consequence). Text comes verbatim from the rig (powerguard.py) so the three surfaces --
      console, HUD, here -- always tell the same story. */
   const warn=$('#rigwarn');
   if(warn){
     const wedged=v.wedge&&v.wedge.message, batt=v.power&&v.power.warning;
+    const ev=window.__evalstatus;                 // filled by refreshEvalStatus(), boot + slow poll
     if(wedged){ warn.textContent='⚠ '+v.wedge.message; warn.className='rig-warn wedge'; warn.hidden=false; }
     else if(batt){ warn.textContent='⚠ '+v.power.warning; warn.className='rig-warn'; warn.hidden=false; }
+    else if(ev && ev.ok===false){
+      warn.textContent='⚠ Last night’s eval found a regression ('+(ev.regressions||[]).join(', ')
+        +') — auto-naming paused itself; see reports/'+(ev.artifact||'');
+      warn.className='rig-warn'; warn.hidden=false;
+    }
     else warn.hidden=true;
   }
   /* Masthead chip: "observation in progress" only while a critter is actually on-cam
@@ -325,6 +438,25 @@ async function refreshHeader(){
     chip.classList.toggle('on',on);
     const t=$('#livechip-txt'); if(t) t.textContent = on ? 'observation in progress' : 'monitoring in progress';
   }
+}
+
+/* The nightly eval gate's verdict (/api/evalstatus). Fetched at boot and on a slow poll -- the
+   artifact only changes when the ~2pm batch writes one, so anything faster is noise. The verdict
+   shows two ways: a masthead warning when a metric regressed (refreshHeader's chain, below
+   wedge/battery), and a one-liner in the Instrument Panel either way. */
+async function refreshEvalStatus(){
+  let ev; try{ ev=await fetch('/api/evalstatus').then(r=>r.json()); }catch(e){ return; }
+  window.__evalstatus=ev;
+  const line=$('#instr-eval');
+  if(!line) return;
+  if(!ev.available){ line.hidden=true; return; }
+  const when=(ev.run_at||'').slice(0,10);
+  line.hidden=false;
+  line.textContent = ev.ok===false
+    ? `Nightly eval (${when}): REGRESSION — ${(ev.regressions||[]).join(', ')}. Auto-naming paused itself; the full diff is in reports/${ev.artifact}.`
+    : ev.ok===true
+    ? `Nightly eval (${when}): no regression past tolerance.`
+    : `Nightly eval (${when}): ran without a baseline to diff against (this run IS the baseline).`;
 }
 
 /* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no
@@ -446,7 +578,11 @@ async function whLog(){
     if(r.error){ whMsg(r.error,true); }
     else{
       const who=names.map(cap1).join(' + ');
-      whMsg(r.multi
+      whMsg(r.as_viewer
+        ? `Logged ${who} — noted for the operator to review (viewer logs never stamp).`
+        : r.group
+        ? `Logged ${who} — family stamp on ${r.stamped||0} frame${r.stamped===1?'':'s'}, counted as several animals.`
+        : r.multi
         ? `Logged ${who} together — co-presence noted.`
         : `Logged ${who}${r.stamped?` · tagged ${r.stamped} frame${r.stamped===1?'':'s'}`:''}.`);
       WH_SEL.clear();
@@ -552,11 +688,14 @@ async function loadCatalogue(){
 }
 let LABELS=[];
 fetch('/api/labels').then(r=>r.json()).then(l=>LABELS=l).catch(()=>{});
-async function openSheet(name){
+async function openSheet(name,fromHash){
+  if(!fromHash) setHash('#species/'+encodeURIComponent(name));
   $('#cat-index').style.display='none'; $('#cat-sheet').style.display='block';
   $('#sheet-name').textContent=cap1(name); $('#sheet-latin').textContent=latinOf(name);
   $('#sheet-crops').innerHTML='<p class="empty">Loading plates…</p>';
-  let rows; try{ rows=await fetch('/api/species/'+encodeURIComponent(name)).then(r=>r.json()); }catch(e){ rows=[]; }
+  let rows;
+  try{ rows=await fetchJSON('/api/species/'+encodeURIComponent(name)); connOK(); }
+  catch(e){ connFail(); $('#sheet-crops').innerHTML=errEmpty(`openSheet(${jarg(name)})`); return; }
   if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">No plates.</p>'; return; }
   $('#sheet-crops').innerHTML=rows.map(r=>cropTile(r,name)).join('');
 }
@@ -567,7 +706,7 @@ function cropTile(r,name,tag){
     LABELS.map(l=>`<option value="${esc(l)}"${l===name?' selected':''}>${esc(cap1(l))}</option>`),
     ['<option value="__other__">+ other (type a label)…</option>']).join('');
   return `<div class="crop ${cls}" data-id="${r.id}">
-    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="${esc(cap1(name||'crop'))}">
     ${stamp}
     ${tag?`<div class="rv-tag lbl">${esc(tag)}</div>`:''}
     <div class="ft"><span class="c">${Math.round((r.confidence||0)*100)}%</span>
@@ -576,7 +715,7 @@ function cropTile(r,name,tag){
         <button class="b dn" title="wrong" onclick="act(${r.id},'reject',this)">✗</button>
         <button class="b" title="correct" onclick="toggleEdit(this)">✎</button>
       </span></div>
-    <select onchange="correct(${r.id},this.value)">${opts}</select>
+    <select onchange="correct(${r.id},this)">${opts}</select>
   </div>`;
 }
 /* Needs Review: the prioritized "most likely mislabeled" crops (suspect species, junk labels,
@@ -587,7 +726,9 @@ async function openReview(){
   $('#cat-index').style.display='none'; $('#cat-sheet').style.display='block';
   $('#sheet-name').textContent='Needs Review'; $('#sheet-latin').textContent='most likely mislabeled';
   $('#sheet-crops').innerHTML='<p class="empty">Gathering the suspect plates…</p>';
-  let d; try{ d=await fetch('/api/review').then(r=>r.json()); }catch(e){ d={crops:[]}; }
+  let d;
+  try{ d=await fetchJSON('/api/review'); connOK(); }
+  catch(e){ connFail(); $('#sheet-crops').innerHTML=errEmpty('openReview()'); return; }
   const rows=d.crops||[];
   if(!rows.length){ $('#sheet-crops').innerHTML='<p class="empty">Nothing flagged for review — every label has been checked.</p>'; return; }
   const head=`<p class="hint" style="color:var(--faint);font-style:italic">Showing ${rows.length} of ${d.total} flagged · sorted most-suspect first · ✓ confirm · ✗ wrong · ✎ correct the identification.</p>`;
@@ -604,17 +745,34 @@ async function act(id,action,btn){
   if(action==='verify'){ crop.classList.add('v-1'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v1">✓ confirmed</span>'); }
   if(action==='reject'){ crop.classList.add('v-0'); crop.insertAdjacentHTML('afterbegin','<span class="stamp v0">✗ wrong</span>'); crop.classList.add('editing'); }
 }
-async function correct(id,species){
-  if(species==='__other__'){ species=(prompt('New label for this crop (e.g. cat food):')||'').trim(); }
+/* '+ other…' used to open window.prompt — unstylable, miserable on a phone, and silently
+   swallowed by some in-app browsers. The select swaps for an inline input + save instead;
+   Escape restores the select. */
+function otherSpeciesInline(sel, save){
+  const wrap=document.createElement('span');
+  wrap.style.cssText='display:inline-flex;gap:4px;align-items:center';
+  wrap.innerHTML=`<input placeholder="new species label…" style="width:130px;padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.25);border-radius:4px;color:inherit;font:inherit">
+    <button class="gear">save</button>`;
+  const inp=wrap.querySelector('input'), go=wrap.querySelector('button');
+  go.onclick=()=>{ const v=(inp.value||'').trim(); if(!v){ inp.focus(); return; } save(v); };
+  inp.onkeydown=e=>{ if(e.key==='Enter') go.click(); if(e.key==='Escape'){ sel.value=''; wrap.replaceWith(sel); } };
+  sel.replaceWith(wrap);
+  inp.focus();
+}
+async function correct(id,sel){
+  const species=sel&&sel.value;
+  if(species==='__other__'){ otherSpeciesInline(sel, v=>_correctPost(id,v,null)); return; }
   if(!species)return;
-  const sel=(typeof event!=='undefined'&&event)?(event.currentTarget||event.target):null;   // the <select> that changed
+  _correctPost(id,species,sel);
+}
+async function _correctPost(id,species,sel){
   if(sel){ sel.disabled=true; sel.style.opacity='.45'; }
   try{ await fetch('/api/detection/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'correct',species})}); connOK(); }
   catch(e){ connFail(); if(sel){ sel.disabled=false; sel.style.opacity=''; } return; }
   const crop=document.querySelector(`.crop[data-id="${id}"]`);
   if(crop){ crop.style.transition='opacity .4s'; crop.style.opacity='.25'; }
 }
-function closeSheet(){ $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
+function closeSheet(){ setHash('#cat'); $('#cat-sheet').style.display='none'; $('#cat-index').style.display='block'; loadCatalogue(); }
 
 /* ---------- explorer: drill into the field tallies ---------- */
 let exploreStack=[], visitsData=[], obsState=null, __exploreFrom='live';
@@ -624,12 +782,24 @@ function goTally(t){
   exploreStack=[];
   explore(t, {}, t==='obs'?'Observations':'Days Afield');
 }
-function explore(screen,params,title,sub){
+function explore(screen,params,title,sub,fromHash){
   if(!exploreStack.length) __exploreFrom=__curView;   // Back lands on the tab you drilled in from
   exploreStack.push({screen,params:params||{},title:title||'',sub:sub||''});
+  // The two shareable drill-downs write themselves into the URL (deep link + refresh survival +
+  // a truthful browser Back); the rest of the explorer stays memory-only — see the router note.
+  if(!fromHash){
+    if(screen==='profile'&&params&&params.name) setHash('#profile/'+encodeURIComponent(String(params.name)));
+    else if(screen==='day'&&params&&params.date) setHash('#day/'+params.date);
+  }
   renderExplore();
 }
-function exploreBack(){ exploreStack.pop(); exploreStack.length?renderExplore():show(__exploreFrom||'live'); }
+function exploreBack(){
+  const cur=exploreStack[exploreStack.length-1];
+  const encoded=cur&&((cur.screen==='profile'&&cur.params.name)||(cur.screen==='day'&&cur.params.date));
+  exploreStack.pop();
+  if(encoded&&parseHash(location.hash)){ history.back(); return; }  // hashchange renders the ancestor
+  exploreStack.length?renderExplore():show(__exploreFrom||'live');
+}
 function renderExplore(){
   const cur=exploreStack[exploreStack.length-1]; if(!cur)return;
   show('explore');
@@ -672,7 +842,7 @@ function obsTile(r){
   const conf=r.species_confidence!=null?r.species_confidence:r.confidence;
   const v=r.verified;
   return `<div class="crop ${v===1?'v-1':v===0?'v-0':''}"${r.species?` data-sp="${esc(r.species)}"`:''} title="${esc(fmtDateTime(r.timestamp))}">
-    <img loading="lazy" src="${media(r.crop_path)}" alt="">
+    <img loading="lazy" src="${media(r.crop_path)}" alt="${esc(sp)} · ${esc(fmtDateTime(r.timestamp))}">
     <div class="ft"><span class="c">${Math.round((conf||0)*100)}%</span><span class="obs-sp">${esc(sp)}</span></div>
   </div>`;
 }
@@ -704,17 +874,12 @@ function visitCard(v,i){
   const inds=(v.individuals||[]).map(n=>`<span class="vl-ind clickable" title="open ${esc(cap1(n))}'s profile" onclick="event.stopPropagation();openProfile(${jarg(n)})">${esc(cap1(n))}</span>`).join('');
   // The curation tools (confirm/correct species, name the individual) hide behind the ✎ so the
   // card itself stays a reading surface: who, when, how long, play. stopPropagation keeps the
-  // whole label layer from triggering the card's play/drill.
+  // whole label layer from triggering the card's play/drill. The tools are BUILT on first open
+  // (vlabelOpen): rendered eagerly, the ~40-option species corrector times a 269-card Visit Log
+  // was most of the landing page's DOM.
   const footer=`<div class="vlabel" onclick="event.stopPropagation()">
-      <button class="gear vlabel-toggle" onclick="this.closest('.vlabel').classList.toggle('open')" title="confirm or correct this visit's labels">✎ label</button>
-      <div class="vlabel-tools">
-        <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:6px">
-          <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
-          ${speciesSelect('vsp-'+i,sp)}
-          <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
-        <div style="display:flex;gap:5px;align-items:center;margin-top:6px">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
-        <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>
-      </div>
+      <button class="gear vlabel-toggle" onclick="vlabelOpen(this,${i})" title="confirm or correct this visit's labels">✎ label</button>
+      <div class="vlabel-tools"></div>
     </div>`;
   return `<div class="card vcard" data-vi="${i}">
     <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}${narch?`<span class="arch-badge" title="${narch===nclips?'all':narch} of these clips play from the backup archive">archive</span>`:''}</div>
@@ -724,6 +889,25 @@ function visitCard(v,i){
       <div class="meta"><span class="count">${v.count}<small> obs</small></span><span class="conf">${v.minutes>=1?Math.round(v.minutes)+' min':'brief'}</span></div>
       ${footer}
     </div></div>`;
+}
+/* Build a visit card's label tools the first time its ✎ opens. The card index is the key into
+   visitsData, same as every other per-card action (_visitTarget). */
+function vlabelOpen(btn,i){
+  const wrap=btn.closest('.vlabel'); if(!wrap) return;
+  const tools=wrap.querySelector('.vlabel-tools');
+  if(tools && !tools.dataset.built){
+    tools.dataset.built='1';
+    const v=(visitsData||[])[i]||{};
+    const sp=(v.title&&v.title!=='animal')?v.title:'';
+    tools.innerHTML=`
+        <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:6px">
+          <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+          ${speciesSelect('vsp-'+i,sp)}
+          <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
+        <div style="display:flex;gap:5px;align-items:center;margin-top:6px">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
+        <span id="vst-${i}" class="lbl" style="opacity:.8;min-height:14px"></span>`;
+  }
+  wrap.classList.toggle('open');
 }
 /* ---------- individual profile: one animal's whole record ---------- */
 async function renderProfile(params,body){
@@ -745,7 +929,7 @@ async function renderProfile(params,body){
   const comp=(p.companions||[]).map(c=>
     `<button class="cast-chip" onclick="openProfile(${jarg(c.name)})">${esc(cap1(c.name))}<small>×${c.n_visits}</small></button>`).join('');
   const refs=(p.references||[]).map(r=>
-    `<img loading="lazy" src="${media(r.crop_path)}" alt="" title="${esc(r.kind==='video_frame'?'phone video frame':'phone photo')}${r.captured_at?' · '+esc(fmtDateTime(r.captured_at)):''}${r.note?' · '+esc(r.note):''}">`).join('');
+    `<img loading="lazy" src="${media(r.crop_path)}" alt="reference photo" title="${esc(r.kind==='video_frame'?'phone video frame':'phone photo')}${r.captured_at?' · '+esc(fmtDateTime(r.captured_at)):''}${r.note?' · '+esc(r.note):''}">`).join('');
   visitsData=p.visits;
   body.innerHTML=`
     <div class="profile-head panel">
@@ -760,6 +944,7 @@ async function renderProfile(params,body){
       ${comp?`<div class="castrow"><span class="lbl">Seen together with</span>${comp}</div>`:''}
       ${refs?`<div class="profile-refs"><span class="lbl">Reference shots — phone (identity certified by hand)</span><div class="refstrip">${refs}</div></div>`:''}
     </div>
+    ${profileEventsHTML(name, p.events||[])}
     <h2 class="sec">Visits <span class="n">${p.visits.length<p.n_visits?`the newest ${p.visits.length} of ${p.n_visits}`:'each card plays its clips'}</span></h2>
     <div class="cards">${p.visits.map(visitCard).join('')}</div>
     <h2 class="sec">Photographs <span class="n" id="prof-photo-n"></span></h2>
@@ -767,6 +952,34 @@ async function renderProfile(params,body){
   wireVisitCards(body);
   obsState={day:null,species:null,start:null,end:null,individual:name,offset:0};
   await loadMoreObs();
+}
+/* The field notebook: this animal's STORY as dated notes (life_events). The knowledge that
+   used to evaporate — kits first emerged, an injury noticed, a debut night — gets a dated line
+   a future reader (or next spring's comparison) can find. Append-only; correct a wrong note
+   with another note, the way a paper notebook works. */
+function profileEventsHTML(name, events){
+  const rows=events.map(e=>`<div class="fr-row" style="margin:4px 0"><span class="lbl" style="opacity:.6;margin-right:6px">${esc(e.event_date||String(e.created_at||'').slice(0,10))}</span>${esc(e.note)}${e.labeled_by?` <span class="lbl" style="opacity:.5">— ${esc(e.labeled_by)}</span>`:''}</div>`).join('');
+  return `<h2 class="sec">Field Notebook <span class="n">${events.length?events.length+' entr'+(events.length===1?'y':'ies'):'the story, in dated notes'}</span></h2>
+    <div class="panel" style="padding:10px 14px">
+      ${rows||'<p class="empty" style="padding:0">No entries yet — the first litter, a limp, a debut night: write it down while you remember it.</p>'}
+      <div class="ev-add" style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        <input type="date" id="ev-date" style="padding:4px 6px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit;font:inherit">
+        <input id="ev-note" placeholder="what happened…" maxlength="500" style="flex:1;min-width:180px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit" onkeydown="if(event.key==='Enter')this.nextElementSibling.click()">
+        <button class="gear" onclick="profileAddEvent(${jarg(name)})">add to the notebook</button>
+      </div>
+    </div>`;
+}
+async function profileAddEvent(name){
+  const note=($('#ev-note')&&$('#ev-note').value||'').trim();
+  if(!note){ if($('#ev-note')) $('#ev-note').focus(); return; }
+  const date=($('#ev-date')&&$('#ev-date').value)||null;
+  const restore=busyBtn();
+  try{
+    const r=await fetch('/api/individual/event',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,note,date})}).then(x=>x.json());
+    if(r.error){ restore(); alert(r.error); return; }
+    openProfile(name);   // re-render with the new entry
+  }catch(e){ restore(); connFail(); }
 }
 
 function _visitTarget(i){ const v=visitsData[i]||{}; return {source:v.source,start:v.start,end:v.end}; }
@@ -798,7 +1011,9 @@ function dayCard(d){
 
 async function renderDay(params,body){
   const date=params.date;
-  let s; try{ s=await fetch('/api/stats').then(r=>r.json()); }catch(e){ s={}; }
+  let s;
+  try{ s=await fetchJSON('/api/stats'); connOK(); }
+  catch(e){ connFail(); body.innerHTML=errEmpty(`explore('day',{date:${jarg(date)}})`); return; }
   const d=(s.by_day||[]).find(x=>x.day===date)||{crops:0,visits:0,classes:{}};
   $('#explore-sub').textContent=`${(d.crops||0).toLocaleString()} obs · ${d.visits||0} visits`;
   // The night FOLLOWING day d runs dusk(d) -> dawn(d+1), so it's anchored on d+1 in the digest.
@@ -899,7 +1114,9 @@ function straightWord(s){ if(s==null) return ''; return s>=0.8?'a direct line':s
 function motionStrip(m){
   if(!m||!(m.tracks>0)) return '';
   const bits=[];
-  const app=APPROACH_WORD[m.approach]; if(app) bits.push(`<b>${app}</b>`);
+  if(m.tag) bits.push(`<b>${esc(m.tag)}</b>`);   // the what-they-DID word leads: fed here / passed through / lingered
+  const app=APPROACH_WORD[m.approach]; if(app&&!m.tag) bits.push(`<b>${app}</b>`);
+  else if(app) bits.push(app);
   const sw=straightWord(m.straightness); if(sw) bits.push(sw);
   if(m.moving_frac!=null) bits.push(`moving ${Math.round(m.moving_frac*100)}%`);
   // Speed: a hushed, size-confounded aside — omitted unless we have nothing more robust to say.
@@ -970,9 +1187,12 @@ function wireIndivMotion(root){
    prev/next anchors. The stitched reel is fetched alongside and re-polled while building. */
 let DSP={edition:'auto', date:null};
 let __dspSeq=0, __reelTimer=null;
-function setDispatch(ed){ DSP.edition=ed; loadDispatch(); }
-function dspNav(date, edition){ DSP={edition:edition||DSP.edition, date:date||null}; loadDispatch(); }
-function dspLatest(){ DSP={edition:'auto', date:null}; loadDispatch(); }
+/* A dated dispatch lives in the URL (#dispatch/DATE/EDITION — shareable, refresh-proof);
+   "latest" is just the plain #dispatch tab. */
+function _dspHash(){ setHash(DSP.date?`#dispatch/${DSP.date}/${DSP.edition}`:'#dispatch'); }
+function setDispatch(ed){ DSP.edition=ed; _dspHash(); loadDispatch(); }
+function dspNav(date, edition){ DSP={edition:edition||DSP.edition, date:date||null}; _dspHash(); loadDispatch(); }
+function dspLatest(){ DSP={edition:'auto', date:null}; _dspHash(); loadDispatch(); }
 function openDispatchAt(date, edition){ dspNav(date, edition); show('dispatch'); }
 
 async function loadDispatch(){
@@ -980,17 +1200,27 @@ async function loadDispatch(){
   clearTimeout(__reelTimer);
   const seq=++__dspSeq;
   const qs='edition='+encodeURIComponent(DSP.edition)+(DSP.date?'&date='+encodeURIComponent(DSP.date):'');
-  let d, rc, rl;
+  /* The digest text renders the moment it (and the roll call) arrive; the REEL streams into its
+     own slot afterwards. It used to sit in the same Promise.all, which held the whole page on a
+     bare "Loading…" for as long as /api/reel took — measured 2026-08-08 at 6s with the reel
+     already BUILT, and a first-view ffmpeg stitch takes minutes. The readable half is ready in
+     ~0.3s; serve it. */
+  let d, rc;
   try{
-    [d, rc, rl] = await Promise.all([
+    [d, rc] = await Promise.all([
       fetch('/api/digest?'+qs).then(r=>r.json()),
       fetch('/api/rollcall').then(r=>r.json()).catch(()=>({cast:[]})),
-      fetch('/api/reel?'+qs).then(r=>r.ok?r.json():null).catch(()=>null),   // older server -> no reel
     ]);
   }catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
   if(seq!==__dspSeq) return;                    // a newer navigation superseded this load
   window.__digest=d;
-  renderDispatch(d, rc, rl);
+  renderDispatch(d, rc, {status:'loading'});
+  let rl=null;
+  try{ rl=await fetch('/api/reel?'+qs).then(r=>r.ok?r.json():null); }catch(e){ rl=null; }  // older server -> no reel
+  if(seq!==__dspSeq) return;
+  if(rl && rl.status==='ready') window.__reelMan=rl;
+  const el=document.getElementById('reel-sec');  // swap the reel slot only; never yank the page
+  if(el) el.innerHTML=reelSection(d, rl);        // under the reader's scroll
   if(rl && rl.status==='building') pollReel(qs, seq, 40);
 }
 /* While the server stitches the condensed cut, quietly re-ask and swap the reel section in
@@ -1021,8 +1251,9 @@ function rollcallSection(rc){
   const fresh=cast.filter(c=>c.days_since!=null && c.days_since<=10)
                   .sort((a,b)=>a.days_since-b.days_since);
   const gone=cast.filter(c=>!(c.days_since!=null && c.days_since<=10));
-  const sinceText=c=> c.days_since==null ? '' :
+  const sinceText=c=>{ const base=c.days_since==null ? '' :
     c.days_since===0 ? 'seen today' : c.days_since===1 ? 'seen yesterday' : `${c.days_since} days ago`;
+    return base && c.via_group ? base+' (with the kits)' : base; };
   const card=c=>{
     const av=c.crop?`style="background-image:url('${media(c.crop)}')"`:'';
     return `<div class="rc-card${c.overdue?' overdue':''}" onclick="show('indiv')"
@@ -1099,7 +1330,9 @@ function reelSection(d, rl){
   const total=playlist.reduce((a,c)=>a+(c.seconds||0),0);
   const poster=(d.plate&&d.plate.crop_path)||playlist[0].thumb;
   const note = rl&&rl.status==='building'
-    ? `<div class="reel-links lbl"><span class="reel-note">✂ a condensed cut is being stitched — it will appear here in a minute or two</span></div>` : '';
+    ? `<div class="reel-links lbl"><span class="reel-note">✂ a condensed cut is being stitched — it will appear here in a minute or two</span></div>`
+    : rl&&rl.status==='loading'
+    ? `<div class="reel-links lbl"><span class="reel-note">… checking for a condensed cut</span></div>` : '';
   return `<h2 class="sec">Highlight Reel <span class="n">${playlist.length} clip${playlist.length>1?'s':''} · ${fmtDur(total)}</span></h2>
     <div class="panel reelhero" id="reelhero" onclick="reelPlayAll()" style="background-image:url('${poster?media(poster):''}')">
       <div class="big-play">&#9654;</div>
@@ -1166,6 +1399,10 @@ function renderDispatch(d, rc, rl){
     const lead = n&&n.first_ever ? 'First ever recorded' : (n&&n.days_since ? `First in ${n.days_since} days` : 'Notable');
     flags.push(`<span class="flag new">❋ ${lead}: ${esc(nameOf(sp))}</span>`); });
   (d.quiet||[]).forEach(q=>{ flags.push(`<span class="flag quiet">— No ${esc(nameOf(q.species))} this ${esc(d.edition)} (usually ${Math.round(q.frac*100)}% of ${esc(d.edition)}s)</span>`); });
+  if(d.coverage&&d.coverage.dark_minutes>=30){
+    const cv=d.coverage, hrs=cv.dark_minutes>=90?Math.round(cv.dark_minutes/6)/10+' h':cv.dark_minutes+' min';
+    flags.push(`<span class="flag" style="background:rgba(255,120,90,.12);border-color:rgba(255,120,90,.4)" title="the coverage ledger says the camera was not watching for part of this period — a dark camera is not an empty yard, so read tonight's absence claims (quiet regulars, first/last) accordingly">⚠ camera dark ${esc(hrs)} of this ${esc(d.edition)}${infoDot('The rig records when each camera is actually watching (open / lost / reconnected / stopped). This period has a known dark stretch, so “no X tonight” may mean “camera was down”, not “X didn’t come”. Periods before the ledger existed say nothing either way.')}</span>`);
+  }
   if(d.moon){ flags.push(`<span class="flag moon">${d.moon.glyph} ${esc(d.moon.name)} · ${d.moon.illum_pct}% lit</span>`); }
   if(flags.length) html+=`<div class="lede">${flags.join('')}</div>`;
   if(d.empty){ body.innerHTML=html+`<p class="empty">A quiet ${esc(d.edition)} — no visitors recorded.</p>`+roll; return; }
@@ -1174,7 +1411,8 @@ function renderDispatch(d, rc, rl){
   html+=`<div id="reel-sec">${reelSection(d, rl)}</div>`;
   html+=visitLogSection(d);
   html+=roll;
-  const t=[['visits',(d.visits||0).toLocaleString()],['species',(d.species||[]).length],
+  const t=[['visits',(d.visits||0).toLocaleString()],
+    [(d.n_surprising?'species (+'+d.n_surprising+' to verify)':'species'),(d.species||[]).length-(d.n_surprising||0)],
     ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
   html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
   if(d.plate){ const p=d.plate;
@@ -1188,7 +1426,8 @@ function renderDispatch(d, rc, rl){
       </div></div>`;
   }
   window.__rollClips=(d.species||[]).map(s=> s.clip?{...s.clip, species:s.species}:null);
-  html+=`<h2 class="sec">The Roll <span class="n">${(d.species||[]).length} species</span></h2>`;
+  const nSurp=d.n_surprising||0, nSp=(d.species||[]).length;
+  html+=`<h2 class="sec">The Roll <span class="n">${nSp-nSurp} species${nSurp?` + ${nSurp} surprising`:''}</span>${nSurp?infoDot('A "surprising" species is one whose own record says it is almost never active at this hour — a goldfinch at 2 AM is nearly always a mislabeled crop of something else (kit-melee crops get forced onto the nearest species). They are listed at the bottom as questions, not counted as fauna; their crops are exactly the ones worth correcting in the Catalogue.'):''}</h2>`;
   html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
   body.innerHTML=html;
   body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
@@ -1199,8 +1438,9 @@ function renderDispatch(d, rc, rl){
 }
 function entryRow(s,i){
   const n=s.novelty||{}, badges=[];
-  if(n.first_ever) badges.push('<span class="badge new">New</span>');
-  else if((n.days_since||0)>=3) badges.push(`<span class="badge gap">first in ${n.days_since}d</span>`);
+  if(s.surprising) badges.push(`<span class="badge" style="background:rgba(255,170,60,.16);border:1px solid rgba(255,170,60,.4)" title="${esc(s.surprise_note||'')}">⚠ surprising — verify</span>`);
+  if(n.first_ever&&!s.surprising) badges.push('<span class="badge new">New</span>');
+  else if((n.days_since||0)>=3&&!s.surprising) badges.push(`<span class="badge gap">first in ${n.days_since}d</span>`);
   if((s.streak||0)>=3) badges.push(`<span class="badge streak">${s.streak} in a row</span>`);
   const active=new Set(s.active_hours||[]);
   const hrs=s.hours||[], max=Math.max(1,...hrs);
@@ -1218,6 +1458,61 @@ function entryRow(s,i){
       <div class="clock" title="all-time activity by hour; gold = this period">${clock}</div>
     </div>
   </div>`;
+}
+
+/* ---------- Seasons: the longitudinal view ----------
+   Weekly per-species sparklines + first/last dates + the accumulation curve. The Calendar
+   answers "what happened on the 4th?"; this answers "what is my yard DOING this year?" — the
+   crows collapsing after mid-July, raccoon traffic doubling when the kits emerged, whether a
+   new species is still turning up. Next year, "same week last year" lands here. */
+async function loadSeasons(){
+  const body=$('#seasons-body'); body.innerHTML='<p class="empty">Leafing back through the weeks…</p>';
+  let d;
+  try{ d=await fetchJSON('/api/seasons'); connOK(); }
+  catch(e){ connFail(); body.innerHTML=errEmpty('loadSeasons()'); return; }
+  if(!(d.species||[]).length){ body.innerHTML='<p class="empty">No visits yet — the weekly picture draws itself as the record grows.</p>'; return; }
+  const weeks=d.weeks||[];
+  const wkLabel=w=>w.slice(5);           // '2026-W27' -> 'W27'
+  const spark=(vals)=>{
+    const max=Math.max(1,...vals);
+    return vals.map((v,i)=>`<span title="${esc(weeks[i])}: ${v} visit${v===1?'':'s'}" style="display:inline-block;width:10px;height:${v?Math.max(2,Math.round(Math.sqrt(v/max)*26)):1}px;background:${v?'var(--gilt)':'rgba(255,255,255,.12)'};opacity:${v?Math.max(.45,v/max):1}"></span>`).join('');
+  };
+  let html=`<h2 class="sec">The Weeks <span class="n">${weeks.length} week${weeks.length===1?'':'s'} · ${d.species.length} species</span></h2>
+    <div class="lbl" style="opacity:.6;margin:-4px 0 10px">${weeks.length?esc(wkLabel(weeks[0])+' → '+wkLabel(weeks[weeks.length-1])):''} · bar height = visits that week</div>
+    <div style="display:flex;flex-direction:column;gap:8px">`;
+  html+=d.species.map(s=>`<div class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px;flex-wrap:wrap">
+      <div style="min-width:190px"><div style="font-weight:600">${esc(nameOf(s.species))}</div>
+        <div class="lbl" style="opacity:.72">${s.n_visits} visits · first ${esc(s.first||'?')} · last ${esc(s.last||'?')}</div></div>
+      <div style="display:flex;align-items:flex-end;gap:2px;height:28px;overflow-x:auto" title="visits per ISO week">${spark(s.weekly)}</div>
+    </div>`).join('');
+  html+=`</div>`;
+  const acc=d.accumulation||[];
+  if(acc.length>1){
+    const w=680,h=120,px=30,py=12;
+    const t0=new Date(acc[0].date).getTime(), t1=new Date(acc[acc.length-1].date).getTime()||t0+1;
+    const maxN=acc[acc.length-1].n_species;
+    const pts=acc.map(a=>{
+      const x=px+((new Date(a.date).getTime()-t0)/Math.max(1,t1-t0))*(w-px-10);
+      const y=h-py-(a.n_species/maxN)*(h-2*py);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const marks=acc.map(a=>{
+      const x=px+((new Date(a.date).getTime()-t0)/Math.max(1,t1-t0))*(w-px-10);
+      const y=h-py-(a.n_species/maxN)*(h-2*py);
+      return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" fill="var(--gilt)"><title>${esc(a.date)} · #${a.n_species}: ${esc(nameOf(a.species))}</title></circle>`;
+    }).join('');
+    html+=`<h2 class="sec">Species Accumulation <span class="n">have you seen everything this yard gets?</span>${infoDot('Each dot is a species’ FIRST-EVER appearance in the record. A curve still climbing means the yard is still introducing itself; a flat tail means the regular cast is known and anything new now is real news.')}</h2>
+      <div class="panel" style="padding:10px 14px;overflow-x:auto">
+        <svg viewBox="0 0 ${w} ${h}" style="width:100%;max-width:${w}px;display:block" role="img" aria-label="species accumulation curve">
+          <line x1="${px}" y1="${h-py}" x2="${w-8}" y2="${h-py}" stroke="var(--rule2)"/>
+          <polyline points="${pts}" fill="none" stroke="var(--gilt)" stroke-opacity=".6" stroke-width="1.5"/>
+          ${marks}
+          <text x="2" y="${py+6}" fill="var(--faint)" font-size="9" font-family="var(--mono)">${maxN}</text>
+        </svg>
+        <div class="lbl" style="opacity:.6;margin-top:4px">${esc(acc[0].date)} → ${esc(acc[acc.length-1].date)} · hover a dot for the debut</div>
+      </div>`;
+  }
+  body.innerHTML=html;
 }
 
 /* ---------- Calendar ---------- */
@@ -1262,9 +1557,11 @@ function renderBehavior(d){
     const win=s.typical_window;
     const wtxt=win?`${String(win.start_hour).padStart(2,'0')}–${String(win.end_hour).padStart(2,'0')}h`:'—';
     const dwell=s.dwell_median_s>=60?Math.round(s.dwell_median_s/60)+'m':Math.round(s.dwell_median_s)+'s';
+    const sa=s.sun_anchor;
+    const saTxt=sa?` · ${sa.median_offset_min>=0?'~'+fmtOffset(sa.median_offset_min)+' after':'~'+fmtOffset(-sa.median_offset_min)+' before'} ${sa.anchor}`:'';
     return `<div class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px">
       <div><div style="font-weight:600">${esc(nameOf(s.species))}</div>
-        <div class="lbl" style="opacity:.72">${s.n_visits} visits · ${s.visits_per_day}/day · dwell ~${dwell} · usually ${wtxt}</div></div>
+        <div class="lbl" style="opacity:.72">${s.n_visits} visits · ${s.visits_per_day}/day · dwell ~${dwell} · usually ${wtxt}${saTxt?esc(saTxt):''}${sa?infoDot('Arrivals anchored to the sun instead of the clock: the season-proof reading. This species’ median arrival is '+fmtOffset(Math.abs(sa.median_offset_min))+' '+(sa.median_offset_min>=0?'after':'before')+' civil '+sa.anchor+' (n='+sa.n+'). Clock hours smear as sunset walks across the season; “40 minutes after dusk” stays true all year.'):''}</div></div>
       <div style="display:flex;align-items:flex-end;gap:1px;height:20px" title="arrivals by hour (0–23h); highlighted = typical window">${behaviorClock(hours,win)}</div>
     </div>`;
   }).join('')+`</div>`;
@@ -1273,7 +1570,46 @@ function renderBehavior(d){
     html+=`<div class="lede">`+d.co_occurrence.map(c=>
       `<span class="flag">${esc(nameOf(c.a))} + ${esc(nameOf(c.b))} · ${c.n}</span>`).join('')+`</div>`;
   }
+  html+=politicsHTML(d.politics);
+  html+=moonChartHTML(d.moon);
   body.innerHTML=html;
+}
+/* Yard politics: the DIRECTIONAL half of "seen together" — who avoids whom, who yields the
+   yard. Observational (the payload's own caveat rides in the ⓘ). */
+function politicsHTML(p){
+  if(!p) return '';
+  const sup=(p.suppression||[]), yld=(p.yields||[]);
+  if(!sup.length&&!yld.length) return '';
+  let html=`<h2 class="sec">Yard Politics <span class="n">who avoids whom, who gives way</span>${infoDot((p.note||'')+' — Suppression: after A has been, B’s next arrival takes X× longer than B’s usual gap. Yielding: B was mid-visit when A arrived and left within three minutes.')}</h2><div class="lede">`;
+  html+=sup.map(s=>`<span class="flag quiet" title="${s.n} A-then-B sequences; B's usual gap ${s.baseline_min} min, after ${esc(nameOf(s.a))} it stretches to ${s.after_min} min">${esc(nameOf(s.b))} stays away ${s.factor}× longer after ${esc(nameOf(s.a))} · n=${s.n}</span>`).join('');
+  html+=yld.map(y=>`<span class="flag" style="background:rgba(255,170,60,.12);border-color:rgba(255,170,60,.35)" title="${y.n_yield} of ${y.n_encounters} mid-visit encounters ended within 3 minutes of the arrival">${esc(nameOf(y.a))} arrives → ${esc(nameOf(y.b))} leaves (${Math.round(y.rate*100)}% of ${y.n_encounters})</span>`).join('');
+  return html+`</div>`;
+}
+const fmtOffset=m=>{ m=Math.round(Math.abs(m)); return m>=90?`${Math.floor(m/60)}h${String(m%60).padStart(2,'0')}`:`${m} min`; };
+/* Nocturnal visits per night vs moon illumination — the glyph upgraded to a question with an
+   answer either way ("no lunar effect in this lit yard" is itself a finding worth having). */
+function moonChartHTML(moon){
+  const rows=(moon&&moon.nights)||[];
+  if(rows.length<10) return '';
+  const w=680,h=140,px=34,py=14;
+  const maxV=Math.max(1,...rows.map(r=>r.n_visits));
+  const pts=rows.filter(r=>r.illum_pct!=null).map(r=>{
+    const x=px+(r.illum_pct/100)*(w-px-10);
+    const y=h-py-(r.n_visits/maxV)*(h-2*py);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="var(--gilt)" fill-opacity=".55"><title>${esc(r.night)} · ${r.n_visits} visit${r.n_visits===1?'':'s'} · moon ${r.illum_pct}%</title></circle>`;
+  }).join('');
+  return `<h2 class="sec">Moonlight <span class="n">does a brighter night change the traffic?</span>${infoDot((moon&&moon.note)||'')}</h2>
+    <div class="panel" style="padding:10px 14px;overflow-x:auto">
+      <svg viewBox="0 0 ${w} ${h}" style="width:100%;max-width:${w}px;display:block" role="img" aria-label="nocturnal visits per night against moon illumination">
+        <line x1="${px}" y1="${h-py}" x2="${w-8}" y2="${h-py}" stroke="var(--rule2)"/>
+        <line x1="${px}" y1="${py}" x2="${px}" y2="${h-py}" stroke="var(--rule2)"/>
+        <text x="${px}" y="${h-2}" fill="var(--faint)" font-size="9" font-family="var(--mono)">new</text>
+        <text x="${w-34}" y="${h-2}" fill="var(--faint)" font-size="9" font-family="var(--mono)">full</text>
+        <text x="2" y="${py+6}" fill="var(--faint)" font-size="9" font-family="var(--mono)">${maxV}</text>
+        ${pts}
+      </svg>
+      <div class="lbl" style="opacity:.6;margin-top:4px">each dot is one night · ${rows.length} nights</div>
+    </div>`;
 }
 
 /* ---------- individuals (phase 3: suggest-confirm loop + hand-label the clusters) ---------- */
@@ -1282,15 +1618,24 @@ function renderBehavior(d){
    rather than asking for a huge limit (the server rebuilds the matcher per call). */
 let REID_MODE='recent', REID_OFFSET=0;
 const REID_LIMIT=30;
+let __indivSeq=0;
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
-  let d=null,q=null;
   const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`;
-  try{
-    [q,d]=await Promise.all([
-      fetch('/api/reid/queue'+qs).then(r=>r.json()).catch(()=>null),
-      fetch('/api/individuals').then(r=>r.json())]);
-  }catch(e){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
+  const seq=++__indivSeq;
+  /* The queue can take SECONDS when the server's cache is cold — 24s measured 2026-08-08 after
+     a 2,900-crop family night (the matcher rebuilds whenever the DB changed; the nightly batch
+     now pre-warms it, but a mid-day label invalidates again). The cast overview is milliseconds.
+     Render what's ready; stream the queue into the page when it lands. */
+  const qP=fetch('/api/reid/queue'+qs).then(r=>r.json()).catch(()=>null);
+  let d=null;
+  try{ d=await fetch('/api/individuals').then(r=>r.json()); }catch(e){ d=null; }
+  if(seq!==__indivSeq) return;                  // superseded by a mode/page change
+  if(d) renderIndividuals(d, {__pending:true});
+  else body.innerHTML='<p class="empty">Matching the recent visits against the cast — this can take a moment after a busy night…</p>';
+  const q=await qP;
+  if(seq!==__indivSeq) return;
+  if(!d && !q){ body.innerHTML='<p class="empty">Could not load individuals.</p>'; return; }
   renderIndividuals(d,q);
 }
 function reidSetMode(m){ if(m===REID_MODE) return; REID_MODE=m; REID_OFFSET=0; loadIndividuals(); }
@@ -1321,13 +1666,15 @@ function reidContextChip(v){
   const m=Math.round((c.gap_s||0)/60);
   const when=m<1?'moments':(m===1?'1 min':m+' min');
   const rel=c.direction==='after'?'after':'before';
-  return `<span class="flag" style="background:rgba(200,180,255,.13);border-color:rgba(200,180,255,.38)" title="context only — this never changes the appearance ranking. Adjacent visits on the same camera inside an hour are the same animal about 70% of the time, against a 28% base rate, but as an automatic rule it was wrong every time it fired.">started ${when} ${rel} the visit you named <b>${esc(c.name)}</b></span>`;
+  const why='Context only — this never changes the appearance ranking. Adjacent visits on the same camera inside an hour are the same animal about 70% of the time, against a 28% base rate, but as an automatic rule it was wrong every time it fired. It renders here for your eye and nowhere else.';
+  return `<span class="flag" style="background:rgba(200,180,255,.13);border-color:rgba(200,180,255,.38)" title="${esc(why)}">started ${when} ${rel} the visit you named <b>${esc(c.name)}</b>${infoDot(why)}</span>`;
 }
 function reidCard(v){
   const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
   const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
   const multiEv=[v.co_present_frames? `${v.co_present_frames} still frame(s)`:'', v.co_present_clips? `${v.co_present_clips} clip(s)`:''].filter(Boolean).join(' + ');
-  const multi=v.multi? `<span class="flag" style="background:rgba(255,170,60,.16);border-color:rgba(255,170,60,.4)" title="${multiEv||'two animals'} show two animals at once — co-arrival is behaviour signal; the appearance suggestion is a blend">2+ animals</span>` : '';
+  const multiWhy=`${multiEv||'The evidence'} shows two animals at once. Who-arrives-with-whom is real behaviour signal, but the appearance suggestion for this visit is a BLEND of the animals present — name the visit by its main animal, or skip it.`;
+  const multi=v.multi? `<span class="flag" style="background:rgba(255,170,60,.16);border-color:rgba(255,170,60,.4)" title="${esc(multiWhy)}">2+ animals${infoDot(multiWhy)}</span>` : '';
   let sugg='', act='';
   if(v.confirmed_as){
     sugg=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">= ${esc(v.confirmed_as)} ✓</span>`;
@@ -1399,7 +1746,7 @@ function reidCard(v){
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       ${thumb}
       <div style="min-width:150px"><div style="font-weight:600">visit <span style="opacity:.7">#${v.visit_id}</span> · ${reidWhen(v.started_at)}</div>
-        <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} embedded</div></div>
+        <div class="lbl" style="opacity:.72">${mins} · ${v.n_crops} crops · ${v.n_embedded} analysed</div></div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex:1">${sugg} ${clipSugg} ${multi} ${reidContextChip(v)}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>
     </div>
@@ -1425,7 +1772,7 @@ async function renderUnblend(vid){
   let d; try{ d=await fetch('/api/reid/unblend?visit_id='+vid).then(r=>r.json()); }
   catch(e){ box.innerHTML='<p class="lbl">Could not un-blend.</p>'; return; }
   REID_UNBLEND[vid]=d.groups||[];
-  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'nothing to separate yet — needs clip tracklets (clipmotion + clipembed) or embedded still crops (embed.py --co-present)')}</p>`; return; }
+  if(!REID_UNBLEND[vid].length){ box.innerHTML=`<p class="lbl" style="opacity:.7">${esc(d.note||'nothing to separate yet — needs analysed clip tracks (clipmotion + clipembed) or analysed still crops (embed.py --co-present)')}</p>`; return; }
   const co=(d.co_present&&d.co_present.names)||[];
   const anySugg=REID_UNBLEND[vid].some(g=>(g.suggestion||[]).length);
   const hint=co.length>=2
@@ -1440,7 +1787,7 @@ async function renderUnblend(vid){
   const coLog=co.length>=2
     ? `<div class="ub-colog">📓 You logged <b>${co.map(n=>esc(cap1(n))).join(' + ')}</b> here together${d.co_present.observed_at?` · ${esc(fmtClock(d.co_present.observed_at)||'')}`:''}.</div>`
     : '';
-  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} ${d.basis==='stills'?'still':'clip'} tracklet(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
+  box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:6px">${d.n_tracklets} separated ${d.basis==='stills'?'still':'clip'} track(s) → ${REID_UNBLEND[vid].length} group(s). ${hint}</div>`
     +coLog
     +REID_UNBLEND[vid].map((g,i)=>reidUnblendGroup(vid,g,i)).join('');
 }
@@ -1459,7 +1806,7 @@ function reidUnblendGroup(vid,g,i){
   const quick=(!g.label?(g.co_names||[]):[]).filter(n=>n!==g.co_elim && !(top&&n===top.name))
     .map(n=>`<button class="gear" onclick="reidUnblendConfirm(${vid},${i},${jarg(n)})" title="you logged this pair as here together">＋ ${esc(cap1(n))}</button>`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;flex-wrap:wrap">
-    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} tracklet(s)${g.n_crops?` · ${g.n_crops} crop(s)`:''} · coh ${g.cohesion}</div></div>
+    <div style="min-width:96px"><div style="font-weight:600">group ${i+1}</div><div class="lbl" style="opacity:.7">${g.n} track(s)${g.n_crops?` · ${g.n_crops} crop(s)`:''} · similarity ${g.cohesion}</div></div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;flex:1">${thumbs}</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${lab}${elim}${sugg}${quick}${reidInput(iid,'name…')}<button class="gear" onclick="reidUnblendLabel(${vid},${i})">Name</button></div>
   </div>`;
@@ -1495,7 +1842,7 @@ function reidBootCard(g,i){
     `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
     <div style="min-width:170px"><div style="font-weight:600">look-alike group ${i+1}</div>
-      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti? ` · ${nmulti}× 2+ animals`:''}</div></div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · look-alike ${g.cohesion}${nmulti? ` · ${nmulti}× 2+ animals`:''}</div></div>
     <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
     <div style="display:flex;gap:6px;align-items:center">${reidInput('rg-'+i,'name this individual…')}<button class="gear" onclick="reidNameGroup(${i})">Name all</button></div>
   </div>`;
@@ -1503,17 +1850,27 @@ function reidBootCard(g,i){
 /* Re-fit: once a cast exists, sort the unconfirmed remainder into "looks like <name>" buckets
    (bulk-confirm) and candidate-new-individual groups, and flag anyone named only on a pair visit. */
 let REID_REFIT=null;
+/* Bulk confirms stop at this similarity. A UI guard, not a measured operating point: the card
+   below happily offered "all 39 as The Dude" over a 36–68% match range, and wholesale stamping
+   in the lookalike zone is exactly how a label set rots (the labels are the only thing the eval
+   says works — see Template Freshness). Below the floor you confirm one at a time, eyes on. */
+const BULK_FLOOR=0.70;
 function reidFitCard(name,bucket){
   const vs=bucket.visits||[];
   const thumbs=vs.slice(0,8).map(x=>x.rep_crop?
-    `<img src="/media/${encodeURI(x.rep_crop)}" loading="lazy" title="visit #${x.visit_id} · ${Math.round(x.similarity*100)}%" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`:'').join('');
+    `<img src="/media/${encodeURI(x.rep_crop)}" loading="lazy" alt="visit ${x.visit_id} thumbnail" title="visit #${x.visit_id} · ${Math.round(x.similarity*100)}%" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`:'').join('');
   const lo=Math.round(vs[vs.length-1].similarity*100), hi=Math.round(vs[0].similarity*100);
+  const strong=vs.filter(x=>(x.similarity||0)>=BULK_FLOOR).length;
+  const weak=vs.length-strong;
+  const pct=Math.round(BULK_FLOOR*100);
+  const act=strong
+    ? `<button class="gear" onclick="reidConfirmFit(${jarg(name)},this)" title="confirm the ${strong} visit(s) matching ${esc(name)} at ${pct}%+ in one go${weak?`. The ${weak} weaker one(s) stay in the queue for one-by-one review — bulk-stamping the lookalike zone is how label sets rot`:''}">✓ the ${strong} strong (≥${pct}%) as ${esc(name)}</button>`
+    : `<span class="lbl" style="opacity:.7" title="every match here is below ${pct}% — that's the lookalike zone, so confirm these one at a time in the queue below">all under ${pct}% — review one by one</span>`;
   return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
     <div style="min-width:150px"><div style="font-weight:600">looks like ${esc(name)}</div>
-      <div class="lbl" style="opacity:.72">${vs.length} unconfirmed visit(s) · ${lo}–${hi}% match</div></div>
+      <div class="lbl" style="opacity:.72">${vs.length} unconfirmed visit(s) · ${lo}–${hi}% match${weak&&strong?` · ${weak} below the ${pct}% bulk floor`:''}</div></div>
     <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
-    <div style="display:flex;gap:6px;align-items:center">
-      <button class="gear" onclick="reidConfirmFit(${jarg(name)})" title="confirm all ${vs.length} visits as ${esc(name)}">✓ All ${vs.length} as ${esc(name)}</button></div>
+    <div style="display:flex;gap:6px;align-items:center">${act}</div>
   </div>`;
 }
 function reidNovelCard(g,i){
@@ -1523,7 +1880,7 @@ function reidNovelCard(g,i){
     `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:58px;height:58px;object-fit:cover;border-radius:4px">`).join('');
   return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
     <div style="min-width:170px"><div style="font-weight:600">possible new individual ${i+1}</div>
-      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · cohesion ${g.cohesion}${nmulti?` · ${nmulti}× 2+ animals`:''}</div></div>
+      <div class="lbl" style="opacity:.72">${g.visits.length} visit(s) · ${span} · look-alike ${g.cohesion}${nmulti?` · ${nmulti}× 2+ animals`:''}</div></div>
     <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
     <div style="display:flex;gap:6px;align-items:center">${reidInput('rn-'+i,'name…')}<button class="gear" onclick="reidNameNovel(${i})">Name all</button></div>
   </div>`;
@@ -1567,8 +1924,9 @@ function reidFunnelHTML(f){
               f.rejected?`<b style="font-family:var(--mono)">${f.rejected}</b> you left unnamed`:''].filter(Boolean).join(' · ');
   const srcs=(f.by_source||[]).length>1? `<div class="lbl" style="opacity:.72;margin-top:4px">`+
     f.by_source.map(s=>`<span title="${s.templated?'confirmed templates exist for this camera':'NO confirmed template comes from this camera — visits here cannot be matched from appearance, whatever the score says'}">${esc(s.source)}: ${s.visits} visits · ${s.confirmed} confirmed${s.templated?'':' · <b>no templates</b>'}</span>`).join(' &nbsp;·&nbsp; ')+`</div>` : '';
+  const funnelWhy='Where this species’ visits actually go. Visits: every visit in the database. With a prototype: enough analysed crops to be compared at all. Confirmed by you: a human named the visit — the only labels that become templates. Usable templates: confirmed AND solo (a two-animal visit blends two animals and can never be matched). Addressable: has a prototype, not yet confirmed, not multi-animal, not left-unnamed — the visits the automatic tier is allowed to look at. The gap between addressable and auto-named is the automation’s shortfall, as a number instead of a feeling.';
   return `<div class="panel" style="padding:8px 14px;margin-bottom:10px">
-    <div class="lbl" style="opacity:.85">${chain}</div>
+    <div class="lbl" style="opacity:.85">${chain}${infoDot(funnelWhy)}</div>
     <div class="lbl" style="opacity:.72;margin-top:4px" title="addressable = has a prototype, not yet confirmed, not multi-animal, not left-unnamed — the visits the automatic tier is allowed to look at">${side}</div>
     ${srcs}</div>`;
 }
@@ -1611,18 +1969,32 @@ function reidFreshnessHTML(cast,staleDays){
     const d=c.days_since_template, [bg,bd]=reidFreshTone(d,staleDays);
     const age=d==null?'no usable template':(d<1?'today':Math.round(d)+'d ago');
     const warn=(d==null||d>=(staleDays||14))?' ⚠':'';
-    const gone=`<button class="gear" style="padding:0 5px;margin-left:4px" title="${esc(c.name)} isn't coming back? Record the last day you saw them. The nightly pass then stops writing this name onto later visits — everything else is unchanged." onclick="reidSetDeparted(${jarg(c.name)},${jarg((c.last_seen||'').slice(0,10))})">moved on?</button>`;
-    return `<span class="flag" style="background:${bg};border-color:${bd}" title="${esc(c.name)}: ${c.n_visits} confirmed visit(s), ${c.n_templates||0} of them usable as templates (solo). Newest template ${d==null?'does not exist':reidWhen(c.newest_template)}. Identification accuracy against a template this old is roughly ${d==null?'nil':(d<1?'0.82':(d<7?'0.7':(d<14?'0.48':'0.22')))} top-1 — confirm a fresh solo visit for ${esc(c.name)} to reset it.">${esc(c.name)} · <b>${age}</b>${warn}<span style="opacity:.6"> · ${c.n_templates||0}/${c.n_visits}</span>${gone}</span>`;
+    const gone=`<button class="gear" style="padding:0 5px;margin-left:4px" title="${esc(c.name)} isn't coming back? Record the last day you saw them. The nightly pass then stops writing this name onto later visits — everything else is unchanged." onclick="reidSetDeparted(this,${jarg(c.name)},${jarg((c.last_seen||'').slice(0,10))})">moved on?</button>`;
+    const freshWhy=`${c.name}: ${c.n_visits} confirmed visit(s), ${c.n_templates||0} of them usable as templates (solo). Newest template ${d==null?'does not exist':reidWhen(c.newest_template)}. Identification against a template this old is roughly ${d==null?'nil':(d<1?'0.82':(d<7?'0.7':(d<14?'0.48':'0.22')))} top-1 — confirm a fresh solo visit for ${c.name} to reset it.`;
+    return `<span class="flag" style="background:${bg};border-color:${bd}" title="${esc(freshWhy)}">${esc(c.name)} · <b>${age}</b>${warn}<span style="opacity:.6"> · ${c.n_templates||0}/${c.n_visits}</span>${infoDot(freshWhy)}${gone}</span>`;
   }).join(' ');
   return `<h2 class="sec">Template Freshness <span class="n">who the matcher can still recognise — stalest first</span></h2>
     <p class="lbl" style="opacity:.75;margin:2px 0 6px">Appearance goes stale fast on this animal: identification is ~0.82 correct against a template from the same night, ~0.48 at a week, ~0.22 at three weeks — barely above guessing the commonest name. The number is days since that individual's newest <b>confirmed solo</b> visit, and the second pair is usable templates / confirmations. If one of them has simply stopped coming, say so — a template outlives the animal, and the nightly pass has no other way to find out.</p>
     <div class="lede" style="margin-bottom:10px">${chips}</div>`;
 }
-async function reidSetDeparted(name,lastSeen){
-  const d=(prompt(`Last day you saw ${name} (YYYY-MM-DD).\n\nVisits up to and including this day can still be named ${name}; later ones will never be auto-named ${name} again.`,
-                  lastSeen||'')||'').trim();
-  if(!d) return;
-  await postIndivStatus({name, status:'departed', effective_date:d});
+function reidSetDeparted(btn,name,lastSeen){
+  /* Inline <input type=date> in place of the old window.prompt: the native date picker makes
+     this a two-tap phone flow with validation for free, and it can't be suppressed by an
+     in-app browser the way system dialogs can. Prefilled with the animal's last-seen day —
+     the answer it almost always is. */
+  const wrap=document.createElement('span');
+  wrap.style.cssText='display:inline-flex;gap:4px;align-items:center;margin-left:4px';
+  wrap.innerHTML=`<input type="date" value="${esc(lastSeen||'')}" style="padding:2px 4px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.25);border-radius:4px;color:inherit;font:inherit"
+      title="the last day ${esc(name)} was here — visits up to and including it can still be named ${esc(name)}; later ones never get auto-named ${esc(name)} again">
+    <button class="gear" style="padding:0 5px">✓ moved on</button>
+    <button class="gear" style="padding:0 5px" title="never mind">✕</button>`;
+  const [ok,cancel]=wrap.querySelectorAll('button');
+  const inp=wrap.querySelector('input');
+  ok.onclick=async()=>{ const d=(inp.value||'').trim(); if(!d){ inp.focus(); return; }
+    await postIndivStatus({name, status:'departed', effective_date:d}); };
+  cancel.onclick=()=>{ wrap.replaceWith(btn); };
+  btn.replaceWith(wrap);
+  inp.focus();
 }
 async function reidSetResident(name){
   if(!confirm(`Put ${name} back on the roster? The nightly pass may name recent visits ${name} again.`)) return;
@@ -1654,11 +2026,14 @@ function reidModesHTML(q){
   const prev=q.offset>0?`<button class="gear" onclick="reidPage(-1)">← newer</button>`:'';
   const next=(q.offset+q.limit)<q.n_matched?`<button class="gear" onclick="reidPage(1)">older →</button>`:'';
   const pager=q.n_matched?`<span class="lbl" style="opacity:.7">${from}–${to} of ${q.n_matched}</span> ${prev} ${next}`:'';
-  return `<div id="reid-modes" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 10px">${tabs}
+  const modesWhy=(q.modes||['recent']).map(m=>{ const [l,t]=REID_MODE_LABELS[m]||[m,'']; return `${l}: ${t}`; }).join('  •  ');
+  return `<div id="reid-modes" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 10px">${tabs}${infoDot('Four slices of the same review pool — '+modesWhy)}
     <span style="flex:1"></span>${pager}</div>`;
 }
 function reidQueueHTML(q){
   if(!q) return '';
+  if(q.__pending) return `<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>
+    <p class="empty">Matching the recent visits against the cast — this can take a moment after a busy night…</p>`;
   q={...q, queue:q.queue||[], bootstrap:q.bootstrap||[]};
   const hasFunnel=!!(q.funnel&&q.funnel.visits);
   if(!q.queue.length&&!q.bootstrap.length&&!q.refit&&!hasFunnel) return '';
@@ -1705,24 +2080,40 @@ async function postVisitLabel(target, body, after){
 }
 function visitSpeciesCorrect(target, selectId, after){
   const sel=document.getElementById(selectId); if(!sel) return;
-  let sp=sel.value;
-  if(sp==='__other__'){ sp=(prompt('New species label (e.g. striped skunk):')||'').trim(); }
+  const sp=sel.value;
+  if(sp==='__other__'){ otherSpeciesInline(sel, v=>postVisitLabel(target,{species:v},after)); return; }
   if(!sp) return;
   postVisitLabel(target, {species:sp}, after);
 }
-async function reidConfirmMany(visitIds,name){
+async function reidConfirmMany(visitIds,name,btn){
+  let done=0;
+  if(btn) btn.disabled=true;
   try{
-    for(const vid of visitIds)
+    for(const vid of visitIds){
       await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({visit_id:vid,name})});
+      done++;
+      if(btn) btn.textContent=`saving ${done}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
+    }
     loadIndividuals();
-  }catch(e){ alert('Could not save: '+e); }
+  }catch(e){
+    alert(`Could not save: ${e}${done?` — ${done} of ${visitIds.length} were saved before the failure`:''}`);
+    loadIndividuals();   // re-render so the saved part shows honestly
+  }
 }
-async function reidConfirmFit(name){
+async function reidConfirmFit(name,btn){
   const b=REID_REFIT&&REID_REFIT.fits&&REID_REFIT.fits[name]; if(!b) return;
-  const ids=b.visits.map(x=>x.visit_id);
-  if(!confirm(`Confirm all ${ids.length} visits as ${name}?`)) return;
-  reidConfirmMany(ids,name);
+  const ids=b.visits.filter(x=>(x.similarity||0)>=BULK_FLOOR).map(x=>x.visit_id);
+  if(!ids.length) return;
+  // Two taps instead of a system confirm(): the first arms the button in place (styleable,
+  // works in the in-app browsers that suppress window.confirm), the second commits.
+  if(btn && btn.dataset.armed!=='1'){
+    btn.dataset.armed='1'; btn.dataset.label=btn.textContent;
+    btn.textContent=`really stamp ${ids.length} as ${name}? tap again`;
+    setTimeout(()=>{ if(btn.isConnected&&btn.dataset.armed==='1'){ btn.dataset.armed=''; btn.textContent=btn.dataset.label; } },6000);
+    return;
+  }
+  reidConfirmMany(ids,name,btn);
 }
 async function reidNameNovel(i){
   const inp=document.getElementById('rn-'+i);
@@ -1817,7 +2208,7 @@ async function togglePoses(name){
   let d; try{ d=await fetch('/api/reid/poses?individual='+encodeURIComponent(name)).then(r=>r.json()); }
   catch(e){ box.innerHTML='<p class="lbl">Could not load poses.</p>'; return; }
   const poses=d.poses||[];
-  if(!poses.length){ box.innerHTML='<p class="lbl" style="opacity:.7">Not enough embedded crops to cluster poses yet.</p>'; return; }
+  if(!poses.length){ box.innerHTML='<p class="lbl" style="opacity:.7">Not enough analysed crops to cluster poses yet.</p>'; return; }
   box.innerHTML=`<div class="lbl" style="opacity:.75;margin-bottom:8px">${esc(name)}'s characteristic poses — ${d.n_groups} group(s) of crops that share a body posture/viewpoint (the biggest ${poses.length} shown):</div>`
     +`<div style="display:flex;flex-wrap:wrap;gap:14px">`+poses.map((p,i)=>
       `<div style="flex:0 0 auto"><div class="lbl" style="opacity:.6;font-family:var(--mono);font-size:11px;margin-bottom:3px">pose ${i+1} · ${p.n} crops</div>`
@@ -2041,6 +2432,7 @@ async function refreshNaming(){
   const map={ loading:['#d9a23b','Identifier: warming up…'],
               ready:['#5b8c5a','Identifier: on'],
               stopped:['#b4503f','Identifier: stopped'] };
+  window.__frNaming=n.state;          // first-run checklist reads this
   const m=map[n.state];
   if(!m){ el.style.display='none'; return; }
   el.style.display='';
@@ -2052,6 +2444,30 @@ async function refreshNaming(){
 }
 /* ---------- first-run orientation: shown only while the database is still empty ---------- */
 let __firstRunLanded=false;   // so the empty-DB redirect to Live fires at most once per page load
+function _frChecklist(){
+  /* The newcomer's most fragile hour is "is it working?" -- answer it with live state the page
+     already polls, instead of leaving them to README archaeology. Each row re-renders on the
+     stats poll, so a fixed camera or a finished model download ticks itself green. */
+  const cam=window.__frCamera;                      // stashed by refreshLive's checkFeeds pass
+  const naming=window.__frNaming;                   // stashed by refreshNaming
+  const geo=window.__frGeo;                         // stashed by refreshHeader (lat/lon set?)
+  const row=(state,txt)=>'<div class="fr-row">'
+    +'<span class="fr-dot" style="color:'+(state==='ok'?'#5b8c5a':state==='warn'?'#d9a23b':'#8a7d63')+'">'
+    +(state==='ok'?'●':state==='warn'?'●':'○')+'</span> '+txt+'</div>';
+  let rows='';
+  rows+=row(cam===true?'ok':cam===false?'warn':'wait',
+    cam===true?'Camera connected — frames are coming in.'
+    :cam===false?'No camera frames yet. Still plugging in? <code>python backyard_cam.py --list-cameras</code> finds the right index; set <code>camera_index</code> in config_local.py.'
+    :'Checking the camera…');
+  rows+=row(naming==='ready'?'ok':naming==='loading'?'warn':'wait',
+    naming==='ready'?'Species identifier is on — new visitors get named automatically.'
+    :naming==='loading'?'Species identifier is downloading/loading its models (first run can take minutes on the model download — gigabytes, one time only).'
+    :'Species identifier: not running (it starts with the rig by default).');
+  rows+=row(geo?'ok':'warn',
+    geo?'Location set — day/night editions and sun-aware features are on.'
+    :'No latitude/longitude yet — day/night features are off. Two lines in config_local.py turn them on.');
+  return rows;
+}
 function maybeFirstRun(s){
   const el=document.getElementById('firstrun'); if(!el) return;
   const empty=!(s&&s.total_crops);
@@ -2059,30 +2475,41 @@ function maybeFirstRun(s){
     // A brand-new, empty rig should see the welcome card (it lives in the Live view), not the
     // empty Dispatch we land on by default. Redirect once; afterwards the user can navigate freely.
     if(!__firstRunLanded){ __firstRunLanded=true; show('live'); }
-    if(!el.dataset.filled){
-      el.innerHTML='<div class="fr-card"><div class="fr-title">Welcome to your Backyard Observatory</div>'
-        +'<p>The camera is watching the yard right now &mdash; there&rsquo;s nothing else to start. As real animals visit, this log fills in by itself: their photographs, the species name, and over days, who comes and when.</p>'
-        +'<p class="fr-soft">It can take a while for the first visitor to appear. Leave it running and check back later.</p>'
-        +'<button class="fr-x" type="button" onclick="dismissIntro()">Got it</button></div>';
-      el.dataset.filled='1';
-    }
+    el.innerHTML='<div class="fr-card"><div class="fr-title">Welcome to your Backyard Observatory</div>'
+      +'<p>The camera watches the yard by itself &mdash; as animals visit, this log fills in: their photographs, the species name, and over days, who comes and when.</p>'
+      +_frChecklist()
+      +'<p class="fr-soft">Try it now: wave at the camera. You&rsquo;ll be drawn on the live view but not saved &mdash; the rig only keeps animals. Then leave it running and check back later. '
+      +'Curious how any of it works? <a href="/making-of/" target="_blank" rel="noopener">The making-of site</a> walks the whole pipeline on real data.</p>'
+      +'<button class="fr-x" type="button" onclick="dismissIntro()">Got it</button></div>';
     el.hidden=false;
   } else { el.hidden=true; }
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere();
-// Land on the view in the URL hash when there is one (deep links / refresh keep their tab);
-// else the Visit Log — the scroll-around-and-see-what-happened surface. maybeFirstRun still
-// redirects a brand-new empty rig to Live.
-{ const h=location.hash.replace('#','');
-  show(VIEWS.includes(h)?h:'visits', true); }
-setInterval(refreshLive,6000);
-setInterval(refreshHeader,4000);
-setInterval(refreshNaming,4000);
-setInterval(checkFeeds,8000);
-setInterval(refreshWhoshere,6000);
-setInterval(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); },2000);   // live controls while the panel's open
+loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); refreshEvalStatus(); refreshRole();
+// Land wherever the URL hash points — a tab, a profile, a day, a species sheet, a dated
+// dispatch (deep links and refresh keep their place); else the Visit Log — the
+// scroll-around-and-see-what-happened surface. maybeFirstRun still redirects a brand-new
+// empty rig to Live.
+if(!applyHash(location.hash)) show('visits', true);
+/* Pollers pause while the page is hidden. A phone left on the dashboard in a background tab was
+   hitting three endpoints every few seconds ALL NIGHT — battery there, steady wakeups on the
+   same box that runs the detector here. The MJPEG streams already detach off-tab
+   (syncLiveStreams) and whoshere/checkFeeds early-return off their tab; this completes the
+   pattern for the base pollers. On becoming visible again everything refreshes at once, so the
+   page feels instantly fresh instead of up-to-6-seconds stale. */
+function vispoll(fn,ms){ setInterval(()=>{ if(!document.hidden) fn(); },ms); }
+vispoll(refreshLive,6000);
+vispoll(refreshHeader,4000);
+vispoll(refreshNaming,4000);
+vispoll(checkFeeds,8000);
+vispoll(refreshWhoshere,6000);
+vispoll(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); },2000);   // live controls while the panel's open
+vispoll(refreshEvalStatus,30*60*1000);   // the eval artifact changes once a day (~2pm batch)
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden) return;
+  refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); checkFeeds();
+});
 /* ---------- lightbox: click any crop/frame to enlarge ---------- */
 /* Delegated so it covers every served image across all tabs (review queue, cast, species
    browser, explorer) with no per-image wiring -- and any future <img src="/media/..."> too.
@@ -2131,5 +2558,62 @@ setInterval(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); 
       e.preventDefault();
       openFrom(t);
     }
+  });
+})();
+
+/* ---------- info popovers: the tappable ⓘ ----------
+   The load-bearing explanations used to live ONLY in title= tooltips, which do not exist on a
+   phone — so the most-explained tab in the codebase read as pure jargon on the device the
+   family actually uses. infoDot() renders a small ⓘ whose text opens in a real popover on
+   tap/click/Enter; a title= on the host element stays as the desktop hover shortcut. */
+function infoDot(text){ return ` <span class="infodot" role="button" tabindex="0" aria-label="explain" data-info="${esc(text)}">ⓘ</span>`; }
+(function(){
+  const pop=document.createElement('div');
+  pop.className='infopop'; pop.hidden=true;
+  document.body.appendChild(pop);
+  let openFor=null;
+  function closePop(){ pop.hidden=true; openFor=null; }
+  function openPop(dot){
+    pop.textContent=dot.dataset.info||'';
+    pop.hidden=false; openFor=dot;
+    pop.style.maxWidth=Math.min(340, window.innerWidth-24)+'px';
+    const r=dot.getBoundingClientRect(), ph=pop.offsetHeight, pw=pop.offsetWidth;
+    const x=Math.min(Math.max(8, r.left), window.innerWidth-pw-8);
+    let y=r.bottom+6; if(y+ph>window.innerHeight-8) y=Math.max(8, r.top-ph-6);
+    pop.style.left=x+'px'; pop.style.top=y+'px';
+  }
+  document.addEventListener('click',e=>{
+    const dot=e.target.closest&&e.target.closest('.infodot');
+    if(dot){ e.stopPropagation(); e.preventDefault(); (openFor===dot&&!pop.hidden)?closePop():openPop(dot); return; }
+    if(!pop.hidden) closePop();
+  }, true);   // capture: the dot often sits inside cards with their own click handlers
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closePop(); });
+  window.addEventListener('scroll',()=>{ if(!pop.hidden) closePop(); }, {passive:true});
+})();
+
+/* ---------- keyboard floor ----------
+   The click-only cards become real tab stops. A MutationObserver stamps role/tabindex onto the
+   recurring card selectors as they render (many render paths, one wiring point), and one
+   delegated keydown makes Enter/Space activate whatever a click would. */
+(function(){
+  const SEL='.vcard,.daycard,.rc-card,.crop,.card[data-sp],.fs,.cal-cell[data-day],.tally[onclick]';
+  const stampOne=el=>{ if(!el.hasAttribute('tabindex')){ el.setAttribute('tabindex','0'); el.setAttribute('role','button'); } };
+  const stamp=root=>{ if(root.querySelectorAll) root.querySelectorAll(SEL).forEach(stampOne); };
+  stamp(document);
+  new MutationObserver(muts=>muts.forEach(m=>m.addedNodes.forEach(n=>{
+    if(n.nodeType!==1) return;
+    if(n.matches&&n.matches(SEL)) stampOne(n);
+    stamp(n);
+  }))).observe(document.body,{childList:true,subtree:true});
+  document.addEventListener('keydown',e=>{
+    if(e.key!=='Enter'&&e.key!==' ') return;
+    const t=e.target;
+    if(!t.closest||['BUTTON','A','INPUT','SELECT','TEXTAREA'].includes(t.tagName)) return;
+    const el=t.closest(SEL+',.infodot');
+    if(!el||el!==t) return;              // only when the stamped element itself holds focus
+    e.preventDefault();
+    if(typeof el.onclick==='function'||el.hasAttribute('onclick')||el.classList.contains('infodot')){ el.click(); return; }
+    const img=el.querySelector('img[src*="/media/"]'); if(img){ img.click(); return; }
+    el.click();
   });
 })();

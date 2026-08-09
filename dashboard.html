@@ -33,6 +33,7 @@
   <button id="tab-behavior" onclick="show('behavior')">Behaviour</button>
   <button id="tab-indiv" onclick="show('indiv')">Individuals</button>
   <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
+  <button id="tab-seasons" onclick="show('seasons')">Seasons</button>
   <button id="tab-cat" onclick="show('cat')">Specimen Catalogue</button>
 </nav>
 
@@ -141,11 +142,21 @@
   <section id="view-calendar" class="view">
     <div id="calendar-body"><p class="empty">Loading the calendar&hellip;</p></div>
   </section>
+
+  <!-- ============ SEASONS (the longitudinal view: weekly trends, first/last dates,
+       the species-accumulation curve — where "same week last year" will live) ============ -->
+  <section id="view-seasons" class="view">
+    <div id="seasons-body"><p class="empty">Leafing back through the weeks&hellip;</p></div>
+  </section>
 </main>
 <div class="foot">Recorded by an unblinking eye at the sliding glass door. Counts are observations; one visit may leave many.<br>
 <!-- This "Source" link is the AGPL section 13 offer of source: anyone reached by the LAN dashboard
      gets the code from here, so it has to point at the real public repo, not a typo'd account. -->
-<a href="https://github.com/unclemattmakes/backyard-critter-cam" target="_blank" rel="noopener">Source</a> &middot; <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">AGPL-3.0</a></div>
+<a href="/making-of/" target="_blank" rel="noopener">How it works</a> &middot; <a href="https://github.com/unclemattmakes/backyard-critter-cam" target="_blank" rel="noopener">Source</a> &middot; <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener">AGPL-3.0</a>
+<!-- Operator/viewer split (only shown when the rig has an operator_token configured): the one
+     place a household device turns itself into an operator. refreshRole() fills it in. -->
+<span id="role-link" hidden style="cursor:pointer;text-decoration:underline;margin-left:6px" onclick="roleToggle()"></span>
+<span id="role-entry" hidden style="margin-left:6px"><input type="password" placeholder="operator token…" style="padding:2px 6px;background:rgba(0,0,0,.3);border:1px solid var(--rule2);border-radius:3px;color:inherit;font:inherit;width:130px" onkeydown="if(event.key==='Enter')roleSave()"><button class="fr-x" style="margin:0 0 0 4px;padding:3px 8px" onclick="roleSave()">unlock</button></span></div>
 
 <!-- Camera settings (popped out from the Live plate's Settings button) -->
 <div id="settings" class="modal" hidden>
@@ -155,6 +166,9 @@
     <h3>Instrument Panel <span class="lbl" id="instr-cam"></span></h3>
     <p class="hint">Adjust the camera in real time. If the picture is soft, try toggling <em>Autofocus</em>. Controls your camera can&rsquo;t change are shown locked.</p>
     <p class="hint" id="instr-net" hidden>This is a networked camera &mdash; its exposure, focus and white balance are set on the camera itself (its own app or web page), not here.</p>
+    <!-- The nightly eval gate's verdict (run_clipmotion.bat step 5, /api/evalstatus): the
+         measurement culture's one-line receipt. Filled by refreshEvalStatus(). -->
+    <p class="hint" id="instr-eval" hidden></p>
     <div id="controls"></div>
 
     <!-- Ignore zones: static bits of scenery the detector keeps mistaking for an animal.

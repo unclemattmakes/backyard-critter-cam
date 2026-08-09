@@ -1,10 +1,43 @@
   :root{
     --bg:#15130d; --panel:#1c1910; --panel2:#221e14; --ink:#e9dec6; --dim:#a89b7e;
-    --faint:#6d6249; --rule:#37301f; --rule2:#4a4029;
+    /* --faint was #6d6249 (~3.1:1 on the bg) — a WCAG AA fail at exactly the 10.5px size the
+       .lbl class uses it for. #8b7f60 keeps the same parchment hue at ~4.6:1. */
+    --faint:#8b7f60; --rule:#37301f; --rule2:#4a4029;
     --gilt:#c9a24b; --sage:#94a36b; --rust:#c05f3e; --ok:#86ab5d;
     --serif:'Iowan Old Style','Palatino Linotype','Book Antiqua',Palatino,'Hoefler Text',Constantia,Georgia,'Times New Roman',serif;
     --mono:'Cascadia Code','Cascadia Mono',Consolas,'SFMono-Regular',ui-monospace,monospace;
   }
+  /* Keyboard floor: one visible focus ring for every real and stamped control (the JS promotes
+     the click-only cards to role=button tabindex=0). Never shown for mouse clicks. */
+  :focus-visible{ outline:2px solid var(--gilt); outline-offset:2px; border-radius:3px; }
+  /* Motion is decorative here; honour the OS-level "less of it, please". */
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{ animation-duration:.01ms !important; animation-iteration-count:1 !important;
+      transition-duration:.01ms !important; scroll-behavior:auto !important; }
+  }
+  /* VIEWER MODE (body.viewer — the operator/viewer split, set by refreshRole when the rig has an
+     operator_token and this browser hasn't entered it). The curation chrome disappears; reading,
+     playing, profiles and the attributed "who's here" log remain. Comfort only — the SERVER
+     refuses un-tokened writes regardless, at the do_POST choke point. */
+  body.viewer .vlabel,                 /* per-visit ✎ label tools */
+  body.viewer .crop .acts,             /* catalogue ✓/✗/✎ */
+  body.viewer .crop select,
+  body.viewer .review-launch,          /* Needs Review launcher */
+  body.viewer .live-pane .gear,        /* camera settings gear on the live plates */
+  body.viewer #view-indiv .gear,       /* queue confirm/correct/bulk controls */
+  body.viewer #view-indiv input,
+  body.viewer .ev-add,                 /* field-notebook entry form on profiles */
+  body.viewer #zones-sec { display:none !important; }
+
+  /* The tappable ⓘ + its popover (infoDot in dashboard.js): the phone-reachable home for the
+     explanations that used to live only in title= tooltips. */
+  .infodot{ display:inline-block; margin-left:4px; padding:0 3px; cursor:pointer; color:var(--gilt);
+    opacity:.75; font-style:normal; font-family:var(--serif); font-size:12px; user-select:none; }
+  .infodot:hover{ opacity:1; }
+  .infopop{ position:fixed; z-index:1200; background:var(--panel2); border:1px solid var(--rule2);
+    border-radius:6px; padding:10px 12px; color:var(--dim); font-family:var(--serif);
+    font-size:13.5px; line-height:1.45; letter-spacing:normal; text-transform:none;
+    box-shadow:0 8px 28px rgba(0,0,0,.55); }
   *{box-sizing:border-box;}
   html,body{margin:0; overflow-x:hidden;}
   body{
@@ -494,6 +527,11 @@
     text-transform:uppercase; color:var(--gilt); background:none; border:1px solid var(--rule2);
     border-radius:3px; padding:7px 14px; cursor:pointer; }
   .firstrun .fr-x:hover{ border-color:var(--gilt); }
+  /* the first-run checklist rows: live is-it-working state, re-rendered on the stats poll */
+  .firstrun .fr-row{ color:var(--dim); margin:7px 0; max-width:66ch; padding-left:2px; }
+  .firstrun .fr-row code{ font-family:var(--mono); font-size:11.5px; color:var(--ink);
+    background:var(--panel2); border:1px solid var(--rule2); border-radius:3px; padding:1px 5px; }
+  .firstrun .fr-dot{ display:inline-block; width:1em; }
 
   /* ---------- Cast Roll Call (Dispatch): the named cast with last-seen / overdue ---------- */
   .rollcall{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:10px; }
