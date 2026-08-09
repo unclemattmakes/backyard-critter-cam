@@ -242,17 +242,26 @@ visit is **0.90 days**.)*
 
 </details>
 
-### 3.2 Say "this identity has lapsed" wherever a name is used — the quick one
-Carved out of the chain design by review as **worth shipping regardless of whether the chain ever
-happens.** Today the only place that admits an identity has gone stale is the operator-only
-Template Freshness panel; everywhere else — the profile page, the suggestion payload, the roll
-call — a 40-day-old template ranks as an equal to yesterday's without comment.
+### ~~3.2 Say "this identity has lapsed" wherever a name is used~~ — **shipped 2026-08-09**
+`individuals.identity_lapse` is the state (**fresh / fading / lapsed / none**) plus the expected
+top-1 at that template age, and every boundary is a measurement rather than a choice: re-measured
+at finer granularity, top-1 runs 0.741 same-night → 0.482 at a week → 0.403 at ten days → **0.259
+at a fortnight, below the 0.345 majority baseline**. Somewhere between 10 and 14 days the matcher
+stops beating "just say Stan"; `reid_queue_stale_days` was already 14 for that reason, so the
+state reads that number instead of inventing a second one to drift from.
 
-The data is already computed. What is missing is a first-class per-individual **lapsed** state,
-surfaced wherever a name is consumed, that says the matcher can no longer vouch for this animal
-and a human re-anchor is what fixes it. It turns the eval's honest ceiling — you cannot reliably
-name an animal nobody has confirmed in a week or two — from a fact buried in a document into a
-fact the interface tells you.
+It is surfaced in all four places a name is consumed — the cast panel, **every queue suggestion**
+(the offer now carries the lapse of the name it proposes), the profile page, and the roll call,
+where it sits beside *overdue* as the other half of the question: overdue is about the raccoon not
+coming, lapsed is about nobody having confirmed it. **Labelled, never filtered** — gating on
+template age is a measured-dead idea (§7).
+
+Two things fell out of wiring it to several surfaces at once, both now fixed: the dashboard's
+hard-coded accuracy table was quoting the **session-leaked** 0.82 for a same-night template, and
+a first cut had the roll call calling Notch *fresh, 0.7 days* while the Individuals tab called the
+same animal *lapsed, 45.6 days* — a confirmation the nightly embed pass had not reached is not a
+template, and the multi-animal test needs all three of `is_multi`'s channels (dropping the clip one
+cost three weeks of error on Stan). One definition now, `individuals.usable_template_visits`.
 
 ### 3.3 Family-by-structure: the half of the group-label fix that is still missing
 The **defensive** half shipped (group labels can no longer poison the template pool). The
