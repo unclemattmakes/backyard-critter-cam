@@ -704,3 +704,17 @@ def test_census_line_is_logged_even_with_the_veto_off(tmp_path, monkeypatch, cap
     out = capsys.readouterr().out
     assert "detector census:" in out
     assert "run(s)" in out and "longest empty run" in out
+
+
+def test_veto_census_line_reaches_the_log_from_the_real_loop(tmp_path, monkeypatch, capsys):
+    """The unit tests above prove VetoCensus counts; this proves the capture loop actually CALLS
+    it. That distinction is the whole reason this class exists -- refimg's shadow week wrote only
+    its suppressions, so "it flagged nothing" and "it is perfectly precise" were the same log, and
+    telling them apart cost a full replay of the week off recorded clips."""
+    cfg = _loop_cfg(tmp_path / "vetocensus", refimg_enabled=True, refimg_certify_hold_s=0.0)
+    real = backyard_cam.VetoCensus
+    monkeypatch.setattr(backyard_cam, "VetoCensus", lambda: real(period_s=0.0))
+    _drive(cfg, monkeypatch)
+    out = capsys.readouterr().out
+    assert "veto census:" in out
+    assert "box(es) judged" in out
