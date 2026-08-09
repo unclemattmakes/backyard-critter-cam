@@ -372,6 +372,26 @@ def clip_match(vec: np.ndarray, templates: dict, threshold: float) -> list:
     return [(n, s, k) for n, s, k in ranked if s >= threshold]
 
 
+def max_separated(boxes, iou_max: float = 0.45) -> int:
+    """How many of these boxes are mutually separate -- a LOWER BOUND on the bodies in one frame.
+
+    Greedy, and greedy on purpose: the true answer is a maximum clique, and greedy under-counts.
+    Under-counting is the only safe direction for a claim of the form "the yard held at least this
+    many animals at once", which is the only claim this corpus can support. The detector's recall
+    on a huddle is about 0.39 (config.py, tiledetect), so the number is a floor twice over.
+
+    Deliberately NOT an attribution: it says how many bodies, never whose. Counting kits per
+    mother from track overlap was proposed, tested against the one eye-verified four-animal window
+    and killed -- the glass door's clips held ZERO sustained tracklets there and the detector
+    produced a maximum of one box at any instant (docs/deferred-work.md, Killed).
+    """
+    keep: list = []
+    for b in boxes:
+        if all(iou(b, k) < iou_max for k in keep):
+            keep.append(b)
+    return len(keep)
+
+
 def co_present_frames(rows, iou_max: float = 0.45) -> int:
     """How many timestamps in `rows` ([(timestamp, (x1,y1,x2,y2)), ...], one species) hold >= 2
     plausibly-separate boxes (pairwise IoU < iou_max). This is the "2+ raccoons at once" badge.

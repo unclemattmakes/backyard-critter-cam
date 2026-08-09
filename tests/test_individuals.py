@@ -1442,3 +1442,12 @@ def test_usable_template_visits_matches_what_the_matcher_would_use(conn):
     lapses = individuals.lapse_by_name(conn, "raccoon")
     assert lapses["stan"]["state"] == "lapsed"       # the only template is well over a fortnight old
     assert individuals.lapse_by_name(conn, "raccoon", names=["nobody"]) == {}
+
+
+def test_max_separated_is_a_greedy_lower_bound():
+    """Greedy on purpose. The exact answer is a maximum clique; greedy under-counts, and
+    under-counting is the only safe direction for "the yard held at least this many at once"."""
+    boxes = [(0, 0, 10, 10), (50, 50, 60, 60), (100, 100, 110, 110)]
+    assert individuals.max_separated(boxes) == 3
+    assert individuals.max_separated([(0, 0, 10, 10), (1, 1, 11, 11)]) == 1   # one animal, twice
+    assert individuals.max_separated([]) == 0

@@ -1520,5 +1520,45 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         "first_visitor": {"species": pr[0]["label"], "time": pr[0]["dt"].isoformat()},
         "last_visitor": {"species": pr[-1]["label"], "time": pr[-1]["dt"].isoformat()},
         "busiest_hour": ({"hour": bh[0], "visits": bh[1]} if bh else None),
+        "crowd": crowd_peak(pr),
     })
     return done(out)
+
+
+def crowd_peak(rows, iou_max: float = 0.45) -> dict:
+    """The busiest INSTANT of a period: "at least N animals were in the yard at once".
+
+    A LOWER BOUND, and it must always be worded as one. Three separate floors sit under it: the
+    detector's recall on a huddle is about 0.39; `individuals.max_separated` is greedy; and the
+    glass door's sparse saved stills only see the instants something was written. The number is
+    what the yard DEMONSTRABLY held, never what it held.
+
+    NO ATTRIBUTION, ever -- how many bodies, never whose, and never "all four of CutiePie's kits
+    showed". Per-family kit headcount from track overlap was proposed, tested against the one
+    eye-verified four-animal window, and killed: the covering glass-door clips held zero sustained
+    tracklets and the detector produced a maximum of ONE box at any instant where a human counted
+    four (docs/deferred-work.md, Killed). This is the salvageable kernel of that idea and nothing
+    more. It is also SEASONAL -- the kits are kit-sized now and will not be -- so it dates itself.
+
+    `rows` are the digest's row dicts (dt / source / label / bbox_*). Returns
+    {n, at, source, by_species} for the instant with the largest separated set, or n=0.
+    """
+    import individuals
+    by_instant: dict = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        if r.get("bbox_x1") is None:
+            continue
+        by_instant[(r["source"], r["timestamp"])][r["label"]].append(
+            (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]))
+    best = {"n": 0, "at": None, "source": None, "by_species": {}}
+    for (src, ts), by_sp in by_instant.items():
+        # Count within a species AND across the whole instant: two crows and a raccoon is three
+        # animals, and one species' own boxes are the case the IoU rule was measured for.
+        per_sp = {sp: individuals.max_separated(bs, iou_max) for sp, bs in by_sp.items()}
+        n = max(max(per_sp.values()),
+                individuals.max_separated([b for bs in by_sp.values() for b in bs], iou_max))
+        if n > best["n"]:
+            best = {"n": n, "at": ts, "source": src,
+                    "by_species": {k: v for k, v in sorted(per_sp.items(), key=lambda kv: -kv[1])
+                                   if v}}
+    return best

@@ -427,3 +427,46 @@ def test_sun_without_a_location_still_gives_a_positive_day():
     dawn, dusk = stats._sun(cfg, date(2026, 8, 7))
     assert dawn < dusk and (dusk - dawn) == timedelta(hours=12)       # the 06:00/18:00 fallback
     stats._SUN_CACHE.clear()
+
+
+# ---- crowd_peak: "at least N animals at once", a lower bound and nothing more ---------
+# The salvageable kernel of the killed per-family kit headcount. Every test here pins the
+# UNDER-counting direction, because a claim of the form "the yard held at least this many" is the
+# only claim this corpus supports -- the detector's recall on a huddle is about 0.39.
+
+def _row(ts, box, *, label="raccoon", source="glass_door_cam"):
+    return {"timestamp": ts, "dt": None, "source": source, "label": label,
+            "bbox_x1": box[0], "bbox_y1": box[1], "bbox_x2": box[2], "bbox_y2": box[3]}
+
+
+def test_crowd_peak_counts_separate_bodies_at_one_instant():
+    rows = [_row("t1", (0, 0, 10, 10)), _row("t1", (50, 50, 60, 60)), _row("t1", (90, 90, 99, 99)),
+            _row("t2", (0, 0, 10, 10))]
+    c = stats.crowd_peak(rows)
+    assert c["n"] == 3 and c["at"] == "t1" and c["by_species"] == {"raccoon": 3}
+
+
+def test_crowd_peak_does_not_count_the_detector_double_boxing_one_animal():
+    # High IoU is one animal boxed twice; that is what the 0.45 cut was measured for.
+    rows = [_row("t1", (0, 0, 10, 10)), _row("t1", (1, 1, 11, 11))]
+    assert stats.crowd_peak(rows)["n"] == 1
+
+
+def test_crowd_peak_adds_up_across_species():
+    rows = [_row("t1", (0, 0, 10, 10), label="raccoon"),
+            _row("t1", (50, 50, 60, 60), label="Virginia opossum")]
+    c = stats.crowd_peak(rows)
+    assert c["n"] == 2 and c["by_species"] == {"raccoon": 1, "Virginia opossum": 1}
+
+
+def test_crowd_peak_never_counts_across_cameras():
+    # Two yards' worth of boxes at the same instant is not two animals in one frame.
+    rows = [_row("t1", (0, 0, 10, 10), source="glass_door_cam"),
+            _row("t1", (50, 50, 60, 60), source="trail_cam_sd")]
+    assert stats.crowd_peak(rows)["n"] == 1
+
+
+def test_crowd_peak_is_empty_without_boxes():
+    assert stats.crowd_peak([])["n"] == 0
+    assert stats.crowd_peak([{"timestamp": "t", "source": "s", "label": "raccoon",
+                              "bbox_x1": None}])["n"] == 0

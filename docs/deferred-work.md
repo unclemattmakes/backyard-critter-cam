@@ -263,17 +263,25 @@ same animal *lapsed, 45.6 days* — a confirmation the nightly embed pass had no
 template, and the multi-animal test needs all three of `is_multi`'s channels (dropping the clip one
 cost three weeks of error on Stan). One definition now, `individuals.usable_template_visits`.
 
-### 3.3 Family-by-structure: the half of the group-label fix that is still missing
-The **defensive** half shipped (group labels can no longer poison the template pool). The
-**identifying** half did not: nothing counts how many animals a family visit actually held.
+### 3.3 Family-by-structure — the counting half shipped 2026-08-09; attribution stays dead
+`stats.crowd_peak` now reports the busiest INSTANT of each period — "at least N animals at once",
+with the time, the camera and the species mix — in the digest and on the Dispatch tab. It is a
+lower bound three times over (detector recall on a huddle ~0.39, the counting is greedy, the
+stills only see instants something was saved), it carries **no attribution** ever, and the wording
+says "at least" everywhere it appears. Measured on the corpus: the trail cam demonstrably held
+**5 raccoons at once** on 2026-08-04 01:19 and again on 08-07 00:59; 14 of its 21 nights reach 4+.
+The glass door reaches 3+ on 33 of 63 nights — mostly crows, but 4 raccoons at once on 08-06.
 
-Review's corrections, which matter because the obvious version is wrong: every count must be a
-**lower bound**, aggregated per night from clip sustained tracklets *plus* still cannot-link
-cliques — not from stills alone. Measured on the 08-07/08 family night, stills gave CutiePie
-{4, 4}, Stan {2, 3}, Pedro {1, 2, 2, 2, 3} against a truth of 5 / 4 / 3: CutiePie separates,
-Stan and Pedro collide. So the queue's wording has to be "CutiePie + Kits (at least 4 animals
-seen at once)", never a headcount. And it is a **seasonal** signal — it needs re-validating as
-the kits grow into adult-sized bodies.
+**One correction to this entry, measured.** It said to aggregate "from clip sustained tracklets";
+taken literally that is wrong. `clip_tracks.n_sustained` counts TRACKLETS, not simultaneous
+animals — one animal fragments into many — and summing it per night reports *19 animals* on a
+trail-cam night whose stills say 5. A real clip-side count needs per-sample overlap from the
+stored `track` polyline (which does carry sample times and boxes, so it is buildable). Until it
+is, the shipped count is stills-only and says so.
+
+Still missing, and still gated on a human: per-VISIT wording in the suggest-confirm queue
+("CutiePie + Kits (at least 4 animals seen at once)"). And it is a **seasonal** signal — it needs
+re-validating as the kits grow into adult-sized bodies.
 
 ### 3.4 Buy the resolution the ear notch needs
 The notch is the one **era-invariant** marker in this cast, and it fails only on *resolution* — not

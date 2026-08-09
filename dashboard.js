@@ -1442,6 +1442,17 @@ function renderDispatch(d, rc, rl){
   const t=[['visits',(d.visits||0).toLocaleString()],
     [(d.n_surprising?'species (+'+d.n_surprising+' to verify)':'species'),(d.species||[]).length-(d.n_surprising||0)],
     ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
+  /* AT LEAST N AT ONCE. A floor three times over -- the detector's recall on a huddle is ~0.39,
+     the counting is greedy, and the stills only see instants something was saved. So it says
+     "at least", it never names anybody, and it never claims a litter is intact: counting kits
+     per mother was tested against the one eye-verified four-animal window and killed, because
+     the detector produced ONE box where a human counted four. */
+  if(d.crowd&&d.crowd.n>=2){
+    const c=d.crowd, mix=Object.entries(c.by_species||{}).filter(([,v])=>v>=1)
+      .map(([k,v])=>`${v}× ${nameOf(k)}`).join(', ');
+    t.push(['at least '+c.n+' at once',
+      `<span title="${esc(`The busiest instant of this ${d.edition}: ${c.n} separate bodies in one frame on ${c.source||'a camera'} at ${(c.at||'').slice(11,19)}${mix?' — '+mix:''}. A LOWER bound — the detector misses animals in a huddle (recall ~0.39), the count is deliberately greedy, and the saved stills only catch instants something was written. It says how many bodies, never whose.`)}">${(c.at||'').slice(11,16)}</span>`]);
+  }
   html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
   if(d.plate){ const p=d.plate;
     html+=`<div class="panel hero">
