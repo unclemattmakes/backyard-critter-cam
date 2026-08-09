@@ -498,10 +498,14 @@ finished.
 - **`labeled_by` now records who, but nothing reads it.** No per-labeller view, no agreement rate,
   no review tier — see §5.1. (Fixed on 2026-08-09: the column was shipped the day before with
   *nothing* writing to it, operator confirms included.)
-- **The archive-gated prune was never built.** The only-copy protection for trail-cam footage is
-  still a ritual (`--backup-first`, a generous budget, remembering the weekly lag) rather than an
-  invariant. Making the pruner refuse to delete a file the day-archive does not contain — for
-  sources marked irreplaceable — turns the project's stated asymmetry into code.
+- ~~**The archive-gated prune was never built.**~~ **Shipped 2026-08-09.**
+  `cfg.clips_irreplaceable_sources` (default `("trail_cam_sd",)`) makes `prune_clips` refuse to
+  delete a file whose day-archive zip is not already on the backup drive. It **fails closed** three
+  ways — no destination configured, an unreachable drive, an unrecognised path layout all mean
+  "I cannot prove a copy exists", so the file survives and the budget is exceeded — and it says so
+  loudly, because only a human running `backup.py` can clear it. Replaceable sources are untouched:
+  the live rig's rolling window must keep rolling whatever the backup drive is doing, or an
+  unplugged drive quietly fills the disk.
 - **Shadow-mode reviews still depend on memory.** `STATUS.txt` reports the flag count, which is
   most of the value, but there is no `shadow_reviews` record (feature, shipped date, review due,
   reviewed date) and no dashboard nag. §1.4 is the live example of why that matters — and half of
