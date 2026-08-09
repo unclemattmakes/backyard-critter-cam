@@ -123,6 +123,21 @@ VIEW_PERSIST_S = 300.0
 # ... and silence is not evidence either: if day frames stop arriving mid-disagreement the yard
 # was not being watched, so the pending disagreement is dropped rather than bridged.
 VIEW_MAX_GAP_S = 60.0
+# The same rule applied to the TEMPLATE, which is what the shadow week showed it also needs.
+# Measured 2026-08-09 on this glass door: with the camera provably stationary, day-frame
+# fingerprints taken at different times of day correlate 0.075-0.68 -- far below VIEW_CORR_MIN.
+# Nothing about that is a reposition; it is the sun. The template survives it only because it
+# BLENDS toward every agreeing frame, i.e. it tracks the light as long as frames keep arriving.
+# Across the night no day frame arrives at all, so the template freezes on an evening frame, and
+# the first five continuous minutes of dawn read as five minutes of sustained disagreement: the
+# rig bumped the epoch at 2026-08-09T05:56:52 at corr 0.261, while the two references four
+# minutes either side of the bump correlate 0.987 -- identical framing, same wall, same pots.
+# A template from before an interval nobody watched cannot testify that the camera moved, so it
+# is re-seeded instead. THE COST IS REAL AND DELIBERATE: a reposition performed during a lull
+# longer than this is never detected. That is the safe direction -- a missed epoch bump leaves a
+# stale reference that the pixel test and refimg_max_age_s still have to get past, while a FALSE
+# bump silently destroys the recurrence ledger every single morning.
+VIEW_TEMPLATE_MAX_GAP_S = VIEW_PERSIST_S
 
 # --- Certification ----------------------------------------------------------------------------
 CERTIFY_QUIET_AREA = 200.0       # largest motion blob, 320x180 px^2 (~0.35% of frame)
@@ -130,6 +145,17 @@ CERTIFY_MIN_FRAMES = 4           # ... over at least this many detector verdicts
 CERTIFY_MAX_GAP_S = 8.0          # a certification run may not bridge a hole in observation
 MOTION_BLOB_MIN_PX = 25.0        # 320x180 px^2 below which a blob is sensor noise
 MOTION_DILATE_PX = 4             # grow each remembered blob before subtracting it from cover
+# 0.9 STAYS. It was re-examined against the live shadow week on 2026-08-09 and the bar is not what
+# makes the veto thin -- the accumulation underneath it is. Replaying all 5,402 glass-door
+# detections of 2026-08-07 21:21 -> 08-09 11:39 against the banked references (every box scored on
+# its own crop, so nothing depends on clip frame timing) gives, at bars 0.9 / 0.7 / 0.5 / off:
+# 26 / 34 / 68 / 117 suppressions -- and EVERY ONE of those 117, opened and looked at, is the same
+# tipped watering can. Lowering the bar therefore buys more copies of an object already caught,
+# while spending the one gate that answers the design's own photographed failure (a certified
+# reference with an undetected raccoon walking the wall in it, design section 4.3). Measured cover
+# fractions at real boxes over that window: day median 0.000 / max 0.825 -- NO day box has ever
+# reached this bar, so on this camera the veto is a night instrument; night median 0.000 but
+# 7.2% at or above 0.9, which is where all 18 live flags came from.
 COVER_MIN_FRACTION = 0.9         # this share of a box's pixels must be KNOWN or the veto abstains
 
 # --- Decisions --------------------------------------------------------------------------------
@@ -248,6 +274,12 @@ class ViewWatcher:
     sustained across `persist_s` of wall clock, uninterrupted by a gap in observation, before the
     epoch moves.
 
+    AND THE TEMPLATE IS RE-SEEDED ACROSS A GAP, not only the pending disagreement. See
+    VIEW_TEMPLATE_MAX_GAP_S: this fingerprint does not survive a change of daylight (0.075-0.68
+    across one stationary day), it only TRACKS it, and it cannot track across a night. Without
+    this the rig calls sunrise a reposition every morning -- measured once on 2026-08-09, and the
+    mechanism guarantees it repeats.
+
     An epoch bump is the loudest event in this module: it retires every reference and flushes the
     recurrence ledger, because both are expressed in image coordinates that no longer mean
     anything. Suppression then stops until a fresh reference certifies and a spot re-earns its
@@ -255,13 +287,15 @@ class ViewWatcher:
     """
 
     def __init__(self, corr_min=VIEW_CORR_MIN, persist_s=VIEW_PERSIST_S,
-                 max_gap_s=VIEW_MAX_GAP_S, epoch=0):
+                 max_gap_s=VIEW_MAX_GAP_S, epoch=0, template_max_gap_s=VIEW_TEMPLATE_MAX_GAP_S):
         self.corr_min = float(corr_min)
         self.persist_s = float(persist_s)
         self.max_gap_s = float(max_gap_s)
+        self.template_max_gap_s = float(template_max_gap_s)
         self.epoch = int(epoch)
         self.template: EdgeFingerprint | None = None
         self.changes: list[tuple[float, float]] = []   # (ts, correlation) of each bump
+        self.reseeds = 0            # templates dropped across an unwatched gap (dawn, mostly)
         self._since = None          # when the current disagreement started
         self._worst = None          # lowest correlation seen during it
         self._last_day_ts = None
@@ -280,6 +314,14 @@ class ViewWatcher:
         if gap is not None and gap > self.max_gap_s:
             # We stopped watching. Whatever was pending is not evidence of anything.
             self._since = self._worst = None
+            if gap > self.template_max_gap_s:
+                # ... and neither is the template. Disagreement is only evidence when it is
+                # SUSTAINED across an interval we actually watched, so a template from before an
+                # interval we did not watch cannot start that clock. This is the line that stops
+                # sunrise reading as a camera move; see VIEW_TEMPLATE_MAX_GAP_S.
+                self.template = fingerprint
+                self.reseeds += 1
+                return self.epoch
         corr = self.template.correlate(fingerprint)
         if corr >= self.corr_min:
             self._since = self._worst = None
@@ -464,6 +506,23 @@ class ReferenceManager:
     abstention, while the watering can -- which fires the detector constantly but never moves --
     stays vetoable.
 
+    That memory is ONE ARRAY OF TIMESTAMPS, not a list of rectangles, and the difference is two
+    measured bugs rather than a refactor. The first shipped version remembered
+    `cv2.boundingRect()` of each blob, which disowns pixels that never moved: measured over the
+    13,438 motion-positive frames of 2026-08-09 00:00-05:30, a frame's bounding boxes claim 1.37x
+    the area its blobs actually occupy (median 1.33, p90 1.53). The second is cost -- it kept every
+    rectangle of the last hour and re-drew all of them on EVERY frame, on the capture thread:
+    measured 4.9 ms at 2,500 remembered rectangles and 16.7 ms at 10,000, against the 7.6 ms the
+    whole per-frame veto was budgeted at, and the busiest measured hour on this rig ran 1,546
+    detector frames. A per-pixel "last blobbed at" map is 460 KB flat, O(1) per frame, and disowns
+    exactly the pixels something moved over.
+
+    Be clear about what that fix is NOT: it does not unblock the veto. Re-measured on the same
+    night, the honest cover at real detection boxes goes from median 0.000 to 0.009 and 0.0% of
+    boxes reach COVER_MIN_FRACTION either way. A detector box is, for anything that moves, exactly
+    the pixels that just moved -- so coverage abstaining on animals is the gate WORKING, and the
+    thin part is that furniture's own pixels get disowned too whenever something passes near it.
+
     The counters (`n_detector_runs`, `n_detector_empty`, `n_certified`, `longest_empty_run_s`) are
     design §8 item 1: true certification availability is unmeasurable offline, because the DB only
     records frames where something WAS found. The shadow week is what measures it.
@@ -484,7 +543,9 @@ class ReferenceManager:
         self.view = view if view is not None else ViewWatcher()
 
         self._refs: dict[str, Reference] = {}
-        self._motion: list[tuple[float, tuple]] = []      # [(ts, box)] within no_update_s
+        # Per-pixel "when did something last blob over you", at the working resolution. -inf means
+        # "never", so an untouched map covers the whole frame without a special case.
+        self._motion_at = np.full((H, W), -np.inf, np.float64)
         self._run_start = None
         self._run_illum = None
         self._run_n = 0
@@ -515,7 +576,7 @@ class ReferenceManager:
         obs.detector_ran = detections is not None
         obs.boxes = tuple(obs.to_working(b) for b in (detections or ()))
 
-        area, blobs = _blobs(motion_mask, self.blob_min_px)
+        area, blobs, footprint = _blobs(motion_mask, self.blob_min_px, self.dilate_px)
         obs.motion_area = area
         obs.motion_boxes = tuple(blobs)
 
@@ -526,9 +587,8 @@ class ReferenceManager:
             self.epoch_changes += 1
             self.flush()
 
-        for b in blobs:
-            self._motion.append((obs.ts, b))
-        self._motion = [(t, b) for (t, b) in self._motion if obs.ts - t <= self.no_update_s]
+        if footprint is not None:
+            self._motion_at[footprint] = obs.ts
 
         self._advance(obs)
         return obs
@@ -570,30 +630,32 @@ class ReferenceManager:
         """Drop everything. Called on a view-epoch change: a reference for a scene that no longer
         exists is exactly the silent failure config.py warns about with hand-measured zones."""
         self._refs.clear()
-        self._motion.clear()
+        self._motion_at.fill(-np.inf)
         self._run_start = self._run_illum = None
         self._run_n = 0
 
     # -- reading it back -------------------------------------------------------------------
-    def get(self, illumination) -> Reference | None:
+    def get(self, illumination, now=None) -> Reference | None:
         """The current reference for an illumination state, with its cover mask applied.
 
         Age is NOT checked here -- the veto owns that gate, so a stale reference produces an
         explicit ABSTAIN with an age in the trace instead of silently vanishing.
+
+        `now` defaults to the last frame observed, which is what the capture loop wants: coverage
+        is read immediately after observe(), and reading it against a LATER clock would quietly
+        expire motion the reference has not yet been re-certified against.
         """
         ref = self._refs.get(illumination)
         if ref is None:
             return None
-        blocked = np.zeros((H, W), bool)
-        d = self.dilate_px
-        for _, (x1, y1, x2, y2) in self._motion:
-            blocked[max(0, int(y1) - d):int(y2) + d, max(0, int(x1) - d):int(x2) + d] = True
+        if now is None:
+            now = self._last_ts if self._last_ts is not None else 0.0
+        blocked = (float(now) - self._motion_at) <= self.no_update_s
         return Reference(
             image=ref.image, captured_at=ref.captured_at, illumination=ref.illumination,
             view_epoch=ref.view_epoch, provenance=PROVENANCE_MOTION_MASKED,
             fingerprint=ref.fingerprint, cover=~blocked, source=ref.source, id=ref.id,
-            detail=dict(ref.detail, masked_fraction=round(float(blocked.mean()), 4),
-                        n_motion_regions=len(self._motion)))
+            detail=dict(ref.detail, masked_fraction=round(float(blocked.mean()), 4)))
 
     @property
     def view_epoch(self) -> int:
@@ -634,29 +696,49 @@ def prepare(frame_bgr, now=None) -> Observation:
                        frame_w=w, frame_h=h)
 
 
-def _blobs(motion_mask, blob_min_px):
-    """(largest blob area, [bounding boxes]) from a MotionGate foreground mask, at 320x180.
+def _blobs(motion_mask, blob_min_px, dilate_px=MOTION_DILATE_PX):
+    """(largest blob area, [bounding boxes], footprint mask) from a MotionGate foreground mask.
+
+    Everything is at the 320x180 working resolution. The FOOTPRINT is what coverage consumes: each
+    kept blob's own filled outline, dilated by `dilate_px`. The boxes are informational only
+    (`Observation.motion_boxes`).
+
+    Filled outline, NOT the bounding rectangle -- the rectangle was what the first version
+    remembered, and it disowns pixels nothing ever moved over. Measured over the 13,438
+    motion-positive frames of 2026-08-09 00:00-05:30 on this camera: a frame's bounding boxes claim
+    1.37x the area of its blobs (median 1.33, p90 1.53). The outline is filled rather than used
+    raw because MOG2's foreground on a night animal is ragged -- an unfilled silhouette would leave
+    holes inside the very body the coverage gate exists to protect.
 
     The prototype kept only the LARGEST blob's box, because that is all the rig's MotionGate
     exposes. Keeping every blob above the noise floor is strictly more conservative: it can only
     remove more pixels from the cover mask, i.e. abstain more and suppress less.
     """
     if motion_mask is None:
-        return 0.0, []
+        return 0.0, [], None
     m = np.asarray(motion_mask)
     if m.dtype != np.uint8:
         m = (m.astype(bool) * 255).astype(np.uint8)
     if m.shape[:2] != (H, W):
         m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
     contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    largest, boxes = 0.0, []
+    largest, boxes, keep = 0.0, [], []
     for c in contours:
         a = float(cv2.contourArea(c))
         largest = max(largest, a)
         if a >= blob_min_px:
             x, y, bw, bh = cv2.boundingRect(c)
             boxes.append((float(x), float(y), float(x + bw), float(y + bh)))
-    return largest, boxes
+            keep.append(c)
+    if not keep:
+        return largest, boxes, None
+    footprint = np.zeros((H, W), np.uint8)
+    cv2.drawContours(footprint, keep, -1, 1, cv2.FILLED)
+    d = int(dilate_px)
+    if d > 0:
+        footprint = cv2.dilate(
+            footprint, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1)))
+    return largest, boxes, footprint.astype(bool)
 
 
 # =================================================================================================

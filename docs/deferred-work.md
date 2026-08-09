@@ -62,21 +62,38 @@ from the eval corpus by `db.is_group_label`, so the numbers will differ from the
 machinery is `eval.py --reid` + `evalmetrics.py`; the nightly batch now writes a fresh artifact
 every night, so a current baseline already exists.
 
-### 1.4 The refimg shadow review — but read this first: the veto is currently inert
-The plan was to review the flags around 2026-08-14 with `python refimg.py --review --days 7`.
-**Measured 2026-08-09: there is nothing to review.** After a full busy night with the veto
-live, `SELECT COUNT(*) FROM detections WHERE suppressed_at IS NOT NULL` returns **0** — and 109
-reference images were banked in that window, so the veto is running, not missing.
+### 1.4 The refimg shadow review — **done 2026-08-09**, and it needs one human decision
+Full write-up with every number: [the shadow review](refimg-review-2026-08-09.md). The short
+version, because two things this entry said the same morning turned out to be wrong:
 
-The cause is the coverage gate: `COVER_MIN_FRACTION = 0.9` requires 90% of a box's pixels to be
-"known" before the veto will judge, and the measured cover fractions of the banked masks are
-median **0.000** by day and **0.075** by night. Essentially every box abstains.
+- **The veto is not inert. It has flagged 18 rows and all 18 are furniture** — the tipped watering
+  can against the shrub, 01:44–01:48 on 08-09, which landed a few hours after this entry was
+  written. Every crop was opened. The original review question was answerable and its answer is
+  the good one.
+- **0.9 is not the wrong bar.** Replaying all 5,402 glass-door detections of the shadow week
+  against the exact banked references, at bars 0.9 / 0.7 / 0.5 / off, gives 26 / 34 / 68 / 117
+  suppressions — and every one of the 117, opened, is the same watering can. Lowering the bar buys
+  more copies of an object already caught while spending the only gate that answers the design's
+  own photographed failure (a certified reference with an undetected raccoon in it). It stays.
 
-So the honest review is a different question — not "are these flags furniture?" but **"why does
-the motion-mask coverage never reach the bar?"** Either the mask-accumulation policy needs to
-run much longer before a reference is certified usable, or 0.9 is the wrong bar for this scene.
-Answer that before concluding anything about the veto's accuracy: an inert veto looks exactly
-like a perfectly precise one from the outside, and only one of those is worth shipping.
+What is true is that coverage binds: 94.9% of boxes die on `reference_has_no_pixels_here`, and **no
+daytime box has ever cleared the bar** (max 0.825 over 1,577), so on this camera the veto is a
+night instrument. Shipped in response, all still shadow mode: the coverage memory is now a
+per-pixel map of filled contours rather than a list of bounding rectangles (correctness, and it
+takes the capture thread off a 4.9 ms-at-2,500-rectangles redraw); `ViewWatcher` re-seeds its
+template across an unwatched gap, because **the rig was calling sunrise a camera reposition**
+(§4 of the write-up — corr 0.987 across the "move", and the false bump flushes the recurrence
+ledger every morning); and a `VetoCensus` line every hour now counts the abstentions, which is the
+number whose absence made this dig necessary at all.
+
+**The human decision that remains** is design §8 item 2, the measurement that says whether the
+coverage gate is essential or overhead: run MegaDetector at conf 0.1 over a day of banked certified
+reference frames and count the boxes the live 0.25 threshold rejected. It was deliberately not run
+here — it means a second MegaDetector process on the GPU beside the live rig, and this box has
+already lost the rig once to memory exhaustion. It wants a quiet window.
+
+Still worth doing on the ordinary schedule: `python refimg.py --review --days 7` around 2026-08-14,
+now that there is a week of flags and an hourly census line to read beside them.
 
 ### 1.5 One decision left (the restart already happened)
 - ~~Restart the rig~~ — **done**: the rig came up at 2026-08-08T21:54 running the new code, and
@@ -109,8 +126,8 @@ facts kill that route:
   (`save_full_frame` is off by design);
 - the bank covers about **a day**; the labelled corpus covers two months, so only ~9 of ~181
   confirmed visits have a contemporaneous reference;
-- `view_epochs` is **empty**, so "same camera epoch" is a rubber stamp across a door camera that
-  gets repositioned every few days.
+- `view_epochs` is **empty for every camera but one, and that one row is a false bump** (§8), so
+  "same camera epoch" is a rubber stamp across a door camera that gets repositioned every few days.
 
 **Do it the plain way instead**, which needs nothing new: blank the animal's box in the crop
 itself (fill with the crop's own border statistics, or simply mask it) and re-embed. Validate the
@@ -403,7 +420,10 @@ finished.
   sources marked irreplaceable — turns the project's stated asymmetry into code.
 - **Shadow-mode reviews still depend on memory.** `STATUS.txt` reports the flag count, which is
   most of the value, but there is no `shadow_reviews` record (feature, shipped date, review due,
-  reviewed date) and no dashboard nag. §1.4 is the live example of why that matters.
+  reviewed date) and no dashboard nag. §1.4 is the live example of why that matters — and half of
+  the specific gap it exposed is now closed: `VetoCensus` logs every refimg decision hourly,
+  abstentions included, so "it flagged nothing" can no longer hide the reason. The *scheduling*
+  half is still a date in a comment in `config_local.py`.
 - **The never-fired safety paths are still never-fired.** See §7.
 
 ## 7. Killed, with reasons
@@ -455,6 +475,28 @@ instrument — the human eye via the live-sighting log today, and mass if a load
 It also flags a real casualty worth remembering: **the camera swap invalidated the depth
 calibration**, so any future pixel-size reasoning has to be refit per camera era.
 
+### Lowering `COVER_MIN_FRACTION` to unblock the refimg veto — killed by the replay
+The obvious reading of §1.4's first draft: coverage abstains on 94.9% of boxes, so lower the bar.
+Measured 2026-08-09 by replaying all 5,402 glass-door detections of the shadow week against the
+banked references, each box scored on its own crop so nothing depends on clip frame timing: bars
+0.9 / 0.7 / 0.5 / **off entirely** give 26 / 34 / 68 / **117** suppressions, and **all 117, opened
+and looked at, are the same tipped watering can.** So the bar is not what is holding the veto back
+— it is not dangerous to lower on this corpus, it is simply *pointless*, and it spends the one gate
+that answers the design's photographed failure mode (a properly certified reference with an
+undetected raccoon walking the wall in it). Thirty-eight hours without that failure recurring is not
+evidence about a rare unrecoverable event. Full numbers: [the shadow review](refimg-review-2026-08-09.md) §3.
+
+### "The bounding-box amplification is why coverage never reaches the bar" — killed at 1.37×
+The suspicion was that `_blobs` remembering `cv2.boundingRect()` instead of the blob itself was
+inflating the disowned area enough to explain a 95% abstention rate. Re-running the rig's own
+`MotionGate` over the 13,438 motion-positive frames of 2026-08-09 00:00–05:30 says the
+amplification is **median 1.33, mean 1.37, p90 1.53** — real, but an order of magnitude short of
+the explanation. Switching to filled contours moves the cover at real detection boxes from median
+0.000 to 0.009 and leaves **0.0% of boxes** reaching the bar either way. It shipped anyway, as a
+correctness and capture-thread-cost fix, and is recorded here so nobody re-proposes it as the thing
+that will make the veto fire. The real ceiling is structural: a detector box is, for anything that
+moves, exactly the pixels that just moved.
+
 ### Already-dead elsewhere, listed so they stay dead
 - **Gait / stride as an identity signal** — 27 of 25,041 tracks resolve a stride, and the values
   pile at the band edges. At ~10 fps effective sampling, raccoon stride (1.5–2.5 Hz) is
@@ -498,7 +540,10 @@ calibration**, so any future pixel-size reasoning has to be refit per camera era
   `staticfilter` was written for, and the same class that produced 308 phantom "brown rats" on
   the trail cam. Worth a look and a purge, and a reminder that a heat map or a size statistic
   will happily describe a barbecue cover with great confidence.
-- **`view_epochs` is empty on every camera.** The table exists precisely so a repositioned camera
-  starts a new epoch instead of silently corrupting anything keyed to pixel geometry, and nothing
-  writes it yet. It is a prerequisite hiding under three separate items here (§2.1, §5.3, and the
-  trail-cam half of the furniture veto).
+- **`view_epochs` holds exactly one row, and it is wrong** (corrected 2026-08-09; it was empty when
+  this list was written). `glass_door_cam` epoch 1, 05:56:52, corr 0.261 — written by the dawn
+  false-reposition bug, 35 minutes after dawn at the camera, between two references that correlate
+  0.987. The bug is fixed, the row is not: epoch 1 is in force and the current references are keyed
+  to it, so deleting it would orphan them. It is a one-line correction to make deliberately. The
+  table is still empty for the trail cam, where it remains a prerequisite hiding under §2.1, §5.3
+  and the trail-cam half of the furniture veto.
