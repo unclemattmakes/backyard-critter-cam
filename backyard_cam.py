@@ -1378,10 +1378,16 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             print(f"{tag} could not open camera src={spec.src!r} yet -- will keep trying to connect."
                   + ("" if spec.is_url else "  (if it never opens, `python backyard_cam.py "
                      "--list-cameras` finds the right index)"))
+            db.record_coverage(cfg.db_path, spec.source, "down", "waiting-to-open")
             cap = reconnect_capture(spec, cfg, stop_event)
         if cap is None:
             return                                  # only reached when we're shutting down
         print(f"{tag} open ({spec.src!r}).")
+        # The COVERAGE LEDGER: written at the rare transitions only (open / read-failure /
+        # reconnect / stop), so every later absence claim -- "no robin this night", "overdue" --
+        # can know whether the camera was even watching. record_coverage never raises and uses
+        # its own short connection (the capture thread must not touch the shared WAL lock).
+        db.record_coverage(cfg.db_path, spec.source, "up", "opened")
 
         recorder = clips.ClipRecorder(cfg, conn, source=spec.source) if record else None
 
@@ -1438,6 +1444,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             if not ok or frame is None:
                 read_fails += 1
                 if read_fails >= READ_FAIL_TOLERANCE:
+                    db.record_coverage(cfg.db_path, spec.source, "down", "read-failed")
                     try:
                         cap.release()
                     except Exception:
@@ -1446,6 +1453,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     read_fails = 0
                     if cap is None:
                         break                       # only None when we're shutting down
+                    db.record_coverage(cfg.db_path, spec.source, "up", "reconnected")
                     active_period = None            # re-apply the profile after a reconnect
                     last_profile_check = 0.0
                     # open_capture just re-asserted the all-auto baseline on the fresh device.
@@ -1648,6 +1656,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     except Exception as e:  # never let one camera's crash take down the whole rig
         print(f"{tag} capture thread stopped on error: {e}")
     finally:
+        db.record_coverage(cfg.db_path, spec.source, "down", "stopped")
         if recorder is not None:
             try:
                 recorder.finalize(shutdown=True)    # flush any clip mid-record (writes its DB row)
@@ -1893,6 +1902,36 @@ def run(cfg: config.Config) -> None:
               f"{clips_note}{zone_note}{veto_note}")
 
 
+def serve_only(cfg: config.Config) -> int:
+    """--serve-only: the dashboard over the existing database, with NO capture stack -- no
+    camera opened, no detector built (so no model download), no naming helper spawned. One
+    synthetic FrameBuffer/bridge per configured camera keeps every per-camera endpoint
+    answering (the Live tab shows its normal "Camera feed unavailable" overlay); every other
+    tab -- Visit Log, Dispatch, Calendar, Individuals, Catalogue -- reads the DB exactly as
+    usual. This is the "browse footage you imported" and "read an old archive on a laptop"
+    mode: it starts in seconds because the heavy imports the capture path needs never run."""
+    frame_buffers = {s.source: web.FrameBuffer() for s in cfg.camera_specs()}
+    control_bridges = {s.source: web.CameraControlBridge() for s in cfg.camera_specs()}
+    zone_store = web.IgnoreZoneStore.load(cfg)
+    try:
+        server = web.start(cfg, frame_buffers, control_bridges, zone_store)
+    except OSError as e:
+        print(f"[web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
+        print("[web] is another rig already serving? Try --port N.")
+        return 1
+    print(f"Dashboard (serve-only): http://{cfg.web_host}:{cfg.web_port}   (open in a browser)")
+    print("  No live camera in this mode -- the Live tab says so. Everything else reads the")
+    print(f"  database at {cfg.db_path}. Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nStopping.")
+    finally:
+        web.shutdown(server)
+    return 0
+
+
 # ---- CLI ---------------------------------------------------------------------------
 def parse_args() -> tuple[config.Config, argparse.Namespace]:
     c = CONFIG
@@ -1951,6 +1990,11 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="Minutes between detections that separates one visit from the next (--stats).")
     p.add_argument("--serve", action="store_true", default=c.serve,
                    help="Also serve a local web dashboard (live stream + stats) in the browser.")
+    p.add_argument("--serve-only", action="store_true",
+                   help="Serve ONLY the dashboard over the existing database -- no camera, no "
+                        "detector, no model downloads, starts in seconds. For browsing imported "
+                        "footage (see the README's 'Try it on footage you already have') or "
+                        "reading an archive on a machine with no rig attached.")
     p.add_argument("--port", type=int, default=c.web_port, help="Web dashboard port (with --serve).")
     p.add_argument("--host", default=c.web_host,
                    help="Web dashboard bind host (default 127.0.0.1; 0.0.0.0 exposes it on the LAN).")
@@ -1998,6 +2042,8 @@ def main() -> int:
     if args.stats:
         print_stats(cfg)
         return 0
+    if args.serve_only:
+        return serve_only(cfg)
     try:
         run(cfg)
     except CudaUnavailableError as e:

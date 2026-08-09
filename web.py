@@ -15,6 +15,7 @@ restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/s
 from __future__ import annotations
 
 import gzip
+import hmac
 import ipaddress
 import json
 import os
@@ -367,6 +368,14 @@ _MEDIA_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
 }
+
+# The making-of site's static types (it is HTML + CSS + JS + baked JSON + the media above).
+_MAKINGOF_TYPES = {
+    **_MEDIA_TYPES,
+    ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8", ".json": "application/json",
+    ".svg": "image/svg+xml", ".ico": "image/x-icon", ".md": "text/plain; charset=utf-8",
+}
 _RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
 _MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
 _MAX_STREAMS = 6                 # base cap on concurrent MJPEG viewers (one LAN client can't exhaust
@@ -477,10 +486,16 @@ def _web_clip(src: Path, clips_root: Path, cache_root: Path):
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".tmp.mp4")
         try:
+            # -c:a aac, not -an: the live rig's clips carry no audio track (OpenCV frame pipe),
+            # so for them this changes nothing -- but a trail-cam MP4 arrives with its microphone
+            # track intact (import copies the file whole), and growls/kit-chitter are ID evidence
+            # the owner actually uses. Re-encode rather than copy: trail cams like ADPCM/PCM
+            # audio, which browsers refuse; AAC always plays. No audio in -> no audio out.
             subprocess.run(
                 [_FFMPEG, "-y", "-loglevel", "error", "-i", str(src),
                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(tmp)],
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 "-c:a", "aac", "-b:a", "96k", str(tmp)],
                 check=True, timeout=180,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
@@ -664,6 +679,14 @@ def _individual_profile(cfg, name: str) -> dict:
             hit = _archive_zip_for(c.get("clip_path") or "")
             restored = hit and (_ARCHIVE_ROOT / hit[1]).is_file()
             c["archive_ok"] = bool(restored or (hit and hit[0] in have))
+    # The individual's STORY (life_events ledger): dated free-text notes for the profile
+    # timeline. Read-only here; POST /api/individual/event appends.
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is not None:
+        try:
+            prof["events"] = db.life_events(conn, name)
+        finally:
+            conn.close()
     return prof
 
 
@@ -702,6 +725,13 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
     builds a private one from the DB; edits then persist but nothing live is watching them."""
     if zone_store is None:
         zone_store = IgnoreZoneStore.load(cfg)
+    if not frame_buffers:
+        # No live camera at all (a serve-only caller, or a test passing bare dicts): synthesize
+        # one dead pane for the primary source rather than dying on next(iter({})) below. The
+        # Live tab then shows its normal "Camera feed unavailable" overlay, which is the truth.
+        frame_buffers = {cfg.source: FrameBuffer()}
+        control_bridges = dict(control_bridges or {})
+        control_bridges.setdefault(cfg.source, CameraControlBridge())
     allowed_dirs = [d.resolve() for d in (cfg.crops_dir, cfg.frames_dir, cfg.clips_dir,
                                           getattr(cfg, "clip_crops_dir", cfg.clips_dir),
                                           # refcam's detector crops of the phone reference shots
@@ -785,6 +815,12 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 return False
             return True
 
+        def _is_operator(self) -> bool:
+            """The operator/viewer split -- see _operator_decision for the whole rule."""
+            return _operator_decision(getattr(cfg, "operator_token", None),
+                                      self.client_address[0] if self.client_address else "",
+                                      self.headers.get("X-Operator-Token"))
+
         def do_GET(self):
             if not self._lan_guard():
                 return
@@ -840,6 +876,13 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._json(_zones_payload(cfg, src, control_bridges[src].snapshot()))
                 elif path == "/api/naming":
                     self._json(_naming_status())
+                elif path == "/api/evalstatus":
+                    self._json(_eval_status())
+                elif path == "/api/role":
+                    # Which tier THIS client is. The client uses it for comfort (hiding the
+                    # curation chrome); the server refuses viewer writes regardless, in do_POST.
+                    self._json({"operator": self._is_operator(),
+                                "split": bool(getattr(cfg, "operator_token", None))})
                 elif path == "/api/live/now":
                     self._json(_live_now(cfg, self._src()))
                 elif path == "/api/crops":
@@ -874,6 +917,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                                                 date=(q.get("date") or [None])[0]))
                 elif path == "/api/behavior":
                     self._json(_cached(cfg, "behavior", lambda: behavior.overview(cfg), hold_s=30))
+                elif path == "/api/seasons":
+                    self._json(_cached(cfg, "seasons", lambda: stats.seasons_overview(cfg), hold_s=60))
                 elif path == "/api/individuals":
                     self._json(_cached(cfg, "individuals", lambda: stats.individuals_overview(cfg)))
                 elif path == "/api/rollcall":
@@ -930,6 +975,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._archived_clip(path[len("/archive/clip/"):])
                 elif path.startswith("/media/"):
                     self._media(path[len("/media/"):])
+                elif path == "/making-of" or path.startswith("/making-of/"):
+                    # The explainer site, served from the rig itself: family on the LAN gets
+                    # "what am I looking at?" without needing the public URL. Same folder the
+                    # GitHub Pages deploy publishes; no build step, plain files.
+                    self._makingof(path[len("/making-of"):].lstrip("/"))
                 else:
                     self._send(404, "text/plain", b"not found")
             except (BrokenPipeError, ConnectionResetError):
@@ -960,6 +1010,15 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 data = json.loads(raw or b"{}")
             except Exception:
                 data = {}
+            # THE VIEWER GATE (cfg.operator_token). A viewer's one allowed write is the "who's
+            # here" log, which _live_sighting records as attributed, NO-STAMP testimony -- the
+            # pair-path semantics, so a guest's enthusiasm can never contaminate a template.
+            # Everything else mutating is refused HERE, at the same choke point as the CSRF
+            # guard, so endpoints nobody has written yet are covered by construction.
+            if not self._is_operator() and path != "/api/live/sighting":
+                self._json({"error": "viewing only -- ask the operator for the token "
+                                     "(dashboard footer) to edit", "viewer": True}, code=403)
+                return
             try:
                 if path not in ("/api/camera", "/api/zones", "/api/zones/delete"):
                     stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
@@ -973,6 +1032,20 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._zone_delete(data)
                 elif path == "/api/individual/status":
                     self._individual_status(data)
+                elif path == "/api/individual/event":
+                    # Append one dated note to an individual's story: {"name","note","date"?}.
+                    try:
+                        conn = db.connect(cfg.db_path)
+                        try:
+                            row = db.add_life_event(
+                                conn, data.get("name"), data.get("note"),
+                                event_date=data.get("date") or None,
+                                labeled_by=(str(data.get("logged_by") or "").strip()[:40] or None))
+                        finally:
+                            conn.close()
+                        self._json({"ok": True, "event": row})
+                    except ValueError as e:
+                        self._json({"error": str(e)}, code=400)
                 elif path == "/api/individual":
                     self._individual_action(data)
                 elif path == "/api/reid/confirm":
@@ -1114,16 +1187,21 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             source = data.get("source")
             source = source if source in frame_buffers else primary
             visit = stats.current_live_visit(cfg, source)
+            # Attribution + the viewer tier. `logged_by` is whoever this browser says is typing
+            # (optional, self-reported, length-capped); a VIEWER's log additionally records with
+            # stamp=False -- testimony in live_sightings, nothing written onto crops.
+            operator = self._is_operator()
+            logged_by = (str(data.get("logged_by") or "").strip()[:40] or None)
             conn = db.connect(cfg.db_path)
             try:
                 res = db.record_live_sighting(
                     conn, source=source, names=names,
                     span_start=visit.get("start"), span_end=visit.get("end"),
-                    note=data.get("note"))
+                    note=data.get("note"), stamp=operator, labeled_by=logged_by)
                 if res.get("error"):
                     self._json({"error": res["error"]}, code=400)
                     return
-                self._json({"ok": True, "visit": visit, **res})
+                self._json({"ok": True, "visit": visit, "as_viewer": not operator, **res})
             finally:
                 conn.close()
 
@@ -1285,6 +1363,26 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 serve = web_ver
             self._serve_file(serve, "video/mp4")
 
+        def _makingof(self, rel):
+            """Serve the making-of explainer from making-of/ -- same containment discipline as
+            _media (resolve, then prove the result is inside the one allowed root). Bare
+            /making-of serves the index; a directory path serves its index.html."""
+            root = (config.ROOT / "making-of").resolve()
+            if not root.is_dir():
+                self._send(404, "text/plain", b"the making-of site isn't in this checkout")
+                return
+            target = (root / urllib.parse.unquote(rel)).resolve() if rel else root
+            if not _is_within(target, root):
+                self._send(404, "text/plain", b"not found")
+                return
+            if target.is_dir():
+                target = target / "index.html"
+            if not target.is_file():
+                self._send(404, "text/plain", b"not found")
+                return
+            ctype = _MAKINGOF_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            self._serve_file(target, ctype)
+
         def _media(self, rel):
             target = (config.ROOT / urllib.parse.unquote(rel)).resolve()
             if not any(_is_within(target, d) for d in allowed_dirs) or not target.is_file():
@@ -1355,6 +1453,64 @@ def _naming_status() -> dict:
         return data
     except Exception:
         return {"state": "off"}
+
+
+def _operator_decision(token_cfg, peer_host, sent_token) -> bool:
+    """The operator/viewer rule, pure (unit-testable without a socket). No token configured =
+    everyone is an operator -- the historical behaviour and the fresh-clone default. With a
+    token: loopback is implicitly operator (you are at the rig), and any other client is
+    operator only when its X-Operator-Token header matches -- entered once per browser in the
+    dashboard footer, then attached to every request. Constant-time compare; a wrong token is
+    simply a viewer, never an error."""
+    if not token_cfg:
+        return True
+    try:
+        if ipaddress.ip_address(peer_host or "").is_loopback:
+            return True
+    except ValueError:
+        pass
+    return hmac.compare_digest(str(sent_token or ""), str(token_cfg))
+
+
+_EVAL_STATUS_CACHE = {"key": None, "value": None}
+
+
+def _eval_status() -> dict:
+    """The nightly regression gate's verdict, read off the newest reports/eval_*.json (written by
+    run_clipmotion.bat's eval step). The dashboard shows this so a metric slide is a chip on the
+    masthead the morning after, not a discovery weeks later. Cached on (path, mtime) -- artifacts
+    only change when the nightly batch writes one. Degrades to {available: False} on a machine
+    that has never run eval; that is a fact, not an error."""
+    d = config.ROOT / "reports"
+    try:
+        files = sorted(d.glob("eval_*.json")) if d.exists() else []
+    except OSError:
+        files = []
+    if not files:
+        return {"available": False}
+    p = files[-1]
+    try:
+        key = (str(p), p.stat().st_mtime)
+    except OSError:
+        return {"available": False}
+    if _EVAL_STATUS_CACHE["key"] == key:
+        return _EVAL_STATUS_CACHE["value"]
+    try:
+        art = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"available": False}
+    diff = art.get("baseline_diff") or {}
+    out = {
+        "available": True,
+        "artifact": p.name,
+        "run_at": (art.get("meta") or {}).get("run_at"),
+        # ok True/False when the run diffed a baseline; None = no gate ran (first artifact).
+        "ok": diff.get("ok") if diff else None,
+        "regressions": [r.get("metric") for r in (diff.get("regressions") or [])],
+        "baseline_run_at": diff.get("baseline_run_at"),
+    }
+    _EVAL_STATUS_CACHE["key"], _EVAL_STATUS_CACHE["value"] = key, out
+    return out
 
 
 def _qs_int(q: dict, key: str, default: int, lo: int, hi: int) -> int:
@@ -1858,7 +2014,9 @@ def _candidate_labels(cfg) -> list:
         labels.update(r[0] for r in conn.execute(
             "SELECT DISTINCT species FROM detections WHERE species IS NOT NULL"))
         conn.close()
-    return sorted(labels)
+    # Case-insensitive: labels mix cases ("American crow" vs "band-tailed pigeon"), and a plain
+    # sorted() split the dropdown into two alphabets -- capitals first, then a second A-Z run.
+    return sorted(labels, key=str.casefold)
 
 
 def _prewarm(cfg):

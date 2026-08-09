@@ -570,6 +570,91 @@ def test_reid_queue_endpoint_returns_200_and_valid_json(corpus, db_path):
         t.join(timeout=5)
 
 
+def test_makingof_route_serves_the_explainer_and_stays_contained(corpus, db_path):
+    """/making-of/ serves the static explainer from the repo (index fallback for the bare and
+    directory paths), and the containment check refuses a path that escapes the folder."""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        for path in ("/making-of", "/making-of/", "/making-of/index.html"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as r:
+                assert r.status == 200, path
+                assert "text/html" in r.headers.get("Content-Type", "")
+                assert b"Behind" in r.read(4096)
+        # An escape attempt must 404, not serve repo files outside making-of/.
+        # (urllib.error is loaded by urllib.request's own import at the top of this file.)
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/making-of/%2e%2e/config.py", timeout=10)
+        assert e.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def test_operator_decision_covers_all_four_cases():
+    """The operator/viewer rule, pure. No token = everyone operates (fresh-clone default);
+    with a token: loopback always operates (you are at the rig), a matching header operates,
+    anything else views. A wrong token is a viewer, never an error."""
+    assert web._operator_decision(None, "192.168.1.50", None) is True       # split off
+    assert web._operator_decision("", "192.168.1.50", "anything") is True   # split off (empty)
+    assert web._operator_decision("sesame", "127.0.0.1", None) is True      # loopback shortcut
+    assert web._operator_decision("sesame", "::1", None) is True            # IPv6 loopback
+    assert web._operator_decision("sesame", "192.168.1.50", "sesame") is True   # right token
+    assert web._operator_decision("sesame", "192.168.1.50", "guess") is False    # wrong token
+    assert web._operator_decision("sesame", "192.168.1.50", None) is False       # no token
+    assert web._operator_decision("sesame", "not-an-ip", None) is False          # weird peer -> viewer
+
+
+def test_operator_split_reports_role_and_loopback_operates(corpus, db_path):
+    """Socket-level: with a token configured, /api/role says the split is on, loopback is
+    implicitly operator, and a mutating POST from loopback passes the gate. (The viewer-refusal
+    branch is covered by the pure-decision test above -- a real socket test cannot fake its
+    peer address.)"""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    cfg.operator_token = "sesame"
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, role = _get(port, "/api/role")
+        assert status == 200 and role["split"] is True and role["operator"] is True
+        status, body = _post(port, "/api/reid/confirm", {"visit_id": 999999, "name": "X"})
+        assert "viewer" not in (body or {})   # passed the gate; outcome is the endpoint's own
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def test_evalstatus_endpoint_degrades_honestly(corpus, db_path):
+    """/api/evalstatus answers 200 always; on a machine with no reports/ artifacts it says
+    available:false rather than erroring (a fresh clone has never run eval)."""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, body = _get(port, "/api/evalstatus")
+        assert status == 200
+        assert "available" in body
+        if body["available"]:                  # this repo may hold real artifacts -- shape-check
+            assert set(body) >= {"artifact", "run_at", "ok", "regressions"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
 # ---- the roster: marking an individual as no longer resident -------------------------
 # Templates outlive the animal. Notch's last labelled crop is 2026-06-30 and Matt confirms it
 # stopped coming, but at the recommended operating point the auto tier still lined up to write
