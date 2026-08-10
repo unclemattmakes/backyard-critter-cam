@@ -956,6 +956,21 @@ async function renderProfile(params,body){
     ? `<span class="flag" style="opacity:.85">moved on${p.status.effective_date?' · last resident day '+esc(p.status.effective_date):''}</span>` : '';
   const comp=(p.companions||[]).map(c=>
     `<button class="cast-chip" onclick="openProfile(${jarg(c.name)})">${esc(cap1(c.name))}<small>×${c.n_visits}</small></button>`).join('');
+  /* WHAT THEY MOSTLY DO. The per-visit tag has been computed since the coarse behaviour pass and
+     discarded every time; this is the total. Two honesty rules baked in: it prints how many
+     visits it could NOT tag (a visit with no overlapping clip has no motion features, and on this
+     corpus that is about half of them), and below three tagged visits it shows counts instead of
+     percentages -- "100% fed here" off one visit is a sentence about arithmetic. */
+  const bh=p.behaviour;
+  const bhRow=(bh&&bh.n_tagged)?(()=>{
+    const parts=Object.entries(bh.share||{}).map(([k,v])=>
+      bh.thin?`${bh.tags[k]}× ${esc(k)}`:`${Math.round(v*100)}% ${esc(k)}`);
+    const why=`From ${bh.n_tagged} of ${bh.n_visits} visits — the rest had no clip overlapping them, so no motion to read. `+
+      (bh.thin?`Too few to quote a percentage, so these are counts.`:``)+
+      ` The tag is a coarse reading of three motion features, not a verdict.`;
+    return `<div class="lbl" style="opacity:.78" title="${esc(why)}">Mostly: ${parts.join(' · ')}`+
+      `<span style="opacity:.6"> · ${bh.n_tagged}/${bh.n_visits} visits readable</span>${infoDot(why)}</div>`;
+  })():'';
   const refs=(p.references||[]).map(r=>
     `<img loading="lazy" src="${media(r.crop_path)}" alt="reference photo" title="${esc(r.kind==='video_frame'?'phone video frame':'phone photo')}${r.captured_at?' · '+esc(fmtDateTime(r.captured_at)):''}${r.note?' · '+esc(r.note):''}">`).join('');
   visitsData=p.visits;
@@ -968,6 +983,7 @@ async function renderProfile(params,body){
       </div>
       <div class="lbl" style="opacity:.78">first seen ${esc(fmtDateTime(p.first_seen))} · last seen ${esc(fmtDateTime(p.last_seen))}${stamps?` · labels: ${stamps}`:''}${p.unfiled?` · ${p.unfiled} newest photos not yet filed into a visit`:''}</div>
       ${depart}
+      ${bhRow}
       ${lost?`<div class="lbl" style="opacity:.6">${lost} clip${lost===1?'':'s'} pruned before the backups began (or the backup drive is unreachable) — not shown.</div>`:''}
       ${comp?`<div class="castrow"><span class="lbl">Seen together with</span>${comp}</div>`:''}
       ${refs?`<div class="profile-refs"><span class="lbl">Reference shots — phone (identity certified by hand)</span><div class="refstrip">${refs}</div></div>`:''}
@@ -1442,6 +1458,17 @@ function renderDispatch(d, rc, rl){
   const t=[['visits',(d.visits||0).toLocaleString()],
     [(d.n_surprising?'species (+'+d.n_surprising+' to verify)':'species'),(d.species||[]).length-(d.n_surprising||0)],
     ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
+  /* AT LEAST N AT ONCE. A floor three times over -- the detector's recall on a huddle is ~0.39,
+     the counting is greedy, and the stills only see instants something was saved. So it says
+     "at least", it never names anybody, and it never claims a litter is intact: counting kits
+     per mother was tested against the one eye-verified four-animal window and killed, because
+     the detector produced ONE box where a human counted four. */
+  if(d.crowd&&d.crowd.n>=2){
+    const c=d.crowd, mix=Object.entries(c.by_species||{}).filter(([,v])=>v>=1)
+      .map(([k,v])=>`${v}× ${nameOf(k)}`).join(', ');
+    t.push(['at least '+c.n+' at once',
+      `<span title="${esc(`The busiest instant of this ${d.edition}: ${c.n} separate bodies in one frame on ${c.source||'a camera'} at ${(c.at||'').slice(11,19)}${mix?' — '+mix:''}. A LOWER bound — the detector misses animals in a huddle (recall ~0.39), the count is deliberately greedy, and the saved stills only catch instants something was written. It says how many bodies, never whose.`)}">${(c.at||'').slice(11,16)}</span>`]);
+  }
   html+=`<div class="tallies">${t.map(([k,v])=>`<div class="tally" style="cursor:default"><div class="n">${v}</div><div class="k lbl">${k}</div></div>`).join('')}</div>`;
   if(d.plate){ const p=d.plate;
     html+=`<div class="panel hero">
@@ -1736,7 +1763,12 @@ function reidCard(v){
   }else if((v.candidates||[]).length){
     const top=v.candidates[0];
     const rest=v.candidates.slice(1).map(c=>`${esc(c.name)} ${Math.round(c.similarity*100)}%`).join(' · ');
+    // The offer carries the LAPSE state of the name it proposes. "Looks like Stan 79%" reads the
+    // same whether Stan was confirmed last night or five weeks ago, and those are not the same
+    // offer: past the crossing the match is at or below guessing the commonest name. Labelled,
+    // never filtered — gating suggestions on template age was measured and rejected.
     sugg=`<span class="flag" title="nearest confirmed visit: #${top.via_visit} (${reidWhen(top.via_started)})">looks like <b>${esc(top.name)}</b> ${Math.round(top.similarity*100)}%</span>`
+        +lapseBadge(top.lapse)
         +(v.novel? `<span class="flag" style="background:rgba(255,120,90,.14);border-color:rgba(255,120,90,.4)" title="best match is below the novelty threshold">possibly someone new</span>`:'')
         +(rest? `<span class="lbl" style="opacity:.6">${rest}</span>`:'');
     act=`<button class="gear" onclick="reidConfirm(${v.visit_id},${jarg(top.name)})" title="yes, it's ${esc(top.name)}">✓ ${esc(top.name)}</button>
@@ -1958,16 +1990,35 @@ function reidFunnelHTML(f){
     <div class="lbl" style="opacity:.72;margin-top:4px" title="addressable = has a prototype, not yet confirmed, not multi-animal, not left-unnamed — the visits the automatic tier is allowed to look at">${side}</div>
     ${srcs}</div>`;
 }
-/* TEMPLATE FRESHNESS. Appearance identity decays: measured here, leave-one-visit-out top-1 goes
-   0.818 → 0.482 → 0.222 as the newest usable template ages 0 → 7 → 21 days, against a 0.348
-   majority-class baseline. So the age of an individual's newest confirmed SOLO visit is not
-   trivia, it is the priority list — stalest first, and loud when it is past the cut. */
-function reidFreshTone(days,staleDays){
-  const cut=staleDays||14;
+/* TEMPLATE FRESHNESS, and the LAPSE state that now rides with every name.
+   Appearance identity decays: session-blocked leave-one-visit-out top-1 goes 0.741 → 0.482 →
+   0.259 as the newest usable template ages 0 → 7 → 14 days, against a 0.345 majority-class
+   baseline — so somewhere between 10 days (0.403) and 14 (0.259) the matcher stops beating
+   "just say the commonest name". That crossing is what `lapse.state` means, and the expected
+   top-1 now comes from the SERVER (individuals.identity_lapse) instead of a table hard-coded
+   here: the numbers that used to sit in this file were the session-LEAKED ones (0.82 for a
+   same-night template), which is the flattering half of the very finding it was quoting. */
+function reidFreshTone(days,staleDays,lapse){
+  const st=lapse&&lapse.state;
+  if(st==='none'||st==='lapsed') return ['rgba(255,120,90,.16)','rgba(255,120,90,.45)'];
+  if(st==='fading')              return ['rgba(255,190,80,.15)','rgba(255,190,80,.42)'];
+  if(st==='fresh')               return ['rgba(90,200,120,.14)','rgba(90,200,120,.4)'];
+  const cut=staleDays||14;       // no server lapse block (an older payload): fall back to the age
   if(days==null) return ['rgba(255,120,90,.16)','rgba(255,120,90,.45)'];
   if(days>=cut)  return ['rgba(255,120,90,.16)','rgba(255,120,90,.45)'];
   if(days>=cut/2)return ['rgba(255,190,80,.15)','rgba(255,190,80,.42)'];
   return ['rgba(90,200,120,.14)','rgba(90,200,120,.4)'];
+}
+/* One badge, everywhere a name is offered. Says the thing the interface used to leave unsaid:
+   the matcher can no longer vouch for this animal, and a human re-anchor is what fixes it. */
+function lapseBadge(lapse){
+  if(!lapse||lapse.state==='fresh') return '';
+  const t={none:['no template','rgba(255,120,90,.16)','rgba(255,120,90,.45)'],
+           lapsed:['lapsed','rgba(255,120,90,.16)','rgba(255,120,90,.45)'],
+           fading:['fading','rgba(255,190,80,.15)','rgba(255,190,80,.42)']}[lapse.state];
+  if(!t) return '';
+  return `<span class="flag" style="background:${t[1]};border-color:${t[2]};margin-left:4px"
+    title="${esc(lapse.why||'')}">${t[0]}</span>`;
 }
 /* THE ROSTER. Animals move on, and a stale template is not the same fact as a departed animal —
    you can't confirm a fresh visit for a raccoon that stopped coming. Marking someone gone (with
@@ -1994,15 +2045,16 @@ function reidFreshnessHTML(cast,staleDays){
   if(!list.length) return '';
   const chips=list.map(c=>{
     if(c.status==='departed') return reidDepartedHTML(c);
-    const d=c.days_since_template, [bg,bd]=reidFreshTone(d,staleDays);
+    const d=c.days_since_template, [bg,bd]=reidFreshTone(d,staleDays,c.lapse);
     const age=d==null?'no usable template':(d<1?'today':Math.round(d)+'d ago');
     const warn=(d==null||d>=(staleDays||14))?' ⚠':'';
     const gone=`<button class="gear" style="padding:0 5px;margin-left:4px" title="${esc(c.name)} isn't coming back? Record the last day you saw them. The nightly pass then stops writing this name onto later visits — everything else is unchanged." onclick="reidSetDeparted(this,${jarg(c.name)},${jarg((c.last_seen||'').slice(0,10))})">moved on?</button>`;
-    const freshWhy=`${c.name}: ${c.n_visits} confirmed visit(s), ${c.n_templates||0} of them usable as templates (solo). Newest template ${d==null?'does not exist':reidWhen(c.newest_template)}. Identification against a template this old is roughly ${d==null?'nil':(d<1?'0.82':(d<7?'0.7':(d<14?'0.48':'0.22')))} top-1 — confirm a fresh solo visit for ${c.name} to reset it.`;
+    const et=c.lapse&&c.lapse.expected_top1;
+    const freshWhy=`${c.name}: ${c.n_visits} confirmed visit(s), ${c.n_templates||0} of them usable as templates (solo). Newest template ${d==null?'does not exist':reidWhen(c.newest_template)}. ${c.lapse?c.lapse.why:`Identification against a template this old is roughly ${et==null?'nil':et} top-1 — confirm a fresh solo visit for ${c.name} to reset it.`}`;
     return `<span class="flag" style="background:${bg};border-color:${bd}" title="${esc(freshWhy)}">${esc(c.name)} · <b>${age}</b>${warn}<span style="opacity:.6"> · ${c.n_templates||0}/${c.n_visits}</span>${infoDot(freshWhy)}${gone}</span>`;
   }).join(' ');
   return `<h2 class="sec">Template Freshness <span class="n">who the matcher can still recognise — stalest first</span></h2>
-    <p class="lbl" style="opacity:.75;margin:2px 0 6px">Appearance goes stale fast on this animal: identification is ~0.82 correct against a template from the same night, ~0.48 at a week, ~0.22 at three weeks — barely above guessing the commonest name. The number is days since that individual's newest <b>confirmed solo</b> visit, and the second pair is usable templates / confirmations. If one of them has simply stopped coming, say so — a template outlives the animal, and the nightly pass has no other way to find out.</p>
+    <p class="lbl" style="opacity:.75;margin:2px 0 6px">Appearance goes stale fast on this animal: identification is ~0.74 correct against a template from the same night, ~0.48 at a week, and ~0.26 at a fortnight — which is <em>below</em> simply guessing the commonest name (~0.34). That crossing is what “lapsed” means. The number is days since that individual's newest <b>confirmed solo</b> visit, and the second pair is usable templates / confirmations. If one of them has simply stopped coming, say so — a template outlives the animal, and the nightly pass has no other way to find out.</p>
     <div class="lede" style="margin-bottom:10px">${chips}</div>`;
 }
 function reidSetDeparted(btn,name,lastSeen){

@@ -1353,3 +1353,101 @@ def test_fetch_for_embedding_visit_ids_restriction(conn):
     rows = db.fetch_for_embedding(conn, individuals.EMBED_MODEL, species=None,
                                   min_confidence=0.25, redo=False, visit_ids={v1})
     assert [r[0] for r in rows] == [d1]
+
+
+# ---------------------------------------------------------------------------
+# LAPSED IDENTITY -- the decay curve as a first-class per-individual state.
+# ---------------------------------------------------------------------------
+# The project's single most consequential measurement is that appearance identity decays in about
+# a week. Until this shipped, one operator-only panel said so and every other surface presented a
+# 40-day-old template as an equal to yesterday's. These pin the boundaries to the numbers they
+# came from, so a future reader who moves one has to move a measurement with it.
+
+def test_expected_top1_interpolates_the_measured_curve():
+    assert individuals.expected_top1(0) == 0.741
+    assert individuals.expected_top1(7) == 0.482
+    assert 0.482 > individuals.expected_top1(8.5) > 0.403      # between the 7- and 10-day points
+    assert individuals.expected_top1(None) is None
+
+
+def test_expected_top1_goes_flat_past_the_last_measured_point():
+    # Nine points on 139 probes do not support extrapolation, so it must not invent one.
+    assert individuals.expected_top1(21) == individuals.expected_top1(400) == 0.122
+
+
+def test_identity_lapse_crosses_where_the_matcher_stops_beating_a_guess():
+    # Measured: 0.403 top-1 at 10 days (above the 0.345 majority baseline), 0.259 at 14 (below).
+    assert individuals.identity_lapse(10, 5, stale_days=14)["state"] == "fading"
+    assert individuals.identity_lapse(10, 5, stale_days=14)["beats_guessing"] is True
+    lapsed = individuals.identity_lapse(14, 5, stale_days=14)
+    assert lapsed["state"] == "lapsed" and lapsed["beats_guessing"] is False
+
+
+def test_identity_lapse_fresh_and_none():
+    assert individuals.identity_lapse(0.4, 5)["state"] == "fresh"
+    # No usable template is NOT the same as a stale one, and it is the louder of the two.
+    for n, d in ((0, 3.0), (5, None)):
+        assert individuals.identity_lapse(d, n)["state"] == "none"
+
+
+def test_identity_lapse_explains_the_fix_rather_than_the_failure():
+    why = individuals.identity_lapse(30, 5)["why"]
+    assert "re-anchor" in why and "%" in why
+
+
+def test_template_freshness_reports_the_newest_solo_confirmation(conn):
+    class _M:
+        visit_started = {1: "2026-06-01T21:00:00-07:00", 2: "2026-06-20T21:00:00-07:00"}
+        def templates(self):
+            return [("Stan", 1, None), ("Stan", 2, None), ("Notch", 1, None)]
+    now = datetime.fromisoformat("2026-06-22T21:00:00-07:00")
+    f = individuals.template_freshness(_M(), now=now)
+    assert f["Stan"]["n_templates"] == 2
+    assert f["Stan"]["newest_template"] == "2026-06-20T21:00:00-07:00"
+    assert f["Stan"]["days_since_template"] == pytest.approx(2.0)
+    assert f["Stan"]["lapse"]["state"] == "fresh"
+    assert f["Notch"]["lapse"]["state"] == "lapsed"      # its only template is 21 days old
+
+
+def test_usable_template_visits_matches_what_the_matcher_would_use(conn):
+    """The DB-side template set must be the matcher's set, or the surfaces disagree -- which they
+    did, by six weeks, in the first cut of this. Three visits, three different reasons to differ.
+    """
+    # 1. a clean solo visit with enough embedded crops: a template.
+    good = [_det(conn, minutes=m) for m in (0, 0.2, 0.4)]
+    v_good = _visit(conn, good, start_min=0, end_min=1)
+    for d in good:
+        _embed(conn, d, _unit(1, 0))
+    db.label_visit(conn, v_good, "Stan", source="human")
+    # 2. confirmed and NEWER, but the embed pass has not reached it: NOT a template. This is the
+    #    exact shape that made a profile page say "confirmed 0.7 days ago" about an animal the
+    #    matcher had lost six weeks earlier.
+    fresh = [_det(conn, minutes=m) for m in (100, 100.2, 100.4)]
+    v_fresh = _visit(conn, fresh, start_min=100, end_min=101)
+    db.label_visit(conn, v_fresh, "Stan", source="human")
+    # 3. confirmed, embedded, but two separated boxes in the same instant: a blended prototype.
+    pair = [_det(conn, minutes=200, bbox=(0, 0, 10, 10)), _det(conn, minutes=200, bbox=(50, 50, 60, 60)),
+            _det(conn, minutes=200.2, bbox=(0, 0, 10, 10)), _det(conn, minutes=200.2, bbox=(50, 50, 60, 60)),
+            _det(conn, minutes=200.4, bbox=(0, 0, 10, 10)), _det(conn, minutes=200.4, bbox=(50, 50, 60, 60))]
+    v_pair = _visit(conn, pair, start_min=200, end_min=201)
+    for d in pair:
+        _embed(conn, d, _unit(1, 0))
+    db.label_visit(conn, v_pair, "Stan", source="human")
+
+    usable = individuals.usable_template_visits(conn, "raccoon")
+    assert set(usable) == {v_good}
+    assert usable[v_good][0] == "Stan"
+
+    # And the lapse state is computed off THAT visit, not off the newer unembedded confirmation.
+    lapses = individuals.lapse_by_name(conn, "raccoon")
+    assert lapses["stan"]["state"] == "lapsed"       # the only template is well over a fortnight old
+    assert individuals.lapse_by_name(conn, "raccoon", names=["nobody"]) == {}
+
+
+def test_max_separated_is_a_greedy_lower_bound():
+    """Greedy on purpose. The exact answer is a maximum clique; greedy under-counts, and
+    under-counting is the only safe direction for "the yard held at least this many at once"."""
+    boxes = [(0, 0, 10, 10), (50, 50, 60, 60), (100, 100, 110, 110)]
+    assert individuals.max_separated(boxes) == 3
+    assert individuals.max_separated([(0, 0, 10, 10), (1, 1, 11, 11)]) == 1   # one animal, twice
+    assert individuals.max_separated([]) == 0

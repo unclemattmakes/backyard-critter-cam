@@ -52,6 +52,7 @@ first round of naming is "name these groups", not "name 1653 crops".
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import sqlite3
 import sys
@@ -65,6 +66,261 @@ import db
 import reidutil
 
 EMBED_MODEL = "megadescriptor-l-384"
+
+# ---------------------------------------------------------------------------
+# LAPSED IDENTITY: the decay curve, as a first-class per-individual state.
+# ---------------------------------------------------------------------------
+# The single most consequential fact this project has measured about itself is that appearance
+# identity decays in about a week -- and until now the only surface that admitted it was one
+# operator-only panel. Everywhere else a 40-day-old template ranked as an equal to yesterday's,
+# silently. These constants make "the matcher can no longer vouch for this animal" something the
+# interface can SAY, in the one place it matters: next to the name.
+#
+# Session-blocked leave-one-visit-out top-1 against the newest ALLOWED template's age, re-measured
+# 2026-08-09 on n=139 confirmed-solo raccoon visits over 6 individuals (the 2026-08-05 identity
+# eval's protocol and corpus, one Notch return later):
+TEMPLATE_AGE_TOP1 = ((0, 0.741), (1, 0.705), (2, 0.669), (3, 0.626), (5, 0.590),
+                     (7, 0.482), (10, 0.403), (14, 0.259), (17, 0.165), (21, 0.122))
+# ... against the majority baseline, which is what "no better than guessing" means here: always
+# answer with the commonest name in the cast (Stan, 48 of 139).
+TEMPLATE_AGE_BASELINE = 0.345
+# THE CROSSING IS MEASURED, NOT CHOSEN. Between 10 days (0.403, still above the baseline) and 14
+# (0.259, below it) the matcher stops beating "just say Stan". cfg.reid_queue_stale_days is
+# already 14 for exactly this reason, so the lapse state reads that number rather than inventing
+# a second one that could drift away from it.
+LAPSE_FRESH_DAYS = 3.0          # 0.626 top-1 and better: the matcher is worth listening to
+LAPSE_STATES = ("fresh", "fading", "lapsed", "none")
+
+
+def expected_top1(days) -> float | None:
+    """Interpolate TEMPLATE_AGE_TOP1 at a template age in days. None for an unknown age.
+
+    Linear between the measured points and flat past the last one -- deliberately not a fitted
+    curve. Nine points on 139 probes do not support a functional form, and pretending otherwise
+    would dress a measurement up as a model."""
+    if days is None:
+        return None
+    d = max(0.0, float(days))
+    pts = TEMPLATE_AGE_TOP1
+    if d >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if d <= x1:
+            return round(y0 + (y1 - y0) * (d - x0) / (x1 - x0), 3) if x1 > x0 else y0
+    return pts[-1][1]
+
+
+def identity_lapse(days_since_template, n_templates: int = 0, stale_days=None, cfg=None) -> dict:
+    """Has this individual's identity LAPSED? -> {state, days, expected_top1, beats_guessing, why}.
+
+    One definition, so the profile page, the suggestion payload and the roll call cannot drift
+    apart -- and so the number a reader is shown is the measured one rather than a hard-coded
+    table in a template string that nobody re-measures.
+
+      none    no usable template at all -- nothing can be matched, at any age.
+      fresh   newer than LAPSE_FRESH_DAYS.
+      fading  older than that but still beating the majority baseline.
+      lapsed  at or past cfg.reid_queue_stale_days: top-1 has fallen to or below "always say the
+              commonest name". The fix is a human re-anchor -- confirm one fresh solo visit --
+              and NOT a better backbone; that is the whole finding of the 2026-08-05 eval.
+
+    A lapsed identity is never hidden, dropped or down-ranked. It is LABELLED. Filtering by age was
+    already measured and rejected (wrong-name rate 0.119 -> 0.137 while coverage fell 18.0% ->
+    16.1%), so this states the fact and leaves the ranking exactly as it is.
+    """
+    stale = float((cfg or config.CONFIG).reid_queue_stale_days if stale_days is None
+                  else stale_days)
+    n = int(n_templates or 0)
+    d = None if days_since_template is None else float(days_since_template)
+    if n <= 0 or d is None:
+        return {"state": "none", "days": d, "expected_top1": None, "beats_guessing": False,
+                "why": "no confirmed solo visit to match against -- confirm one to start."}
+    top1 = expected_top1(d)
+    beats = bool(top1 is not None and top1 > TEMPLATE_AGE_BASELINE)
+    if d >= stale:
+        state = "lapsed"
+        why = (f"newest confirmed solo visit is {d:.0f} days old; at that age identification is "
+               f"about {top1:.0%} correct, at or below simply guessing the commonest name "
+               f"({TEMPLATE_AGE_BASELINE:.0%}). Confirm one fresh solo visit to re-anchor.")
+    elif d < LAPSE_FRESH_DAYS:
+        state = "fresh"
+        why = f"confirmed {d:.1f} days ago; identification is about {top1:.0%} correct."
+    else:
+        state = "fading"
+        why = (f"newest confirmed solo visit is {d:.0f} days old; identification is about "
+               f"{top1:.0%} correct and falling to {TEMPLATE_AGE_BASELINE:.0%} (guessing) by "
+               f"{stale:.0f} days.")
+    return {"state": state, "days": d, "expected_top1": top1, "beats_guessing": beats, "why": why}
+
+
+def template_freshness(matcher, now=None, cfg=None) -> dict:
+    """{name: {n_templates, newest_template, days_since_template, lapse}} over each individual's
+    CONFIRMED SOLO visits -- exactly the set `templates()` hands the matcher.
+
+    This is the priority list, not a decoration: an individual whose freshest template is a
+    fortnight old effectively cannot be recognised, and the `lapse` block is what lets every
+    surface that consumes a name say so in the same words."""
+    out: dict = {}
+    for name, vid, _proto in matcher.templates():
+        started = matcher.visit_started.get(vid)
+        e = out.setdefault(name, {"n_templates": 0, "newest_template": None})
+        e["n_templates"] += 1
+        if started and (e["newest_template"] is None or started > e["newest_template"]):
+            e["newest_template"] = started
+    for e in out.values():
+        e["days_since_template"] = _days_since(e["newest_template"], now)
+        e["lapse"] = identity_lapse(e["days_since_template"], e["n_templates"], cfg=cfg)
+    return out
+
+
+def _days_since(ts, now=None):
+    """Whole-ish days between an ISO timestamp and now (float, one decimal). None if unparseable."""
+    t = db.parse_local(ts) if ts else None
+    if t is None:
+        return None
+    ref = now or datetime.now().astimezone()
+    return round((ref - t).total_seconds() / 86400.0, 1)
+
+
+def _multi_visit_ids(conn, visit_ids, cfg=None) -> set:
+    """VisitMatcher.is_multi's verdict, for a GIVEN SET of visits, without building a matcher.
+    Same three channels at the same thresholds, so the display surfaces and the matcher cannot
+    disagree about which visits are usable as templates.
+
+    Scoped to `visit_ids` because that is the difference between usable and not: asked about every
+    visit in the corpus this took 18 seconds (138k detections through a Python co-presence loop,
+    plus one clip pass per species). Only CONFIRMED visits can ever be templates, and there are a
+    couple of hundred of those."""
+    cfg = cfg or config.CONFIG
+    ids = {int(v) for v in visit_ids}
+    if not ids:
+        return set()
+    holes = ",".join("?" * len(ids))
+    idl = sorted(ids)
+    # One indexed pass over the confirmed visits' own detections, grouped in Python. A
+    # self-join that pre-filtered "instants holding 2+ boxes" in SQL was tried and is MUCH worse
+    # here (minutes, not seconds) -- SQLite plans it as a scan and the visit_id index stops
+    # earning its keep. The plain fetch is 1.5 s over ~200 visits and that is the shipped shape.
+    rows: dict = defaultdict(list)
+    for r in conn.execute(
+            f"""SELECT visit_id, timestamp, species, bbox_x1, bbox_y1, bbox_x2, bbox_y2
+                FROM detections WHERE species IS NOT NULL AND visit_id IN ({holes})""", idl):
+        rows[(r["visit_id"], r["species"])].append(
+            (r["timestamp"], (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"])))
+    out = {vid for (vid, _sp), rs in rows.items()
+           if co_present_frames(rs) >= cfg.reid_co_presence_min}
+
+    # CLIP co-presence, in one pass over the clips that qualify rather than one pass per species.
+    # Timestamps are parsed ONCE and the clips are bucketed per source and sorted, so each visit
+    # bisects into its own few seconds instead of walking the lot: the naive nested loop was
+    # 207 x 2,206 pairs and 0.87 s of re-parsing ISO strings, which was the whole cost of this
+    # function.
+    from clipmotion import SUSTAINED_HITS
+    by_source: dict = defaultdict(list)
+    for c in conn.execute(
+            """SELECT c.source, c.started_at, c.ended_at,
+                      SUM(CASE WHEN t.n_hits >= ? THEN 1 ELSE 0 END) AS n_sustained
+               FROM clips c JOIN clip_tracks t ON t.clip_id = c.id
+               GROUP BY c.id HAVING n_sustained >= 2""", (SUSTAINED_HITS,)):
+        a = db.parse_local(c["started_at"])
+        b = db.parse_local(c["ended_at"] or c["started_at"])
+        if a is not None:
+            by_source[c["source"]].append((a.timestamp(), (b or a).timestamp()))
+    for lst in by_source.values():
+        lst.sort()
+    starts = {s: [a for a, _b in lst] for s, lst in by_source.items()}
+    spans = multi_name_sighting_spans(conn)
+    for v in conn.execute(
+            f"SELECT id, source, started_at, ended_at FROM visits WHERE id IN ({holes})", idl):
+        if v["id"] in out:
+            continue
+        va = db.parse_local(v["started_at"])
+        vb = db.parse_local(v["ended_at"] or v["started_at"]) or va
+        lst = by_source.get(v["source"]) or []
+        if va is not None and lst:
+            hi = bisect.bisect_right(starts[v["source"]], vb.timestamp())
+            n = sum(1 for a, b in lst[:hi] if b >= va.timestamp())
+            if n >= cfg.reid_clip_co_presence_min_clips:
+                out.add(v["id"])
+                continue
+        if any(v["source"] == s and _iso_overlap(v["started_at"], v["ended_at"], a, b)
+               for s, a, b in spans):
+            out.add(v["id"])
+    return out
+
+
+def usable_template_visits(conn, species=None, cfg=None, names=None) -> dict:
+    """{visit_id: (name, started_at)} for every visit that is ACTUALLY USABLE as a template --
+    VisitMatcher.templates()' set, derived without loading a single embedding vector.
+
+    Four conditions, and the fourth is the one a naive version forgets:
+      1. human-confirmed (auto names never become templates);
+      2. not a GROUP stamp -- "Stan + Kits" is several animals under one name;
+      3. not multi-animal -- a two-animal visit's prototype blends two animals. ALL THREE of
+         VisitMatcher.is_multi's channels, not just the obvious one: simultaneous separated boxes
+         in the stills, CLIP co-presence, and a multi-name live sighting. Dropping the clip
+         channel is what made this disagree with the Individuals tab by three weeks about Stan --
+         the full-rate clips catch pairs the sparse stills never see;
+      4. ENOUGH EMBEDDED CROPS TO HAVE A PROTOTYPE, COUNTED WITHIN THE VISIT'S OWN SPECIES. A
+         visit confirmed last night whose crops the nightly embed pass has not reached yet is not
+         a template -- the matcher cannot use it, so saying "confirmed 0.7 days ago" about it is a
+         comfortable lie. And the count has to be per species, because VisitMatcher's is: a visit
+         holding three embedded crops of something else is not three raccoon templates. Getting
+         either half wrong is how three surfaces disagreed by six weeks about the same animal.
+    """
+    cfg = cfg or config.CONFIG
+    want = None if names is None else {str(n).strip().casefold() for n in names}
+    confirmed = {vid: nm for vid, nm in db.confirmed_visit_labels(conn, species).items()
+                 if not db.is_group_label(nm)
+                 and (want is None or str(nm).strip().casefold() in want)}
+    if not confirmed:
+        return {}
+    idl = sorted(confirmed)
+    holes = ",".join("?" * len(idl))
+    embedded: dict = {}
+    for r in conn.execute(
+            f"""SELECT d.visit_id, d.species, COUNT(*) FROM detections d
+                JOIN detection_embeddings e ON e.detection_id = d.id AND e.model = ?
+                WHERE d.confidence >= ? AND d.visit_id IN ({holes})
+                GROUP BY d.visit_id, d.species""",
+            [EMBED_MODEL, cfg.reid_suggest_min_conf] + idl):
+        embedded[(r[0], r[1])] = r[2]
+    vis = {r[0]: (r[1], r[2]) for r in conn.execute(
+        f"SELECT id, started_at, species FROM visits WHERE id IN ({holes})", idl)}
+    multi = _multi_visit_ids(conn, idl, cfg)
+    out = {}
+    for vid, name in confirmed.items():
+        if vid in multi:
+            continue
+        started, sp = vis.get(vid, (None, None))
+        # A visit whose own species column is NULL falls back to whichever species its embedded
+        # crops mostly carry -- the same rule apply_visit_label and the stills un-blend use.
+        sp = species or sp
+        if sp is None:
+            cands = [(n, s) for (v, s), n in embedded.items() if v == vid]
+            sp = max(cands)[1] if cands else None
+        if embedded.get((vid, sp), 0) < cfg.reid_proto_min_crops:
+            continue
+        out[vid] = (name, started)
+    return out
+
+
+def lapse_by_name(conn, species=None, now=None, cfg=None, names=None) -> dict:
+    """{casefolded name: lapse dict} straight from the database -- the same answer
+    `template_freshness` gives a live matcher, for the surfaces that must not pay to build one.
+
+    `names` narrows the whole computation to the individuals asked about, which is most of the
+    cost: a profile page wants ONE animal and there is no reason for it to walk the other two
+    hundred confirmed visits to find out about it."""
+    per: dict = {}
+    for _vid, (name, started) in usable_template_visits(conn, species, cfg=cfg,
+                                                        names=names).items():
+        e = per.setdefault(str(name).strip().casefold(), {"n": 0, "newest": None})
+        e["n"] += 1
+        if started and (e["newest"] is None or started > e["newest"]):
+            e["newest"] = started
+    return {k: identity_lapse(_days_since(v["newest"], now), v["n"], cfg=cfg)
+            for k, v in per.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +370,26 @@ def clip_match(vec: np.ndarray, templates: dict, threshold: float) -> list:
     still visit). Its own threshold because clip vectors sit lower than the still prototypes."""
     ranked = sorted(((n, float(vec @ c), k) for n, (c, k) in templates.items()), key=lambda r: -r[1])
     return [(n, s, k) for n, s, k in ranked if s >= threshold]
+
+
+def max_separated(boxes, iou_max: float = 0.45) -> int:
+    """How many of these boxes are mutually separate -- a LOWER BOUND on the bodies in one frame.
+
+    Greedy, and greedy on purpose: the true answer is a maximum clique, and greedy under-counts.
+    Under-counting is the only safe direction for a claim of the form "the yard held at least this
+    many animals at once", which is the only claim this corpus can support. The detector's recall
+    on a huddle is about 0.39 (config.py, tiledetect), so the number is a floor twice over.
+
+    Deliberately NOT an attribution: it says how many bodies, never whose. Counting kits per
+    mother from track overlap was proposed, tested against the one eye-verified four-animal window
+    and killed -- the glass door's clips held ZERO sustained tracklets there and the detector
+    produced a maximum of one box at any instant (docs/deferred-work.md, Killed).
+    """
+    keep: list = []
+    for b in boxes:
+        if all(iou(b, k) < iou_max for k in keep):
+            keep.append(b)
+    return len(keep)
 
 
 def co_present_frames(rows, iou_max: float = 0.45) -> int:

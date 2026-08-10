@@ -312,6 +312,46 @@ def test_census_rolls_once_per_period_and_resets():
     assert c.roll(150.0) is None        # the new period has only just started
 
 
+# ---- VetoCensus: the abstentions, which are the whole shadow-mode question ------------
+# db.record_suppression writes a row only for SUPPRESS, so an inert veto and a perfectly precise
+# one look identical in the database. That is the state the 2026-08-09 review found, and digging
+# out the reason meant replaying the whole shadow week against the banked reference PNGs.
+
+def _decision(reason, cover=None, decision=refimg.ABSTAIN):
+    return refimg.Decision(decision=decision, reason=reason, cover=cover)
+
+
+def test_veto_census_counts_every_decision_not_only_the_suppressions():
+    c = backyard_cam.VetoCensus()
+    c.note(_decision("reference_has_no_pixels_here", cover=0.0))
+    c.note(_decision("reference_has_no_pixels_here", cover=0.12))
+    c.note(_decision("pixels_differ_from_empty", cover=0.95, decision=refimg.KEEP))
+    c.note(None)                                        # no prepared frame: counted, not dropped
+    assert c.reasons == {"reference_has_no_pixels_here": 2,
+                         "pixels_differ_from_empty": 1, "not_evaluated": 1}
+
+
+def test_veto_census_reports_how_close_the_abstentions_came():
+    """"How many did it flag" is the easy half. "How close did the rest come" is the half that
+    says whether the bar is wrong or the accumulation under it is."""
+    c = backyard_cam.VetoCensus(period_s=100.0)
+    assert c.roll(0.0) is None
+    for cover in (0.0, 0.0, 0.0, 0.95):
+        c.note(_decision("reference_has_no_pixels_here", cover=cover))
+    line = c.roll(200.0)
+    assert "4 box(es) judged" in line
+    assert "cover p50" in line and "1 at or above the bar" in line
+    assert c.reasons == {} and c.covers == []
+
+
+def test_veto_census_prints_an_hour_in_which_nothing_was_judged():
+    c = backyard_cam.VetoCensus(period_s=100.0)
+    c.roll(0.0)
+    line = c.roll(200.0)
+    assert line is not None and "0 box(es) judged" in line
+    assert "no box reached the coverage gate" in line
+
+
 # ---- HUD: one extra token, and nothing else -----------------------------------------
 
 def test_hud_without_a_ref_token_is_pixel_identical():
@@ -664,3 +704,17 @@ def test_census_line_is_logged_even_with_the_veto_off(tmp_path, monkeypatch, cap
     out = capsys.readouterr().out
     assert "detector census:" in out
     assert "run(s)" in out and "longest empty run" in out
+
+
+def test_veto_census_line_reaches_the_log_from_the_real_loop(tmp_path, monkeypatch, capsys):
+    """The unit tests above prove VetoCensus counts; this proves the capture loop actually CALLS
+    it. That distinction is the whole reason this class exists -- refimg's shadow week wrote only
+    its suppressions, so "it flagged nothing" and "it is perfectly precise" were the same log, and
+    telling them apart cost a full replay of the week off recorded clips."""
+    cfg = _loop_cfg(tmp_path / "vetocensus", refimg_enabled=True, refimg_certify_hold_s=0.0)
+    real = backyard_cam.VetoCensus
+    monkeypatch.setattr(backyard_cam, "VetoCensus", lambda: real(period_s=0.0))
+    _drive(cfg, monkeypatch)
+    out = capsys.readouterr().out
+    assert "veto census:" in out
+    assert "box(es) judged" in out

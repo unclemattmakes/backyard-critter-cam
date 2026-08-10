@@ -377,3 +377,142 @@ def test_point_fold_spread_pools_back_to_the_whole_corpus_number():
     assert spread["overall"]["assigned"] == 10
     assert spread["folds"]["coverage_min"] == pytest.approx(1.0)
     assert spread["folds"]["errors_max_in_a_fold"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Forward-chronological replay: "does identity PROPAGATE forward?"
+# ---------------------------------------------------------------------------
+# Every case below is small enough to work out on paper, because the thing this function measures
+# -- a machine name becoming a template for the next machine name -- is exactly the mechanism that
+# is invisible in leave-one-visit-out and unrecoverable once it ships.
+
+def _fc_units(spec, t0=datetime(2026, 6, 1, 21, 0)):
+    """[(key, label, day_offset), ...] -> LooUnits with distinct nights, one per day offset."""
+    return [em.LooUnit(k, lab, f"n{d}", t0 + timedelta(days=d)) for k, lab, d in spec]
+
+
+def test_forward_replay_a_probe_never_sees_the_future():
+    # 'p' is FIRST in time, so the perfect Stan template that comes later is not available to it:
+    # forward means causal, which is the whole difference from the embargo protocol.
+    units = _fc_units([("p", "Stan", 0), ("later", "Stan", 1)])
+    r = em.forward_chain_replay(units, _sim_table({("p", "later"): 0.99}),
+                                threshold=0.5, margin=0.0)
+    first = {p["key"]: p for p in r["probes"]}["p"]
+    assert first["top"] is None and first["novel_probe"] is True
+    assert {p["key"]: p for p in r["probes"]}["later"]["correct"] is True
+
+
+def test_forward_replay_without_a_horizon_makes_no_anchors():
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Stan", 2)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.9})
+    direct = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0)
+    assert direct["n_anchors"] == 0 and direct["anchor_depth_max"] == 0
+
+
+def test_forward_replay_an_anchor_carries_the_name_where_no_human_template_reaches():
+    # The design's claim, in three visits. Nobody named 'b', so it is not a human template; 'c'
+    # looks nothing like the named 'a' but does look like 'b'. Chained, the name reaches 'c'.
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Stan", 2)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.1})
+    direct = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, unlabelled=["b"])
+    chained = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                      unlabelled=["b"])
+    assert direct["assigned"] == 1 and chained["assigned"] == 2
+    assert chained["anchor_depth_max"] == 1        # c's name is one machine hop from a human
+
+
+def test_forward_replay_an_anchor_is_redundant_when_every_visit_is_already_named():
+    # Why `unlabelled` is load-bearing rather than decorative: with 'b' named by a human, its
+    # label is a template in its own right and the anchor duplicates it exactly. A chained arm
+    # measured on an all-labelled corpus therefore CANNOT show a gain -- it can only add a wrong
+    # candidate -- and reading that as "chaining does not work" would be reading the corpus.
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Stan", 2)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.1})
+    direct = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0)
+    chained = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3)
+    assert direct["assigned"] == chained["assigned"] == 2
+
+
+def test_forward_replay_an_anchor_past_the_horizon_is_not_a_template():
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Stan", 20)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.1})
+    near = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=30,
+                                   unlabelled=["b"])
+    far = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                  unlabelled=["b"])
+    assert near["assigned"] == 2 and far["assigned"] == 1
+
+
+def test_forward_replay_counts_the_descendants_of_a_wrong_name():
+    # The compensating control, measured rather than asserted: 'b' is really Notch but gets called
+    # Stan, then vouches for 'c'. Both names are on tainted ground and the bundle has to say so --
+    # a chain that hides this looks MORE confident the further the mistake travels.
+    units = _fc_units([("a", "Stan", 0), ("b", "Notch", 1), ("c", "Notch", 2)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.1})
+    chained = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                      unlabelled=["b"])
+    assert chained["wrong"] == 2                      # b named Stan, then c named Stan via b
+    assert chained["descendant_contamination"] == 1   # c is the one standing on the mistake
+
+
+def test_forward_replay_session_blocking_covers_anchors_too():
+    # An anchor from the SAME night as the probe is the same leak session blocking exists to stop;
+    # letting the machine's own same-night name back in would be worse than the human's.
+    t0 = datetime(2026, 6, 1, 21, 0)
+    units = [em.LooUnit("a", "Stan", "n0", t0),
+             em.LooUnit("b", "Stan", "n1", t0 + timedelta(days=1)),
+             em.LooUnit("c", "Stan", "n1", t0 + timedelta(days=1, hours=1))]
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.99, ("a", "c"): 0.0})
+    r = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                unlabelled=["b"])
+    # The replay named b "Stan" an hour ago, on THIS night. Allowed back in, that anchor would
+    # hand c a 0.99 -- the same-session leak wearing a machine's hat. Blocked, all that is left
+    # is the previous night's human template at 0.0.
+    got = {p["key"]: p for p in r["probes"]}["c"]
+    assert got["s1"] == pytest.approx(0.0)
+
+
+def test_forward_replay_anchor_labels_scope_who_may_propagate():
+    # "Scope the chain to Stan / Notch / Pedro explicitly; kits are out."
+    units = _fc_units([("a", "Elliot", 0), ("b", "Elliot", 1), ("c", "Elliot", 2)])
+    sim = _sim_table({("a", "b"): 0.9, ("b", "c"): 0.9, ("a", "c"): 0.1})
+    open_chain = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                         unlabelled=["b"])
+    scoped = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, horizon_days=3,
+                                     unlabelled=["b"], anchor_labels=["Stan"])
+    assert open_chain["assigned"] == 2 and scoped["assigned"] == 1
+
+
+def test_forward_replay_recency_days_reproduces_the_rejected_pure_gate():
+    # The measured-harmful arm has to stay RUNNABLE as a baseline, or the composite is compared
+    # against nothing. A pure recency gate REMOVES old templates; that is what killed it.
+    units = _fc_units([("old", "Stan", 0), ("p", "Stan", 30)])
+    sim = _sim_table({("old", "p"): 0.9})
+    ageblind = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0)
+    gated = em.forward_chain_replay(units, sim, threshold=0.5, margin=0.0, recency_days=7)
+    assert ageblind["assigned"] == 1 and gated["assigned"] == 0
+
+
+def test_forward_replay_probes_are_readable_by_the_operating_point_functions():
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Notch", 2)])
+    r = em.forward_chain_replay(units, _sim_table({("a", "b"): 0.9, ("a", "c"): 0.2,
+                                                   ("b", "c"): 0.2}),
+                                threshold=0.5, margin=0.0)
+    ev = em.evaluate_point(r["probes"], 0.5, 0.0)
+    assert ev["assigned"] >= 1 and "error_rate" in ev
+
+
+def test_forward_replay_drops_units_with_no_timestamp():
+    units = [em.LooUnit("a", "Stan", "n0", datetime(2026, 6, 1)), em.LooUnit("b", "Stan", "n1")]
+    r = em.forward_chain_replay(units, lambda a, b: 0.9, threshold=0.5, margin=0.0)
+    assert r["n_probes"] == 1                          # a forward replay with no clock is not one
+
+
+def test_adjacency_propagation_is_the_calendar_baseline():
+    # "The same animal usually comes back tomorrow" is a real prior in this yard. Any chained arm
+    # that cannot beat it is measuring the calendar, not the animal.
+    units = _fc_units([("a", "Stan", 0), ("b", "Stan", 1), ("c", "Notch", 2), ("d", "Notch", 40)])
+    r = em.adjacency_propagation(units, horizon_days=7)
+    assert r["assigned"] == 2                          # b from a, c from b; d is past the horizon
+    assert r["wrong"] == 1                             # c is Notch, named after Stan
+    assert r["wrong_name_rate"] == pytest.approx(0.5)
