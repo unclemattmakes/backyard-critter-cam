@@ -233,6 +233,7 @@ function showClip(){
     ${c.seconds?`<span class="mono" style="font-size:12px">· ${fmtDur(c.seconds)}</span>`:''}
     ${c.dets?`<span class="mono" style="font-size:12px">· ${c.dets} detection${c.dets===1?'':'s'}</span>`:''}
     ${c.conf!=null?`<span class="c mono" style="font-size:12px">· ~${Math.round(c.conf*100)}%</span>`:''}
+    ${clipVideoBadge(c)}
     ${c.archived?`<span class="mono" style="font-size:12px;color:var(--gilt)" title="the local copy was pruned for disk space; this plays the backup archive's copy">· from the archive</span>`:''}
     ${__reelMode?`<span class="mono" style="font-size:12px;margin-left:auto;color:var(--faint)">${__ci+1} / ${__clips.length}</span>`:''}`;
   const prev=$('#clip-prev'), next=$('#clip-next');
@@ -1649,7 +1650,8 @@ const REID_LIMIT=30;
 let __indivSeq=0;
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
-  const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`;
+  const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`
+          +(REID_SINCE_H===null?'':`&since_h=${REID_SINCE_H}`);
   const seq=++__indivSeq;
   /* The queue can take SECONDS when the server's cache is cold — 24s measured 2026-08-08 after
      a 2,900-crop family night (the matcher rebuilds whenever the DB changed; the nightly batch
@@ -1697,6 +1699,38 @@ function reidContextChip(v){
   const why='Context only — this never changes the appearance ranking. Adjacent visits on the same camera inside an hour are the same animal about 70% of the time, against a 28% base rate, but as an automatic rule it was wrong every time it fired. It renders here for your eye and nowhere else.';
   return `<span class="flag" style="background:rgba(200,180,255,.13);border-color:rgba(200,180,255,.38)" title="${esc(why)}">started ${when} ${rel} the visit you named <b>${esc(c.name)}</b>${infoDot(why)}</span>`;
 }
+/* WHAT IS ACTUALLY IN THIS VIDEO — three states, and the difference between the last two is the
+   entire point of the badge.
+
+   A clip's `dets`/`conf` do not always describe the video. On the trail cam they describe the
+   STILL PHOTO that triggered the recording (measured: 1,089 of 1,101 trail-cam clips carry a
+   max_confidence byte-identical to some still's), and that camera starts rolling ~2-3 s after
+   the photo — long enough for a close animal to leave the frame. The 2026-08-09 01:48 opossum
+   visit is the case that prompted this: its stills score 0.93 and its linked 4 s video is empty
+   in every frame.
+
+   So "no tracks / no detections" must NOT be rendered as "nothing was there" until something has
+   actually looked. `video_checked` is that distinction, and it is why absence of evidence gets
+   its own wording instead of borrowing the confident one. */
+function clipVideoBadge(c){
+  if(!c) return '';
+  const F='font-size:12px';
+  if(!c.video_checked){
+    return `<span class="mono" style="${F};color:var(--faint)" title="Nothing has run a detector over this video's frames yet, so the counts above describe the photo that TRIGGERED the recording — not what the video shows. On the trail cam the camera starts ~2-3s after that photo, so the animal is sometimes already gone.">· video not checked</span>`;
+  }
+  if(!c.video_dets){
+    // DELIBERATELY HEDGED. We cannot say "no animal in this video" and be honest: measured over
+    // the 1,244 clips overlapping a human-confirmed animal visit, max-confidence runs p10 0.50 /
+    // median 0.80, while the audited empty-video phantom peaks at 0.502. Every bar that rejects
+    // the phantom also rejects ~20% of REAL animals, so absence is unprovable from confidence
+    // alone. What IS true and worth saying is the thing that started this: the numbers beside
+    // this clip describe the still that triggered it, not the video.
+    const weak=(c.video_conf!=null)?` (best ${Math.round(c.video_conf*100)}%)`:'';
+    return `<span class="mono" style="${F};color:var(--gilt)" title="A detector ran over this video's own frames and found nothing it could call an animal with confidence — but that is NOT proof the yard was empty. On this corpus a fifth of clips containing a confirmed animal also score this low, and the detector fires on dark IR background at similar scores. Treat the stills as the evidence and this video as unconfirmed.">· video unconfirmed${weak}</span>`;
+  }
+  return `<span class="mono" style="${F};color:var(--ok,#7ec87e)" title="found by running a detector over this video's own frames, independently of the still that triggered it">· ${c.video_dets} in video${c.video_conf!=null?` ~${Math.round(c.video_conf*100)}%`:''}</span>`;
+}
+
 function reidCard(v){
   const mins=v.dwell_s>=90? Math.round(v.dwell_s/60)+' min' : (v.dwell_s||0)+'s';
   const thumb=v.rep_crop? `<img src="/media/${encodeURI(v.rep_crop)}" loading="lazy" style="width:84px;height:84px;object-fit:cover;border-radius:6px">` : '';
@@ -2058,6 +2092,206 @@ function reidModesHTML(q){
   return `<div id="reid-modes" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 10px">${tabs}${infoDot('Four slices of the same review pool — '+modesWhy)}
     <span style="flex:1"></span>${pager}</div>`;
 }
+/* ---------- ONE AT A TIME: the focused per-visit review ----------------------------------
+   The queue above renders 30 cards and asks for 30 verdicts at once, which is a wall, not a
+   question. This asks ONE question about ONE visit with everything the rig knows in front of
+   you -- every crop, every clip, and the same minutes as seen by the OTHER camera.
+
+   The cross-camera panel is the part that isn't cosmetic. A trail-cam visit cannot be
+   appearance-matched at all (its prototypes score a median 0.249 against every glass-door
+   template, and trail-cam-to-trail-cam similarity is flat), so the only thing that can ever
+   name one is a human noticing the glass door saw the same animal in the same minutes. That
+   pairing exists for 109 of 521 glass-door raccoon visits and was shown nowhere until now.
+
+   Visit ids churn: visits.py rebuilds and renumbers from scratch (labels live on DETECTIONS and
+   survive, ids do not). So a dossier that comes back empty is EXPECTED, not an error -- the flow
+   skips it and says the list went stale rather than showing a broken card. */
+let REID_FOCUS={ids:[],i:0,on:false,cache:{},stale:false};
+
+function focusStart(ids){
+  if(!ids||!ids.length) return;
+  REID_FOCUS={ids:ids.slice(),i:0,on:true,cache:{},stale:false};
+  focusRender();
+  const el=document.getElementById('reid-focus');
+  if(el) el.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function focusExit(){ REID_FOCUS.on=false; loadIndividuals(); }
+function focusGo(d){
+  const f=REID_FOCUS;
+  const next=f.i+d;
+  if(next<0||next>=f.ids.length){ focusRender(); return; }
+  f.i=next; focusRender();
+}
+async function focusFetch(vid){
+  if(REID_FOCUS.cache[vid]) return REID_FOCUS.cache[vid];
+  const d=await fetch('/api/reid/dossier?visit_id='+encodeURIComponent(vid))
+    .then(r=>r.json()).catch(()=>null);
+  if(d) REID_FOCUS.cache[vid]=d;
+  return d;
+}
+async function focusRender(){
+  const host=document.getElementById('reid-focus');
+  if(!host||!REID_FOCUS.on) return;
+  const f=REID_FOCUS, vid=f.ids[f.i];
+  host.innerHTML=`<div class="panel" style="padding:14px"><p class="empty">Loading visit ${f.i+1} of ${f.ids.length}…</p></div>`;
+  const d=await focusFetch(vid);
+  // A renumbered-away visit: skip forward to the next one that still exists.
+  if(!d||!d.visit_id){
+    f.stale=true;
+    if(f.i+1<f.ids.length){ f.i++; focusRender(); return; }
+    host.innerHTML=`<div class="panel" style="padding:14px">
+      <p class="empty">This review list is out of date — the visits were renumbered by a rebuild since it was built. Nothing was lost (names live on the crops); the list just needs rebuilding.</p>
+      <button class="gear" onclick="focusExit()">↺ rebuild the list</button></div>`;
+    return;
+  }
+  host.innerHTML=focusHTML(d);
+}
+function focusEvidence(d,idPrefix){
+  REID_VISIT_CLIPS[d.visit_id]=d.clips||[];
+  const n=(d.clips||[]).length;
+  // Say up front how many of this visit's clips actually SHOW the animal, so the reader isn't
+  // sent to play an empty video that the still evidence promised something in.
+  const checked=(d.clips||[]).filter(x=>x.video_checked);
+  const withAnimal=checked.filter(x=>x.video_dets);
+  let clipNote='';
+  if(n && checked.length===n && !withAnimal.length)
+    clipNote=`<span class="lbl" style="opacity:.75;color:var(--gilt)">no animal confirmed in any of these videos — go by the stills</span>`;
+  else if(n && checked.length)
+    clipNote=`<span class="lbl" style="opacity:.65">${withAnimal.length} of ${checked.length} videos confirm the animal</span>`;
+  else if(n)
+    clipNote=`<span class="lbl" style="opacity:.55">video not checked yet</span>`;
+  const clipBtn=n?`<button class="gear" onclick="reidPlayClips(${d.visit_id})" title="watch the clip${n>1?'s':''} from this visit">▶ ${n} clip${n>1?'s':''}</button>${clipNote}`:'';
+  const tiles=(d.crops||[]).map(c=>`<img src="/media/${encodeURI(c.path||c)}" loading="lazy" title="${esc((c.at||'').slice(11,19))}${c.conf?' · '+Math.round(c.conf*100)+'%':''} — click to enlarge" style="width:74px;height:74px;object-fit:cover;border-radius:5px;cursor:zoom-in">`).join('');
+  const more=(d.n_crops||0)>(d.crops||[]).length
+    ? `<span class="lbl" style="opacity:.6">showing the ${(d.crops||[]).length} sharpest of ${d.n_crops}</span>`:'';
+  return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px">${clipBtn}${tiles}</div>
+          ${more?`<div style="margin-top:5px">${more}</div>`:''}`;
+}
+function focusHTML(d){
+  const f=REID_FOCUS;
+  const mins=d.n_crops||0;
+  const when=fmtClock(d.started_at);
+  const day=(d.started_at||'').slice(0,10);
+  const top=(d.candidates||[])[0];
+  const clipTop=(d.clip_candidates||[])[0];
+
+  // What the machine thinks -- stated with its own confidence, never as the default answer.
+  let hint='';
+  if(d.confirmed_as) hint=`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">already confirmed: <b>${esc(d.confirmed_as)}</b></span>`;
+  else if(d.cross_source) hint=`<span class="flag" style="background:rgba(150,150,160,.16);border-color:rgba(180,180,190,.4)" title="no confirmed template comes from this camera; appearance does not carry between cameras here, so any number would be noise">no machine guess is possible for this camera — your eye decides</span>`;
+  else if(top) hint=`<span class="flag">best guess <b>${esc(top.name)}</b> ${Math.round(top.similarity*100)}%</span>`
+    +(d.novel?`<span class="flag" style="background:rgba(255,120,90,.14);border-color:rgba(255,120,90,.4)">might be someone new</span>`:'')
+    +((d.candidates||[]).slice(1,3).map(c=>`<span class="lbl" style="opacity:.6">${esc(c.name)} ${Math.round(c.similarity*100)}%</span>`).join(' '));
+  else hint=`<span class="lbl" style="opacity:.65">${esc(d.note||'no guess yet')}</span>`;
+  if(clipTop) hint+=`<span class="flag" style="background:rgba(120,160,220,.16);border-color:rgba(120,160,220,.45)" title="a separate signal: appearance in CLIP space, from the un-blended tracklets">clip-match <b>${esc(clipTop.name)}</b> ${Math.round(clipTop.similarity*100)}%</span>`;
+  if(d.auto_as) hint+=`<span class="flag" style="background:rgba(120,200,255,.13);border-color:rgba(120,200,255,.42)">the nightly pass guessed <b>${esc(d.auto_as)}</b></span>`;
+  if(d.multi){
+    const ev=[d.co_present_frames?`${d.co_present_frames} still frame(s)`:'',d.co_present_clips?`${d.co_present_clips} clip(s)`:''].filter(Boolean).join(' + ');
+    hint+=`<span class="flag" style="background:rgba(255,170,60,.16);border-color:rgba(255,170,60,.4)" title="${esc((ev||'The evidence')+' shows two animals at once, so a single name describes only the main one. Family labels like “Stan + Kits” are the honest answer here.')}">2+ animals in this visit</span>`;
+  }
+
+  // The answer buttons. Solo names first (these are what can become a template), then the
+  // family labels, which are right for a mother-and-kits visit and are recorded but never
+  // become templates -- a blended prototype would teach the matcher four animals as one.
+  const solo=(d.cast||[]).filter(c=>c.name.indexOf(' + ')<0);
+  const group=(d.cast||[]).filter(c=>c.name.indexOf(' + ')>=0);
+  const btn=c=>{
+    const stale=(c.days_since_template!=null&&c.days_since_template>14);
+    const tip=c.n_templates?`${c.n_templates} template(s), newest ${c.days_since_template!=null?Math.round(c.days_since_template)+'d old':'—'}${stale?' — naming this visit would refresh a template that has aged past useful':''}`:'recorded, but this label never becomes a matching template';
+    return `<button class="gear" onclick="focusAnswer(${jarg(c.name)})" title="${esc(tip)}"
+      style="${top&&top.name===c.name?'border-color:rgba(90,200,120,.6);':''}padding:7px 12px">${esc(cap1(c.name))}${stale&&c.n_templates?' <span style="opacity:.6">·stale</span>':''}</button>`;
+  };
+  const answers=`
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${solo.map(btn).join('')}</div>
+    ${group.length?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center">
+       <span class="lbl" style="opacity:.6">family:</span>${group.map(btn).join('')}</div>`:''}
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center;border-top:1px solid var(--rule);padding-top:8px">
+      ${reidInput('focus-new','someone else…')}
+      <button class="gear" onclick="focusAnswerTyped()">Name</button>
+      <button class="gear" onclick="focusAnswer(null,{reject:true})" title="you looked and chose not to name it — the nightly pass will leave this visit alone">leave unnamed</button>
+      <button class="gear" onclick="focusGo(1)" title="decide later — nothing is written">skip →</button>
+      ${d.confirmed_as?`<button class="gear" onclick="focusAnswer(null,{clear:true})" title="remove the existing confirmation">clear</button>`:''}
+    </div>`;
+
+  // The same minutes on the other camera.
+  const nb=(d.neighbours||[]).map(n=>{
+    const off=n.offset_s==null?'':(n.offset_s>=0?`+${Math.round(n.offset_s/60)}`:`${Math.round(n.offset_s/60)}`)+' min';
+    return `<div class="panel" style="padding:9px 12px;margin-top:6px;background:rgba(120,160,220,.06)">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <b>${esc(n.source)}</b>
+        <span class="lbl" style="opacity:.75">${esc((n.started_at||'').slice(11,16))} · ${off} · ${n.n_crops} crop(s)</span>
+        ${n.individual_id?`<span class="flag" style="background:rgba(90,200,120,.15);border-color:rgba(90,200,120,.45)">named ${esc(n.individual_id)}</span>`:'<span class="lbl" style="opacity:.6">unnamed</span>'}
+      </div>
+      ${focusEvidence(n)}
+    </div>`;
+  }).join('');
+  const nbBlock=nb?`<h3 class="sec" style="margin-top:14px;font-size:14px">The same moment, other camera
+      <span class="n">a trail-cam visit can never be matched by appearance — this pairing is the only way it gets a name</span></h3>${nb}`:'';
+
+  return `<div class="panel" style="padding:14px 16px;border-color:rgba(212,175,110,.35)">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <div><b style="font-size:15px">Who is this?</b>
+        <span class="lbl" style="opacity:.7;margin-left:8px">visit ${f.i+1} of ${f.ids.length}</span></div>
+      <div style="display:flex;gap:6px">
+        <button class="gear" onclick="focusGo(-1)"${f.i? '':' disabled'}>← prev</button>
+        <button class="gear" onclick="focusGo(1)"${f.i+1<f.ids.length?'':' disabled'}>next →</button>
+        <button class="gear" onclick="focusExit()">✕ back to the list</button>
+      </div>
+    </div>
+    <div class="lbl" style="opacity:.8;margin-top:6px">${esc(day)} · ${esc(when)} · ${esc(d.source)} · ${mins} crop(s)${d.n_embedded!=null?` · ${d.n_embedded} analysed for appearance`:''}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${hint}</div>
+    ${d.rep_crop?`<div style="margin-top:10px"><img src="/media/${encodeURI(d.rep_crop)}" loading="lazy" style="max-width:260px;border-radius:8px;cursor:zoom-in"></div>`:''}
+    ${focusEvidence(d)}
+    ${nbBlock}
+    <h3 class="sec" style="margin-top:14px;font-size:14px">Your call</h3>
+    ${answers}
+  </div>`;
+}
+function focusAnswerTyped(){
+  const inp=document.getElementById('focus-new');
+  const v=(inp&&inp.value||'').trim();
+  if(!v){ if(inp) inp.focus(); return; }
+  focusAnswer(v);
+}
+async function focusAnswer(name,opts){
+  opts=opts||{};
+  const f=REID_FOCUS, vid=f.ids[f.i];
+  const restore=busyBtn();
+  try{
+    const body={visit_id:vid};
+    if(opts.reject){ body.name=''; body.reject=true; }
+    else if(opts.clear){ body.name=''; }
+    else body.name=name;
+    const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).then(r=>r.json());
+    restore();
+    if(r&&r.error){ alert(r.error); return; }
+    delete f.cache[vid];          // its verdict changed; re-fetch if we come back
+    if(f.i+1<f.ids.length) focusGo(1); else focusRender();
+  }catch(e){ restore(); connFail(); }
+}
+
+/* THE WINDOW. The queue opens on the last 48 h because a list of every visit ever is an archive,
+   not a work list. Says out loud what it is hiding and offers the way out -- a filter you cannot
+   see is indistinguishable from missing data. The window is anchored on the newest visit, not on
+   now, so a quiet night (or a rig that was down) never renders an empty queue that reads as
+   "nothing left to review". */
+let REID_SINCE_H=null;              // null = server default (48)
+function reidWindowHTML(q){
+  const hidden=(q.n_all||0)-(q.n_in_window||0);
+  const cur=q.since_h;
+  if(!cur) {
+    return `<div class="lbl" style="opacity:.7;margin:2px 0 8px">Showing <b>every</b> visit on record (${q.n_all||0}).
+      <button class="gear" onclick="reidSetWindow(48)">back to the last 48h</button></div>`;
+  }
+  const from=q.window_from?fmtClock(q.window_from):'';
+  return `<div class="lbl" style="opacity:.75;margin:2px 0 8px">
+    Last <b>${cur}h</b> of visits${from?` (since ${esc(from)})`:''} — ${q.n_in_window||0} shown${hidden>0?`, ${hidden} older hidden`:''}.
+    ${hidden>0?`<button class="gear" onclick="reidSetWindow(${cur*2})">show ${cur*2}h</button>
+                <button class="gear" onclick="reidSetWindow(0)">show all ${q.n_all}</button>`:''}</div>`;
+}
+function reidSetWindow(h){ REID_SINCE_H=h; loadIndividuals(); }
+
 function reidQueueHTML(q){
   if(!q) return '';
   if(q.__pending) return `<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>
@@ -2081,6 +2315,17 @@ function reidQueueHTML(q){
     html+=`<h2 class="sec">Visit-by-Visit <span class="n">${esc(label)}</span></h2>`;
     if(cast) html+=`<div class="lede" style="margin-bottom:8px">The cast so far: ${cast}</div>`;
     html+=reidModesHTML(q);
+    html+=reidWindowHTML(q);
+    // ONE AT A TIME. Offered on the visits that still need a verdict (an already-confirmed one
+    // doesn't need asking about), because a stack of 30 cards is a wall rather than a question.
+    const askable=q.queue.filter(v=>!v.confirmed_as).map(v=>v.visit_id);
+    if(askable.length){
+      html+=`<div style="margin:6px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="gear" onclick="focusStart(${jarg(askable)})" style="padding:7px 12px;border-color:rgba(212,175,110,.5)">🔍 Review one at a time (${askable.length})</button>
+        <span class="lbl" style="opacity:.65">one visit, every crop and clip it has, plus the same minutes on the other camera — then pick a name</span>
+      </div>`;
+    }
+    html+=`<div id="reid-focus"></div>`;
     html+=q.queue.length
       ? `<div style="display:flex;flex-direction:column;gap:8px">${q.queue.map(reidCard).join('')}</div>`
       : `<p class="empty">Nothing in this slice${q.offset?' — try the newer page':''}. That is a real answer: it means there is nothing of this kind left to review.</p>`;
@@ -2188,10 +2433,63 @@ async function reidNameGroup(i){
     loadIndividuals();
   }catch(e){ alert('Could not save: '+e); }
 }
+/* THE BADGE FACE. Chosen automatically (stats._avatar_for: human-vouched, sharp, confident,
+   well-exposed, squarely framed) but pinnable, because the one thing the picker cannot judge is
+   POSE -- facial landmarks are a measured dead end on this cast, since a raccoon's eyes sit
+   inside a black mask with almost no local contrast. So it gets you a legible animal and you
+   decide which one is iconic. */
+async function pinAvatar(name, crop){
+  const restore=busyBtn();
+  try{
+    const r=await fetch('/api/individual/avatar',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name, crop})}).then(r=>r.json());
+    restore();
+    if(r&&r.error){ alert(r.error); return; }
+    loadIndividuals();
+  }catch(e){ restore(); connFail(); }
+}
+function avatarHTML(g){
+  const a=g&&g.avatar;
+  if(!a||!a.crop){
+    return `<div title="no crop clears the badge bar yet" style="width:78px;height:78px;border-radius:50%;background:rgba(255,255,255,.05);border:1px solid var(--rule);display:flex;align-items:center;justify-content:center;font-size:22px;opacity:.5">?</div>`;
+  }
+  const tip=a.pinned?`pinned by you${a.at?' — '+esc(fmtClock(a.at)):''}`
+                    :`picked automatically${a.at?' — '+esc(fmtClock(a.at)):''}. Open the profile to pin a better one.`;
+  return `<img src="/media/${encodeURI(a.crop)}" loading="lazy" title="${tip}"
+    onclick="openProfile(${jarg(g.id)})"
+    style="width:78px;height:78px;border-radius:50%;object-fit:cover;cursor:pointer;
+           border:2px solid ${a.pinned?'var(--gilt)':'var(--rule)'}">`;
+}
+
+/* WHEN THIS ONE TURNS UP. A 24-bin sparkline of visit ARRIVALS plus, only when the shape is
+   strong enough to mean something, the hours it favours. Arrivals not crops: one animal that sat
+   in front of the camera for 40 minutes would otherwise outweigh ten separate visits. */
+function clockHTML(ck){
+  if(!ck||!ck.n_arrivals) return '';
+  const hrs=ck.hours||[], top=Math.max(...hrs,1);
+  const peak=new Set(ck.peak_hours||[]);
+  const bars=hrs.map((c,h)=>{
+    const pct=Math.round(100*c/top);
+    return `<span title="${h}:00 — ${c} arrival${c===1?'':'s'}" style="display:inline-block;width:4px;margin-right:1px;
+      height:${Math.max(2,Math.round(pct*0.18))}px;vertical-align:bottom;
+      background:${peak.has(h)?'var(--gilt)':'rgba(255,255,255,.30)'}"></span>`;
+  }).join('');
+  const label=(ck.peak_hours||[]).length
+    ? `usually around ${ck.peak_hours.map(h=>((h%12)||12)+(h<12?'am':'pm')).join(' & ')}`
+    : `${ck.n_arrivals} arrival${ck.n_arrivals===1?'':'s'} — no favoured hour yet`;
+  return `<div style="margin-top:5px" title="arrival times across ${ck.n_arrivals} visit(s); midnight at the left">
+    <div style="height:20px;line-height:0">${bars}</div>
+    <div class="lbl" style="opacity:.7;font-size:11px">${esc(label)}</div></div>`;
+}
+
 function indivRow(g){
   const span=(g.first_seen&&g.last_seen)?`${g.first_seen.slice(5,10)} → ${g.last_seen.slice(5,10)}`:'';
+  // Each thumb is a one-click "make this the badge" — the pose judgement the picker can't make.
+  const pinned=(g.avatar&&g.avatar.crop)||'';
   const thumbs=(g.crops||[]).map(c=>
-    `<img src="/media/${encodeURI(c)}" loading="lazy" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join('');
+    `<img src="/media/${encodeURI(c)}" loading="lazy" onclick="pinAvatar(${jarg(g.id)},${jarg(c)})"
+      title="use this as ${esc(g.id)}'s badge" style="width:64px;height:64px;object-fit:cover;border-radius:4px;
+      cursor:pointer;${c===pinned?'outline:2px solid var(--gilt);outline-offset:1px':''}">`).join('');
   // onclick string args go through jarg (JSON.stringify + esc), NOT '${esc(x)}': esc does not
   // neutralize a single quote, so a name with a ' would break out of the JS string literal and
   // inject code. See the esc/jarg note at the top of this file.
@@ -2205,8 +2503,10 @@ function indivRow(g){
        <input id="nm-${esc(g.id)}" placeholder="new name…" style="width:90px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit">`;
   return `<div class="panel" style="padding:10px 14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      ${avatarHTML(g)}
       <div style="min-width:150px"><div style="font-weight:600">${g.placeholder?'<span style="opacity:.65">'+esc(g.id)+'</span>':esc(g.id)}</div>
         <div class="lbl" style="opacity:.72">${esc(nameOf(g.species||''))} · ${g.n_crops} crops · ${esc(span)}</div>
+        ${clockHTML(g.clock)}
         ${g.placeholder?'':`<div class="motion-fp" data-im="${esc(g.id)}"></div>`}</div>
       <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
       <div style="display:flex;gap:6px;align-items:center">${act}</div>

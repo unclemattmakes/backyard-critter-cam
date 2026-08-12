@@ -916,10 +916,18 @@ class VisitMatcher:
         key = str(name or "").strip().casefold()
         if key not in self.departed:
             return False
-        last_day = self.departed[key]
+        last_day, back_on = self.departed[key]
         if not last_day or not started:
             return True                       # departed, but nothing to compare -> never auto-write
-        return str(started)[:10] > str(last_day)[:10]
+        day = str(started)[:10]
+        if day <= str(last_day)[:10]:
+            return False                      # happened while the animal was still resident
+        # ...and if it came BACK, the absence is an interval, not everything-after. Notch was away
+        # 2026-06-24 -> 2026-08-06; without this his real August visits would be refused forever
+        # because of a June departure, which is the opposite of what the guard is for.
+        if back_on and day >= str(back_on)[:10]:
+            return False
+        return True
 
     def templates(self, source=_ALL_SOURCES) -> list:
         """(name, visit_id, prototype) for every confirmed SOLO visit with a usable prototype.
