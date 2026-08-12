@@ -70,6 +70,25 @@ MIN_HITS = 5
 # (2026-06-11): real second animals sustain >=30 boxes; fragments cluster <=10.
 SUSTAINED_HITS = 30
 
+# "Confident enough to SAY there is an animal in this video", for clips.video_detections.
+#
+# NOT the detector floor: MDV6 hallucinates on dark IR background. The 2026-08-09 01:48 clip
+# yielded a 91-box, 3.7 s track sitting on empty shrub at 0.25-0.50 while the frames plainly show
+# nothing, so a raw box count would have badged that video "96 detections, 50%".
+#
+# THIS BAR ONLY LICENSES THE POSITIVE CLAIM. Measured 2026-08-10 against the 1,244 glass-door
+# clips that overlap a HUMAN-CONFIRMED animal visit (ground truth: an animal is present), the
+# max-confidence distribution is min 0.26 / p10 0.50 / median 0.80 -- so ANY bar that rejects the
+# 0.50 phantom also rejects a fifth of the real animals:
+#     bar 0.40 -> 4.0% of confirmed-animal clips called empty
+#     bar 0.50 -> 9.8%
+#     bar 0.60 -> 19.8%   <- and the phantom is 0.502, so it survives 0.40 and 0.50 anyway
+# There is no separating threshold: confidence alone cannot tell "animal in frame" from "phantom
+# on dark background". So the absence claim is NOT SHIPPED -- the dashboard says "shows an animal"
+# above this bar and hedges below it, never "no animal in this video". Finding a signal that CAN
+# support absence (track straightness? the refimg reference?) is open work, not a tuning job.
+VIDEO_ANIMAL_MIN_CONF = 0.60
+
 # Gait band: plausible raccoon stride cadence. Below 0.8 Hz it's milling, above 3.2 Hz it's
 # detector jitter (and unresolvable anyway at the clips' ~10 fps).
 GAIT_BAND = (0.8, 3.2)
@@ -252,11 +271,24 @@ def build_tracks(samples: list, *, jump_base: float = JUMP_BASE, jump_rate: floa
 def extract_tracks(clip_path, detector, sample_hz: float | None):
     """Sample a clip's frames (every frame when sample_hz is None -- the default, for gait
     fidelity at the corpus' ~10 fps), detect in each, NMS, and associate into per-animal
-    tracklets. Returns (tracks, n_samples); (None, 0) if the video can't be opened."""
+    tracklets. Returns (tracks, n_samples, raw); (None, 0, raw) if the video can't be opened.
+
+    `raw` answers a different question from the tracklets -- "is an animal actually VISIBLE in
+    these frames?" -- and is what gets stamped onto clips.video_detections / video_max_conf (see
+    the clips migration in db.py). Two deliberate choices:
+
+      * counted before track association, because a brief or partly-occluded animal can fail
+        MIN_HITS and produce no tracklet while plainly being in the video; tracklets measure
+        sustained motion, not presence;
+      * `n_boxes` counts only boxes at or above VIDEO_ANIMAL_MIN_CONF, while `max_conf` keeps the
+        best score seen at ANY confidence. Raw counts are actively misleading here -- MDV6 tracks
+        phantoms across dark IR background for seconds at a time -- so the count carries the bar
+        and the max carries the honesty about what the bar rejected."""
     import cv2
+    raw = {"n_boxes": 0, "max_conf": None}
     cap = cv2.VideoCapture(str(clip_path))
     if not cap.isOpened():
-        return None, 0
+        return None, 0, raw
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not (fps and fps > 0 and np.isfinite(fps)):   # some containers report 0.0 or NaN here
@@ -282,11 +314,17 @@ def extract_tracks(clip_path, detector, sample_hz: float | None):
                     boxes.append((round(((x1 + x2) / 2) / w, 4), round(((y1 + y2) / 2) / h, 4),
                                   round((x2 - x1) / w, 4), round((y2 - y1) / h, 4),
                                   round(d.confidence, 3)))
-                samples.append((round(idx / fps, 3), nms_boxes(boxes)))
+                kept = nms_boxes(boxes)
+                for b in kept:
+                    if b[4] >= VIDEO_ANIMAL_MIN_CONF:
+                        raw["n_boxes"] += 1
+                    if raw["max_conf"] is None or b[4] > raw["max_conf"]:
+                        raw["max_conf"] = b[4]
+                samples.append((round(idx / fps, 3), kept))
             idx += 1
     finally:
         cap.release()
-    return build_tracks(samples), n_samples
+    return build_tracks(samples), n_samples, raw
 
 
 def fingerprint_line(clip_id, idx, feats, n_hits, n_samples) -> str:
@@ -493,6 +531,56 @@ def link_all(conn, *, dry_run: bool = False, species: str | None = None) -> int:
     return 0
 
 
+def backfill_scan(conn, dry_run: bool = False) -> int:
+    """Give clips that already have tracks their video_detections / video_max_conf, derived from
+    the stored track JSON rather than a fresh detector run.
+
+    Why this exists: `clips_needing_tracks` deliberately skips clips processed before the scan
+    stamp existed, so without a backfill ~90% of the corpus would read "video not checked"
+    forever and the badge would be useless on everything but the newest clips. Re-detecting them
+    all is not an option -- 304 clips took 10,600 s, so the full 3,474 would be well over a day.
+
+    WHAT IS AND ISN'T EXACT. The track JSON holds every box that ASSOCIATED into a tracklet, with
+    its confidence, from the same detector over the same frames -- so for those boxes the numbers
+    are exact. What it cannot see is a detection too brief to form a track (MIN_HITS). That makes
+    the derived count CONSERVATIVE in the one direction that matters least here: a clip whose
+    animal was tracked is reported correctly, and a clip with no track at all is not touched by
+    this path at all (it has no rows, so it goes through the real scan queue instead). The
+    residual error is a clip with tracks whose ONLY strong box never associated, which the track
+    builder makes unlikely by construction."""
+    rows = conn.execute(
+        """SELECT c.id, t.track FROM clips c JOIN clip_tracks t ON t.clip_id = c.id
+           WHERE c.video_scanned_at IS NULL AND c.pruned_at IS NULL""").fetchall()
+    per_clip: dict = {}
+    for r in rows:
+        try:
+            pts = json.loads(r["track"]) or []
+        except (TypeError, ValueError):
+            continue
+        n, best = per_clip.get(r["id"], (0, None))
+        for p in pts:
+            if len(p) < 6:
+                continue
+            conf = p[5]
+            if conf >= VIDEO_ANIMAL_MIN_CONF:
+                n += 1
+            if best is None or conf > best:
+                best = conf
+        per_clip[r["id"]] = (n, best)
+
+    strong = sum(1 for n, _ in per_clip.values() if n)
+    print(f"backfill: {len(per_clip)} clip(s) with tracks but no scan stamp; "
+          f"{strong} show an animal at >= {VIDEO_ANIMAL_MIN_CONF:.2f}, "
+          f"{len(per_clip) - strong} do not.")
+    if dry_run:
+        print("dry run -- nothing written.")
+        return 0
+    for cid, (n, best) in per_clip.items():
+        db.set_clip_video_scan(conn, cid, n_boxes=n, max_conf=best)
+    print(f"wrote {len(per_clip)} clip(s).")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 4: motion fingerprints from behaviour clips.")
     p.add_argument("--device", default=config.CONFIG.device, choices=["cuda", "cpu", "auto"],
@@ -504,6 +592,10 @@ def main() -> int:
     p.add_argument("--show", action="store_true", help="Print stored fingerprints and exit.")
     p.add_argument("--report", action="store_true",
                    help="Motion features grouped by individual/visit + pair-clip comparison.")
+    p.add_argument("--backfill-scan", action="store_true",
+                   help="Fill clips.video_detections/video_max_conf for clips that ALREADY have "
+                        "tracks, deriving them from the stored track JSON instead of re-running "
+                        "the detector (no GPU, seconds not hours).")
     p.add_argument("--link", action="store_true",
                    help="Backfill clip_tracks.individual_id from solo-clip/visit overlap (no GPU). "
                         "Run after extraction (and after naming visits) to feed the two-axis readout.")
@@ -524,6 +616,8 @@ def main() -> int:
             return show_tracks(conn)
         if args.report:
             return report(conn, args.species)
+        if args.backfill_scan:
+            return backfill_scan(conn, dry_run=args.dry_run)
         if args.link:
             return link_all(conn, dry_run=args.dry_run)
 
@@ -570,7 +664,7 @@ def main() -> int:
             if not clip_path.exists():
                 print(f"  clip #{r['id']}: file missing ({r['clip_path']}) -- skipped.")
                 continue
-            tracks, n_samples = extract_tracks(clip_path, detector, args.sample_hz)
+            tracks, n_samples, raw = extract_tracks(clip_path, detector, args.sample_hz)
             if tracks is None:
                 print(f"  clip #{r['id']}: could not open video -- skipped.")
                 continue
@@ -586,10 +680,19 @@ def main() -> int:
                 # The rolling disk budget (clips.prune_clips) deleted this clip mid-batch.
                 print(f"  clip #{r['id']}: pruned while processing -- skipped.")
                 continue
+            # Stamp what the detector saw in THIS VIDEO. Two things fall out of recording it:
+            # the dashboard can stop implying a clip shows what its trigger STILL showed, and a
+            # genuinely empty clip finally has a marker -- without one it has no clip_tracks
+            # rows, is indistinguishable from "never processed", and gets re-detected on every
+            # nightly run forever (measured 2026-08-10: 154 trail-cam clips in that state).
+            db.set_clip_video_scan(conn, r["id"], n_boxes=raw["n_boxes"],
+                                   max_conf=raw["max_conf"])
             for idx, t in enumerate(tracklets):
                 print(fingerprint_line(r["id"], idx, t["features"], t["n_hits"], n_samples))
             if not tracklets:
-                print(f"  clip #{r['id']:<4}   no animal tracked ({n_samples} samples)")
+                seen = (f"{raw['n_boxes']} loose box(es), best {raw['max_conf']:.2f}"
+                        if raw["n_boxes"] else "NOTHING in the video")
+                print(f"  clip #{r['id']:<4}   no animal tracked ({n_samples} samples) -- {seen}")
             done += 1
         print(f"\nDone. {done} clip(s) in {time.time() - t0:.0f}s. "
               f"View any time: python clipmotion.py --show   |   --report")

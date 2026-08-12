@@ -1169,10 +1169,13 @@ class VisitMatcher:
         """Has the human recorded that `name` had already left the yard by the time a visit
         starting at `started` happened? A DATE comparison, not a blanket exclusion.
 
-        Why this exists: one of this cast's raccoons stopped appearing on 2026-06-30 and never
-        came back, but its 46 templates did not stop existing -- so at the recommended operating
-        point the auto tier lined up to write that name onto two visits on 2026-07-03, three days
-        after the animal was last here. That error is invisible to every metric the project has,
+        Why this exists: one of this cast's raccoons stopped appearing on 2026-06-30, but its 46
+        templates did not stop existing -- so at the recommended operating point the auto tier
+        lined up to write that name onto two visits on 2026-07-03, three days after the animal was
+        last here. (It did exactly that on 2026-08-10, before this guard was armed; 33 crops were
+        cleared afterwards.) That raccoon then CAME BACK on 2026-08-06 after 43 days away, which
+        is why the record holds an interval and not a flag -- with only a departure date you would
+        have to choose between blocking the gap and allowing its real August visits. That error is invisible to every metric the project has,
         because leave-one-visit-out scores against labels and a departed animal's labels simply
         stop: the probe set can never contain the case "named an animal that no longer lives
         here". So the fact comes from the human, who knows it, via db.set_individual_status.
@@ -1192,10 +1195,18 @@ class VisitMatcher:
         key = str(name or "").strip().casefold()
         if key not in self.departed:
             return False
-        last_day = self.departed[key]
+        last_day, back_on = self.departed[key]
         if not last_day or not started:
             return True                       # departed, but nothing to compare -> never auto-write
-        return str(started)[:10] > str(last_day)[:10]
+        day = str(started)[:10]
+        if day <= str(last_day)[:10]:
+            return False                      # happened while the animal was still resident
+        # ...and if it came BACK, the absence is an interval, not everything-after. Notch was away
+        # 2026-06-24 -> 2026-08-06; without this his real August visits would be refused forever
+        # because of a June departure, which is the opposite of what the guard is for.
+        if back_on and day >= str(back_on)[:10]:
+            return False
+        return True
 
     def templates(self, source=_ALL_SOURCES) -> list:
         """(name, visit_id, prototype) for every confirmed SOLO visit with a usable prototype.

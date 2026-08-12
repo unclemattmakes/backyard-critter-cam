@@ -294,16 +294,34 @@ def _ids(out):
 
 
 # ---- modes -------------------------------------------------------------------------
-def test_recent_is_the_default_and_is_unchanged(corpus, db_path):
-    """The default must keep showing what it always showed: every visit, newest first. The other
-    modes are opt-in tabs; a silent change to the landing view is a change to Matt's habits."""
+def test_recent_defaults_to_the_last_48h_and_says_what_it_is_hiding(corpus, db_path):
+    """The landing view is a WORK LIST, not an archive. It opens on the last 48 h (Matt, 2026-08-10:
+    "instead of showing so many visits by default"), because a queue of 500 visits is a wall and
+    the honest reaction to a wall is to close the tab.
+
+    Two properties matter as much as the filtering: the payload states the window and the totals
+    it is hiding, so "load older" is an offer rather than a discovery; and the window is anchored
+    on the NEWEST VISIT rather than wall-clock now, so a quiet spell (or the rig being down, which
+    happens here) doesn't render an empty queue that reads as "nothing left to review"."""
     cfg = _rq_cfg(db_path)
     out = _queue(cfg)
     assert out["mode"] == "recent"
-    # Newest first, and nothing filtered out.
     starts = [v["started_at"] for v in out["queue"]]
-    assert starts == sorted(starts, reverse=True)
-    assert len(out["queue"]) == len(corpus) == out["n_matched"]
+    assert starts == sorted(starts, reverse=True)          # still newest-first
+
+    # The corpus' Stan template is 30 days old; everything else is inside two days of the newest.
+    assert corpus["stan_t"] not in _ids(out)
+    assert len(out["queue"]) == len(corpus) - 1 == out["n_matched"]
+    assert out["since_h"] == web.DEFAULT_QUEUE_WINDOW_H
+    assert out["n_in_window"] == len(corpus) - 1 and out["n_all"] == len(corpus)
+    assert out["window_from"]
+
+    # ...and "load older" reaches the whole corpus again.
+    allout = _queue(cfg, since_h=0)
+    assert len(allout["queue"]) == len(corpus) == allout["n_matched"]
+    assert corpus["stan_t"] in _ids(allout)
+    assert allout["window_from"] is None
+
     # An unknown mode falls back to 'recent' rather than erroring or showing nothing.
     assert _queue(cfg, mode="nonsense")["mode"] == "recent"
 
@@ -366,13 +384,14 @@ def test_pagination_walks_the_whole_pool_without_repeats(corpus, db_path):
     total = len(corpus)
     seen = []
     for off in range(0, total, 2):
-        page = _queue(cfg, limit=2, offset=off)
+        # since_h=0 so this exercises PAGINATION over the whole pool, not the 48 h landing window.
+        page = _queue(cfg, limit=2, offset=off, since_h=0)
         assert page["n_matched"] == total       # the count is of the MODE, not of the page
         assert page["offset"] == off and page["limit"] == 2
         assert len(page["queue"]) <= 2
         seen += _ids(page)
     assert len(seen) == total and len(set(seen)) == total
-    assert seen == _ids(_queue(cfg, limit=100))          # same order, just sliced
+    assert seen == _ids(_queue(cfg, limit=100, since_h=0))   # same order, just sliced
     # Past the end is empty, not an error.
     assert _queue(cfg, limit=2, offset=999)["queue"] == []
 
@@ -426,7 +445,8 @@ def test_a_confirmation_on_a_multi_animal_visit_is_not_a_fresh_template(conn, db
 
 # ---- the funnel ----------------------------------------------------------------------
 def test_funnel_counts_are_computed_live(corpus, db_path):
-    f = _queue(_rq_cfg(db_path))["funnel"]
+    # since_h=0: the funnel describes the whole corpus, so score it against the whole corpus.
+    f = _queue(_rq_cfg(db_path), since_h=0)["funnel"]
     assert f["visits"] == len(corpus)
     assert f["with_prototype"] == len(corpus)
     assert f["confirmed"] == 2 and f["templates"] == 2
@@ -915,3 +935,67 @@ def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_pat
         server.shutdown()
         server.server_close()
         t.join(timeout=5)
+
+
+# =====================================================================================
+# THE DOSSIER: one visit, everything about it (_reid_dossier).
+#
+# This is what the one-at-a-time review flow asks for. The queue card is small because it has to
+# render 30 of them; this is the opposite, and the part that carries new information is the
+# CROSS-CAMERA pairing: a trail-cam visit cannot be appearance-matched at all, so a human noticing
+# that the other camera saw the same animal in the same minutes is the only evidence that can ever
+# name one. These tests pin that pairing, and pin the two ways it must NOT mislead -- a camera far
+# away in time is not a neighbour, and a visit id that no longer exists is a normal answer (visits
+# .py renumbers from scratch on every rebuild) rather than a crash.
+# =====================================================================================
+def test_dossier_returns_the_visit_with_its_evidence_and_the_answer_options(corpus, db_path):
+    cfg = _rq_cfg(db_path)
+    out = web._reid_dossier(cfg, corpus["stale_probe"])
+    assert out["visit_id"] == corpus["stale_probe"]
+    assert out["source"] == db.SOURCE_GLASS_DOOR_CAM
+    assert len(out["crops"]) == 3                      # every crop the visit has
+    assert all("path" in c for c in out["crops"])
+    # The answer buttons: the confirmed cast, so "who is this?" offers names rather than a blank box.
+    assert {c["name"] for c in out["cast"]} == {"Stan", "Notch"}
+    # And the machine's own opinion rides alongside, never as the answer.
+    assert out["candidates"] and out["candidates"][0]["name"] == "Stan"
+
+
+def test_dossier_of_a_renumbered_away_visit_is_empty_not_an_error(corpus, db_path):
+    """visits.py rebuilds from scratch and renumbers; labels survive on the detections, ids do not.
+    The flow steps through ids captured earlier, so a vanished one must be an ordinary answer."""
+    cfg = _rq_cfg(db_path)
+    assert web._reid_dossier(cfg, 10_000_000) == {}
+
+
+def test_dossier_pairs_the_same_minutes_on_another_camera(conn, db_path):
+    """The one thing the queue card could never show: a trail-cam visit CANNOT be matched by
+    appearance, so the only evidence that names it is the other camera seeing the same moment."""
+    cfg = _rq_cfg(db_path)
+    door = _visit_with(conn, vec=_unit(1, 0, 0), days_ago=2, minutes=0)
+    near = _visit_with(conn, vec=_unit(0, 1, 0), days_ago=2, minutes=5,
+                       source=db.SOURCE_TRAIL_CAM_SD)
+    # Same camera, same minutes -> NOT a neighbour: the panel is about cross-camera evidence.
+    _visit_with(conn, vec=_unit(1, 0, 0), days_ago=2, minutes=6)
+    # Other camera, hours away -> not the same moment.
+    _visit_with(conn, vec=_unit(0, 1, 0), days_ago=2, minutes=600,
+                source=db.SOURCE_TRAIL_CAM_SD)
+
+    out = web._reid_dossier(cfg, door)
+    got = [n["visit_id"] for n in out["neighbours"]]
+    assert got == [near]
+    n = out["neighbours"][0]
+    assert n["source"] == db.SOURCE_TRAIL_CAM_SD
+    assert n["crops"]                       # the neighbour ships its own evidence, not just a count
+    assert 0 < n["offset_s"] <= web.CROSS_CAMERA_PAD_S
+
+
+def test_dossier_caps_the_crop_strip_sharpest_first(conn, db_path):
+    """A 2,000-crop visit must not hang the tab. Sharpest-first means the cap only ever drops the
+    crops least worth looking at, and the payload says how many it is showing of how many."""
+    cfg = _rq_cfg(db_path)
+    big = _visit_with(conn, vec=_unit(1, 0, 0), days_ago=3,
+                      n=web.DOSSIER_MAX_CROPS + 12)
+    out = web._reid_dossier(cfg, big)
+    assert len(out["crops"]) == web.DOSSIER_MAX_CROPS
+    assert out["n_crops"] == web.DOSSIER_MAX_CROPS + 12

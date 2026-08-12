@@ -138,7 +138,8 @@ def load_clips(conn, include_pruned: bool = False) -> list:
     try:
         rows = conn.execute(
             "SELECT id, source, clip_path, started_at, ended_at, fps, width, height, "
-            "frame_count, detection_count, max_confidence, pruned_at FROM clips "
+            "frame_count, detection_count, max_confidence, pruned_at, "
+            "video_scanned_at, video_detections, video_max_conf FROM clips "
             + ("" if include_pruned else "WHERE pruned_at IS NULL ")
             + "ORDER BY started_at"
         ).fetchall()
@@ -160,6 +161,15 @@ def load_clips(conn, include_pruned: bool = False) -> list:
             "dets": r["detection_count"] or 0,
             "conf": round(r["max_confidence"], 3) if r["max_confidence"] is not None else None,
             "archived": bool(r["pruned_at"]),
+            # The video's OWN evidence (see the clips migration in db.py). THREE states, and the
+            # difference between the last two is the whole point:
+            #   video_checked False -> nobody has run a detector over these frames
+            #   checked, 0 dets     -> looked, and the animal is genuinely not in the video
+            #   checked, N dets     -> the video really does show it
+            "video_checked": r["video_scanned_at"] is not None,
+            "video_dets": r["video_detections"],
+            "video_conf": (round(r["video_max_conf"], 3)
+                           if r["video_max_conf"] is not None else None),
         })
     return out
 
@@ -171,7 +181,9 @@ def _clip_out(c) -> dict | None:
     if not c:
         return None
     out = {"clip_path": c["clip_path"], "start": c["start"], "seconds": c["seconds"],
-           "dets": c["dets"], "conf": c["conf"]}
+           "dets": c["dets"], "conf": c["conf"],
+           "video_checked": c.get("video_checked", False),
+           "video_dets": c.get("video_dets"), "video_conf": c.get("video_conf")}
     if c.get("archived"):
         out["archived"] = True
         out["id"] = c.get("id")
@@ -363,6 +375,173 @@ def species_overview(cfg) -> dict | None:
         conn.close()
 
 
+#: Smallest crop that can serve as an avatar, as a share of the frame's area. A 40x40 speck can
+#: score a fine crop_quality (it is sharp, it is just tiny) and makes an unreadable badge.
+AVATAR_MIN_AREA_FRAC = 0.010
+#: ...and confident enough to be worth putting a name under. crop_quality alone picks sharp-but-
+#: weak crops (measured: it handed Elliot a 0.27 rump and Pedro a 0.36), because sharpness says
+#: nothing about whether the box is the animal or its shadow.
+AVATAR_MIN_CONF = 0.70
+
+
+#: How many DB candidates to actually open and look at. The SQL ordering gets us sharp, confident,
+#: human-vouched crops; only the pixels can say whether one is a blown-out white blob.
+AVATAR_CANDIDATES = 14
+
+
+def _pick_most_legible(rows):
+    """Of several good-on-paper crops, the one a person can actually read at badge size.
+
+    crop_quality and confidence between them still hand back rear views, near-white IR blowouts
+    and letterbox slivers -- measured on the first cut, which gave CutiePie + Kits a crop that is
+    almost pure white and Stan + Kits a dark smear. Those are exposure and framing problems, and
+    neither is visible in the DB, so this opens the shortlist and scores the pixels:
+
+      * EXPOSURE -- punish crops where a big share of pixels are pinned at either end. An IR
+        subject 2 m from the emitter blows out completely; one at 15 m crushes to black. Both
+        score fine on sharpness because an edge is still an edge.
+      * FRAMING  -- prefer squarish. A badge is a square hole; a 4:1 sliver of raccoon flank
+        survives it as a stripe.
+      * CONTRAST -- a legible animal has a spread of tones. A blob has one.
+
+    Falls back to the SQL winner if nothing can be read off disk (a pruned or moved crop)."""
+    best, best_score = None, None
+    for r in rows:
+        # Positional: called with both plain-tuple and Row-factory connections (see _avatar_for).
+        crop_path, _quality, conf = r[0], r[1], r[2]
+        p = db.crop_abspath(crop_path) if crop_path else None
+        img = None
+        if p is not None:
+            try:
+                import cv2
+                img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                img = None
+        if img is None or img.size == 0:
+            continue
+        h, w = img.shape[:2]
+        flat = img.reshape(-1)
+        blown = float((flat >= 250).mean())
+        crushed = float((flat <= 8).mean())
+        spread = float(flat.std()) / 64.0                       # ~1.0 for a well-toned crop
+        ar = (w / h) if h else 1.0
+        squareness = 1.0 / (1.0 + abs(math.log(ar if ar > 0 else 1.0)))
+        score = (min(spread, 1.5)
+                 + 1.2 * squareness
+                 + 0.8 * float(conf or 0)
+                 - 3.0 * max(0.0, blown - 0.15)
+                 - 2.0 * max(0.0, crushed - 0.35))
+        if best_score is None or score > best_score:
+            best, best_score = r, score
+    return best if best is not None else (rows[0] if rows else None)
+
+
+def _avatar_for(conn, iid: str):
+    """The one crop that best says "this is what this animal looks like".
+
+    Ranked on crop_quality, not confidence: confidence is the detector's certainty that SOMETHING
+    is there, which a big blurry rump satisfies as well as a face. crop_quality is the sharpness
+    measure the clip thumbnails already use. Two gates on top of it:
+
+      * a minimum share of the frame, because a tiny crop can be perfectly sharp and still be
+        unreadable at badge size;
+      * HUMAN-stamped crops preferred over auto/cluster ones, so the face on the badge is one a
+        person actually vouched for -- an avatar is the most-repeated assertion of identity in
+        the whole UI, and it should not rest on a nightly guess.
+    """
+    # A human pin always wins. Verified against the detections table rather than trusted blindly,
+    # so a crop that was pruned or renamed since falls back to the automatic pick instead of
+    # rendering a broken image.
+    try:
+        pin = conn.execute(
+            "SELECT avatar_crop FROM individual_status WHERE name = ? AND avatar_crop IS NOT NULL",
+            (iid,)).fetchone()
+    except Exception:
+        pin = None
+    # Positional indexing: this helper is called with both a plain connection (tests, CLI) and a
+    # Row-factory one (the web layer), and sqlite3.Row supports [0] while a bare tuple does not
+    # support ["col"].
+    if pin and pin[0]:
+        hit = conn.execute(
+            "SELECT crop_path, crop_quality, timestamp FROM detections "
+            "WHERE individual_id = ? AND REPLACE(crop_path, '\\', '/') = ? LIMIT 1",
+            (iid, str(pin[0]).replace("\\", "/"))).fetchone()
+        if hit is not None:
+            return {"crop": str(hit[0]).replace("\\", "/"), "quality": hit[1],
+                    "at": hit[2], "pinned": True}
+
+    sql = """SELECT crop_path, crop_quality, confidence, timestamp,
+                    ((bbox_x2 - bbox_x1) * (bbox_y2 - bbox_y1)) /
+                        (CAST(frame_w AS REAL) * frame_h) area_frac
+             FROM detections
+             WHERE individual_id = ? AND crop_path IS NOT NULL
+               AND frame_w > 0 AND frame_h > 0 AND confidence >= ?
+               AND ((bbox_x2 - bbox_x1) * (bbox_y2 - bbox_y1)) /
+                   (CAST(frame_w AS REAL) * frame_h) >= ?
+             ORDER BY (CASE WHEN individual_source = 'human' THEN 0 ELSE 1 END),
+                      crop_quality DESC, confidence DESC
+             LIMIT ?"""
+    # Walk the gates DOWN rather than picking one: an avatar should be the best crop that exists,
+    # and "best" is only meaningful relative to what this animal actually has. A cast member with
+    # nothing but distant night crops still needs a face.
+    cands = []
+    for min_conf, min_area in ((AVATAR_MIN_CONF, AVATAR_MIN_AREA_FRAC),
+                               (0.50, AVATAR_MIN_AREA_FRAC),
+                               (0.50, AVATAR_MIN_AREA_FRAC / 2),
+                               (0.0, 0.0)):
+        cands = conn.execute(sql, (iid, min_conf, min_area, AVATAR_CANDIDATES)).fetchall()
+        if cands:
+            break
+    row = _pick_most_legible(cands) if cands else None
+    if row is None or not row[0]:
+        return None
+    return {"crop": str(row[0]).replace("\\", "/"),
+            "quality": row[1], "at": row[3], "pinned": False}
+
+
+def _arrival_clock(conn, iid: str) -> dict:
+    """WHEN this animal turns up: a 24-bin histogram of VISIT ARRIVALS (not crops).
+
+    Counting arrivals rather than crops is the whole point -- one animal that sat in front of the
+    camera for 40 minutes would otherwise drown out ten separate visits, and "when does Stan show
+    up" is a question about arrivals. Bins are clock hours in the yard's local time, which is what
+    the timestamps already carry.
+
+    `peak_hours` are the hours holding the most arrivals, reported only when there is enough to
+    say: under MIN_ARRIVALS_FOR_PEAK visits the histogram is noise wearing a shape, and the UI
+    shows the count instead of a claim."""
+    rows = conn.execute(
+        """SELECT MIN(timestamp) t FROM detections
+           WHERE individual_id = ? AND visit_id IS NOT NULL GROUP BY visit_id""", (iid,)).fetchall()
+    hours = [0] * 24
+    n = 0
+    for r in rows:
+        dt = db.parse_local(r["t"])
+        if dt is None:
+            continue
+        hours[dt.hour] += 1
+        n += 1
+    # A "peak" has to actually stand out or it is not one. Requiring a real SHARE of the arrivals
+    # (not just "tied for most") is what stops a flat 10-visit histogram reporting seven peak
+    # hours, which the first cut of this did.
+    peak = []
+    if n >= MIN_ARRIVALS_FOR_PEAK:
+        floor = max(2, int(n * PEAK_MIN_SHARE + 0.999))
+        peak = sorted((h for h, c in enumerate(hours) if c >= floor),
+                      key=lambda h: (-hours[h], h))[:3]
+        peak.sort()
+    return {"hours": hours, "n_arrivals": n, "peak_hours": peak,
+            "peak_share": (round(sum(hours[h] for h in peak) / n, 2) if peak and n else None)}
+
+
+#: Below this many recorded arrivals, an "usually shows up at ..." claim is shape-in-noise.
+MIN_ARRIVALS_FOR_PEAK = 8
+#: ...and an hour has to hold at least this share of them to be called a peak at all. Without it,
+#: a flat 10-arrival histogram where every hour holds 1 reports SEVEN peak hours (measured on
+#: CutiePie), which reads as a finding and is the opposite of one.
+PEAK_MIN_SHARE = 0.15
+
+
 def individuals_overview(cfg, thumbs: int = 6) -> dict:
     """Phase-3 labelling: every individual_id group (placeholder clusters like 'raccoon_c01' and
     hand-named individuals like 'Notch') with crop count, time span, dominant species, and a strip
@@ -391,6 +570,9 @@ def individuals_overview(cfg, thumbs: int = 6) -> dict:
                 "species": sp["species"] if sp else None,
                 "first_seen": r["first_seen"], "last_seen": r["last_seen"],
                 "crops": [c["crop_path"].replace("\\", "/") for c in crops if c["crop_path"]],
+                # The badge face + when this one turns up (see _avatar_for / _arrival_clock).
+                "avatar": _avatar_for(conn, r["iid"]),
+                "clock": _arrival_clock(conn, r["iid"]),
             })
         # Named individuals first (the cast), then placeholders by size (biggest worth naming first).
         groups.sort(key=lambda g: (g["placeholder"], -g["n_crops"]))

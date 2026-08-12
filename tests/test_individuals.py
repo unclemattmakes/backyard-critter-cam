@@ -1355,6 +1355,50 @@ def test_fetch_for_embedding_visit_ids_restriction(conn):
     assert [r[0] for r in rows] == [d1]
 
 
+# =====================================================================================
+# ABSENCE IS AN INTERVAL, NOT A FLAG -- animals come back.
+#
+# Notch was away 43 days (last human-confirmed 2026-06-24, back 2026-08-06) and the auto tier
+# named him on five days inside that gap. With only a departure date you must choose between
+# blocking the gap and allowing his real August visits; these pin that you no longer have to.
+# =====================================================================================
+class _FakeMatcher:
+    """is_departed is pure logic over self.departed -- exercise it without building a matcher."""
+    departed = {"notch": ("2026-06-30", "2026-08-06"),
+                "ghost": ("2026-06-30", None),      # left and never came back
+                "nodate": (None, None)}             # departed, date unknown
+    is_departed = individuals.VisitMatcher.is_departed
+
+
+def test_absence_interval_blocks_the_gap_but_not_the_return():
+    m = _FakeMatcher()
+    # While resident -- nameable.
+    assert m.is_departed("Notch", "2026-06-12T22:00:00-07:00") is False
+    assert m.is_departed("Notch", "2026-06-30T23:59:00-07:00") is False
+    # Inside the absence -- refused. 2026-07-03 is the visit the auto tier really did try to name.
+    assert m.is_departed("Notch", "2026-07-03T00:13:00-07:00") is True
+    assert m.is_departed("Notch", "2026-07-20T02:00:00-07:00") is True
+    # After the return -- nameable again. This is the case a bare departure date gets wrong.
+    assert m.is_departed("Notch", "2026-08-06T21:00:00-07:00") is False
+    assert m.is_departed("Notch", "2026-08-10T04:03:00-07:00") is False
+
+
+def test_no_return_date_still_means_gone_for_good():
+    m = _FakeMatcher()
+    assert m.is_departed("ghost", "2026-06-01T00:00:00-07:00") is False
+    assert m.is_departed("ghost", "2026-08-10T00:00:00-07:00") is True
+
+
+def test_departed_with_no_date_fails_closed():
+    """Residency can't be established, so the machine never writes the name -- unchanged."""
+    m = _FakeMatcher()
+    assert m.is_departed("nodate", "2026-06-01T00:00:00-07:00") is True
+    assert m.is_departed("nodate", None) is True
+
+
+def test_an_individual_nobody_has_flagged_is_never_blocked():
+    m = _FakeMatcher()
+    assert m.is_departed("Stan", "2026-07-03T00:00:00-07:00") is False
 # ---------------------------------------------------------------------------
 # LAPSED IDENTITY -- the decay curve as a first-class per-individual state.
 # ---------------------------------------------------------------------------

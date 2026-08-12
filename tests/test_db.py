@@ -539,14 +539,14 @@ def test_individual_status_round_trip_records_a_date_not_a_boolean(conn):
     stored = db.individual_statuses(conn)["Notch"]
     assert stored["effective_date"] == "2026-06-30"
     assert stored["note"] == "last seen at the dish"
-    assert db.departed_individuals(conn) == {"notch": "2026-06-30"}
+    assert db.departed_individuals(conn) == {"notch": ("2026-06-30", None)}
 
 
 def test_individual_status_is_an_upsert_and_reversible(conn):
     db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-30")
     db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-07-02")
     assert len(db.individual_statuses(conn)) == 1          # one row per name, not a log
-    assert db.departed_individuals(conn) == {"notch": "2026-07-02"}
+    assert db.departed_individuals(conn) == {"notch": ("2026-07-02", None)}
     # Undo: the row is KEPT (updated_at says when the call was reversed), but the name is off the
     # departed list, so the auto tier may write it again.
     db.set_individual_status(conn, "Notch", status="resident")
@@ -559,7 +559,7 @@ def test_individual_status_matches_names_case_insensitively(conn):
     db.set_individual_status(conn, "Notch", status="departed", effective_date="2026-06-30")
     db.set_individual_status(conn, "notch", status="departed", effective_date="2026-06-29")
     assert len(db.individual_statuses(conn)) == 1
-    assert db.departed_individuals(conn) == {"notch": "2026-06-29"}
+    assert db.departed_individuals(conn) == {"notch": ("2026-06-29", None)}
 
 
 def test_individual_status_rejects_a_bad_date_or_status(conn):
@@ -585,7 +585,7 @@ def test_departed_with_no_date_fails_closed(conn):
     """No date = no way to tell which visits predate the departure, so the name is simply never
     machine-written (individuals.VisitMatcher.is_departed treats None as always-departed)."""
     db.set_individual_status(conn, "Notch", status="departed")
-    assert db.departed_individuals(conn) == {"notch": None}
+    assert db.departed_individuals(conn) == {"notch": (None, None)}
 
 
 def test_individual_status_survives_a_second_connect(db_path):
@@ -599,7 +599,7 @@ def test_individual_status_survives_a_second_connect(db_path):
     try:
         assert _table_names(c2) == tables_first
         assert "individual_status" in tables_first
-        assert db.departed_individuals(c2) == {"notch": "2026-06-30"}
+        assert db.departed_individuals(c2) == {"notch": ("2026-06-30", None)}
         assert len(db.individual_statuses(c2)) == 1
     finally:
         c2.close()
@@ -975,3 +975,65 @@ def test_refimg_helpers_are_quiet_on_a_db_without_the_tables(db_path):
         assert db.current_view_epoch(ro, GD) == 0
     finally:
         ro.close()
+
+
+# =====================================================================================
+# clips.video_scanned_at -- "we looked at the video" as a fact distinct from "we found something"
+#
+# clips.detection_count/max_confidence describe the STILL that triggered a trail-cam recording,
+# not the video (measured 2026-08-10: 1,089 of 1,101 trail-cam clips carry a max_confidence
+# byte-identical to some still's, and that camera starts rolling ~2-3 s after the photo). These
+# tests pin the two things that fall out of recording the video's own evidence.
+# =====================================================================================
+def _a_clip(conn, source="trail_cam_sd", path="clips/x/a.mp4"):
+    cur = conn.execute(
+        "INSERT INTO clips (source, clip_path, started_at, ended_at, fps, width, height, "
+        "frame_count, detection_count, max_confidence) "
+        "VALUES (?, ?, '2026-08-09T01:48:15-07:00', '2026-08-09T01:48:19-07:00', 30.0, "
+        "3840, 2160, 121, 1, 0.3738)", (source, path))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def test_video_scan_is_recorded_separately_from_the_trigger_stills_numbers(conn):
+    cid = _a_clip(conn)
+    db.set_clip_video_scan(conn, cid, n_boxes=0, max_conf=None)
+    r = conn.execute("SELECT detection_count, max_confidence, video_scanned_at, "
+                     "video_detections, video_max_conf FROM clips WHERE id = ?", (cid,)).fetchone()
+    # The trigger still's numbers are untouched -- "what tripped the camera" stays a real fact...
+    assert r[0] == 1 and abs(r[1] - 0.3738) < 1e-9
+    # ...while the video's own verdict is recorded beside it: looked, found nothing.
+    assert r[2] is not None
+    assert r[3] == 0 and r[4] is None
+
+
+def test_an_empty_clip_is_not_rescanned_forever(conn):
+    """The bug this fixes: a video with no animal produces no clip_tracks rows, so under a
+    track-existence test it was indistinguishable from one never processed and got re-detected on
+    every nightly run (154 trail-cam clips were in that loop)."""
+    cid = _a_clip(conn)
+    model = "megadetector-v6"
+    assert cid in [r["id"] for r in db.clips_needing_tracks(conn, model)]
+    db.set_clip_video_scan(conn, cid, n_boxes=0, max_conf=None)   # looked; nothing there
+    assert cid not in [r["id"] for r in db.clips_needing_tracks(conn, model)]
+
+
+def test_a_clip_with_a_real_animal_records_what_the_video_showed(conn):
+    cid = _a_clip(conn)
+    db.set_clip_video_scan(conn, cid, n_boxes=37, max_conf=0.91)
+    r = conn.execute("SELECT video_detections, video_max_conf FROM clips WHERE id = ?",
+                     (cid,)).fetchone()
+    assert r[0] == 37 and abs(r[1] - 0.91) < 1e-9
+
+
+def test_departed_individuals_carries_a_return_date_when_the_animal_came_back(conn):
+    """The pair is an absence INTERVAL. Notch left and returned 43 days later; a single date
+    cannot express that, and with only a departure the guard would refuse his real visits ever
+    after (see individuals.VisitMatcher.is_departed)."""
+    db.set_individual_status(conn, "Notch", status="departed",
+                             effective_date="2026-06-30", returned_on="2026-08-06")
+    assert db.departed_individuals(conn) == {"notch": ("2026-06-30", "2026-08-06")}
+    assert db.individual_statuses(conn)["Notch"]["returned_on"] == "2026-08-06"
+    # Coming back for good clears the flag entirely, as before.
+    db.set_individual_status(conn, "Notch", status="resident")
+    assert db.departed_individuals(conn) == {}

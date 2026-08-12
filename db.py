@@ -575,11 +575,21 @@ def insert_clip_tracks(conn: sqlite3.Connection, *, clip_id: int, model: str, n_
 
 
 def clips_needing_tracks(conn: sqlite3.Connection, model: str):
-    """Clips that don't yet have a motion track for `model` (resumable batch processing).
-    Pruned clips are excluded -- their video is gone, so there is nothing to extract from."""
+    """Clips nobody has run the detector over yet (resumable batch processing).
+    Pruned clips are excluded -- their video is gone, so there is nothing to extract from.
+
+    "Already done" is `video_scanned_at`, NOT "has clip_tracks rows". A clip whose video is
+    genuinely empty produces no tracklets, so under the old track-existence test it looked
+    identical to one never processed and was re-detected on EVERY nightly run, forever
+    (measured 2026-08-10: 154 trail-cam clips stuck in that loop). The scan stamp is the record
+    that the work happened, independently of whether it found anything -- which is also what
+    lets the dashboard say "we looked, it is empty" rather than staying silent.
+
+    The clip_tracks fallback keeps clips processed BEFORE the stamp existed from being redone."""
     return conn.execute(
         """SELECT c.id, c.clip_path, c.fps FROM clips c
            WHERE c.pruned_at IS NULL
+             AND c.video_scanned_at IS NULL
              AND NOT EXISTS (SELECT 1 FROM clip_tracks t WHERE t.clip_id = c.id AND t.model = ?)
            ORDER BY c.id""", (model,)
     ).fetchall()
@@ -730,6 +740,41 @@ def _migrate(conn: sqlite3.Connection) -> None:
     clip_cols = {r[1] for r in conn.execute("PRAGMA table_info(clips)")}
     if clip_cols and "pruned_at" not in clip_cols:
         conn.execute("ALTER TABLE clips ADD COLUMN pruned_at TEXT")
+    # 2026-08-10: a human-pinned avatar crop. The automatic pick (stats._avatar_for) can get an
+    # animal that is sharp, well-exposed, squarely framed -- and facing away. Judging POSE is not
+    # available to it: facial landmarks were tried and are a NO-GO on this cast because a
+    # raccoon's eyes sit inside a black mask with almost no local contrast, so there is nothing
+    # to find. "Iconic" is a human call, so the human gets to make it and the picker defers.
+    ist_cols = {r[1] for r in conn.execute("PRAGMA table_info(individual_status)")}
+    if ist_cols and "avatar_crop" not in ist_cols:
+        conn.execute("ALTER TABLE individual_status ADD COLUMN avatar_crop TEXT")
+    # 2026-08-10: animals COME BACK. The original guard held one date -- "last day resident" --
+    # which cannot express an absence that ended, and this cast produced one immediately: Notch
+    # was gone 43 days (last human-confirmed 2026-06-24, back 2026-08-06) and the auto tier named
+    # him on FIVE days inside that gap. With only a departure date you must choose between
+    # blocking the gap and allowing his real August visits; `returned_on` closes the interval so
+    # both are right. NULL = still away, which keeps the original fail-closed behaviour.
+    if ist_cols and "returned_on" not in ist_cols:
+        conn.execute("ALTER TABLE individual_status ADD COLUMN returned_on TEXT")
+
+    # 2026-08-10: WHAT IS IN THE VIDEO, as opposed to what triggered it.
+    #
+    # clips.detection_count / max_confidence do NOT always describe the video. On the trail cam
+    # they describe the STILL that triggered the recording: measured, 1,089 of 1,101 trail-cam
+    # clips carry a max_confidence byte-identical to some still's. That camera starts recording
+    # ~2-3 s after the photo, so a close animal can be gone by frame 1 -- the 2026-08-09 01:48
+    # opossum visit links a 4 s clip that is empty in every frame while its stills score 0.93.
+    #
+    # These three columns are the video's OWN evidence, and the NULL state is load-bearing:
+    # `video_scanned_at IS NULL` means nobody has looked, which is not the same as "nothing is
+    # there" and must never be rendered as such. Kept ADDITIVE rather than overwriting the
+    # existing two, because "what tripped the camera" is also a real fact worth keeping.
+    if clip_cols and "video_scanned_at" not in clip_cols:
+        conn.execute("ALTER TABLE clips ADD COLUMN video_scanned_at TEXT")
+    if clip_cols and "video_detections" not in clip_cols:
+        conn.execute("ALTER TABLE clips ADD COLUMN video_detections INTEGER")
+    if clip_cols and "video_max_conf" not in clip_cols:
+        conn.execute("ALTER TABLE clips ADD COLUMN video_max_conf REAL")
     # clip_tracks grew multi-animal + gait columns (2026-06-11, phase 4 part 2).
     ct_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_tracks)")}
     if "track_idx" not in ct_cols:
@@ -1175,7 +1220,7 @@ def as_date(value) -> Optional[str]:
 
 def set_individual_status(conn: sqlite3.Connection, name: str, *, status: str = "departed",
                           effective_date=None, note: Optional[str] = None,
-                          updated_at: Optional[str] = None) -> dict:
+                          updated_at: Optional[str] = None, returned_on=None) -> dict:
     """Record what the human knows about an individual's residency: 'departed' (with the last day
     it was here) or 'resident' (the default state, written back to UNDO a departure).
 
@@ -1192,15 +1237,18 @@ def set_individual_status(conn: sqlite3.Connection, name: str, *, status: str = 
     note_clean = (str(note).strip() or None) if note else None
     at = updated_at or now_local_iso()
     conn.execute(
-        """INSERT INTO individual_status (name, status, effective_date, note, updated_at)
-           VALUES (?, ?, ?, ?, ?)
+        """INSERT INTO individual_status (name, status, effective_date, note, updated_at,
+                                          returned_on)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(name) DO UPDATE SET status = excluded.status,
                                            effective_date = excluded.effective_date,
                                            note = excluded.note,
-                                           updated_at = excluded.updated_at""",
-        (nm, st, day, note_clean, at))
+                                           updated_at = excluded.updated_at,
+                                           returned_on = excluded.returned_on""",
+        (nm, st, day, note_clean, at, as_date(returned_on)))
     conn.commit()
-    return {"name": nm, "status": st, "effective_date": day, "note": note_clean, "updated_at": at}
+    return {"name": nm, "status": st, "effective_date": day, "note": note_clean,
+            "updated_at": at, "returned_on": as_date(returned_on)}
 
 
 def individual_statuses(conn: sqlite3.Connection) -> dict:
@@ -1209,15 +1257,16 @@ def individual_statuses(conn: sqlite3.Connection) -> dict:
     writer has migrated must not explode on a reporting surface (same contract as
     _live_sighting_rows)."""
     try:
-        rows = conn.execute("SELECT name, status, effective_date, note, updated_at "
+        rows = conn.execute("SELECT name, status, effective_date, note, updated_at, returned_on "
                             "FROM individual_status").fetchall()
     except sqlite3.OperationalError:
         return {}
     out = {}
     for r in rows:
-        nm, st, day, note, at = tuple(r)[:5]
+        t = tuple(r)
+        nm, st, day, note, at = t[:5]
         out[nm] = {"name": nm, "status": st, "effective_date": day, "note": note,
-                   "updated_at": at}
+                   "updated_at": at, "returned_on": t[5] if len(t) > 5 else None}
     return out
 
 
@@ -1312,11 +1361,20 @@ def life_events(conn: sqlite3.Connection, name: Optional[str] = None) -> list:
 
 
 def departed_individuals(conn: sqlite3.Connection) -> dict:
-    """{casefolded name: effective_date or None} for the individuals a human has marked departed.
-    Case-folded because the names are free text typed by hand and "notch" is "Notch"; the value is
-    the last day the animal was resident (None = no date given, i.e. always departed)."""
-    return {str(s["name"]).strip().casefold(): s["effective_date"]
-            for s in individual_statuses(conn).values() if s["status"] == "departed"}
+    """{casefolded name: (last_day_here, came_back_on)} for individuals a human has said left.
+
+    Case-folded because the names are free text typed by hand and "notch" is "Notch". The pair is
+    an ABSENCE INTERVAL, not a flag: `last_day_here` is the last day the animal was resident
+    (None = no date, i.e. treat as always away), and `came_back_on` is the day it turned up again
+    (None = still gone). Animals come back -- Notch was away 43 days and returned -- and with only
+    a departure date you have to choose between blocking the gap and allowing the real visits
+    after it."""
+    out = {}
+    for s in individual_statuses(conn).values():
+        if s["status"] == "departed":
+            out[str(s["name"]).strip().casefold()] = (s.get("effective_date"),
+                                                      s.get("returned_on"))
+    return out
 
 
 _MAX_SIGHTING_NAMES = 12   # a "who's here now" log of more than a dozen named animals isn't real.
@@ -1864,6 +1922,49 @@ def _zone_row(row) -> dict:
 
 
 _ZONE_COLS = "id, source, x1, y1, x2, y2, note, created_by, created_at"
+
+
+def set_individual_avatar(conn: sqlite3.Connection, name: str, crop_path: Optional[str]) -> bool:
+    """Pin (or unpin, with None) the crop used as this individual's badge.
+
+    The crop must actually be one of theirs -- pinning someone else's photo to a name is exactly
+    the kind of quiet identity error the rest of this project spends its effort preventing.
+    Returns False if the crop isn't stamped with that name."""
+    nm = str(name or "").strip()
+    if not nm:
+        return False
+    crop = (str(crop_path).replace("\\", "/").strip() or None) if crop_path else None
+    if crop is not None:
+        ok = conn.execute(
+            "SELECT 1 FROM detections WHERE individual_id = ? AND REPLACE(crop_path, '\\', '/') = ? "
+            "LIMIT 1", (nm, crop)).fetchone()
+        if ok is None:
+            return False
+    conn.execute(
+        "INSERT INTO individual_status (name, status, avatar_crop, updated_at) "
+        "VALUES (?, 'resident', ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET avatar_crop = excluded.avatar_crop, "
+        "updated_at = excluded.updated_at",
+        (nm, crop, now_local_iso()))
+    conn.commit()
+    return True
+
+
+def set_clip_video_scan(conn: sqlite3.Connection, clip_id: int, *, n_boxes: int,
+                        max_conf: Optional[float]) -> None:
+    """Record what a detector found in a clip's OWN frames (clipmotion.extract_tracks' `raw`).
+
+    Deliberately separate from clips.detection_count / max_confidence, which on the trail cam
+    describe the still photo that TRIGGERED the recording rather than the video -- see the
+    migration comment on these columns. Writing `video_scanned_at` is what makes "0 detections"
+    mean "we looked and it is empty" instead of "nobody has looked", which is the difference the
+    dashboard badge turns on."""
+    conn.execute(
+        "UPDATE clips SET video_scanned_at = ?, video_detections = ?, video_max_conf = ? "
+        "WHERE id = ?",
+        (now_local_iso(), int(n_boxes), float(max_conf) if max_conf is not None else None,
+         int(clip_id)))
+    conn.commit()
 
 
 def list_ignore_zones(conn: sqlite3.Connection, source: Optional[str] = None) -> list:

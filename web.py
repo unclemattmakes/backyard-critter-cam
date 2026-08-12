@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -965,12 +966,26 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     lim = _qs_int(q, "limit", 30, 1, 100)
                     off = _qs_int(q, "offset", 0, 0, 1_000_000)
                     md = (q.get("mode") or ["recent"])[0]
+                    since = _qs_int(q, "since_h", DEFAULT_QUEUE_WINDOW_H, 0, 24 * 400)
                     # The heaviest endpoint there is (~10s: a full VisitMatcher rebuild), so it
                     # leans hardest on the cache. Label POSTs clear it, so the queue is always
                     # fresh right after a confirm -- the rebuild then happens once, not per open.
-                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}",
+                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}:{since}",
                                        lambda: _reid_queue(cfg, species=sp, limit=lim,
-                                                           offset=off, mode=md), hold_s=60))
+                                                           offset=off, mode=md,
+                                                           since_h=since), hold_s=60))
+                elif path == "/api/reid/dossier":
+                    # One visit, everything about it (see _reid_dossier). Cached per visit id:
+                    # it rebuilds the whole VisitMatcher, and the one-at-a-time flow steps
+                    # BACKWARD as often as forward, so the second look must be free.
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    try:
+                        vid = int((q.get("visit_id") or [""])[0])
+                    except (TypeError, ValueError):
+                        self._send(400, "text/plain", b"bad visit_id")
+                    else:
+                        self._json(_cached(cfg, f"dossier:{vid}",
+                                           lambda: _reid_dossier(cfg, vid), hold_s=120))
                 elif path == "/api/reid/poses":
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(_reid_poses(cfg, (q.get("individual") or [""])[0]))
@@ -1053,6 +1068,17 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._zone_add(data)
                 elif path == "/api/zones/delete":
                     self._zone_delete(data)
+                elif path == "/api/individual/avatar":
+                    # Pin (or clear, with crop=null) an individual's badge photo.
+                    conn = db.connect(cfg.db_path)
+                    try:
+                        ok = db.set_individual_avatar(conn, str(data.get("name") or ""),
+                                                      data.get("crop"))
+                    finally:
+                        conn.close()
+                    self._json({"ok": True} if ok else
+                               {"error": "that crop isn't one of this individual's"},
+                               code=200 if ok else 400)
                 elif path == "/api/individual/status":
                     self._individual_status(data)
                 elif path == "/api/individual/event":
@@ -1735,8 +1761,146 @@ def _reid_funnel(matcher, pool, source_of, template_sources) -> dict:
     }
 
 
+#: How far either side of a visit to look for the SAME MOMENT on another camera. Ten minutes,
+#: because the trail cam's clock is set by hand each cycle and drifts a few minutes against the
+#: rig's, and because a raccoon that leaves the door frame reaches the far camera within that.
+CROSS_CAMERA_PAD_S = 600
+#: Cap on how many crops one dossier ships. The whole point of the one-at-a-time flow is that the
+#: eye gets EVERYTHING, but a 2,000-crop visit would hang the tab; sharpest-first means the cap
+#: only ever removes the crops least worth looking at.
+DOSSIER_MAX_CROPS = 60
+
+
+def _reid_dossier(cfg, visit_id: int, species: str = "raccoon") -> dict:
+    """EVERYTHING known about ONE visit -- the payload behind the one-at-a-time review flow.
+
+    The queue card is deliberately small: it has to render 30 of them. This is the opposite --
+    one visit, every crop, every clip, and the same moment as seen by any OTHER camera. That last
+    part is the reason this endpoint exists rather than the card just growing:
+
+      a trail-cam visit CANNOT be appearance-matched (measured: trail-cam prototypes score a
+      median 0.249 against every glass-door template, and trail-cam-to-trail-cam similarity is
+      flat -- there is no identity structure to threshold). So the only evidence that can ever
+      name one is a human noticing that the glass door saw the same animal in the same minutes.
+      109 of 521 glass-door raccoon visits have a trail-cam visit within CROSS_CAMERA_PAD_S, so
+      that pairing is available for a fifth of the corpus and is currently shown nowhere.
+
+    Read-only. Returns {} for an unknown visit."""
+    import individuals
+
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {}
+    try:
+        v = conn.execute(
+            """SELECT id, source, species, started_at, ended_at, detection_count,
+                      representative_detection_id, individual_id
+               FROM visits WHERE id = ?""", (int(visit_id),)).fetchone()
+        if v is None:
+            return {}
+        species = v["species"] or species
+        matcher = individuals.VisitMatcher(conn, species, cfg)
+        all_clips = stats.load_clips(conn)
+
+        def _crop(det_id):
+            if det_id is None:
+                return None
+            r = conn.execute("SELECT crop_path FROM detections WHERE id = ?",
+                             (det_id,)).fetchone()
+            return r["crop_path"].replace("\\", "/") if r and r["crop_path"] else None
+
+        def _evidence(row):
+            """Crops + clips for one visit, sharpest crop first."""
+            crops = [{"path": r["crop_path"].replace("\\", "/"),
+                      "at": r["timestamp"], "conf": r["confidence"]}
+                     for r in conn.execute(
+                         """SELECT crop_path, timestamp, confidence FROM detections
+                            WHERE visit_id = ? AND crop_path IS NOT NULL
+                            ORDER BY crop_quality DESC, confidence DESC LIMIT ?""",
+                         (row["id"], DOSSIER_MAX_CROPS)).fetchall()]
+            clips = [stats._clip_out(c) for c in stats.clips_overlapping(
+                all_clips, row["source"], db.parse_local(row["started_at"]),
+                db.parse_local(row["ended_at"]))]
+            return crops, clips
+
+        crops, clips = _evidence(v)
+        s = matcher.suggest(v["id"])
+
+        # THE SAME MOMENT ON ANOTHER CAMERA. Compared as instants via db.parse_local, never as
+        # ISO strings: the two sources' rows can carry different UTC offsets (the trail cam's
+        # timestamps are reconstructed at import) and a string compare would silently mis-order
+        # them across a DST boundary.
+        start, end = db.parse_local(v["started_at"]), db.parse_local(v["ended_at"])
+        neighbours = []
+        if start and end:
+            pad = timedelta(seconds=CROSS_CAMERA_PAD_S)
+            lo, hi = start - pad, end + pad
+            day = (lo - timedelta(days=1)).strftime("%Y-%m-%d")
+            for n in conn.execute(
+                    """SELECT id, source, species, started_at, ended_at, detection_count,
+                              representative_detection_id, individual_id
+                       FROM visits WHERE id != ? AND source != ? AND started_at >= ?
+                       ORDER BY started_at""",
+                    (v["id"], v["source"], day)).fetchall():
+                ns, ne = db.parse_local(n["started_at"]), db.parse_local(n["ended_at"])
+                if not ns or not ne or ns > hi or ne < lo:
+                    continue
+                ncrops, nclips = _evidence(n)
+                neighbours.append({
+                    "visit_id": n["id"], "source": n["source"], "species": n["species"],
+                    "started_at": n["started_at"], "ended_at": n["ended_at"],
+                    "n_crops": n["detection_count"], "individual_id": n["individual_id"],
+                    "rep_crop": _crop(n["representative_detection_id"]),
+                    "crops": ncrops, "clips": nclips,
+                    "offset_s": int((ns - start).total_seconds()),
+                })
+
+        # The answer buttons: who the human could plausibly say. Confirmed cast, busiest first,
+        # each carrying how stale its template is so "who is this?" and "who needs a fresh
+        # template?" are the same glance.
+        freshness = _template_freshness(matcher)
+        counts: dict = {}
+        for vid, name in matcher.confirmed.items():
+            counts[name] = counts.get(name, 0) + 1
+        statuses = db.individual_statuses(conn)
+        by_key = {str(k).strip().casefold(): st for k, st in statuses.items()}
+        cast = []
+        for name, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            f = freshness.get(name) or {}
+            st = by_key.get(str(name).strip().casefold()) or {}
+            cast.append({"name": name, "n_visits": n,
+                         "n_templates": f.get("n_templates", 0),
+                         "days_since_template": f.get("days_since_template"),
+                         "status": st.get("status") or "resident"})
+
+        return {
+            "visit_id": v["id"], "source": v["source"], "species": species,
+            "started_at": v["started_at"], "ended_at": v["ended_at"],
+            "n_crops": v["detection_count"],
+            "rep_crop": _crop(v["representative_detection_id"]),
+            "crops": crops, "clips": clips,
+            "confirmed_as": s["confirmed_as"], "auto_as": s["auto_as"],
+            "rejected": v["id"] in matcher.rejected,
+            "candidates": s["candidates"], "clip_candidates": s["clip_candidates"],
+            "novel": s["novel"], "multi": s["multi"],
+            "co_present_frames": s["co_present_frames"],
+            "co_present_clips": s["co_present_clips"],
+            "cross_source": s.get("cross_source", False),
+            "n_embedded": s["n_embedded"], "note": s["note"],
+            "neighbours": neighbours, "cast": cast,
+        }
+    finally:
+        conn.close()
+
+
+#: How far back the review queue reaches by DEFAULT. The queue used to open on the entire corpus
+#: -- 500+ visits -- which is not a work list, it is a wall, and the honest reaction to a wall is
+#: to close the tab. Two nights is what a person can actually still remember seeing.
+DEFAULT_QUEUE_WINDOW_H = 48
+
+
 def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
-                mode: str = "recent") -> dict:
+                mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H) -> dict:
     """The Individuals tab's review queue: visits of `species` with a WHO suggestion each
     (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
     nothing is confirmed yet -- the cold-start visit-groups to name first. Read-only; the heavy
@@ -1776,6 +1940,20 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
         pool = conn.execute(
             """SELECT id, source, started_at, ended_at, detection_count, representative_detection_id
                FROM visits WHERE species = ? ORDER BY started_at DESC""", (species,)).fetchall()
+        # THE WINDOW, applied before the mode filter so "12 ambiguous" means 12 in the window the
+        # reader is looking at, not 12 somewhere in two months. since_h <= 0 means "all of it",
+        # which is what the UI's "load older" walks out to.
+        n_all = len(pool)
+        cutoff = None
+        if since_h and since_h > 0:
+            newest = max((db.parse_local(v["started_at"]) for v in pool), default=None)
+            if newest is not None:
+                # Anchored on the NEWEST VISIT, not on wall-clock now: after a quiet spell (or a
+                # rig that was down, which happens here) a now-anchored window shows an empty
+                # queue and reads as "nothing to review" when the truth is "nothing last night".
+                cutoff = newest - timedelta(hours=float(since_h))
+                pool = [v for v in pool
+                        if (db.parse_local(v["started_at"]) or newest) >= cutoff]
         freshness = _template_freshness(matcher)
         mode, matched = _queue_filter(cfg, matcher, pool, mode, freshness)
         rows = matched[offset:offset + limit]
@@ -1924,6 +2102,9 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
                 "novel_threshold": cfg.reid_novel_threshold,
                 "mode": mode, "modes": list(QUEUE_MODES),
                 "offset": offset, "limit": limit, "n_matched": len(matched),
+                # The window, so the UI can say what it is hiding rather than just hiding it.
+                "since_h": since_h, "n_in_window": len(pool), "n_all": n_all,
+                "window_from": cutoff.isoformat() if cutoff else None,
                 "stale_days": cfg.reid_queue_stale_days,
                 "funnel": _reid_funnel(matcher, pool, source_of, template_sources)}
     finally:
