@@ -3,8 +3,9 @@ REFERENCE-IMAGE VETO -- "that box is furniture, and here is the empty yard that 
 
 The detector fires on things that are not animals: a tipped watering can, a covered barbecue, a
 dark gap in a retaining wall. config.ignore_zones fixes that with a hand-measured rectangle, and
-staticfilter.py fixes it after the fact for a batch import -- but neither works on the live rig,
-because Matt repositions the cameras on purpose (a stale zone fails SILENTLY) and because
+staticfilter.py fixes it after the fact for a batch import (by position and, since 2026-08-12,
+by whether a spot's crops ever change) -- but neither works on the live rig, because Matt
+repositions the cameras on purpose (a stale zone fails SILENTLY) and because
 position alone cannot separate furniture from a raccoon that feeds at a fixed dish every night
 for 27 days. This module asks the question directly instead: *does this box look exactly like the
 empty yard did, at a spot that keeps firing?*

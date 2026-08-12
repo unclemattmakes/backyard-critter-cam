@@ -16,6 +16,14 @@ then re-label existing crops with `python classify.py --redo` (new crops just us
 
 - **Full common names beat bare nouns.** "domestic dog" and "domestic cat" resolve cleanly;
   a bare "dog" once mis-ranked against wild canids. Prefer "brown rat" to "rat".
+- **Know which label your furniture lands on.** Every list has one, and it is not a labelling
+  bug — a forced choice over organisms has to put a dark upright blob *somewhere*. On this yard
+  it is **brown rat**: 306 phantom ones off a grill and chimney starter, then 272 more off a bin
+  on 2026-08-11. A bright blob goes to **raccoon** (a lamp scored `raccoon:78`), and a small
+  textured one scatters across small birds — one paver edge collected twelve species, eight of
+  them birds. Practical consequences: a sudden bloom in that species means *check the crops*
+  before you believe the yard changed, and never use it as ground truth for an animal (see
+  `tools/eval_rigidity.py`, which has to exclude it by name to measure a safety margin at all).
 - **Keep the list tight.** ~20–30 species you actually get (plus a few plausibles). Every label
   is a candidate for *every* crop, so a bloated list dilutes the scores.
 - **Frequency-rank it.** Order doesn't change the math, but it keeps the list honest — put your

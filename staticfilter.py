@@ -30,16 +30,50 @@ mistaken for furniture, and the cost of that choice is some junk surviving. Fals
 recoverable (run the sweep again with a lower --min-count once you have looked); a false
 positive deletes an animal, which is not.
 
+THE SPAN TEST HAS ONE BLIND SPOT: furniture that stops. On 2026-08-11 the trail cam's battery
+died at 23:00, and a bin, a lamp and a paver edge that had been firing for 24-36 minutes simply
+ceased -- under the 60-minute span, so all 669 detections survived the sweep and were labelled.
+The bin alone (one object, split across two boxes by the IoU cut) became 272 "brown rat"; the
+lamp became "raccoon:78". Lowering the span is NOT the fix: in that same cycle real raccoons
+foraged one spot for 23 and 38 minutes, so span cannot separate them at any threshold.
+
+So there is a SECOND, narrow test -- RIGIDITY. Take up to a dozen crops spread across the
+cluster's life, z-normalise each (which costs a global exposure or IR-gain shift nothing, so
+only STRUCTURAL change registers), and take the WORST pair. A rigid object is the same pixels
+every time it fires no matter how long it lasts; an animal that pauses may look similar on
+AVERAGE but always has one pair where it had moved. Measured over this yard's whole trail-cam
+history -- 62 known-furniture spots and 30 animal-dominant clusters, 2026-07-19..2026-08-11 --
+the lowest animal sits at 0.225, and DEFAULT_RIGID_MAXPAIR is 0.15. Read that gap the way
+tools/eval_rigidity.py prints it: 0.225 is 50% ABOVE the threshold (the headroom left unused).
+0.15 is 33% below the animal, which is the smaller and more honest-sounding of the two numbers;
+neither is a licence to creep upward, because above 0.15 nothing new is caught anyway.
+
+Rigidity is deliberately a SUPPLEMENT, not a replacement, and it is weak on purpose. At a
+threshold that safe it catches only 4 of 62 known furniture SPOTS, and two of those four the
+span test already deletes -- so what rigidity genuinely ADDS is 2 spots. It fires on rigid,
+high-volume objects and says nothing about wind-blown vegetation (which is furniture that
+genuinely changes, and scores like an animal). What it buys is that the objects it does catch
+are the ones that fire hardest: on the 2026-08-12 cycle those 2 spots hold 274 of the 669
+furniture detections the span test missed. The other eight spots still need a human. A cluster
+whose crops cannot be read is never judged rigid, on the same principle as a row with no
+parseable timestamp: what cannot be measured must not be deleted.
+
 NOTHING IS DELETED SILENTLY. Every applied sweep appends the dropped rows to a sidecar manifest
 next to the DB (backyard.db.static-dropped-<source>.txt), the same convention as the import
 ledger, and the crop JPEGs are LEFT ON DISK -- so a bad sweep is inspectable after the fact and
-the images survive it. Only DB rows go, and the embeddings cascade with them.
+the images survive it. Only DB rows go, and the embeddings cascade with them. Each spot header
+carries `via=span|rigid` and, when it was measured, `rigidity=N.NNN`: which test condemned a
+spot is part of the record, not something to reconstruct later. tools/eval_rigidity.py reads
+that tag to keep the test out of its own ground truth.
 
   python staticfilter.py --source trail_cam_sd                     # dry run: report, change nothing
   python staticfilter.py --source trail_cam_sd --apply             # ... actually delete the rows
   python staticfilter.py --since 2026-08-03 --until 2026-08-05     # limit to one cycle's window
   python staticfilter.py --min-count 40 --min-span-minutes 120     # stricter (fewer clusters)
+  python staticfilter.py --rigid-maxpair 0.12                      # stricter rigidity
+  python staticfilter.py --no-rigid                                # span only; reads no crops
   python staticfilter.py --explain                                 # show every cluster + verdict
+  python tools/eval_rigidity.py                                    # re-sweep the rigidity cut
 """
 from __future__ import annotations
 
@@ -60,6 +94,17 @@ import db
 DEFAULT_IOU = 0.75            # how identical two boxes must be to count as "the same spot"
 DEFAULT_MIN_COUNT = 15        # detections in one spot before it can be furniture
 DEFAULT_MIN_SPAN_MINUTES = 60.0   # ... spread over at least this long
+
+# --- Rigidity (the second test; see the module docstring) -----------------------------------
+# Worst-pair distance between z-normalised crops, below which a cluster is the same pixels every
+# time and cannot be an animal. Swept over 62 known-furniture spots and 30 animal-dominant
+# clusters spanning 2026-07-19..2026-08-11: furniture reaches down to 0.111, the LOWEST animal
+# is 0.225. 0.15 keeps a 50% margin under that animal; 0.22 would leave 2%, which is not a gap.
+# Re-sweep with tools/eval_rigidity.py after any camera or IR change before touching this.
+DEFAULT_RIGID_MAXPAIR = 0.15
+RIGID_SAMPLE = 12             # crops read per cluster -- the cost of the test, so keep it small
+RIGID_MIN_IMAGES = 4          # fewer readable crops than this and the cluster is not judged
+RIGID_EDGE = 64               # crops compared at this size; big enough for pose, cheap to read
 
 MANIFEST_SUFFIX = "static-dropped"
 
@@ -85,17 +130,69 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _znorm(img) -> list[float]:
+    """Flatten to a zero-mean, unit-variance vector. This is what makes the test survive a
+    changing exposure: the trail cam's IR gain and the sun both shift every pixel together, and
+    after this they shift nothing at all. A flat crop (std 0) would divide by zero, so it falls
+    back to 1.0 and simply compares as all-zeros -- correctly, since a flat crop has no
+    structure to disagree about."""
+    px = img.tobytes()          # mode "L" -> one byte per pixel; getdata() is deprecated in Pillow 14
+    n = len(px)
+    mean = sum(px) / n
+    var = sum((p - mean) ** 2 for p in px) / n
+    sd = var ** 0.5 or 1.0
+    return [(p - mean) / sd for p in px]
+
+
+def rigidity(cluster: "Cluster", crops_root: Path | str, *, sample: int = RIGID_SAMPLE,
+             edge: int = RIGID_EDGE) -> float | None:
+    """Worst-pair distance between this cluster's crops, or None if it cannot be measured.
+
+    None means "unjudged", never "static" -- a missing crop, an unreadable JPEG or no Pillow all
+    have to leave the rows alone. Returning 0.0 on failure would delete them, which is the one
+    mistake this module is built not to make.
+    """
+    try:
+        from PIL import Image                    # local: the DB-only paths must not need Pillow
+    except Exception:
+        return None
+    root = Path(crops_root)
+    vecs = []
+    for r in cluster.sample_rows(sample):
+        p = r.get("crop_path") if isinstance(r, dict) else r["crop_path"]
+        if not p:
+            continue
+        try:
+            with Image.open(root / p) as im:
+                vecs.append(_znorm(im.convert("L").resize((edge, edge))))
+        except Exception:
+            continue                             # one unreadable crop must not sink the cluster
+    if len(vecs) < RIGID_MIN_IMAGES:
+        return None
+    worst = 0.0
+    n = len(vecs[0])
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            a, b = vecs[i], vecs[j]
+            d = sum(abs(x - y) for x, y in zip(a, b)) / n
+            if d > worst:
+                worst = d
+    return worst
+
+
 class Cluster:
     """One spot in the frame that at least one detection landed on, plus every detection that
     landed on it. `anchor` is the first box seen -- fixed, never re-averaged, so membership can't
     drift across the frame one near-miss at a time (a running centroid lets a slow-moving animal
     walk a cluster along with it, which is exactly the failure this filter must not have)."""
 
-    __slots__ = ("anchor", "rows")
+    __slots__ = ("anchor", "rows", "reason", "rigidity")
 
     def __init__(self, anchor, row):
         self.anchor = anchor
         self.rows = [row]
+        self.reason = None      # "span" or "rigid" once find_static has judged it
+        self.rigidity = None    # worst-pair score, when it was measured
 
     @property
     def count(self) -> int:
@@ -116,6 +213,13 @@ class Cluster:
             k = r["species"] or "(unlabeled)"
             out[k] = out.get(k, 0) + 1
         return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+    def sample_rows(self, k: int = RIGID_SAMPLE) -> list:
+        """Up to k rows spread evenly across the cluster's life, not the first k -- the whole
+        point of the rigidity test is to compare the ENDS of a cluster, and the first k rows of
+        a 179-detection burst can all be inside the same ten seconds."""
+        step = max(1, len(self.rows) // k)
+        return self.rows[::step][:k]
 
     def is_static(self, min_count: int, min_span_minutes: float) -> bool:
         """Furniture, not an animal: it appeared often enough AND held one box long enough.
@@ -183,11 +287,27 @@ def load_rows(conn, source: str, *, since: str | None = None, until: str | None 
 
 
 def find_static(rows, *, iou: float = DEFAULT_IOU, min_count: int = DEFAULT_MIN_COUNT,
-                min_span_minutes: float = DEFAULT_MIN_SPAN_MINUTES
+                min_span_minutes: float = DEFAULT_MIN_SPAN_MINUTES,
+                rigid_maxpair: float | None = None, crops_root: Path | str | None = None
                 ) -> tuple[list[Cluster], list[Cluster]]:
-    """(static_clusters, all_clusters) for a batch of detection rows."""
+    """(static_clusters, all_clusters) for a batch of detection rows.
+
+    Two independent ways in, and a cluster only has to satisfy ONE: it held a box long enough
+    (span), or its crops are pixel-identical across its whole life (rigidity). Span is tried
+    first because it costs no disk reads -- rigidity is only measured for clusters that already
+    cleared min_count and that span did not already condemn.
+    """
     clusters = cluster_detections(rows, iou)
-    static = [c for c in clusters if c.is_static(min_count, min_span_minutes)]
+    static = []
+    for c in clusters:
+        if c.is_static(min_count, min_span_minutes):
+            c.reason = "span"
+            static.append(c)
+        elif rigid_maxpair and crops_root and c.count >= min_count:
+            c.rigidity = rigidity(c, crops_root)
+            if c.rigidity is not None and c.rigidity < rigid_maxpair:
+                c.reason = "rigid"
+                static.append(c)
     return static, clusters
 
 
@@ -205,8 +325,9 @@ def describe(static: list[Cluster], total_rows: int, *, prefix: str = "  ") -> l
     for c in sorted(static, key=lambda c: -c.count):
         x1, y1, x2, y2 = (int(v) for v in c.anchor)
         tally = ", ".join(f"{k}:{v}" for k, v in c.species_tally().items())
+        why = "" if c.reason in (None, "span") else f"  via={c.reason}({c.rigidity:.3f})"
         lines.append(f"{prefix}  box ({x1},{y1})-({x2},{y2}) {x2-x1}x{y2-y1}  "
-                     f"n={c.count}  span={c.span_minutes:.0f}min  [{tally}]")
+                     f"n={c.count}  span={c.span_minutes:.0f}min{why}  [{tally}]")
         lines.append(f"{prefix}    e.g. {c.rows[0]['crop_path']}")
     return lines
 
@@ -219,8 +340,10 @@ def append_manifest(db_path: Path | str, source: str, static: list[Cluster]) -> 
         with open(manifest_path(db_path, source), "a", encoding="utf-8") as f:
             for c in static:
                 x1, y1, x2, y2 = (int(v) for v in c.anchor)
+                why = c.reason or "span"
+                rig = "" if c.rigidity is None else f" rigidity={c.rigidity:.3f}"
                 f.write(f"# static spot ({x1},{y1})-({x2},{y2}) n={c.count} "
-                        f"span={c.span_minutes:.0f}min\n")
+                        f"span={c.span_minutes:.0f}min via={why}{rig}\n")
                 for r in c.rows:
                     f.write(f"{r['id']}|{r['timestamp']}|{r['species'] or ''}|{r['crop_path']}\n")
     except Exception as e:
@@ -253,7 +376,8 @@ def apply(conn, db_path: Path | str, source: str, static: list[Cluster]) -> int:
 
 def sweep_batch(conn, cfg, source: str, *, min_id: int, iou: float = DEFAULT_IOU,
                 min_count: int = DEFAULT_MIN_COUNT,
-                min_span_minutes: float = DEFAULT_MIN_SPAN_MINUTES) -> int:
+                min_span_minutes: float = DEFAULT_MIN_SPAN_MINUTES,
+                rigid_maxpair: float | None = DEFAULT_RIGID_MAXPAIR) -> int:
     """The importer's entry point: judge ONLY the rows this run just wrote (id > min_id) and
     delete the static ones. Deliberately scoped to the batch -- a cycle is one camera placement,
     which is the unit over which "the same spot" means anything at all. Returns rows deleted.
@@ -266,10 +390,11 @@ def sweep_batch(conn, cfg, source: str, *, min_id: int, iou: float = DEFAULT_IOU
         if not rows:
             return 0
         static, _ = find_static(rows, iou=iou, min_count=min_count,
-                                min_span_minutes=min_span_minutes)
+                                min_span_minutes=min_span_minutes,
+                                rigid_maxpair=rigid_maxpair, crops_root=config.ROOT)
         if not static:
             print(f"  [static] none of this batch's {len(rows)} detection(s) held one spot for "
-                  f"{min_span_minutes:.0f}+ min -- nothing dropped.")
+                  f"{min_span_minutes:.0f}+ min or sat rigid -- nothing dropped.")
             return 0
         print("\n[static] self-calibrating false-fire filter:")
         for line in describe(static, len(rows)):
@@ -301,6 +426,13 @@ def main() -> int:
                    help="Detections in one spot before it can be called furniture.")
     p.add_argument("--min-span-minutes", type=float, default=DEFAULT_MIN_SPAN_MINUTES,
                    help="How long that spot must keep firing before it counts as static.")
+    p.add_argument("--rigid-maxpair", type=float, default=DEFAULT_RIGID_MAXPAIR,
+                   help="Also drop a spot whose crops are identical across its whole life "
+                        "(worst-pair distance below this), however briefly it fired. Catches "
+                        "furniture that STOPPED before clearing --min-span-minutes.")
+    p.add_argument("--no-rigid", action="store_true",
+                   help="Disable the rigidity test entirely; judge on span alone (the pre-"
+                        "2026-08-12 behaviour, and a pure-DB run that reads no crops).")
     p.add_argument("--explain", action="store_true",
                    help="Print EVERY cluster with its verdict, not just the static ones -- how "
                         "you check the thresholds sit in a gap and not on a knife edge.")
@@ -314,16 +446,19 @@ def main() -> int:
         if not rows:
             print(f"No detections for source='{args.source}' in that window.")
             return 0
+        rigid_cut = None if args.no_rigid else args.rigid_maxpair
         static, clusters = find_static(rows, iou=args.iou, min_count=args.min_count,
-                                       min_span_minutes=args.min_span_minutes)
+                                       min_span_minutes=args.min_span_minutes,
+                                       rigid_maxpair=rigid_cut, crops_root=config.ROOT)
         print(f"{len(rows)} detection(s) for source='{args.source}' -> {len(clusters)} spot(s) "
               f"at IoU {args.iou:g}.")
         if args.explain:
-            print(f"\n  {'n':>5} {'span(min)':>10}  {'verdict':<8} box")
+            print(f"\n  {'n':>5} {'span(min)':>10} {'rigidity':>9}  {'verdict':<8} box")
             for cl in sorted(clusters, key=lambda c: -c.count):
                 x1, y1, x2, y2 = (int(v) for v in cl.anchor)
-                verdict = "STATIC" if cl.is_static(args.min_count, args.min_span_minutes) else "keep"
-                print(f"  {cl.count:5d} {cl.span_minutes:10.1f}  {verdict:<8} "
+                verdict = cl.reason.upper() if cl.reason else "keep"
+                rig = "  --  " if cl.rigidity is None else f"{cl.rigidity:.3f}"
+                print(f"  {cl.count:5d} {cl.span_minutes:10.1f} {rig:>9}  {verdict:<8} "
                       f"({x1},{y1})-({x2},{y2})  [{', '.join(f'{k}:{v}' for k, v in cl.species_tally().items())}]")
         print()
         for line in describe(static, len(rows), prefix=""):
