@@ -629,6 +629,23 @@ def seasons_overview(cfg) -> dict:
     return {"weeks": weeks, "species": species, "accumulation": accumulation}
 
 
+def _annotate_lapse(conn, cfg, cast) -> None:
+    """Attach `lapse` to each roll-call entry, in place. Never raises: a roll call that fails to
+    load because of an identity annotation would be a worse outcome than a missing badge, so any
+    problem degrades to the `none` state (which is the LOUD state, not the quiet one)."""
+    import individuals
+    try:
+        table = individuals.lapse_by_name(conn, cfg=cfg)
+        for c in cast:
+            c["lapse"] = (table.get(str(c["id"]).strip().casefold())
+                          or individuals.identity_lapse(None, 0, cfg=cfg))
+    except Exception:                       # noqa: BLE001 -- see the docstring
+        for c in cast:
+            c.setdefault("lapse", {"state": "none", "days": None, "expected_top1": None,
+                                   "beats_guessing": False,
+                                   "why": "template freshness could not be read."})
+
+
 def cast_rollcall(cfg, now=None) -> dict:
     """The named cast with last-seen + an 'overdue' flag -- the daily "who's back / who hasn't
     shown" roll for the Dispatch and Individuals tab. Placeholder clusters (raccoon_c01) are
@@ -692,6 +709,13 @@ def cast_rollcall(cfg, now=None) -> dict:
                 base["via_group"] = c["id"]
                 base["overdue"] = bool(base["regular"] and base["typical_gap_days"]
                                        and base["days_since"] > max(2, 2 * base["typical_gap_days"]))
+        # HAS THE MATCHER LOST THIS ANIMAL? Different question from "overdue", and the roll is the
+        # one place both belong: overdue is about the RACCOON (it hasn't come), lapsed is about US
+        # (nothing has confirmed it lately, so the matcher can no longer vouch for the name). An
+        # animal can be here every night and lapsed, which is precisely the state that quietly
+        # rots the label set. Computed from human-confirmed, non-group, non-co-present visits --
+        # the same set templates() would use, without loading a single embedding.
+        _annotate_lapse(conn, cfg, cast)
         cast.sort(key=lambda c: (not c["overdue"],
                                  c["days_since"] if c["days_since"] is not None else 1e9))
         return {"cast": cast, "as_of": now.isoformat()}
@@ -833,6 +857,80 @@ def individual_motion(cfg, individual_id) -> dict:
             "moving_frac": _mean("moving_frac"),
             "approach": approach, "retreat": retreat, "steady": steady,
         }
+    finally:
+        conn.close()
+
+
+def behaviour_profile(cfg, individual_id=None, species=None, *, min_visits: int = 3) -> dict:
+    """What this animal mostly DOES, across every visit -- "Stan: 84% fed here" rather than one
+    visit's word.
+
+    The tag has been computed per visit since the coarse behaviour pass shipped and then thrown
+    away every time; totalling it is the entire feature, and it says more about an animal than any
+    single visit does. A `GROUP BY` in spirit, done in Python because the visit/clip relation is a
+    TIME OVERLAP rather than a foreign key (stats.py's standing convention).
+
+    Deliberately NOT built on `clip_tracks.individual_id`: that column is 0-of-897 populated, so
+    `individual_motion` -- which reads it -- returns nothing for everybody. This walks the
+    individual's VISITS instead, which is where their name actually lives.
+
+    Returns {n_visits, n_tagged, tags: {tag: n}, share: {tag: fraction}, dominant, thin}. `thin`
+    is True below `min_visits` tagged visits, and the caller must not print a percentage then --
+    "100% fed here" off one visit is a sentence about arithmetic, not about a raccoon.
+    """
+    out = {"n_visits": 0, "n_tagged": 0, "tags": {}, "share": {}, "dominant": None, "thin": True,
+           "individual_id": individual_id, "species": species}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return out
+    try:
+        if individual_id:
+            visits = conn.execute(
+                """SELECT DISTINCT v.id, v.source, v.started_at, v.ended_at FROM visits v
+                   JOIN detections d ON d.visit_id = v.id
+                   WHERE d.individual_id = ?""", (individual_id,)).fetchall()
+        elif species:
+            visits = conn.execute(
+                "SELECT id, source, started_at, ended_at FROM visits WHERE species = ?",
+                (species,)).fetchall()
+        else:
+            return out
+        out["n_visits"] = len(visits)
+        if not visits:
+            return out
+        # include_pruned=True, and it is the difference between a feature and an empty dict. The
+        # prune is SOFT: the video file goes, the derived clip_tracks stay. Playback has to filter
+        # pruned clips; ANALYTICS must not, or every total silently becomes "the last two weeks".
+        # Measured: filtering them left Stan with 0 tagged visits out of 64.
+        clips = load_clips(conn, include_pruned=True)
+        tracks: dict = defaultdict(list)
+        for r in conn.execute(
+                "SELECT clip_id, straightness, moving_frac FROM clip_tracks"):
+            tracks[r["clip_id"]].append((r["straightness"], r["moving_frac"]))
+        tally: Counter = Counter()
+        for v in visits:
+            start, end = _parse(v["started_at"]), _parse(v["ended_at"])
+            if start is None or end is None:
+                continue
+            rs = [t for c in clips_overlapping(clips, v["source"], start, end)
+                  for t in tracks.get(c["id"], ())]
+            if not rs:
+                continue
+            mf = [m for _s, m in rs if m is not None]
+            st = [s for s, _m in rs if s is not None]
+            tag = _behaviour_tag((end - start).total_seconds() / 60.0,
+                                 sum(mf) / len(mf) if mf else None,
+                                 sum(st) / len(st) if st else None)
+            if tag:
+                tally[tag] += 1
+        n = sum(tally.values())
+        out["n_tagged"] = n
+        out["tags"] = dict(tally.most_common())
+        out["thin"] = n < int(min_visits)
+        if n:
+            out["share"] = {k: round(c / n, 3) for k, c in tally.most_common()}
+            out["dominant"] = tally.most_common(1)[0][0]
+        return out
     finally:
         conn.close()
 
@@ -1134,6 +1232,9 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
             "visits": visits,
             "references": refs,
             "status": status,
+            # What they mostly DO, totalled over every visit. The per-visit tag has been computed
+            # and discarded since the coarse behaviour pass shipped; this is the total.
+            "behaviour": behaviour_profile(cfg, individual_id=name),
         }
     finally:
         conn.close()
@@ -1678,5 +1779,45 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         "first_visitor": {"species": pr[0]["label"], "time": pr[0]["dt"].isoformat()},
         "last_visitor": {"species": pr[-1]["label"], "time": pr[-1]["dt"].isoformat()},
         "busiest_hour": ({"hour": bh[0], "visits": bh[1]} if bh else None),
+        "crowd": crowd_peak(pr),
     })
     return done(out)
+
+
+def crowd_peak(rows, iou_max: float = 0.45) -> dict:
+    """The busiest INSTANT of a period: "at least N animals were in the yard at once".
+
+    A LOWER BOUND, and it must always be worded as one. Three separate floors sit under it: the
+    detector's recall on a huddle is about 0.39; `individuals.max_separated` is greedy; and the
+    glass door's sparse saved stills only see the instants something was written. The number is
+    what the yard DEMONSTRABLY held, never what it held.
+
+    NO ATTRIBUTION, ever -- how many bodies, never whose, and never "all four of CutiePie's kits
+    showed". Per-family kit headcount from track overlap was proposed, tested against the one
+    eye-verified four-animal window, and killed: the covering glass-door clips held zero sustained
+    tracklets and the detector produced a maximum of ONE box at any instant where a human counted
+    four (docs/deferred-work.md, Killed). This is the salvageable kernel of that idea and nothing
+    more. It is also SEASONAL -- the kits are kit-sized now and will not be -- so it dates itself.
+
+    `rows` are the digest's row dicts (dt / source / label / bbox_*). Returns
+    {n, at, source, by_species} for the instant with the largest separated set, or n=0.
+    """
+    import individuals
+    by_instant: dict = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        if r.get("bbox_x1") is None:
+            continue
+        by_instant[(r["source"], r["timestamp"])][r["label"]].append(
+            (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]))
+    best = {"n": 0, "at": None, "source": None, "by_species": {}}
+    for (src, ts), by_sp in by_instant.items():
+        # Count within a species AND across the whole instant: two crows and a raccoon is three
+        # animals, and one species' own boxes are the case the IoU rule was measured for.
+        per_sp = {sp: individuals.max_separated(bs, iou_max) for sp, bs in by_sp.items()}
+        n = max(max(per_sp.values()),
+                individuals.max_separated([b for bs in by_sp.values() for b in bs], iou_max))
+        if n > best["n"]:
+            best = {"n": n, "at": ts, "source": src,
+                    "by_species": {k: v for k, v in sorted(per_sp.items(), key=lambda kv: -kv[1])
+                                   if v}}
+    return best

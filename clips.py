@@ -29,6 +29,7 @@ if that's too much.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 from collections import deque
@@ -39,6 +40,10 @@ import cv2
 
 import config
 import db
+
+# The day-folder shape backup.day_dirs archives. Kept here rather than imported so the pruner
+# never drags backup.py (and its logging/zipfile setup) into the capture process.
+_DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Upper bound assumed for sizing the pre-roll ring (frames = pre_roll_s * this). The real fps is
 # measured for playback; this only bounds the buffer so memory can't grow without limit.
@@ -164,10 +169,14 @@ def prune_clips(cfg: config.Config, conn) -> int:
         total = sum(sz for _, sz, _ in files)
         if total <= budget:
             continue
-        n_here = 0
+        guard = _archive_guard(cfg, key)
+        n_here = n_held = 0
         for _mt, sz, p in sorted(files):       # oldest first, WITHIN this source only
             if total <= budget:
                 break
+            if guard is not None and not guard(p):
+                n_held += 1
+                continue                       # the only copy: the budget does not get to win
             try:
                 p.unlink()
             except OSError:
@@ -190,7 +199,54 @@ def prune_clips(cfg: config.Config, conn) -> int:
             removed += n_here
             print(f"[clips] pruned {n_here} oldest {key or 'legacy'} clip(s) to stay under "
                   f"{budget / 1024 ** 3:g} GB (rolling window).")
+        if n_held:
+            # LOUD, because the budget is now being exceeded on purpose and only a human can fix
+            # it -- run backup.py (or `--backup-first`) and the next prune will proceed.
+            print(f"[clips] KEPT {n_held} {key} clip(s) the budget wanted to delete: they are not "
+                  f"in the day-archive yet, and this source's footage exists nowhere else. "
+                  f"clips/ is over budget by {(total - budget) / 1024 ** 3:.1f} GB until "
+                  f"backup.py archives them.")
     return removed
+
+
+def _archive_guard(cfg: config.Config, key):
+    """A `path -> bool` "is it safe to delete this?" test for an IRREPLACEABLE source, or None
+    when this source is replaceable and the budget alone decides.
+
+    Safe means: the day-archive zip that would hold this clip already exists on the backup
+    destination. Existence of the zip, not of the member -- reading every zip's index on every
+    prune would be minutes of work on the capture box, and a day's zip is written whole.
+
+    FAILS CLOSED, three times over. No backup destination configured, an unreachable drive, or an
+    unrecognised path layout all return "not safe", so the file survives and the budget is
+    exceeded instead. That is the project's stated asymmetry as code: a full disk is a problem you
+    can see and fix, and footage from a card that has since been formatted is not.
+    """
+    sources = getattr(cfg, "clips_irreplaceable_sources", ()) or ()
+    if key is None or key not in {_safe_source(s) for s in sources}:
+        return None
+    dest = getattr(cfg, "backup_dest", None)
+    archive = Path(dest) / "clips" if dest else None
+
+    def safe(p: Path) -> bool:
+        if archive is None:
+            return False
+        try:
+            rel = p.relative_to(cfg.clips_dir)
+        except ValueError:
+            return False
+        parts = rel.parts
+        if len(parts) == 3 and _DAY_DIR_RE.match(parts[1]):     # <source>/<date>/<file>.mp4
+            name = f"clips-{parts[0]}-{parts[1]}.zip"
+        elif len(parts) == 2 and _DAY_DIR_RE.match(parts[0]):   # legacy <date>/<file>.mp4
+            name = f"clips-{parts[0]}.zip"
+        else:
+            return False        # a layout backup.day_dirs would not archive -> assume unarchived
+        try:
+            return (archive / name).is_file()
+        except OSError:
+            return False                          # drive unplugged mid-prune -> keep the footage
+    return safe
 
 
 def _video_codec(path: Path) -> str:

@@ -906,6 +906,64 @@ class DetectorCensus:
 
 
 # ---- Reference-image veto, SHADOW MODE (refimg.py) -----------------------------------
+class VetoCensus:
+    """What the shadow veto DECIDED this hour, including everything it declined to decide.
+
+    This exists because of a specific, expensive lesson. `db.record_suppression` writes a row only
+    when the answer is SUPPRESS, so a veto that abstains on everything is indistinguishable in the
+    database from a veto that is perfectly precise -- and that is exactly the state the 2026-08-09
+    review found it in. Recovering the reason took replaying every detection of the shadow week
+    against the banked reference PNGs off recorded clips. One line an hour would have answered it:
+    94.9% of boxes never got past the coverage gate, and no daytime box has EVER cleared it.
+
+    Deliberately the same shape as DetectorCensus above -- counters, one print per period, no rows,
+    no schema. The cover quantiles are the load-bearing part: the question a shadow review actually
+    has to answer is not "how many did it flag" but "how close did the rest come".
+    """
+
+    def __init__(self, period_s: float = 3600.0):
+        self.period_s = float(period_s)
+        self.reasons: dict[str, int] = {}
+        self.covers: list[float] = []
+        self._start: float | None = None
+
+    def note(self, decision) -> None:
+        """Record one judged box. `decision` is a refimg.Decision, or None when the veto could not
+        evaluate at all (no prepared frame) -- which is itself worth counting."""
+        reason = "not_evaluated" if decision is None else decision.reason
+        self.reasons[reason] = self.reasons.get(reason, 0) + 1
+        if decision is not None and decision.cover is not None:
+            self.covers.append(float(decision.cover))
+
+    def line(self, now: float) -> str:
+        n = sum(self.reasons.values())
+        span_min = (now - (self._start if self._start is not None else now)) / 60.0
+        parts = ", ".join(f"{k} {v}" for k, v in
+                          sorted(self.reasons.items(), key=lambda kv: -kv[1]))
+        cover = "no box reached the coverage gate"
+        if self.covers:
+            c = sorted(self.covers)
+            def pct(p): return c[min(len(c) - 1, int(p * len(c)))]
+            cover = (f"cover p50 {pct(0.50):.3f} / p90 {pct(0.90):.3f} / max {c[-1]:.3f}, "
+                     f"{sum(v >= refimg.COVER_MIN_FRACTION for v in c)} at or above the bar")
+        return (f"veto census: {n} box(es) judged over {span_min:.0f} min -- {parts or 'none'}; "
+                f"{cover}")
+
+    def roll(self, now: float) -> str | None:
+        """The hourly line, or None if the period isn't up. An hour in which the veto judged
+        NOTHING still prints: silence must not stand in for a measurement."""
+        if self._start is None:
+            self._start = now
+            return None
+        if now - self._start < self.period_s:
+            return None
+        text = self.line(now)
+        self._start = now
+        self.reasons = {}
+        self.covers = []
+        return text
+
+
 def _short_age(seconds: float) -> str:
     """A compact age for the HUD: 42s / 7m / 3.1h."""
     s = max(0.0, float(seconds))
@@ -969,6 +1027,8 @@ class RefimgShadow:
         self._pinned: dict = {}          # illumination -> the reference written to the DB
         self.n_suppressed = 0
         self.n_judged = 0
+        # Every decision, not only the suppressions -- see VetoCensus.
+        self.census = VetoCensus()
 
     @classmethod
     def create(cls, cfg: config.Config, source: str, conn, tag: str = "") -> "RefimgShadow | None":
@@ -1050,6 +1110,7 @@ class RefimgShadow:
         None if it could not be evaluated). The row, the crop and every downstream consumer are
         untouched either way -- a SUPPRESS only adds the four metadata columns."""
         if self.obs is None:
+            self.census.note(None)
             return None
         try:
             box = self.obs.to_working(det.bbox)
@@ -1058,6 +1119,7 @@ class RefimgShadow:
             self.recurrence.observe(box, self.obs.ts, epoch=self.obs.view_epoch)
             decision = self.veto.evaluate(box, self.obs, self.ref, self.recurrence)
             self.n_judged += 1
+            self.census.note(decision)
             if decision.suppressed:
                 db.record_suppression(conn, detection_id, db.SUPPRESSED_BY_REFIMG_VETO,
                                       ref_id=decision.ref_id, detail_json=decision.to_json())
@@ -1069,8 +1131,13 @@ class RefimgShadow:
             self.recurrence.save(self.obs.ts)      # throttled + atomic; a no-op most calls
             return decision
         except Exception as e:
+            self.census.note(None)
             self._warn("judging a box", e)
             return None
+
+    def roll_census(self, now: float) -> str | None:
+        """The hourly veto census line, or None. Cheap enough to call every frame."""
+        return self.census.roll(now)
 
     # -- presentation / shutdown -----------------------------------------------------------
     def hud(self) -> str:
@@ -1554,6 +1621,10 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             census_line = census.roll(now)
             if census_line:
                 print(f"{tag} {census_line}")
+            if shadow is not None:
+                veto_line = shadow.roll_census(now)
+                if veto_line:
+                    print(f"{tag} {veto_line}")
 
             # --- Detector (only on motion, rate-limited, under the shared-detector lock) ---
             if motion and (now - last_detect_t) >= cfg.detector_min_interval_s:

@@ -107,6 +107,21 @@ def test_cast_rollcall_recent_regular_not_overdue(conn, db_path):
     assert c["regular"] is True and c["overdue"] is False and c["days_since"] == 0
 
 
+def test_cast_rollcall_reports_the_lapse_state_beside_overdue(conn, db_path):
+    """Two different facts, and the roll is where both belong. "Overdue" is about the RACCOON --
+    it has not come. "Lapsed" is about US -- nothing has confirmed it lately, so the matcher can
+    no longer vouch for the name. An animal that is here every night and lapsed is exactly the
+    state that quietly rots the label set, and it was invisible until this."""
+    for d in (2, 1, 0):
+        _add_named(conn, "Stan", days_ago=d)
+    by = {c["id"]: c for c in stats.cast_rollcall(_cfg(db_path))["cast"]}
+    # Present every night, but nothing here is a human-confirmed SOLO VISIT -- so there is no
+    # template at all, which is the loud state, not the quiet one.
+    assert by["Stan"]["overdue"] is False
+    assert by["Stan"]["lapse"]["state"] == "none"
+    assert by["Stan"]["lapse"]["beats_guessing"] is False
+
+
 # ---- review_queue: the prioritized "most likely mislabeled" pass --------------------
 def test_review_queue_empty_db(conn, db_path):
     rq = stats.review_queue(_cfg(db_path))
@@ -412,3 +427,132 @@ def test_sun_without_a_location_still_gives_a_positive_day():
     dawn, dusk = stats._sun(cfg, date(2026, 8, 7))
     assert dawn < dusk and (dusk - dawn) == timedelta(hours=12)       # the 06:00/18:00 fallback
     stats._SUN_CACHE.clear()
+
+
+# ---- crowd_peak: "at least N animals at once", a lower bound and nothing more ---------
+# The salvageable kernel of the killed per-family kit headcount. Every test here pins the
+# UNDER-counting direction, because a claim of the form "the yard held at least this many" is the
+# only claim this corpus supports -- the detector's recall on a huddle is about 0.39.
+
+def _row(ts, box, *, label="raccoon", source="glass_door_cam"):
+    return {"timestamp": ts, "dt": None, "source": source, "label": label,
+            "bbox_x1": box[0], "bbox_y1": box[1], "bbox_x2": box[2], "bbox_y2": box[3]}
+
+
+def test_crowd_peak_counts_separate_bodies_at_one_instant():
+    rows = [_row("t1", (0, 0, 10, 10)), _row("t1", (50, 50, 60, 60)), _row("t1", (90, 90, 99, 99)),
+            _row("t2", (0, 0, 10, 10))]
+    c = stats.crowd_peak(rows)
+    assert c["n"] == 3 and c["at"] == "t1" and c["by_species"] == {"raccoon": 3}
+
+
+def test_crowd_peak_does_not_count_the_detector_double_boxing_one_animal():
+    # High IoU is one animal boxed twice; that is what the 0.45 cut was measured for.
+    rows = [_row("t1", (0, 0, 10, 10)), _row("t1", (1, 1, 11, 11))]
+    assert stats.crowd_peak(rows)["n"] == 1
+
+
+def test_crowd_peak_adds_up_across_species():
+    rows = [_row("t1", (0, 0, 10, 10), label="raccoon"),
+            _row("t1", (50, 50, 60, 60), label="Virginia opossum")]
+    c = stats.crowd_peak(rows)
+    assert c["n"] == 2 and c["by_species"] == {"raccoon": 1, "Virginia opossum": 1}
+
+
+def test_crowd_peak_never_counts_across_cameras():
+    # Two yards' worth of boxes at the same instant is not two animals in one frame.
+    rows = [_row("t1", (0, 0, 10, 10), source="glass_door_cam"),
+            _row("t1", (50, 50, 60, 60), source="trail_cam_sd")]
+    assert stats.crowd_peak(rows)["n"] == 1
+
+
+def test_crowd_peak_is_empty_without_boxes():
+    assert stats.crowd_peak([])["n"] == 0
+    assert stats.crowd_peak([{"timestamp": "t", "source": "s", "label": "raccoon",
+                              "bbox_x1": None}])["n"] == 0
+
+
+# ---- behaviour_profile: what an animal mostly DOES, totalled -------------------------
+# The per-visit tag has existed since the coarse behaviour pass and been thrown away every time.
+
+def _clip_with_track(conn, *, start_min, end_min, moving_frac, straightness=0.2,
+                     source=db.SOURCE_GLASS_DOOR_CAM, pruned=False):
+    ts = (datetime.now().astimezone() - timedelta(days=1))
+    a = (ts + timedelta(minutes=start_min)).isoformat()
+    b = (ts + timedelta(minutes=end_min)).isoformat()
+    cid = db.insert_clip(conn, source=source, clip_path=f"clips/{start_min}.mp4",
+                         started_at=a, ended_at=b, fps=10.0, width=64, height=36,
+                         frame_count=10, detection_count=1, max_confidence=0.9)
+    if pruned:
+        conn.execute("UPDATE clips SET pruned_at = ? WHERE id = ?", (b, cid))
+    conn.execute(
+        "INSERT INTO clip_tracks (clip_id, model, created_at, n_samples, n_hits, track, "
+        "duration_s, straightness, moving_frac) VALUES (?,?,?,?,?,?,?,?,?)",
+        (cid, "m", a, 10, 10, "[]", 60.0, straightness, moving_frac))
+    conn.commit()
+    return cid, a, b
+
+
+def _visit_over(conn, a, b, *, species="raccoon", individual=None,
+                source=db.SOURCE_GLASS_DOOR_CAM):
+    did = db.insert_detection(conn, timestamp=a, source=source, detection_class="animal",
+                              confidence=0.9, bbox=(0, 0, 10, 10), frame_w=100, frame_h=100,
+                              crop_path="crops/x.jpg", species=species,
+                              individual_id=individual, crop_quality=1.0)
+    vid = db.insert_visit(conn, source=source, species=species, individual_id=individual,
+                          started_at=a, ended_at=b, detection_count=1, max_confidence=0.9,
+                          representative_detection_id=did)
+    db.assign_visit(conn, [did], vid)
+    conn.commit()
+    return vid
+
+
+def test_behaviour_profile_totals_the_per_visit_tag(conn, db_path):
+    # Two long, mostly-still visits ("fed here") and one brief, busy one ("passed through").
+    for i, (mf, dur) in enumerate([(0.1, 5.0), (0.1, 5.0), (0.9, 1.0)]):
+        _, a, b = _clip_with_track(conn, start_min=i * 60, end_min=i * 60 + dur, moving_frac=mf)
+        _visit_over(conn, a, b, individual="Stan")
+    p = stats.behaviour_profile(_cfg(db_path), individual_id="Stan")
+    assert p["n_tagged"] == 3
+    assert p["tags"]["fed here"] == 2 and p["dominant"] == "fed here"
+    assert p["share"]["fed here"] == pytest.approx(2 / 3, abs=5e-4)   # rounded to 3dp
+    assert p["thin"] is False
+
+
+def test_behaviour_profile_counts_visits_whose_clips_were_PRUNED(conn, db_path):
+    """The prune is SOFT: the video goes, the derived tracks stay. Playback has to filter pruned
+    clips; analytics must not, or every total silently becomes "the last two weeks". Measured on
+    the real corpus: filtering them left Stan with 0 tagged visits out of 64."""
+    _, a, b = _clip_with_track(conn, start_min=0, end_min=5.0, moving_frac=0.1, pruned=True)
+    _visit_over(conn, a, b, individual="Stan")
+    assert stats.behaviour_profile(_cfg(db_path), individual_id="Stan")["n_tagged"] == 1
+
+
+def test_behaviour_profile_flags_a_thin_sample_instead_of_printing_a_percentage(conn, db_path):
+    """"100% fed here" off one visit is a sentence about arithmetic, not about a raccoon."""
+    _, a, b = _clip_with_track(conn, start_min=0, end_min=5.0, moving_frac=0.1)
+    _visit_over(conn, a, b, individual="Elliot")
+    p = stats.behaviour_profile(_cfg(db_path), individual_id="Elliot")
+    assert p["n_tagged"] == 1 and p["thin"] is True
+
+
+def test_behaviour_profile_says_how_many_visits_it_could_not_tag(conn, db_path):
+    # A visit with no overlapping clip has no motion features and so no tag -- and the caller has
+    # to be able to see that, or 6 tagged visits out of 64 reads as the whole animal.
+    _, a, b = _clip_with_track(conn, start_min=0, end_min=5.0, moving_frac=0.1)
+    _visit_over(conn, a, b, individual="Stan")
+    far = (datetime.now().astimezone() - timedelta(days=9))
+    _visit_over(conn, far.isoformat(), (far + timedelta(minutes=4)).isoformat(), individual="Stan")
+    p = stats.behaviour_profile(_cfg(db_path), individual_id="Stan")
+    assert p["n_visits"] == 2 and p["n_tagged"] == 1
+
+
+def test_behaviour_profile_works_by_species_too(conn, db_path):
+    _, a, b = _clip_with_track(conn, start_min=0, end_min=5.0, moving_frac=0.1)
+    _visit_over(conn, a, b, species="domestic cat")
+    p = stats.behaviour_profile(_cfg(db_path), species="domestic cat")
+    assert p["n_tagged"] == 1 and p["dominant"] == "fed here"
+
+
+def test_behaviour_profile_empty_without_a_subject(conn, db_path):
+    assert stats.behaviour_profile(_cfg(db_path))["n_visits"] == 0

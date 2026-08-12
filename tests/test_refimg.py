@@ -150,6 +150,38 @@ def test_a_gap_in_observation_cancels_a_pending_disagreement():
     assert w.epoch == 0
 
 
+def test_the_night_gap_re_seeds_the_template_instead_of_calling_sunrise_a_reposition():
+    """THE DAWN BUG, measured on the live rig 2026-08-09T05:56:52.
+
+    Day frames stop at dusk and start again at sunrise, so the template freezes on an evening
+    frame. This fingerprint does not survive a change of daylight -- with the camera provably
+    stationary, that rig's day references correlate 0.075-0.68 across one day -- so the first five
+    continuous minutes of dawn read as five minutes of sustained disagreement and the epoch bumped
+    at corr 0.261, while the two references four minutes either side of the bump correlate 0.987.
+    A false bump retires every reference AND flushes the recurrence ledger, whose >= 2 calendar
+    days of evidence then has to be re-earned. Every morning.
+    """
+    w = refimg.ViewWatcher(persist_s=300.0, max_gap_s=60.0)
+    evening, dawn = fp(yard(seed=1)), fp(yard(seed=99))
+    for t in range(0, 120, 5):
+        w.observe(t, "day", evening)
+    for t in range(9 * 3600, 9 * 3600 + 900, 5):     # nine hours later, dawn, frames flowing
+        w.observe(t, "day", dawn)
+    assert w.epoch == 0
+    assert w.reseeds == 1
+
+
+def test_a_reposition_while_the_yard_is_being_watched_still_bumps():
+    """The re-seed must not disarm the detector it lives in: a move mid-stream is still caught."""
+    w = refimg.ViewWatcher(persist_s=300.0, max_gap_s=60.0)
+    here, moved = fp(yard(seed=1)), fp(yard(seed=99))
+    for t in range(0, 600, 5):
+        w.observe(t, "day", here)
+    for t in range(600, 600 + 400, 5):               # no gap: this really is a reposition
+        w.observe(t, "day", moved)
+    assert w.epoch == 1
+
+
 def test_ir_and_night_frames_never_bump_the_epoch():
     """Every IR frame across 12 days spanning confirmed repositions collapsed into ONE view
     cluster: IR cannot see that the camera moved, so it must never be allowed to vote."""
@@ -270,6 +302,41 @@ def test_coverage_is_forgotten_after_the_no_update_horizon():
     assert not mgr.get("day").covered((45, 35, 105, 85))
     mgr.observe(frame, detections=None, motion_mask=quiet_mask(), now=1010.0 + 3601)
     assert mgr.get("day").covered((45, 35, 105, 85))
+
+
+def test_coverage_remembers_the_blob_and_not_its_bounding_rectangle():
+    """A diagonal streak of motion is not a rectangle of motion.
+
+    The first version remembered cv2.boundingRect() of each blob, which disowns pixels nothing ever
+    moved over -- measured at 1.37x the blobs' own area over the 13,438 motion-positive frames of
+    2026-08-09 00:00-05:30. The corner OFF the streak has to stay covered, or the reference is
+    claiming ignorance it does not have.
+    """
+    mgr = refimg.ReferenceManager(hold_s=4.0)
+    frame = yard()
+    certify(mgr, frame, t0=1000.0)
+    streak = np.zeros((refimg.H, refimg.W), np.uint8)
+    cv2.line(streak, (40, 30), (140, 130), 255, 9)          # a bottom-left-to-top-right diagonal
+    mgr.observe(frame, detections=[], motion_mask=streak, now=1010.0)
+    ref = mgr.get("day")
+    assert not ref.covered((80, 70, 100, 90))               # ON the streak: disowned, as before
+    assert ref.covered((105, 35, 135, 60))                  # the rectangle's corner: never moved
+
+
+def test_the_motion_memory_does_not_grow_with_a_busy_night():
+    """Cost, not safety, and it is on the CAPTURE THREAD. The rectangle list was re-drawn in full
+    on every frame: measured 4.9 ms at 2,500 remembered rectangles and 16.7 ms at 10,000, against
+    the 7.6 ms the whole per-frame veto was budgeted at -- and the busiest hour measured on this
+    rig ran 1,546 detector frames. One timestamp per pixel is flat in both memory and time."""
+    mgr = refimg.ReferenceManager(hold_s=4.0)
+    frame = yard()
+    certify(mgr, frame, t0=1000.0)
+    before = mgr._motion_at.nbytes
+    for i in range(400):
+        mgr.observe(frame, detections=[], motion_mask=blob_mask((i % 200, i % 100,
+                                                                i % 200 + 30, i % 100 + 30)),
+                    now=1010.0 + i)
+    assert mgr._motion_at.nbytes == before
 
 
 def test_an_epoch_change_flushes_every_reference():

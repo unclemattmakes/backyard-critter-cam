@@ -17,6 +17,7 @@ decodable .mp4 (reopened with cv2.VideoCapture, frames counted). cv2 + numpy are
 from __future__ import annotations
 
 import dataclasses
+import os
 import shutil
 import subprocess
 
@@ -572,7 +573,8 @@ def test_prune_budgets_are_per_source(clip_cfg, clip_conn):
         clip_cfg,
         clips_max_gb=_mib_budget(3),                              # live: 3 MiB, holds all 3
         clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(2)},   # card: 2 MiB, sheds 2
-    )
+        clips_irreplaceable_sources=(),   # this test is about the BUDGET split; the archive gate
+    )                                     # is exercised on its own below
 
     assert clips.prune_clips(cfg, clip_conn) == 2
     # Every live clip survives even though they are the NEWEST files present ...
@@ -623,3 +625,69 @@ def test_prune_legacy_flat_clips_still_roll(clip_cfg, clip_conn):
     assert clips.prune_clips(cfg, clip_conn) == 1
     assert not (clip_cfg.clips_dir / "a.mp4").exists()
     assert dict(clip_conn.execute("SELECT id, pruned_at FROM clips").fetchall())[a]
+
+
+# ---- The archive gate: the budget is a preference, "the only copy" is not ------------
+# Until this shipped, protecting irreplaceable footage was a ritual -- remember --backup-first,
+# keep the budget generous, remember backup.py runs weekly and skips today so the newest day
+# always lags. A ritual is a thing you can forget once.
+
+def _dated_clip(cfg, conn, source, day, name, *, mtime, mib=1):
+    """A clip in the REAL on-disk layout: clips/<source>/<YYYY-MM-DD>/<file>.mp4."""
+    d = cfg.clips_dir / source / day
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_bytes(bytes(mib * 1024 * 1024))
+    os.utime(p, (mtime, mtime))
+    cid = db.insert_clip(conn, source=source, clip_path=db.rel_to_root(p),
+                         started_at=f"{day}T21:00:00-07:00", ended_at=f"{day}T21:00:05-07:00",
+                         fps=10.0, width=64, height=36, frame_count=10,
+                         detection_count=1, max_confidence=0.9)
+    conn.commit()
+    return cid, p
+
+
+def test_prune_refuses_to_delete_the_only_copy(clip_cfg, clip_conn, tmp_path):
+    """An irreplaceable source's clip is kept when its day-archive does not exist yet -- even
+    though the budget says delete it. The card is formatted every cycle; this footage exists in
+    exactly one place until backup.py has zipped it."""
+    _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4", mtime=1_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    cfg = dataclasses.replace(clip_cfg, backup_dest=dest,
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(1)},
+                              clips_irreplaceable_sources=("trail_cam_sd",))
+    assert clips.prune_clips(cfg, clip_conn) == 0
+    assert (clip_cfg.clips_dir / "trail_cam_sd" / "2026-08-01" / "a.mp4").exists()
+
+
+def test_prune_proceeds_once_the_day_archive_exists(clip_cfg, clip_conn, tmp_path):
+    _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4", mtime=1_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    (dest / "clips" / "clips-trail_cam_sd-2026-08-01.zip").write_bytes(b"PK" + bytes([5, 6]) + bytes(18))
+    cfg = dataclasses.replace(clip_cfg, backup_dest=dest,
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(1)},
+                              clips_irreplaceable_sources=("trail_cam_sd",))
+    assert clips.prune_clips(cfg, clip_conn) == 1
+    assert not (clip_cfg.clips_dir / "trail_cam_sd" / "2026-08-01" / "a.mp4").exists()
+
+
+def test_prune_gate_fails_closed_without_a_backup_destination(clip_cfg, clip_conn):
+    """No drive configured, an unplugged drive, an unrecognised layout: all mean "I cannot prove
+    a copy exists", and all keep the footage. A full disk is a problem you can see and fix."""
+    _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4", mtime=1_000, mib=2)
+    cfg = dataclasses.replace(clip_cfg, backup_dest=None,
+                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(1)},
+                              clips_irreplaceable_sources=("trail_cam_sd",))
+    assert clips.prune_clips(cfg, clip_conn) == 0
+
+
+def test_prune_gate_only_guards_the_sources_named_irreplaceable(clip_cfg, clip_conn, tmp_path):
+    """The live rig can re-record tomorrow, so its rolling window must keep rolling whatever the
+    backup drive is doing -- otherwise an unplugged drive quietly fills the disk."""
+    _dated_clip(clip_cfg, clip_conn, "glass_door_cam", "2026-08-01", "a.mp4", mtime=1_000, mib=2)
+    cfg = dataclasses.replace(clip_cfg, backup_dest=tmp_path / "nowhere",
+                              clips_max_gb=_mib_budget(1),
+                              clips_irreplaceable_sources=("trail_cam_sd",))
+    assert clips.prune_clips(cfg, clip_conn) == 1
