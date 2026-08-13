@@ -80,10 +80,15 @@ Dedupe does not touch the second inflation mechanism, because a shrub is genuine
 the raccoon beside it. Frames stored as "four animals, three of them raccoons" turned out by eye
 to be one raccoon plus a shrub, a tipped bucket and a wall.
 
-staticfilter.py already suppresses furniture on batch imports, but it keys on box persistence
-alone -- "nothing holds one box for an hour" -- which is false for a fixed-framing camera where a
-raccoon feeds at a fixed dish, and running it on the live rig would delete thousands of real
-raccoon rows. So this module adds the criterion an animal cannot satisfy: a static box's PIXELS
+staticfilter.py already suppresses furniture on batch imports. Its primary test keys on box
+persistence -- "nothing holds one box for an hour" -- which is false for a fixed-framing camera
+where a raccoon feeds at a fixed dish, so running THAT test on the live rig would delete
+thousands of real raccoon rows. (Since 2026-08-12 it has a second, pixel-based test as well --
+see its "rigidity" -- which is the same argument this module makes; the two were arrived at
+independently and agree. The difference is that staticfilter applies rigidity on its own,
+"however briefly it fired", where this module insists on BOTH conditions, because it runs live
+against a raccoon that may sit still for one burst.) So this module adds the criterion an
+animal cannot satisfy: a static box's PIXELS
 do not change either.
 
     motion_ratio = mean |frame_t - frame_t-1| INSIDE the box
@@ -359,9 +364,11 @@ class Cluster:
                      motion_max: float = DEFAULT_MOTION_RATIO,
                      min_frames: int = DEFAULT_STATIC_MIN_FRAMES,
                      min_share: float = DEFAULT_STATIC_MIN_SHARE) -> bool:
-        """BOTH conditions, never either. Persistence alone is what makes staticfilter.py unsafe
-        on the live rig (a raccoon feeding at a fixed dish holds a near-identical box); dead
-        pixels alone would catch an animal that happened to freeze for a moment."""
+        """BOTH conditions, never either. Persistence alone is what makes staticfilter.py's SPAN
+        test unsafe on the live rig (a raccoon feeding at a fixed dish holds a near-identical
+        box); dead pixels alone would catch an animal that happened to freeze for a moment.
+        staticfilter ships its pixel test unconditionally because a trail-cam batch is judged
+        after the fact, where a wrong call is inspectable; live, it would not be."""
         if self.n_frames < min_frames:
             return False
         if n_sampled > 0 and self.n_frames / n_sampled < min_share:

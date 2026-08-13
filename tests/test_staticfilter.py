@@ -151,3 +151,98 @@ def test_other_sources_are_never_swept(tmp_path):
     staticfilter.apply(conn, tmp_path / "t.db", "trail_cam_sd", static)
     assert conn.execute(
         "SELECT COUNT(*) FROM detections WHERE source='glass_door_cam'").fetchone()[0] == 40
+
+
+# --- Rigidity: the second test, for furniture that STOPS before it clears the span ------------
+# These need real crops on disk (the span tests above are pure DB), so each writes JPEGs into
+# tmp_path and points crops_root at it. The span is kept far under min_span_minutes throughout,
+# so anything caught here was caught by rigidity and nothing else.
+
+def _pattern(shift=0, bias=0):
+    """A deterministic 64x64 texture. `shift` moves it (an animal changing pose); `bias`
+    brightens every pixel equally (the IR gain or the sun, which must cost nothing)."""
+    from PIL import Image
+    im = Image.new("L", (64, 64))
+    im.putdata([max(0, min(255, ((x + shift) * 7 ^ (y * 13)) % 256 + bias))
+                for y in range(64) for x in range(64)])
+    return im
+
+
+def _add_with_crop(conn, tmp_path, *, when, box, img, name):
+    (tmp_path / "crops").mkdir(exist_ok=True)
+    rel = f"crops/{name}.jpg"
+    img.save(tmp_path / rel, quality=95)
+    db.insert_detection(
+        conn, timestamp=when.astimezone().isoformat(), source="trail_cam_sd",
+        detection_class="animal", confidence=0.4, bbox=box, frame_w=2560, frame_h=1440,
+        crop_path=rel, frame_path=None,
+    )
+
+
+BIN = (2071.0, 490.0, 2299.0, 970.0)
+
+
+def _fill_short(conn, tmp_path, imgs, box=BIN, minutes=25):
+    """20 detections holding one box for `minutes` -- under the 60-minute span rule on purpose."""
+    for i, img in enumerate(imgs):
+        _add_with_crop(conn, tmp_path, when=T0 + timedelta(minutes=minutes * i / (len(imgs) - 1)),
+                       box=box, img=img, name=f"c{i:03d}")
+
+
+def test_rigid_object_is_found_even_though_span_would_miss_it(tmp_path):
+    """2026-08-11: the battery died and a bin that had fired 179 times in 29 minutes stopped
+    before it could clear the span. It was labelled 'brown rat' and kept. It must not be."""
+    conn = _conn(tmp_path)
+    _fill_short(conn, tmp_path, [_pattern() for _ in range(20)])
+    rows = staticfilter.load_rows(conn, "trail_cam_sd")
+    static, _ = staticfilter.find_static(
+        rows, rigid_maxpair=staticfilter.DEFAULT_RIGID_MAXPAIR, crops_root=tmp_path)
+    assert len(static) == 1
+    assert static[0].reason == "rigid", "span cannot reach a 25-minute cluster"
+    assert static[0].rigidity < staticfilter.DEFAULT_RIGID_MAXPAIR
+
+
+def test_rigidity_survives_an_exposure_shift(tmp_path):
+    """The same object under a changing IR gain is still the same object. This is the whole
+    reason the crops are z-normalised before they are compared."""
+    conn = _conn(tmp_path)
+    _fill_short(conn, tmp_path, [_pattern(bias=b) for b in range(0, 60, 3)])
+    rows = staticfilter.load_rows(conn, "trail_cam_sd")
+    static, _ = staticfilter.find_static(
+        rows, rigid_maxpair=staticfilter.DEFAULT_RIGID_MAXPAIR, crops_root=tmp_path)
+    assert len(static) == 1 and static[0].reason == "rigid"
+
+
+def test_lingering_animal_is_never_rigid(tmp_path):
+    """The guard that matters. A raccoon that feeds in one spot for 23 minutes holds its box --
+    it is only its CHANGING pixels that save it, so this asserts they do."""
+    conn = _conn(tmp_path)
+    _fill_short(conn, tmp_path, [_pattern(shift=i * 3) for i in range(20)])
+    rows = staticfilter.load_rows(conn, "trail_cam_sd")
+    static, clusters = staticfilter.find_static(
+        rows, rigid_maxpair=staticfilter.DEFAULT_RIGID_MAXPAIR, crops_root=tmp_path)
+    assert static == [], "a moving animal must never be called furniture"
+    assert clusters[0].rigidity > staticfilter.DEFAULT_RIGID_MAXPAIR
+
+
+def test_unreadable_crops_are_never_deleted(tmp_path):
+    """What cannot be measured must not be deleted -- the same rule the module already applies
+    to a row whose timestamp will not parse. Here the crops simply are not there."""
+    conn = _conn(tmp_path)
+    for i in range(20):
+        _add(conn, when=T0 + timedelta(minutes=25 * i / 19), box=BIN)   # crop_path points nowhere
+    rows = staticfilter.load_rows(conn, "trail_cam_sd")
+    static, clusters = staticfilter.find_static(
+        rows, rigid_maxpair=staticfilter.DEFAULT_RIGID_MAXPAIR, crops_root=tmp_path)
+    assert static == []
+    assert clusters[0].rigidity is None, "unjudged, which must not read as 0.0"
+
+
+def test_rigidity_is_opt_in(tmp_path):
+    """find_static without a threshold is the pre-2026-08-12 filter exactly, and reads no disk."""
+    conn = _conn(tmp_path)
+    _fill_short(conn, tmp_path, [_pattern() for _ in range(20)])
+    rows = staticfilter.load_rows(conn, "trail_cam_sd")
+    static, clusters = staticfilter.find_static(rows)
+    assert static == []
+    assert clusters[0].rigidity is None

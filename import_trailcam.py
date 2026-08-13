@@ -57,10 +57,15 @@ Weber grill, its chimney starter, a dark gap that read as eyeshine and a shrub l
 flash produced 395 of 789 detections -- half the cycle, labelled 'brown rat' and 'Virginia
 opossum' by a classifier doing its job on a barbecue. The live rig fixes this with hand-measured
 config.ignore_zones, which is wrong HERE: this camera is repositioned on purpose, and a stale
-zone fails silently. So the filter derives the spots per batch instead -- boxes that repeat in
-one place for hours are furniture, because an animal's box changes shape as it moves -- and the
-ORDER matters: it runs before the video pass so the clip gate never buys disk for footage whose
-only 'animal' was the grill. --no-static-filter keeps everything.
+zone fails silently. So the filter derives the spots per batch instead, on two independent
+tests: boxes that repeat in one place for HOURS are furniture (an animal's box changes shape as
+it moves), and so are boxes whose CROPS NEVER CHANGE, however briefly they fired. The second
+test exists because of this importer's own worst cycle: on 2026-08-11 the camera's battery died
+at 23:00 and a bin, a lamp and a paver edge stopped after 24-36 minutes -- under the span, so
+669 detections survived and were labelled (272 "brown rat" off the bin, "raccoon:78" off the
+lamp). Order matters: the sweep runs before the video pass, so the clip gate never buys disk for
+footage whose only 'animal' was the grill. --no-static-filter keeps everything;
+--static-rigid-maxpair 0 disables only the second test.
 
   python import_trailcam.py D:\DCIM\100MEDIA                 # ingest one SD-card dump (GPU)
   python import_trailcam.py D:\dump --recursive              # walk subfolders too
@@ -71,6 +76,7 @@ only 'animal' was the grill. --no-static-filter keeps everything.
   python import_trailcam.py D:\drop --watch                  # poll a drop folder forever
   python import_trailcam.py D:\DCIM\100MEDIA --backup-first  # archive before anything can prune
   python import_trailcam.py D:\dump --no-static-filter       # keep static false-fires too
+  python import_trailcam.py D:\dump --static-rigid-maxpair 0 # ... keep only the rigid ones
   python import_trailcam.py D:\dump --no-burst-frames        # don't keep a full frame per burst
 
 SPECIES COME AFTER THE IMPORT (same as live crops): rows land with species NULL, and the visit
@@ -952,6 +958,11 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    help="How long one spot must keep firing before it counts as static.")
     p.add_argument("--static-iou", type=float, default=staticfilter.DEFAULT_IOU,
                    help="How identical two boxes must be to count as the same spot.")
+    p.add_argument("--static-rigid-maxpair", type=float,
+                   default=staticfilter.DEFAULT_RIGID_MAXPAIR,
+                   help="Also drop a spot whose crops are identical across its whole life, "
+                        "however briefly it fired -- this is what catches furniture that STOPPED "
+                        "(a dying battery) before clearing --static-min-span-minutes. 0 disables.")
     p.add_argument("--no-burst-frames", dest="burst_frames", action="store_false",
                    default=c.trailcam_keep_burst_frame,
                    help="Do NOT keep one full frame per still burst. Retention exists so the "
@@ -1052,7 +1063,8 @@ def main() -> int:
                 dropped_static = staticfilter.sweep_batch(
                     conn, cfg, args.source, min_id=first_new_id, iou=args.static_iou,
                     min_count=args.static_min_count,
-                    min_span_minutes=args.static_min_span_minutes)
+                    min_span_minutes=args.static_min_span_minutes,
+                    rigid_maxpair=args.static_rigid_maxpair or None)
                 saved -= dropped_static
             # Right after the sweep, because the sweep is the only thing that deletes rows: a burst
             # whose entire trigger was furniture now holds a frame no detection points at.

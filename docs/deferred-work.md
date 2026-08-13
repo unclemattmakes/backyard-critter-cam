@@ -555,6 +555,25 @@ finished.
 **Do not rebuild these.** Each was proposed, tested against real data, and died — recorded here so
 the next enthusiastic reading of the same idea meets the measurement that killed it.
 
+### Lowering `staticfilter`'s span so it catches furniture that stopped — killed by the raccoons
+On 2026-08-11 the trail cam's battery died at 23:00. A bin, a lamp and a paver edge had been
+firing for 24–36 minutes and simply ceased — under the 60-minute span rule, so 669 detections
+survived the sweep and were labelled (272 "brown rat" off the bin, `raccoon:78` off the lamp).
+The obvious fix is to drop `--min-span-minutes` to ~20.
+
+It cannot be done. In that *same cycle* two real raccoons foraged one spot for **23 and 38
+minutes** — both confirmed by eye, clear crops, visibly shifting between frames. Their spans sit
+inside the furniture's range, so no span threshold separates them; a 20-minute rule would have
+deleted ~29 verified raccoon detections to recover the bin. Span measures how long something sat
+still, and a feeding raccoon sits still.
+
+What shipped instead is a second, independent test on a different axis — `rigidity`, the
+worst-pair distance between a cluster's own z-normalised crops (2026-08-12). It is honest about
+being partial: at a threshold with headroom under the lowest real animal (0.225) it adds only 2
+spots on that cycle, 274 of the 669. Wind-blown vegetation is furniture that genuinely changes
+and scores like an animal, so it is out of reach by construction. **The remaining eight spots
+were found by a human looking at crops, and that is still the only method that finds them.**
+
 ### Per-family kit headcount from track overlap — killed on the detector, not the logic
 The proposal: count the maximum number of *simultaneous* sustained tracklets in family visits to
 get nightly kit counts ("did all four of CutiePie's kits show tonight?"). It correctly sidestepped
@@ -735,9 +754,21 @@ moves, exactly the pixels that just moved.
   without them.
 - **A furniture bin worth purging.** The kit-age-class measurement turned up ~730 glass-door
   detections clustered on one static box at high IoU — the same class of false-fire
-  `staticfilter` was written for, and the same class that produced 308 phantom "brown rats" on
+  `staticfilter` was written for, and the same class that produced 306 phantom "brown rats" on
   the trail cam. Worth a look and a purge, and a reminder that a heat map or a size statistic
-  will happily describe a barbecue cover with great confidence.
+  will happily describe a barbecue cover with great confidence. **The class recurred on
+  2026-08-11** (272 more off a bin, plus a lamp that read as `raccoon:78`), which is what bought
+  the `rigidity` test — so the glass-door bin now has a scoring tool pointed at exactly its
+  shape. It is still not a licence to sweep the live rig: `staticfilter`'s span half is unsafe
+  there (a raccoon feeds at a fixed dish nightly), and `tools/eval_rigidity.py` has only ever
+  been calibrated against `trail_cam_sd`. Re-run it per source before trusting a number.
+- **Rigidity reaches rigid objects only, and says nothing about a real brown rat.** The test
+  ships at 0.15 against a lowest-measured-animal of 0.225, but its animal population deliberately
+  excludes `brown rat` — on this rig that label is what dark upright *furniture* collects, so
+  admitting it drags the apparent floor to 0.134 and the margin evaporates. Quantified exposure:
+  two surviving clusters (156 rows, 07-21 and 07-31) would be deleted by a sweep today. Both look
+  like the bin. Neither is proven, and no number in the eval would warn you if a real rat ever
+  held still. A handful of `species_verified` rows on genuine small mammals would close this.
 - **`view_epochs` holds exactly one row, and it is wrong** (corrected 2026-08-09; it was empty when
   this list was written). `glass_door_cam` epoch 1, 05:56:52, corr 0.261 — written by the dawn
   false-reposition bug, 35 minutes after dawn at the camera, between two references that correlate

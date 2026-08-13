@@ -39,5 +39,9 @@ the way it does. Findings in them have largely been addressed since.
   designed and then raced against real footage before shipping: why the bare-pixel metric erases
   raccoons, why rolling background models are forbidden here, and why it went out in shadow mode.
 
-Developer utilities live in [../tools/](../tools/); `check_endpoints.py` there cross-checks the
-dashboard's `/api/` calls against the routes `web.py` actually defines.
+Developer utilities live in [../tools/](../tools/). `check_endpoints.py` cross-checks the
+dashboard's `/api/` calls against the routes `web.py` actually defines. `eval_rigidity.py`
+re-sweeps `staticfilter.DEFAULT_RIGID_MAXPAIR` — the threshold below which a repeat-firing spot
+is judged furniture on its pixels rather than its persistence — against this yard's own
+furniture and animal populations. **Run it before changing that constant**: it deletes rows,
+and the number it defends is the distance to the lowest-scoring real animal on record.
