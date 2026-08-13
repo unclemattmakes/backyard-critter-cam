@@ -51,8 +51,8 @@ see [Try it on footage you already have](#try-it-on-footage-you-already-have).
   suggest-confirm loop
 - [Behaviour clips (phase 4 capture)](#behaviour-clips-phase-4-capture) ·
   [Behaviour analysis (phase 4)](#behaviour-analysis-phase-4)
-- [Output](#output) · [Backups](#backups) · [Database schema](#database-schema) ·
-  [Configuration](#configuration)
+- [Output](#output) · [Backups](#backups) · [A morning email](#a-morning-email) ·
+  [Database schema](#database-schema) · [Configuration](#configuration)
 - [Security & privacy](#security--privacy) — there is no login; read this before the dashboard
   leaves your machine
 - [Responsible use](#responsible-use) — it is a camera pointed at the outdoors
@@ -835,6 +835,51 @@ Schedule it weekly with Windows Task Scheduler (runs as you, no admin needed):
 schtasks /Create /TN "Backyard critter-cam backup" /SC WEEKLY /D MON /ST 03:30 `
     /TR "C:\path\to\backyard\.venv\Scripts\pythonw.exe C:\path\to\backyard\backup.py"
 ```
+
+---
+
+## A morning email
+
+`newsletter.py` mails you last night's Dispatch as a small newspaper — the same
+`period_digest` the dashboard's Dispatch tab renders, laid out for an inbox: a lede of who
+came and when, a hero photo re-judged for *cuteness* rather than raw sharpness (how much
+animal is in frame, whether the focus is on the animal or the yard behind it, night eyeshine
+as a "facing you" signal — and never an upscaled crop), the visit timeline with thumbnails,
+the species roll, and the named cast's roll call. The digest's honesty rules travel with it: crowd counts
+are floors, "surprising" species are listed as questions, and a night the camera wasn't
+watching says so.
+
+Sending uses [Resend](https://resend.com)'s REST API (free tier is plenty for one email a
+day) via a single stdlib HTTP call — no SDK. Photos are embedded as inline attachments
+because the alternatives genuinely fail in mail clients: your dashboard's image URLs are
+LAN-only, and Gmail strips `data:` URIs. Set three values in `config_local.py` (never
+`config.py` — the key is a secret and this repo is public; see
+`config_local.example.py`):
+
+```python
+cfg.email_to = "you@example.com"
+cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"  # a Resend-verified domain
+cfg.email_resend_api_key = "re_..."
+```
+
+Try it, then schedule it (runs as you, no admin needed):
+
+```powershell
+python newsletter.py --no-send   # render one issue to reports\mail\ and open it in a browser
+```
+
+```powershell
+schtasks /Create /TN "Backyard critter-cam morning mail" /SC DAILY /ST 07:00 `
+    /TR "C:\path\to\backyard\.venv\Scripts\pythonw.exe C:\path\to\backyard\newsletter.py"
+```
+
+Details that take care of themselves: in midwinter a 07:00 task can fire before dawn, so the
+script sleeps until the night is actually complete rather than mailing the wrong one; a
+visitor-less night still sends a short "quiet night" issue (absence is information — set
+`cfg.email_send_quiet = False` to skip those); every issue is also written to
+`reports/mail/` as a browser-viewable copy, so nothing is lost while email is unconfigured;
+and until all three values are set the scheduled run is a polite no-op. A back-issue is
+`python newsletter.py --date 2026-08-10 --edition night`.
 
 ---
 

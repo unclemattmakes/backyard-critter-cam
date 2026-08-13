@@ -396,6 +396,26 @@ class Config:
     # (already machine-only). Set False only if you deliberately front it with your own auth/VPN.
     lan_only: bool = True
 
+    # ---- Morning email (newsletter.py: the Dispatch, delivered) -------------------
+    # A daily email of the completed night (or day), rendered from the same period_digest the
+    # dashboard's Dispatch tab shows -- schedule `python newsletter.py` after dawn (README "A
+    # morning email"). All three values below must be set for anything to send; unset (the
+    # default), the script renders a local archive copy under reports/mail/ and exits politely,
+    # so the scheduled task can predate the email account. Set them in config_local.py, NEVER
+    # here: the API key is a secret, and this file is public. Be deliberate about email_to --
+    # sending mail moves yard photos off this machine (through Resend, to that inbox), which is
+    # the widest the project's media ever travels automatically.
+    email_to: str | None = None            # recipient ("you@example.com")
+    email_from: str | None = None          # verified Resend sender ("Name <a@your-domain.com>")
+    email_resend_api_key: str | None = None    # https://resend.com -> API Keys ("re_...")
+    # Link target for "Open the full Dispatch". Default (None) guesses http://<hostname>:<web_port>,
+    # which resolves for most phones on the same Wi-Fi; set explicitly if your network says otherwise.
+    email_dashboard_url: str | None = None
+    # A visitor-less night still mails a short "quiet night" issue by default -- absence is
+    # information too (and the issue says when the camera wasn't watching). False = quiet
+    # periods are archived but not sent.
+    email_send_quiet: bool = True
+
     # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
     # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
     # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust

@@ -97,3 +97,15 @@ def apply(cfg):
     # a rolling window (clips_max_gb) -- the backup is what outlives the pruning.
     # from pathlib import Path
     # cfg.backup_dest = Path(r"C:\cloud-synced-folder\backyard")
+
+    # The morning email (newsletter.py) -- last night's Dispatch as a small newspaper in your
+    # inbox. Sending needs a free https://resend.com account with a verified sender domain; all
+    # three values are private, so they live here, never in config.py. Schedule
+    # `python newsletter.py` daily (README "A morning email"); until these are set the script
+    # just archives each issue locally under reports/mail/. Photos ride inside the email, so
+    # point email_to only at people you'd show the dashboard to.
+    # cfg.email_to = "you@example.com"
+    # cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"
+    # cfg.email_resend_api_key = "re_..."
+    # cfg.email_dashboard_url = "http://192.168.1.20:8000"   # if the hostname guess doesn't resolve
+    # cfg.email_send_quiet = False                           # skip the email on visitor-less nights
