@@ -78,6 +78,12 @@ MAX_VISIT_THUMBS = 10     # visits beyond this still get a text row, just no pho
 MAX_ROLL_ROWS = 8         # species rows with photos; a longer roll is summarized in one line
 MAX_IMAGE_BYTES = 8_000_000   # absolute safety cap across all embedded images (Resend caps at 40MB)
 RESEND_URL = "https://api.resend.com/emails"
+# Resend's API sits behind Cloudflare, which BANS urllib's default "Python-urllib/3.x" signature:
+# the request never reaches Resend and comes back as an HTML-less `403 error code: 1010` -- a
+# Cloudflare code, not an API error, which is why it says nothing about keys or domains. Any
+# honest agent string clears it (verified 2026-08-12: default -> 403/1010, this -> a real API
+# response). Identify the tool rather than impersonate a browser.
+USER_AGENT = "backyard-critter-cam/1.0 (+https://github.com/unclemattmakes/backyard-critter-cam)"
 
 # Playful pseudo-taxonomic labels, mirrored from dashboard.js (flavour only, same caveat).
 _LATIN = {
@@ -1061,14 +1067,26 @@ def send_issue(cfg, subject, html, text, images, to=None) -> str:
     req = urllib.request.Request(
         RESEND_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json",
+                 "User-Agent": USER_AGENT,
                  "Authorization": f"Bearer {cfg.email_resend_api_key}"},
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode() or "{}").get("id", "?")
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Resend refused the email ({e.code}): "
-                           f"{e.read().decode(errors='replace')[:500]}") from e
+        body = e.read().decode(errors="replace")[:500]
+        hint = ""
+        if "1010" in body or "error code:" in body:
+            # A Cloudflare block, not an API verdict -- say so, or the next reader spends the
+            # morning checking a key that was never the problem.
+            hint = (" -- that is a CLOUDFLARE block (not a Resend API error): the request never "
+                    "reached the API. Usually the User-Agent header went missing.")
+        elif e.code == 403 and "domain" in body.lower():
+            hint = (" -- verify the sending domain in Resend (Domains -> add the DNS records) "
+                    "and make sure email_from uses an address at that domain.")
+        elif e.code == 401:
+            hint = " -- check email_resend_api_key, and that it has SEND permission."
+        raise RuntimeError(f"Resend refused the email ({e.code}): {body}{hint}") from e
 
 
 def write_archive(cfg, bundle, images, out_path: Path | None = None) -> Path:

@@ -441,6 +441,8 @@ def test_send_issue_success_and_refusal(tmp_path, monkeypatch):
     def fake_urlopen(req, timeout):
         seen["url"] = req.full_url
         seen["auth"] = req.headers.get("Authorization")
+        # Header keys are capitalized by urllib's Request; read case-insensitively.
+        seen["ua"] = next((v for k, v in req.headers.items() if k.lower() == "user-agent"), None)
         seen["body"] = json.loads(req.data.decode())
         return OkResp()
 
@@ -449,6 +451,9 @@ def test_send_issue_success_and_refusal(tmp_path, monkeypatch):
     assert out == "email_123"
     assert seen["url"] == newsletter.RESEND_URL and seen["auth"] == "Bearer re_test"
     assert seen["body"]["subject"] == "s"
+    # A User-Agent is MANDATORY: Resend sits behind Cloudflare, which bans urllib's default
+    # "Python-urllib/3.x" signature outright -- 403 "error code: 1010", before the API sees it.
+    assert seen["ua"] and "python-urllib" not in seen["ua"].lower()
 
     def refuse(req, timeout):
         raise urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {},
@@ -456,6 +461,20 @@ def test_send_issue_success_and_refusal(tmp_path, monkeypatch):
 
     monkeypatch.setattr(newsletter.urllib.request, "urlopen", refuse)
     with pytest.raises(RuntimeError, match="domain not verified"):
+        newsletter.send_issue(cfg, "s", "h", "t", {})
+
+
+def test_cloudflare_block_is_named_as_such(tmp_path, monkeypatch):
+    """A Cloudflare 1010 says nothing about keys or domains, and reads exactly like an auth
+    failure -- so the error must name it, or the next reader debugs the wrong thing."""
+    cfg = mkcfg(tmp_path)
+
+    def blocked(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {},
+                                     io.BytesIO(b"error code: 1010"))
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", blocked)
+    with pytest.raises(RuntimeError, match="CLOUDFLARE"):
         newsletter.send_issue(cfg, "s", "h", "t", {})
 
 
