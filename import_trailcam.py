@@ -119,6 +119,25 @@ IDEMPOTENCY (re-runs must not double-import). Three layers, all boring on purpos
 
 Robust by design (PLAN.md "boring and robust"): an unreadable/corrupt image is warned about and
 skipped; one bad file never aborts the batch.
+
+BUT A SKIPPED STILL IS A HOLE IN THE EVIDENCE, NOT A ZERO (learned the hard way 2026-08-14).
+Not aborting the batch is right; letting the rest of the run treat unread files as if they had
+been read and held nothing is not. The clip gate above answers "was anything there?" by counting
+the detections the still pass wrote, so a still that never loaded is indistinguishable from a
+still that showed an empty yard -- and the 'no-animal' verdict it produces used to be LEDGERED,
+i.e. settled forever, so a re-run would not revisit it. On 2026-08-14 a mid-run pip install (see
+detector.py's YOLO_AUTOINSTALL note) made 121 consecutive stills unreadable; the 12 videos of
+that window were written off, and 11 of them held raccoons. Three rules came out of it:
+  * every read failure is COLLECTED, not just printed, and reported loudly at the end -- one
+    quiet line per file is invisible in a 3,000-line log, and the old summary was identical to a
+    clean run's;
+  * a 'no-animal' verdict reached while any still failed to read is acted on but NOT ledgered,
+    so the next run re-probes it (import_videos(trust_no_animal=...));
+  * the actual exception is always carried, and "the file is gone" is distinguished from "the
+    file is right there and still would not read" -- they have different causes and different
+    fixes, and the old message asserted the first while the truth was the second.
+Exit codes: 0 clean, 1 bad folder, 2 CUDA unavailable, 3 PARTIAL IMPORT (some file could not be
+read -- nothing was ledgered for it, so re-running the same command retries it).
 """
 from __future__ import annotations
 
@@ -233,6 +252,24 @@ def image_timestamp(path: Path) -> datetime:
     if dt is None:
         dt = datetime.fromtimestamp(path.stat().st_mtime)
     return dt.astimezone()
+
+
+def describe_read_failure(path: Path, exc: BaseException) -> str:
+    """Why a file could not be read, in the two flavours that need different responses.
+
+    'vanished' (the file is genuinely gone) is the benign race this scan was written for: a
+    --watch drainer or --processed-dir move pulled the file out from under us, and there is
+    nothing to do about it. 'present but unreadable' is the alarming one -- a flaky reader, a
+    dying card, or the interpreter itself being broken underneath the process (see the
+    YOLO_AUTOINSTALL note in detector.py). They looked identical until 2026-08-14, when 121
+    perfectly good stills were reported as 'vanished' and the real exception was thrown away,
+    leaving nothing to diagnose from. Always carry the exception: it is the only evidence."""
+    try:
+        gone = not path.exists()
+    except OSError:                     # even the existence check can fail on a sick device
+        gone = False
+    where = "file is GONE" if gone else "file is STILL THERE"
+    return f"{where}; {type(exc).__name__}: {exc}"
 
 
 def imported_keys(conn, source: str) -> set[str]:
@@ -692,24 +729,34 @@ _VIDEO_DONE = {"stored", "no-animal"}
 
 def import_videos(folder: Path, conn, cfg: config.Config, *, source: str, recursive: bool,
                   skip: set[str], window_s: float, require_animal: bool,
-                  processed_dir: Path | None = None) -> tuple[int, int, int]:
+                  processed_dir: Path | None = None, trust_no_animal: bool = True,
+                  deferred: list[str] | None = None) -> tuple[int, int, int]:
     """Import every video in `folder` once, as behaviour clips. Same idempotency contract as
     import_folder (the shared ledger, keyed per file), and the same never-fail-the-batch posture.
     Returns (stored, skipped_already, skipped_no_animal).
 
     Videos are imported AFTER the stills on purpose: the animal gate reads the detections the
-    stills just wrote, so the two passes must not be interleaved."""
+    stills just wrote, so the two passes must not be interleaved.
+
+    `trust_no_animal=False` says the still pass did not manage to read every file, so a 'no
+    animal in the trigger' verdict may rest on stills that were never ingested rather than on
+    stills that held nothing. Such a verdict is still acted on for THIS run (the clip isn't
+    stored) but is NOT written to the ledger, so the next run re-probes it instead of retiring it
+    forever. Names of those videos are appended to `deferred` when given."""
     videos = list_videos(folder, recursive)
     if not videos:
         return 0, 0, 0
     print(f"\nFound {len(videos)} video(s) in {folder}. Importing as clips "
           f"(source='{source}'{'' if require_animal else ', ALL videos'}) ...")
+    if require_animal and not trust_no_animal:
+        print("  [!] the still pass could not read every file, so 'no animal' verdicts this run "
+              "are UNPROVEN -- they will not be ledgered, and the next run will re-probe them.")
     stored = already = empty = 0
     for path in videos:
         try:
             key = video_skip_key(path)
-        except OSError:
-            print(f"  skip (vanished mid-scan): {path.name}")
+        except OSError as e:
+            print(f"  skip (could not read): {path.name} -- {describe_read_failure(path, e)}")
             continue
         stem_key = skip_key(path.stem, key.split(LEDGER_KEY_SEP, 1)[1])
         if key in skip or stem_key in skip:
@@ -719,10 +766,18 @@ def import_videos(folder: Path, conn, cfg: config.Config, *, source: str, recurs
                               require_animal=require_animal)
         if status not in _VIDEO_DONE:
             continue                    # transient -- leave it unledgered so a re-run retries it
+        # A no-animal video is normally ledgered: that verdict came from its trigger's stills,
+        # which don't change on a re-run, so re-probing it every cycle would burn minutes to
+        # reach the same answer. That reasoning holds only while the stills actually loaded --
+        # when they didn't, "no detections in the window" means "we never looked", and ledgering
+        # it retires real footage on the strength of a failed read. It cost 11 clips of raccoons
+        # on 2026-08-14 before this branch existed. --all-videos remains the blunt recovery.
+        if status == "no-animal" and not trust_no_animal:
+            empty += 1
+            if deferred is not None:
+                deferred.append(path.name)
+            continue                    # unledgered AND unmoved, exactly like a transient failure
         stored += (status == "stored")
-        # A no-animal video is still ledgered: that verdict came from its trigger's stills, which
-        # don't change on a re-run, so re-probing it every cycle would burn minutes to reach the
-        # same answer. --all-videos is the way to bring those in later.
         empty += (status == "no-animal")
         skip.add(key)
         append_ledger(cfg.db_path, source, key)
@@ -815,7 +870,8 @@ def _print_next_step(saved: int) -> None:
 
 def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
                   source: str, recursive: bool, processed_dir: Path | None,
-                  skip: set[str], bursts: "BurstFrames | None" = None) -> tuple[int, int, int]:
+                  skip: set[str], bursts: "BurstFrames | None" = None,
+                  read_failures: list[str] | None = None) -> tuple[int, int, int]:
     """Import every image in `folder` once. `skip` is the set of skip keys (basename|capture-
     second) already imported (default idempotency); files moved to --processed-dir won't reappear
     anyway. Updates `skip` in place as it goes so a single pass never imports the same file twice.
@@ -824,7 +880,12 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
     `bursts` (optional) groups the stills into triggers and keeps one full frame per group. It is
     fed only the files this pass actually INGESTS: an already-imported file left its own burst's
     frame behind on the run that imported it, and letting a skipped file advance the burst clock
-    would only smear two real triggers together."""
+    would only smear two real triggers together.
+
+    `read_failures` (optional) collects one line per file this pass could NOT read. Pass it
+    whenever the caller goes on to import videos: the clip gate decides 'no animal' by looking up
+    the detections these stills wrote, so a still that failed to load makes that verdict
+    evidence-free rather than merely negative. See import_videos(trust_no_animal=...)."""
     images = list_images(folder, recursive)
     if not images:
         print(f"No images ({'/'.join(sorted(IMAGE_EXTS))}) found in {folder}"
@@ -836,12 +897,18 @@ def import_folder(folder: Path, detector: Detector, conn, cfg: config.Config, *,
     imported = saved_total = skipped = 0
     for path in images:
         # The capture second is a cheap EXIF header read (no pixel decode) -- fine to do even for
-        # files we're about to skip. stat() can still race a --watch drainer moving the file out
-        # from under us; treat a vanished file like a corrupt one (warn-ish and move on).
+        # files we're about to skip. It can fail two ways: the file really went away (a --watch
+        # drainer moving it out from under us -- benign), or it is right there and unreadable
+        # anyway (flaky card/reader, or a broken interpreter). Either way one bad file must not
+        # abort the batch, but it MUST be recorded: an unread still is a hole in the evidence the
+        # video gate reads, not merely a file we skipped.
         try:
             captured = image_timestamp(path)
-        except OSError:
-            print(f"  skip (vanished mid-scan): {path.name}")
+        except OSError as e:
+            detail = describe_read_failure(path, e)
+            print(f"  skip (could not read): {path.name} -- {detail}")
+            if read_failures is not None:
+                read_failures.append(f"{path.name}: {detail}")
             continue
         ts = captured.strftime(KEY_TS_FMT)
         # The ledger keys on the full filename; the DB-recovery fallback keys on the stem (the
@@ -1051,9 +1118,20 @@ def main() -> int:
             # placement, the only span over which "the same spot" means anything.
             first_new_id = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM detections").fetchone()[0]
+            read_failures: list[str] = []
             imported, saved, skipped = import_folder(
                 folder, detector, conn, cfg, source=args.source, recursive=args.recursive,
-                processed_dir=processed_dir, skip=skip, bursts=bursts)
+                processed_dir=processed_dir, skip=skip, bursts=bursts,
+                read_failures=read_failures)
+            # Say it here, between the passes, as well as in the final summary. One quiet line per
+            # file is how 121 unread stills scrolled past unnoticed inside a 3,000-line log.
+            if read_failures:
+                print(f"\n  [!] {len(read_failures)} file(s) could not be read this pass. Their "
+                      f"detections are MISSING, not empty:")
+                for line in read_failures[:5]:
+                    print(f"        {line}")
+                if len(read_failures) > 5:
+                    print(f"        ... and {len(read_failures) - 5} more")
             # Static false-fires go BEFORE the videos, not after: the clip gate keeps a video whose
             # trigger produced an animal crop, so a grill scoring 'animal' would otherwise buy
             # disk space for footage of nothing happening -- and on a card that is the only copy,
@@ -1071,11 +1149,15 @@ def main() -> int:
             dropped_frames = bursts.drop_orphans(conn) if bursts.written else 0
             # Videos AFTER the stills: the animal gate reads the detections the stills just wrote.
             v_stored = v_already = v_empty = 0
+            deferred_videos: list[str] = []
             if args.videos:
                 v_stored, v_already, v_empty = import_videos(
                     folder, conn, cfg, source=args.source, recursive=args.recursive, skip=skip,
                     window_s=args.video_pair_window, require_animal=not args.all_videos,
-                    processed_dir=processed_dir)
+                    processed_dir=processed_dir,
+                    # The clip gate reads the detections the still pass just wrote, so it can only
+                    # be trusted if that pass read everything it was given.
+                    trust_no_animal=not read_failures, deferred=deferred_videos)
                 if v_stored and prune_ok:
                     clips.prune_clips(cfg, conn)    # honour this source's own rolling budget
             extra = f" (skipped {skipped} already-imported)" if skipped else ""
@@ -1097,12 +1179,25 @@ def main() -> int:
                       f"veto runs at import time.")
             if args.videos:
                 v_extra = f", {v_already} already-imported" if v_already else ""
+                unproven = (f" ({len(deferred_videos)} of them UNPROVEN -- not ledgered, the next "
+                            f"run re-probes them)" if deferred_videos else "")
                 print(f"  Clips: stored {v_stored} video(s); skipped {v_empty} with no animal "
-                      f"in the trigger{v_extra}.")
+                      f"in the trigger{v_extra}{unproven}.")
             if saved:
                 refresh_visits(conn, cfg)
                 _print_next_step(saved)
+            # A partial import must never read as a clean one. This is the last thing printed and
+            # it changes the exit code, because the summary above is otherwise indistinguishable
+            # from a full success -- which is exactly how 121 dropped stills went unnoticed.
             rc = 0
+            if read_failures:
+                print(f"\n[PARTIAL IMPORT] {len(read_failures)} file(s) in {folder} could not be "
+                      f"read and were NOT imported. Nothing was ledgered for them, so re-running "
+                      f"this same command will retry them.")
+                print("  Check the card is still mounted and healthy. If the files are 'STILL "
+                      "THERE' above, the failure was in this process, not on the card -- re-run "
+                      "before formatting anything.")
+                rc = 3
     finally:
         conn.close()
     return rc

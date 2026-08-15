@@ -14,12 +14,29 @@ The first run downloads the chosen weight into weights/ (stdlib urllib); later r
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import config
+
+# Ultralytics pip-installs missing "requirements" INTO THIS VENV MID-RUN unless told otherwise
+# (utils/__init__.py: AUTOINSTALL = getenv("YOLO_AUTOINSTALL", True)), and then warns "Restart
+# runtime or rerun command for updates to take effect" -- i.e. it knows the running process is
+# now inconsistent, having already made it so. On 2026-08-14 one such install (pi-heif) landed
+# mid trail-cam import; every still read after it raised, 121 files were dropped, and the video
+# gate that reads their detections silently wrote off 11 clips of real animals. A long batch job
+# must not mutate the interpreter it is running on.
+#
+# Set here, at module import, so it lands before the lazy `from ultralytics import YOLO` in
+# Detector.__init__ (that import is what first reads the flag) and covers every entry point that
+# builds a detector. setdefault, so an operator can still opt back in from the environment.
+# Turning it off does NOT introduce a new failure mode: with AUTOINSTALL false, ultralytics'
+# check_requirements() simply returns False (utils/checks.py) instead of installing -- it never
+# raises, so a genuinely missing optional extra degrades rather than crashing the batch.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 
 class CudaUnavailableError(RuntimeError):

@@ -233,10 +233,12 @@ def _video_cfg(tmp_path, db_path):
                    clips_max_gb=0)          # 0 = no cap, so tests never race the pruner
 
 
-def _import_videos(folder, conn, cfg, skip, *, require_animal=True, window_s=30.0):
+def _import_videos(folder, conn, cfg, skip, *, require_animal=True, window_s=30.0,
+                   trust_no_animal=True, deferred=None):
     return import_trailcam.import_videos(
         folder, conn, cfg, source="trail_cam_sd", recursive=False, skip=skip,
-        window_s=window_s, require_animal=require_animal)
+        window_s=window_s, require_animal=require_animal,
+        trust_no_animal=trust_no_animal, deferred=deferred)
 
 
 def _seed_detection(conn, when: str, conf=0.9):
@@ -335,6 +337,130 @@ def test_unreadable_video_is_retried_not_retired(conn, db_path, tmp_path):
     skip = set()
     assert _import_videos(tmp_path, conn, cfg, skip) == (0, 0, 0)
     assert skip == set()
+    assert import_trailcam.read_ledger(cfg.db_path, "trail_cam_sd") == set()
+
+
+# --- unread stills poison the clip gate (2026-08-14) -------------------------------------
+#
+# The still pass feeds the video pass: "no animal in the trigger" is decided by counting the
+# detections the stills wrote. A still that never loaded therefore looks exactly like a still of
+# an empty yard -- and that verdict used to be LEDGERED, retiring the clip forever. One mid-run
+# pip install made 121 stills unreadable and wrote off 12 videos; 11 held raccoons.
+
+def _fail_reading(monkeypatch, *names: str, exc=None):
+    """Make image_timestamp raise for `names`, exactly as a sick reader (or a broken interpreter)
+    does mid-scan, while every other file reads normally."""
+    real = import_trailcam.image_timestamp
+    bad = set(names)
+
+    def fake(path):
+        if path.name in bad:
+            raise exc or OSError(22, "Invalid argument")
+        return real(path)
+
+    monkeypatch.setattr(import_trailcam, "image_timestamp", fake)
+
+
+def test_describe_read_failure_separates_gone_from_still_there(tmp_path):
+    """The old message asserted 'vanished mid-scan' for both cases and threw the exception away,
+    which is why the real failure could not be diagnosed afterwards. Present-but-unreadable is
+    the alarming one and must not be reported as a benign race."""
+    here = _write_image(tmp_path / "IMAG0001.JPG")
+    gone = tmp_path / "IMAG0002.JPG"
+
+    present = import_trailcam.describe_read_failure(here, OSError(22, "Invalid argument"))
+    assert "STILL THERE" in present
+    assert "Invalid argument" in present          # the evidence survives
+
+    absent = import_trailcam.describe_read_failure(gone, FileNotFoundError(2, "nope"))
+    assert "GONE" in absent
+
+
+def test_unreadable_still_is_collected_and_left_unledgered(conn, db_path, tmp_path, monkeypatch):
+    """A still that cannot be read is skipped (one bad file never aborts the batch) but is
+    REPORTED to the caller and stays out of the ledger, so a re-run picks it up."""
+    cfg = _video_cfg(tmp_path, db_path)
+    good = _write_image(tmp_path / "IMAG0001.JPG")
+    bad = _write_image(tmp_path / "IMAG0002.JPG")
+    _set_mtime(good, "2026-08-14 06:48:36")
+    _set_mtime(bad, "2026-08-14 06:49:00")
+    _fail_reading(monkeypatch, "IMAG0002.JPG")
+
+    failures: list[str] = []
+    imported, saved, _ = import_trailcam.import_folder(
+        tmp_path, _StubDetector(), conn, cfg, source="trail_cam_sd", recursive=False,
+        processed_dir=None, skip=set(), read_failures=failures)
+
+    assert imported == 1 and saved == 1                     # the readable one still imported
+    assert len(failures) == 1 and "IMAG0002.JPG" in failures[0]
+    assert "STILL THERE" in failures[0]                     # it was never actually missing
+    ledger = import_trailcam.read_ledger(cfg.db_path, "trail_cam_sd")
+    assert not any(k.startswith("IMAG0002") for k in ledger)
+
+
+def test_unproven_no_animal_video_is_not_ledgered(conn, db_path, tmp_path):
+    """THE REGRESSION. With the still pass known to be incomplete, an empty-looking trigger is
+    still skipped for this run but must NOT be settled: no ledger line, no skip-key, so the next
+    run re-probes it once the stills are actually in."""
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0009.MP4")
+    _set_mtime(v, "2026-08-14 06:50:22")                    # no detection seeded for this trigger
+
+    skip: set[str] = set()
+    deferred: list[str] = []
+    assert _import_videos(tmp_path, conn, cfg, skip,
+                          trust_no_animal=False, deferred=deferred) == (0, 0, 1)
+    assert deferred == ["IMAG0009.MP4"]
+    assert skip == set()                                    # nothing retired
+    assert import_trailcam.read_ledger(cfg.db_path, "trail_cam_sd") == set()
+    assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 0
+
+    # ...and the re-run, once the stills are in, actually stores it.
+    _seed_detection(conn, "2026-08-14 06:50:20")
+    assert _import_videos(tmp_path, conn, cfg, skip)[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 1
+
+
+def test_unproven_run_still_ledgers_videos_that_DID_find_an_animal(conn, db_path, tmp_path):
+    """Only the negative verdicts are held back. A clip whose trigger produced a crop rests on
+    evidence that exists, so it stores and ledgers normally even on a run with read failures --
+    otherwise every incomplete run would re-copy gigabytes it already has."""
+    cfg = _video_cfg(tmp_path, db_path)
+    v = _write_video(tmp_path / "IMAG0007.MP4", seconds=2.0, fps=10.0)
+    _set_mtime(v, "2026-08-14 06:51:42")
+    _seed_detection(conn, "2026-08-14 06:51:38")
+
+    skip: set[str] = set()
+    deferred: list[str] = []
+    assert _import_videos(tmp_path, conn, cfg, skip,
+                          trust_no_animal=False, deferred=deferred) == (1, 0, 0)
+    assert deferred == []
+    assert import_trailcam.video_skip_key(v) in skip
+
+
+def test_read_failure_flows_through_to_the_clip_gate(conn, db_path, tmp_path, monkeypatch):
+    """The two halves wired the way main() wires them (trust_no_animal=not read_failures) -- the
+    seam the original bug lived in. An unreadable still must make that trigger's video unproven
+    rather than empty."""
+    cfg = _video_cfg(tmp_path, db_path)
+    still = _write_image(tmp_path / "IMAG3119.JPG")
+    _set_mtime(still, "2026-08-14 06:50:20")
+    video = _write_video(tmp_path / "IMAG3131.MP4")
+    _set_mtime(video, "2026-08-14 06:50:22")
+    _fail_reading(monkeypatch, "IMAG3119.JPG")
+
+    failures: list[str] = []
+    skip: set[str] = set()
+    import_trailcam.import_folder(
+        tmp_path, _StubDetector(), conn, cfg, source="trail_cam_sd", recursive=False,
+        processed_dir=None, skip=skip, read_failures=failures)
+    assert failures                                          # the still never made it in
+
+    deferred: list[str] = []
+    _import_videos(tmp_path, conn, cfg, skip,
+                   trust_no_animal=not failures, deferred=deferred)
+
+    assert deferred == ["IMAG3131.MP4"]                      # held open, not written off
     assert import_trailcam.read_ledger(cfg.db_path, "trail_cam_sd") == set()
 
 
