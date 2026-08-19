@@ -104,8 +104,8 @@ def apply(cfg):
     # `python newsletter.py` daily (README "A morning email"); until these are set the script
     # just archives each issue locally under reports/mail/. Photos ride inside the email, so
     # point email_to only at people you'd show the dashboard to.
-    # cfg.email_to = "you@example.com"
+    # cfg.email_to = "you@example.com"                       # or "you@example.com, them@example.com"
     # cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"
     # cfg.email_resend_api_key = "re_..."
-    # cfg.email_dashboard_url = "http://192.168.1.20:8000"   # if the hostname guess doesn't resolve
+    # cfg.email_dashboard_url = "http://192.168.1.20:8000"   # override the auto-detected LAN address
     # cfg.email_send_quiet = False                           # skip the email on visitor-less nights

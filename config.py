@@ -405,11 +405,19 @@ class Config:
     # here: the API key is a secret, and this file is public. Be deliberate about email_to --
     # sending mail moves yard photos off this machine (through Resend, to that inbox), which is
     # the widest the project's media ever travels automatically.
-    email_to: str | None = None            # recipient ("you@example.com")
+    # Recipient(s). One address, several comma-separated ("you@example.com, them@example.com"),
+    # or a list. Everyone listed sees every other address in the To: header -- right for a
+    # household paper, wrong for a mailing list, so it is stated rather than discovered.
+    email_to: str | tuple[str, ...] | list[str] | None = None
     email_from: str | None = None          # verified Resend sender ("Name <a@your-domain.com>")
     email_resend_api_key: str | None = None    # https://resend.com -> API Keys ("re_...")
-    # Link target for "Open the full Dispatch". Default (None) guesses http://<hostname>:<web_port>,
-    # which resolves for most phones on the same Wi-Fi; set explicitly if your network says otherwise.
+    # Where the issue's links point (every headline, species, animal and visit in it deep-links
+    # into the dashboard). Default (None) uses this machine's LAN IP and web_port, re-derived per
+    # issue so a DHCP change heals itself overnight. It is the IP and not the hostname because
+    # phones resolve mDNS, not NetBIOS: "http://thispc:8000" simply fails on iOS and Android,
+    # which is where the paper is actually read. Set explicitly for a fixed host name, a
+    # different port, or a reverse proxy. The links only reach the rig from your own network --
+    # by design; the dashboard has no login (see "Security & privacy" in the README).
     email_dashboard_url: str | None = None
     # A visitor-less night still mails a short "quiet night" issue by default -- absence is
     # information too (and the issue says when the camera wasn't watching). False = quiet

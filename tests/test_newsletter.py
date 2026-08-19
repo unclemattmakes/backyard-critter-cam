@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,6 +66,13 @@ def mkdigest(**over):
 def mkbundle(d=None, rc=None):
     return {"d": d or mkdigest(), "rc": rc or {"cast": []}, "issue_no": 34,
             "base_url": "http://rig:8000", "generated": "2026-08-12T06:30:00-07:00"}
+
+
+def text_of(html):
+    """The visible text of a rendered issue. Assertions about WORDING should not break when the
+    markup around a name changes -- which is exactly what happened when every name in the cast
+    became a deep link."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html))
 
 
 def jpeg_bytes(w=200, h=150, color=(120, 90, 60)):
@@ -223,20 +231,20 @@ def test_cast_rollcall_dedupes_groups_and_judges_by_period():
         {"id": "ziggy + kits", "species": "raccoon", "days_since": 1, "overdue": False,
          "last_seen": "2026-08-11T23:00:00-07:00"},
     ]}
-    html = newsletter.render_email(mkbundle(d, rc), {}, lambda cid: None)
-    assert "Came by:</b> Pedro (with the kits)" in html
-    assert "Pedro + Kits" not in html                       # the group never gets its own line
-    assert "Notch (6d)" in html
-    assert "Cutie + Kits" not in html                       # absent group: not a fact
-    assert "Ziggy + Kits" in html                           # present group with no base: shown
+    text = text_of(newsletter.render_email(mkbundle(d, rc), {}, lambda cid: None))
+    assert "Came by: Pedro (with the kits)" in text
+    assert "Pedro + Kits" not in text                       # the group never gets its own line
+    assert "Notch (6d)" in text
+    assert "Cutie + Kits" not in text                       # absent group: not a fact
+    assert "Ziggy + Kits" in text                           # present group with no base: shown
 
 
 def test_quiet_issue_still_renders_moon_and_rollcall():
     d = mkdigest(empty=True, visits=0, species=[], visit_log=[], plate=None, novel=[], quiet=[])
     rc = {"cast": [{"id": "stan", "species": "raccoon", "days_since": 3, "overdue": False,
                     "last_seen": "2026-08-09T02:00:00-07:00"}]}
-    html = newsletter.render_email(mkbundle(d, rc), {}, lambda cid: None)
-    assert "quiet night" in html and "Waning Crescent" in html and "Stan (3d)" in html
+    text = text_of(newsletter.render_email(mkbundle(d, rc), {}, lambda cid: None))
+    assert "quiet night" in text and "Waning Crescent" in text and "Stan (3d)" in text
 
 
 # ---- images --------------------------------------------------------------------------
@@ -518,3 +526,141 @@ def test_archive_written_with_data_uris(tmp_path):
     assert p == tmp_path / "reports" / "mail" / "2026-08-12-night.html"
     body = p.read_text(encoding="utf-8")
     assert "data:image/jpeg;base64," in body and "cid:" not in body
+
+
+# ---- recipients ----------------------------------------------------------------------
+
+def test_recipients_accepts_every_way_a_person_types_them(tmp_path):
+    """A household grows. One address, several comma-separated (what people actually type into
+    a config), or a list -- all mean the same To: line."""
+    r = newsletter.recipients
+    assert r(mkcfg(tmp_path, email_to="a@x.com")) == ["a@x.com"]
+    assert r(mkcfg(tmp_path, email_to="a@x.com, b@y.com")) == ["a@x.com", "b@y.com"]
+    assert r(mkcfg(tmp_path, email_to="a@x.com; b@y.com")) == ["a@x.com", "b@y.com"]
+    assert r(mkcfg(tmp_path, email_to=["a@x.com", "b@y.com"])) == ["a@x.com", "b@y.com"]
+    assert r(mkcfg(tmp_path, email_to=("a@x.com",))) == ["a@x.com"]
+    # Blanks from a trailing comma, and a duplicate that would otherwise be a second billed
+    # recipient of the same paper.
+    assert r(mkcfg(tmp_path, email_to="a@x.com, , b@y.com, A@X.com")) == ["a@x.com", "b@y.com"]
+    assert r(mkcfg(tmp_path, email_to=None)) == []
+    # An explicit --to overrides config entirely, and takes the same forms.
+    assert r(mkcfg(tmp_path, email_to="a@x.com"), "c@z.com, d@z.com") == ["c@z.com", "d@z.com"]
+
+
+def test_payload_and_configured_follow_the_list(tmp_path):
+    cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    assert newsletter.resend_payload(cfg, "s", "h", "t", {})["to"] == ["a@x.com", "b@y.com"]
+    assert newsletter.email_configured(cfg)
+    assert not newsletter.email_configured(mkcfg(tmp_path, email_to=""))
+    assert not newsletter.email_configured(mkcfg(tmp_path, email_to=[]))
+
+
+# ---- where the links point -----------------------------------------------------------
+
+def test_dashboard_base_prefers_lan_ip_over_hostname(tmp_path, monkeypatch):
+    """A bare Windows hostname does not resolve from a phone (mDNS, not NetBIOS), and the phone
+    is where this is read -- so the LAN IP wins whenever one can be found."""
+    cfg = mkcfg(tmp_path, email_dashboard_url=None)
+    monkeypatch.setattr(newsletter, "_lan_ip", lambda: "192.168.0.101")
+    assert newsletter.dashboard_base(cfg) == "http://192.168.0.101:8000"
+    # No LAN to find -> the hostname is still better than nothing.
+    monkeypatch.setattr(newsletter, "_lan_ip", lambda: None)
+    assert newsletter.dashboard_base(cfg).startswith("http://")
+    # An explicit setting always wins, trailing slash trimmed.
+    assert newsletter.dashboard_base(
+        mkcfg(tmp_path, email_dashboard_url="https://yard.example/")) == "https://yard.example"
+
+
+def test_lan_ip_refuses_a_public_address(monkeypatch):
+    """A public address here would mean the rig sits directly on the internet; a link to it does
+    not belong in an email."""
+    class FakeSock:
+        def __init__(self, ip):
+            self.ip = ip
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return (self.ip, 9)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(newsletter.socket, "socket", lambda *a: FakeSock("8.8.8.8"))
+    assert newsletter._lan_ip() is None
+    monkeypatch.setattr(newsletter.socket, "socket", lambda *a: FakeSock("192.168.0.101"))
+    assert newsletter._lan_ip() == "192.168.0.101"
+
+
+def test_dashboard_answering(monkeypatch):
+    import contextlib
+    monkeypatch.setattr(newsletter.socket, "create_connection",
+                        lambda addr, timeout: contextlib.nullcontext())
+    assert newsletter.dashboard_answering("http://192.168.0.101:8000") is True
+
+    def refuse(addr, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(newsletter.socket, "create_connection", refuse)
+    assert newsletter.dashboard_answering("http://192.168.0.101:8000") is False
+    assert newsletter.dashboard_answering("not a url") is None
+
+
+def test_issue_deep_links_into_the_dashboard():
+    """Every thing the paper talks about should open the page about that thing -- not the front
+    door. The dashboard routes on the URL hash, so these are the routes it actually parses."""
+    rc = {"cast": [{"id": "miss b.", "species": "raccoon", "days_since": 2, "overdue": False,
+                    "last_seen": "2026-08-09T02:00:00-07:00"}]}
+    b = mkbundle(mkdigest(), rc)
+    html = newsletter.render_email(b, {}, lambda cid: None)
+    assert "http://rig:8000/#dispatch/2026-08-12/night" in html   # the hero + masthead link
+    assert "http://rig:8000/#day/2026-08-11" in html              # the visit row's own day
+    assert "http://rig:8000/#species/raccoon" in html             # the roll row's sheet
+    assert "http://rig:8000/#profile/miss%20b." in html           # the cast member's profile
+    assert "http://rig:8000/#live" in html                        # footer: the other rooms
+    # Percent-encoding matters: the cast contains spaces, apostrophes and the " + " of a family
+    # stamp, and a raw '+' in a URL fragment would decode as a space.
+    assert "%20%2B%20" in newsletter.render_email(
+        mkbundle(mkdigest(), {"cast": [{"id": "stan + kits", "species": "raccoon",
+                                        "days_since": 0, "overdue": False,
+                                        "last_seen": "2026-08-11T23:00:00-07:00"}]}),
+        {}, lambda cid: None)
+
+
+def test_unidentified_species_gets_no_dead_link():
+    """'animal' has no catalogue sheet -- the dashboard leaves it unclickable, so must the paper."""
+    d = mkdigest()
+    d["species"][0]["species"] = "animal"
+    html = newsletter.render_email(mkbundle(d), {}, lambda cid: None)
+    assert "#species/animal" not in html
+
+
+def test_footer_says_when_the_rig_was_not_answering():
+    """A dead tap should accuse the right thing: the dashboard being down, not the address."""
+    up = newsletter.render_email({**mkbundle(), "lan_ok": True}, {}, lambda cid: None)
+    assert "work on the home Wi-Fi" in up and "wasn’t answering" not in up
+    down = newsletter.render_email({**mkbundle(), "lan_ok": False}, {}, lambda cid: None)
+    assert "wasn’t answering" in down
+
+
+def test_text_part_carries_the_links_too():
+    txt = newsletter.render_text(mkbundle())
+    assert "http://rig:8000/#dispatch/2026-08-12/night" in txt
+    assert "http://rig:8000/#live" in txt
+    assert "home Wi-Fi" in txt
+
+
+def test_preview_never_waits_for_dawn(tmp_path, monkeypatch):
+    """--no-send renders a preview. Waiting hours to look at a file is absurd, and because the
+    wait is silent on a buffered pipe it reads as a hang (measured: a midnight `--no-send` sat
+    for 15 minutes having used 0.015s of CPU)."""
+    called = []
+    monkeypatch.setattr(newsletter, "wait_for_dawn", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(newsletter, "collect_issue",
+                        lambda *a, **k: {"d": {"empty": True, "reason": "no data"}})
+    newsletter.main(["--no-send"])
+    assert not called

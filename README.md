@@ -849,6 +849,15 @@ the species roll, and the named cast's roll call. The digest's honesty rules tra
 are floors, "surprising" species are listed as questions, and a night the camera wasn't
 watching says so.
 
+Everything in it **deep-links back into the dashboard** — a visit opens that day, a species
+opens its catalogue sheet, a cast member opens their profile, the hero opens that Dispatch.
+Those links reach the rig **over your own network only** (the dashboard has no login — see
+[Security & privacy](#security--privacy)), so they work from the sofa and not from the bus.
+The address is auto-detected per issue: your machine's **LAN IP**, not its hostname, because
+phones resolve mDNS rather than NetBIOS and `http://your-pc:8000` simply fails on iOS and
+Android. Re-deriving it every morning means a DHCP change heals itself; override with
+`cfg.email_dashboard_url` for a fixed name, a different port, or a reverse proxy.
+
 Sending uses [Resend](https://resend.com)'s REST API (free tier is plenty for one email a
 day) via a single stdlib HTTP call — no SDK. Photos are embedded as inline attachments
 because the alternatives genuinely fail in mail clients: your dashboard's image URLs are
@@ -857,10 +866,13 @@ LAN-only, and Gmail strips `data:` URIs. Set three values in `config_local.py` (
 `config_local.example.py`):
 
 ```python
-cfg.email_to = "you@example.com"
+cfg.email_to = "you@example.com"     # or "you@example.com, someone@else.com" (or a list)
 cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"  # a Resend-verified domain
 cfg.email_resend_api_key = "re_..."
 ```
+
+Several recipients share one email, so each sees the others' addresses in the `To:` header —
+right for a household paper, wrong for a mailing list.
 
 Try it, then schedule it (runs as you, no admin needed):
 
