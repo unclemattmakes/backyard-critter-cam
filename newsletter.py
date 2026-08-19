@@ -51,13 +51,16 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import ipaddress
 import json
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time as _time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -176,6 +179,86 @@ def _species_line(splist, cap=3) -> str:
 
 
 # ---------------------------------------------------------------------------
+# WHO IT GOES TO, and WHERE ITS LINKS POINT.
+# ---------------------------------------------------------------------------
+
+def recipients(cfg, override=None) -> list[str]:
+    """The issue's To: list. Accepts one address, a comma/semicolon-separated string, or a
+    list/tuple -- a household grows, and `email_to = "a@x.com, b@y.com"` is what a person
+    naturally types. Order is preserved, blanks dropped, case-insensitive duplicates collapsed
+    (Resend treats a repeat as a second recipient).
+
+    Everyone on this list sees every other address in the To: header. For a household paper that
+    is the right default -- it reads like one letter to the family, not a mail-merge -- but it is
+    a disclosure, so it is said here and in config.py rather than discovered by a reader."""
+    raw = override if override is not None else getattr(cfg, "email_to", None)
+    if raw is None:
+        return []
+    parts = re.split(r"[,;]", raw) if isinstance(raw, str) else list(raw)
+    out, seen = [], set()
+    for part in parts:
+        addr = str(part).strip()
+        if addr and addr.casefold() not in seen:
+            seen.add(addr.casefold())
+            out.append(addr)
+    return out
+
+
+def _lan_ip() -> str | None:
+    """This machine's address ON THE LAN, or None.
+
+    Opens a UDP socket toward a routable address and reads back the local end. No packet is ever
+    sent (UDP connect only sets the peer), and it resolves to the interface the OS would actually
+    use -- which beats enumerating adapters and guessing, on a box that also carries WSL and
+    virtual ones. Only a PRIVATE address is accepted: a public one here would mean the rig sits
+    directly on the internet, and a link to it does not belong in an email."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 9))
+        ip = s.getsockname()[0]
+        addr = ipaddress.ip_address(ip)
+        return ip if addr.is_private and not addr.is_loopback and not addr.is_link_local else None
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def dashboard_base(cfg) -> str:
+    """Where a phone on the sofa should point to reach this rig.
+
+    An explicit email_dashboard_url always wins. Otherwise the LAN IP -- because the bare Windows
+    hostname this used to emit ("http://<this-pc>:8000") frequently does NOT resolve from a
+    phone: iOS and Android ask mDNS for `name.local`, they do not speak NetBIOS, so the one link
+    in the paper died exactly where it was meant to be tapped. The address is re-derived for every
+    issue, so a DHCP reassignment heals itself with tomorrow's edition rather than needing a
+    config edit. Falls back to the hostname when there is no LAN to find."""
+    base = getattr(cfg, "email_dashboard_url", None)
+    if base:
+        return str(base).rstrip("/")
+    return f"http://{_lan_ip() or socket.gethostname().lower()}:{getattr(cfg, 'web_port', 8000)}"
+
+
+def dashboard_answering(base, timeout=1.5) -> bool | None:
+    """Is something accepting connections at `base`? None when the URL can't be parsed.
+
+    Advisory only -- the links print either way, because the rig may well be started between the
+    07:00 send and the reader's coffee, and a link that works later is not a lie. What this buys
+    is the footnote: a dead tap should tell you the DASHBOARD was down, not leave you wondering
+    whether the email got the address wrong."""
+    try:
+        parts = urllib.parse.urlsplit(base)
+        host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+        if not host:
+            return None
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Gathering the issue: the digest + the cast, plus the couple of scalars only the email needs.
 # ---------------------------------------------------------------------------
 
@@ -198,9 +281,7 @@ def collect_issue(cfg, edition="night", date=None, now=None) -> dict:
             issue_no = None
         finally:
             conn.close()
-    base = getattr(cfg, "email_dashboard_url", None)
-    if not base:
-        base = f"http://{socket.gethostname().lower()}:{getattr(cfg, 'web_port', 8000)}"
+    base = dashboard_base(cfg)
     # The email re-judges the digest's plate for CUTENESS (see pick_plate); the digest's own
     # sharpest-frame plate stays as the fallback whenever the re-judging can't run.
     try:
@@ -208,7 +289,7 @@ def collect_issue(cfg, edition="night", date=None, now=None) -> dict:
     except Exception:
         plate = d.get("plate")
     return {"d": d, "rc": rc, "plate": plate, "issue_no": issue_no,
-            "base_url": base.rstrip("/"),
+            "base_url": base, "lan_ok": dashboard_answering(base),
             "generated": (now or datetime.now().astimezone()).isoformat()}
 
 
@@ -732,6 +813,30 @@ def _img_src_data(images):
     return src
 
 
+# Every link is ABSOLUTE and points at the rig on the LAN (see dashboard_base). The dashboard
+# routes on the URL hash -- #day/<date>, #species/<name>, #profile/<name>, #dispatch/<date>/<ed>,
+# and the bare view names -- so the paper can hand a reader the exact page for the thing they are
+# reading about, instead of one link to the front door. Names are percent-encoded because the
+# cast contains spaces, apostrophes and the " + " of a family stamp, and the dashboard decodes
+# with decodeURIComponent.
+def _url(base, frag="") -> str:
+    return f"{base}/#{frag}" if frag else (base or "")
+
+
+def _q(name) -> str:
+    return urllib.parse.quote(str(name or ""), safe="")
+
+
+def _a(href, inner, style="") -> str:
+    """An anchor, or the bare content when there is nowhere to point. Link colour is stated
+    inline: mail clients drop stylesheets, and an unstyled link renders as default blue
+    underline, which would pepper a newspaper with hyperlink-blue."""
+    if not href:
+        return inner
+    return (f'<a href="{_esc(href)}" style="color:inherit;text-decoration:none;{style}">'
+            f'{inner}</a>')
+
+
 def _flag(text, bg=_C["flag_bg"], ink=_C["soft"]) -> str:
     return (f'<span style="display:inline-block;background:{bg};color:{ink};'
             f'border:1px solid {_C["rule"]};border-radius:10px;padding:2px 10px;'
@@ -751,7 +856,8 @@ def render_email(bundle, images, img_src) -> str:
     issue = f"No. {bundle['issue_no']} · " if bundle.get("issue_no") else ""
     moon = d.get("moon")
     moonstr = f" · {moon['glyph']} {_esc(moon['name'])}, {moon['illum_pct']}% lit" if moon else ""
-    dash = f"{bundle['base_url']}/#dispatch/{anchor}/{ed}" if anchor else bundle["base_url"]
+    base = bundle.get("base_url") or ""
+    dash = _url(base, f"dispatch/{anchor}/{ed}") if anchor else base
 
     lede = compose_lede(bundle)
     parts = []
@@ -805,8 +911,7 @@ def render_email(bundle, images, img_src) -> str:
         if hero_src:
             parts.append(f"""
       <div style="margin:14px 0 4px;">
-        <img src="{hero_src}" width="588" alt="{_esc(_name_of(plate.get('species')))} at {_esc(_clock(plate.get('time')))}"
-             style="width:100%;max-width:588px;border-radius:6px;border:1px solid {_C['rule']};display:block;">
+        {_a(dash, f'<img src="{hero_src}" width="588" alt="{_esc(_name_of(plate.get("species")))} at {_esc(_clock(plate.get("time")))}" style="width:100%;max-width:588px;border-radius:6px;border:1px solid {_C["rule"]};display:block;">')}
         <div style="font-size:12px;color:{_C['soft']};margin-top:6px;">{cap}</div>
       </div>""")
         elif plate_src:
@@ -857,18 +962,19 @@ def render_email(bundle, images, img_src) -> str:
                 # crop that failed to load): every row must have the same cell count or email
                 # clients drift the columns.
                 src = img_src(f"v{i}")
+                vurl = _url(base, f"day/{str(v.get('start') or '')[:10]}") if base else ""
                 thumb = (f'<td width="56" style="padding:6px 10px 6px 0;vertical-align:middle;">'
-                         + (f'<img src="{src}" width="56" height="56" alt="" '
-                            f'style="border-radius:6px;display:block;">' if src else "")
+                         + (_a(vurl, f'<img src="{src}" width="56" height="56" alt="" '
+                                     f'style="border-radius:6px;display:block;">') if src else "")
                          + '</td>')
                 rows.append(f"""
         <tr>
           <td width="74" style="padding:6px 8px 6px 0;vertical-align:top;white-space:nowrap;">
-            <b style="font-size:13px;">{_esc(_clock(v.get('start')))}</b>
+            {_a(vurl, f"<b style='font-size:13px'>{_esc(_clock(v.get('start')))}</b>")}
             <div style="font-size:11px;color:{_C['faint']};">{_esc(_dur_text(v.get('minutes')))}</div>
           </td>{thumb}
           <td style="padding:6px 0;vertical-align:middle;">
-            <span style="font-size:14px;font-weight:600;">{_esc(sp)}</span>{inds}{tagstr}
+            {_a(vurl, f"<span style='font-size:14px;font-weight:600'>{_esc(sp)}</span>")}{inds}{tagstr}
           </td>
           <td align="right" style="padding:6px 0;vertical-align:middle;font-size:11px;color:{_C['faint']};white-space:nowrap;">{right}</td>
         </tr>
@@ -899,14 +1005,17 @@ def render_email(bundle, images, img_src) -> str:
                             f'{_esc(latin)}</i>') if latin else ""
                 typ = f' · usually {_esc(s["typical"])}' if s.get("typical") else ""
                 src = img_src(f"s{i}")
+                # 'animal' has no catalogue sheet (the dashboard leaves it unclickable too).
+                surl = (_url(base, f"species/{_q(s.get('species'))}")
+                        if base and s.get("species") not in (None, "animal") else "")
                 thumb = (f'<td width="56" style="padding:6px 10px 6px 0;">'
-                         f'<img src="{src}" width="56" height="56" alt="" '
-                         f'style="border-radius:6px;display:block;"></td>'
+                         + _a(surl, f'<img src="{src}" width="56" height="56" alt="" '
+                                    f'style="border-radius:6px;display:block;">') + '</td>'
                          if src else '<td width="0"></td>')
                 rows.append(f"""
         <tr>{thumb}
           <td style="padding:6px 0;vertical-align:middle;">
-            <span style="font-size:14px;font-weight:600;">{_esc(_name_of(s.get('species')))}</span>{latinstr}
+            {_a(surl, f"<span style='font-size:14px;font-weight:600'>{_esc(_name_of(s.get('species')))}</span>")}{latinstr}
             <div style="font-size:11px;color:{_C['soft']};">{_esc(_clock(s.get('first')))}–{_esc(_clock(s.get('last')))}{typ}</div>
             {"".join(badges)}
           </td>
@@ -967,30 +1076,46 @@ def render_email(bundle, images, img_src) -> str:
                 # absence). Shown only as presence, only when no solo base row exists to carry it.
                 base_known = c["id"].split(" + ", 1)[0].strip().casefold() in solos
                 if not base_known and _in_period(c):
-                    seen.append(_cap1(c["id"]))
+                    seen.append(_a(_url(base, f"profile/{_q(c['id'])}") if base else "",
+                                   f'<b>{_esc(_cap1(c["id"]))}</b>'))
                 continue
             label = _cap1(c["id"])
+            link = _a(_url(base, f"profile/{_q(c['id'])}") if base else "",
+                      f'<b>{_esc(label)}</b>')
             if _in_period(c) or ds <= 0:
-                seen.append(label + (" (with the kits)" if c.get("via_group") else ""))
+                seen.append(link + (" (with the kits)" if c.get("via_group") else ""))
             elif c.get("overdue"):
-                gone.append(f"{label} ({ds}d — overdue)")
+                gone.append(f"{link} ({ds}d — overdue)")
             elif ds <= 10:
-                gone.append(f"{label} ({ds}d)")
+                gone.append(f"{link} ({ds}d)")
         lines = []
         if seen:
-            lines.append(f"<b>Came by:</b> {_esc(', '.join(seen))}.")
+            lines.append(f"<b>Came by:</b> {', '.join(seen)}.")
         if gone:
-            lines.append(f"<b>Not {('tonight' if ed == 'night' else 'today')}:</b> {_esc(', '.join(gone))}.")
+            lines.append(f"<b>Not {('tonight' if ed == 'night' else 'today')}:</b> {', '.join(gone)}.")
         if lines:
             parts.append(_section("Cast Roll Call", f"{len(solos) or len(cast)} named"))
             parts.append(f'<p style="font-size:13px;line-height:1.6;margin:8px 2px;">'
                          f'{"<br>".join(lines)}</p>')
 
     # -- footer -------------------------------------------------------------------
+    # The links reach the rig over the HOME NETWORK and nowhere else -- that is deliberate (the
+    # dashboard has no login), but a reader tapping from a bus deserves to know why nothing
+    # happened, and so does one tapping at the kitchen table while the rig is off.
+    rooms = " &nbsp;·&nbsp; ".join(
+        _a(_url(base, frag), f'<span style="color:{_C["gilt"]};">{label}</span>')
+        for frag, label in (("live", "Live camera"), ("visits", "Visit log"),
+                            ("indiv", "The cast"), ("calendar", "Calendar")))
+    reach = ("Links open the rig's dashboard — they work on the home Wi-Fi."
+             if bundle.get("lan_ok") is not False else
+             "Links open the rig's dashboard on the home Wi-Fi — it wasn’t answering when this "
+             "issue was sent, so start the rig if a link goes nowhere.")
     parts.append(f"""
     <div style="margin-top:22px;padding-top:12px;border-top:3px double {_C['ink']};text-align:center;">
       <a href="{_esc(dash)}" style="color:{_C['gilt']};font-weight:700;font-size:14px;">Open the full Dispatch → highlight reel &amp; clips</a>
+      <p style="font-size:12px;margin:8px 0 0;">{rooms}</p>
       <p style="font-size:11px;color:{_C['faint']};margin:10px 0 0;line-height:1.6;">
+        {_esc(reach)}<br>
         Counts are what the camera demonstrably saw — floors, not censuses.<br>
         Backyard Critter Cam · generated {_esc(bundle['generated'][:16].replace('T', ' '))}
       </p>
@@ -1032,9 +1157,16 @@ def render_text(bundle) -> str:
         out.append(f"  {_name_of(s.get('species'))}: {s.get('visits')} visit"
                    f"{'' if s.get('visits') == 1 else 's'}, {_clock(s.get('first'))}–{_clock(s.get('last'))}"
                    + (" (off-hours; verify)" if s.get("surprising") else ""))
-    out += ["", f"Full dispatch: {bundle['base_url']}/#dispatch"
-            + (f"/{d.get('anchor')}/{ed}" if d.get("anchor") else ""),
-            "Counts are floors, not censuses. Generated " + bundle["generated"][:16].replace("T", " ") + "."]
+    base = bundle.get("base_url") or ""
+    frag = f"dispatch/{d.get('anchor')}/{ed}" if d.get("anchor") else "dispatch"
+    out += ["",
+            f"Full dispatch: {_url(base, frag)}",
+            f"Live camera:   {_url(base, 'live')}",
+            f"The cast:      {_url(base, 'indiv')}",
+            "(these reach the rig on the home Wi-Fi)",
+            "",
+            "Counts are floors, not censuses. Generated "
+            + bundle["generated"][:16].replace("T", " ") + "."]
     return "\n".join(out)
 
 
@@ -1048,7 +1180,7 @@ def resend_payload(cfg, subject, html, text, images, to=None) -> dict:
     references cid:<content_id>)."""
     return {
         "from": cfg.email_from,
-        "to": [to or cfg.email_to],
+        "to": recipients(cfg, to),
         "subject": subject,
         "html": html,
         "text": text,
@@ -1129,7 +1261,7 @@ def wait_for_dawn(cfg, now=None, max_wait_s=4 * 3600, _sleep=_time.sleep) -> flo
 
 
 def email_configured(cfg) -> bool:
-    return bool(getattr(cfg, "email_to", None) and getattr(cfg, "email_from", None)
+    return bool(recipients(cfg) and getattr(cfg, "email_from", None)
                 and getattr(cfg, "email_resend_api_key", None))
 
 
@@ -1143,7 +1275,9 @@ def _say(msg: str, always_log: bool = False) -> None:
     logging swallows emit errors. Here the fallback is explicit, so the 07:00 run both survives
     and leaves a trail."""
     if sys.stdout is not None:
-        print(msg)
+        # flush: this process can then sleep for hours (wait_for_dawn), and a buffered
+        # explanation of WHY is worth nothing -- it arrives with the exit.
+        print(msg, flush=True)
     if always_log or sys.stdout is None:
         try:
             _LOG_PATH.parent.mkdir(exist_ok=True)
@@ -1158,7 +1292,8 @@ def main(argv=None) -> int:
     p.add_argument("--edition", choices=("night", "day", "auto"), default="night",
                    help="Which completed period to write up (default: night).")
     p.add_argument("--date", default=None, help="Anchor date YYYY-MM-DD for a back-issue.")
-    p.add_argument("--to", default=None, help="One-off recipient override (still needs from/key).")
+    p.add_argument("--to", default=None,
+                   help="One-off recipient override, comma-separated (still needs from/key).")
     p.add_argument("--out", default=None, help="Write the archive copy to this path.")
     p.add_argument("--send", action="store_true",
                    help="Strict: exit non-zero if email is unconfigured or refused.")
@@ -1169,7 +1304,10 @@ def main(argv=None) -> int:
 
     from config import CONFIG as cfg
 
-    if args.edition == "night" and not args.date and not args.no_wait:
+    # The dawn wait exists so the 07:00 task never mails the night before by mistake. It is
+    # wrong for every other way of running this: --no-send renders a preview (waiting four
+    # hours to look at a file is absurd), and a pinned --date is already a completed period.
+    if (args.edition == "night" and not args.date and not args.no_wait and not args.no_send):
         wait_for_dawn(cfg)
 
     bundle = collect_issue(cfg, edition=args.edition, date=args.date)
@@ -1203,7 +1341,7 @@ def main(argv=None) -> int:
         _say(f"[newsletter] send FAILED: {e}", always_log=True)
         return 1
     _say(f"[newsletter] sent {d.get('anchor')} {d.get('edition')} -> "
-         f"{args.to or cfg.email_to} (id {mail_id})", always_log=True)
+         f"{', '.join(recipients(cfg, args.to))} (id {mail_id})", always_log=True)
     return 0
 
 
