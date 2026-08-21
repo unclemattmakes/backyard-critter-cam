@@ -377,7 +377,7 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
 
 `python backyard_cam.py --serve` runs the same capture loop **and** a local web page (open
 `http://127.0.0.1:8000`) — a field journal for the yard you can leave open in a browser tab. It
-has grown from a single live feed into **eight tabs**:
+has grown from a single live feed into **nine tabs**:
 
 - **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
   how-long-ago, confidence, a ▶ badge to play its clip, and a live *off-pattern* flag if it
@@ -390,6 +390,15 @@ has grown from a single live feed into **eight tabs**:
 - **Visit Log** — *the landing page*: the yard's comings and goings as scrollable cards (species
   mix, any named individuals, dwell, ▶ its clips), with the named cast across the top so any
   individual is one tap from their profile. The "scroll around and see what happened" surface.
+- **Favourites** — the album. A ♡ on any visit card or photograph keeps it, and this tab
+  collects them: kept visits as their own playable cards, kept photographs as a grid, each with
+  an optional note ("the night the kits came out") and the name of whoever kept it. Unlike every
+  other verdict on the dashboard, a ♡ is **only taste** — it changes no label and nothing
+  downstream reads it, so keeping the cutest photo of Stan can never become evidence that it *is*
+  Stan. A kept visit is remembered as a moment on a camera rather than a visit id (those get
+  renumbered), so it survives re-clustering — star a visit while the animal is still on camera
+  and the card grows to the finished span. A favourite whose crops are later purged is listed as
+  gone rather than quietly disappearing.
 - **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day,
   with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
   reel** — the period's best moments auto-cut into one short stitched video (~1 minute for a
@@ -955,6 +964,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 | `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
 | `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
 | `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
+| `favorites` | What a human kept — a crop (by `detection_id`) or a visit (by `source` + the moment it started, because visit ids are renumbered on every rebuild), plus an optional note and who kept it. Taste, not evidence: nothing machine-side reads it either. |
 | `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
 | `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
 | `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |

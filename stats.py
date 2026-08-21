@@ -989,7 +989,11 @@ def review_queue(cfg, limit: int = 150) -> dict:
         total = len(out)
         for c in out:
             c.pop("_p", None)
-        return {"crops": out[:max(1, int(limit))], "total": total, "shown": min(int(limit), total)}
+        shown = out[:max(1, int(limit))]
+        starred = db.favorite_keys(conn)["detections"]     # so the heart renders filled here too
+        for c in shown:
+            c["favorite"] = c["id"] in starred
+        return {"crops": shown, "total": total, "shown": min(int(limit), total)}
     finally:
         conn.close()
 
@@ -1004,8 +1008,10 @@ def species_crops(cfg, species: str, limit: int = 160) -> list:
             "SELECT id, crop_path, ROUND(species_confidence, 3) conf, species_verified, "
             "timestamp, source FROM detections WHERE species = ? ORDER BY id DESC LIMIT ?",
             (species, int(limit))).fetchall()
+        starred = db.favorite_keys(conn)["detections"]
         return [{"id": r["id"], "crop_path": (r["crop_path"] or "").replace("\\", "/"),
                  "confidence": r["conf"], "verified": r["species_verified"],
+                 "favorite": r["id"] in starred,
                  "timestamp": r["timestamp"], "source": r["source"]} for r in rows]
     finally:
         conn.close()
@@ -1035,9 +1041,14 @@ def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limi
             f"SELECT id, timestamp, species, confidence, species_confidence, species_verified, "
             f"crop_path FROM detections {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
             args + [int(limit), int(offset)]).fetchall()
+        # One star lookup for the whole page (db.favorite_keys is two sets, not a query per row),
+        # so every crop grid renders its hearts already filled -- no second round trip, and no
+        # window where a favourite you just made looks un-made.
+        starred = db.favorite_keys(conn)["detections"]
         crops = [{"id": r["id"], "timestamp": r["timestamp"], "species": r["species"],
                   "confidence": r["confidence"], "species_confidence": r["species_confidence"],
                   "verified": r["species_verified"],
+                  "favorite": r["id"] in starred,
                   "crop_path": (r["crop_path"] or "").replace("\\", "/")} for r in rows]
         return {"crops": crops, "total": total, "offset": int(offset), "limit": int(limit)}
     finally:
@@ -1045,6 +1056,13 @@ def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limi
 
 
 _VISITS_SCAN_ROWS = 15000   # newest detections scanned for the no-filter visits page (see below)
+
+# The columns compute_visits + _shot_score + _named_of need to build a visit card. Shared by
+# visits_page and favorites_page so the two can never drift into rendering different cards for
+# the same visit (favorites_page re-derives a starred visit from scratch -- see _visit_at).
+_VISIT_ROW_COLS = ("id, source, timestamp, detection_class, species, confidence, "
+                   "species_confidence, crop_path, crop_quality, individual_id, "
+                   "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h")
 
 
 def visits_page(cfg, day=None, limit=200) -> dict:
@@ -1060,9 +1078,7 @@ def visits_page(cfg, day=None, limit=200) -> dict:
     if conn is None:
         return {"visits": [], "total": 0}
     try:
-        cols = ("id, source, timestamp, detection_class, species, confidence, species_confidence, "
-                "crop_path, crop_quality, individual_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, "
-                "frame_w, frame_h")
+        cols = _VISIT_ROW_COLS
         windowed = False
         if day:
             rows = conn.execute(
@@ -1086,11 +1102,16 @@ def visits_page(cfg, day=None, limit=200) -> dict:
                     oldest[v["source"]] = v
             visits = [v for v in visits if oldest[v["source"]] is not v]
         visits.sort(key=lambda v: v["start"], reverse=True)
+        starred = db.favorite_keys(conn)["visits"]
         out = []
         for v in visits[:limit]:
             title = v["classes"].most_common(1)[0][0] if v["classes"] else "animal"
+            start_iso = v["start"].isoformat()
             out.append({
-                "start": v["start"].isoformat(), "end": v["end"].isoformat(), "source": v["source"],
+                "start": start_iso, "end": v["end"].isoformat(), "source": v["source"],
+                # Starred? Keyed on (source, start) -- the same key db.add_favorite stores, and
+                # the same ISO string the card will POST back, so the round trip is exact.
+                "favorite": (v["source"], start_iso) in starred,
                 "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
                 "max_conf": round(v["max_conf"], 3), "title": title,
                 "classes": dict(v["classes"].most_common()),
@@ -1101,6 +1122,130 @@ def visits_page(cfg, day=None, limit=200) -> dict:
                 "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
             })
         return {"visits": out, "total": len(visits), "window": windowed}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# FAVOURITES -- the gallery of things a human kept, and the re-derivation that makes a starred
+# VISIT survive the fact that visits are not durable objects here (see the `favorites` table
+# comment in db.py). A starred visit is a MOMENT ON A CAMERA, not a row id: the gallery goes back
+# to the detections and re-clusters the visit that contains that moment, which is exactly what
+# visits_page does for the Visit Log, so the same visit renders the same card in both places --
+# and a visit that was still in progress when it was starred shows its finished self later.
+# ---------------------------------------------------------------------------
+
+# How far past a starred moment to look for the rest of its visit. A visit ends at the first
+# gap > visit_gap_minutes, so this is a SAFETY BOUND, not the expected span: it only decides how
+# much of the night a single query may scan when the camera never went quiet. 12 h covers dusk
+# to dawn -- the longest a real visit could pretend to be -- without letting one starred moment
+# read a whole week of detections.
+_FAV_VISIT_WINDOW_H = 12
+_FAV_VISIT_SCAN_ROWS = 6000     # ... and a row cap, for a night the detector spent on furniture.
+
+
+def _visit_at(conn, cfg, source, started_at, clips=None):
+    """The visit CONTAINING instant `started_at` on `source`, re-clustered from the detections,
+    shaped exactly like a visits_page entry -- or None if nothing is there any more (every crop
+    purged, or a camera that no longer exists). Callers render that None as a tombstone rather
+    than dropping the row: a favourite that quietly disappears is worse than one that says why.
+
+    The scan starts one gap BEFORE the starred moment, so a detection imported later that merges
+    into the front of the visit widens the card instead of splitting it."""
+    start_dt = _parse(started_at)
+    if start_dt is None:
+        return None
+    gap = float(getattr(cfg, "visit_gap_minutes", 5.0) or 5.0)
+    lo = (start_dt - timedelta(minutes=gap)).isoformat()
+    hi = (start_dt + timedelta(hours=_FAV_VISIT_WINDOW_H)).isoformat()
+    rows = conn.execute(
+        f"SELECT {_VISIT_ROW_COLS} FROM detections WHERE source = ? AND timestamp >= ? "
+        "AND timestamp <= ? ORDER BY timestamp LIMIT ?",
+        (source, lo, hi, _FAV_VISIT_SCAN_ROWS)).fetchall()
+    if not rows:
+        return None
+    v = next((c for c in compute_visits(rows, gap, rep_key=_shot_score)
+              if c["start"] <= start_dt <= c["end"]), None)
+    if v is None:
+        return None
+    # Did the row cap cut this visit short? Only possible when the scan filled AND the starred
+    # visit is still running at the last row we read -- i.e. one visit of its own that long. Said
+    # out loud rather than shown as a shorter visit than the Visit Log draws for the same span
+    # (the same reason visits_page reports `window`).
+    truncated = (len(rows) >= _FAV_VISIT_SCAN_ROWS
+                 and v["end"] >= (_parse(rows[-1]["timestamp"]) or v["end"]))
+    if clips is None:
+        clips = load_clips(conn, include_pruned=True)
+    title = v["classes"].most_common(1)[0][0] if v["classes"] else "animal"
+    return {
+        **({"truncated": True} if truncated else {}),
+        "start": v["start"].isoformat(), "end": v["end"].isoformat(), "source": v["source"],
+        "count": v["count"], "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
+        "max_conf": round(v["max_conf"], 3), "title": title,
+        "classes": dict(v["classes"].most_common()),
+        "individuals": _named_of(v),
+        "rep_crop": _web(v.get("rep_crop")),
+        "favorite": True,
+        "clips": [_clip_out(c) for c in
+                  clips_overlapping(clips, v["source"], v["start"], v["end"])],
+    }
+
+
+def favorites_page(cfg, limit: int = 300) -> dict:
+    """The favourites gallery: every starred crop and visit, newest star first.
+
+    Each entry carries the star itself (note, who kept it, when) plus the thing it points at,
+    re-read live -- so a crop relabelled since it was starred shows its CURRENT species, and a
+    starred visit shows its current span and clips. Nothing is snapshotted at starring time
+    except the note, because a gallery that shows stale labels is a second source of truth.
+
+    `gone: true` marks a star whose subject no longer exists (its crops were purged). The row is
+    still listed, with its note: what someone chose to keep, and the fact that it is no longer
+    there, are both worth saying out loud."""
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {"favorites": [], "total": 0, "crops": 0, "visits": 0}
+    try:
+        favs = db.favorites(conn, limit=limit)
+        if not favs:
+            return {"favorites": [], "total": 0, "crops": 0, "visits": 0}
+        # Every starred crop in one query (not one per row), then matched back up below.
+        det_ids = [f["detection_id"] for f in favs
+                   if f["kind"] == "detection" and f["detection_id"] is not None]
+        crops = {}
+        if det_ids:
+            marks = ",".join("?" * len(det_ids))
+            for r in conn.execute(
+                    "SELECT id, source, timestamp, species, confidence, species_confidence, "
+                    f"species_verified, crop_path, individual_id FROM detections WHERE id IN ({marks})",
+                    det_ids):
+                crops[r["id"]] = {
+                    "id": r["id"], "source": r["source"], "timestamp": r["timestamp"],
+                    "species": r["species"], "confidence": r["confidence"],
+                    "species_confidence": r["species_confidence"],
+                    "verified": r["species_verified"], "individual": r["individual_id"],
+                    "crop_path": _web(r["crop_path"]), "favorite": True}
+        clips = load_clips(conn, include_pruned=True) if any(
+            f["kind"] == "visit" for f in favs) else []
+        out = []
+        for f in favs:
+            item = {"fav_id": f["id"], "kind": f["kind"], "note": f["note"],
+                    "labeled_by": f["labeled_by"], "created_at": f["created_at"]}
+            if f["kind"] == "detection":
+                item["detection_id"] = f["detection_id"]
+                item["crop"] = crops.get(f["detection_id"])
+                item["gone"] = item["crop"] is None
+            else:
+                item["source"], item["started_at"] = f["source"], f["started_at"]
+                item["visit"] = _visit_at(conn, cfg, f["source"], f["started_at"], clips)
+                # The span as it stood when starred -- the only thing worth showing for a visit
+                # whose crops are gone, and never used when the live one is available.
+                item["ended_at"] = f["ended_at"]
+                item["gone"] = item["visit"] is None
+            out.append(item)
+        return {"favorites": out, "total": len(out),
+                "crops": sum(1 for f in out if f["kind"] == "detection"),
+                "visits": sum(1 for f in out if f["kind"] == "visit")}
     finally:
         conn.close()
 
@@ -1179,6 +1324,7 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
                     g["rep_crop"], g["rep_score"] = r["crop_path"], score
 
         companions = Counter()
+        starred = db.favorite_keys(conn)["visits"]   # profile cards are Visit Log cards
         visits = []
         for vid, g in grouped.items():
             if g["start"] is None:
@@ -1187,8 +1333,10 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
             for other in _named_of(g):
                 if other != name:
                     companions[other] += 1
+            start_iso = g["start"].isoformat()
             visits.append({
-                "visit_id": vid, "start": g["start"].isoformat(), "end": g["end"].isoformat(),
+                "visit_id": vid, "start": start_iso, "end": g["end"].isoformat(),
+                "favorite": (g["source"], start_iso) in starred,
                 "source": g["source"], "count": g["count"], "n_mine": g["n_mine"],
                 "minutes": round((g["end"] - g["start"]).total_seconds() / 60.0, 1),
                 "max_conf": round(g["max_conf"], 3), "title": title,

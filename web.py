@@ -939,6 +939,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self._json(reel.reel_status(cfg, edition=(q.get("edition") or ["auto"])[0],
                                                 date=(q.get("date") or [None])[0]))
+                elif path == "/api/favorites":
+                    # The gallery of kept things. Cached like every other read; every POST
+                    # clears the whole API cache, so a star shows up here on the next open.
+                    self._json(_cached(cfg, "favorites", lambda: stats.favorites_page(cfg)))
                 elif path == "/api/behavior":
                     self._json(_cached(cfg, "behavior", lambda: behavior.overview(cfg), hold_s=30))
                 elif path == "/api/seasons":
@@ -1101,6 +1105,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._reid_confirm(data)
                 elif path == "/api/visit/label":
                     self._visit_label(data)
+                elif path == "/api/favorite":
+                    self._favorite(data)
                 elif path == "/api/live/sighting":
                     self._live_sighting(data)
                 elif path == "/api/reid/unblend/label":
@@ -1216,6 +1222,49 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             conn = db.connect(cfg.db_path)
             try:
                 self._json({"ok": True, **db.apply_visit_label(conn, **kw)})
+            finally:
+                conn.close()
+
+        def _favorite(self, data):
+            """Star / un-star one crop or one visit -- "keep this".
+
+            Body: {"kind":"detection", "detection_id":n} or
+                  {"kind":"visit", "source":.., "start":.., "end":..}, plus:
+              "on":    false to un-star (default true).
+              "note":  present (including "" or null) = set the caption exactly, the same
+                       key-present idiom _visit_label uses for `name`.
+
+            The visit form takes source+start+end -- _visitTarget's shape, the same one
+            /api/visit/label takes -- because a visit id is not a durable handle here (the Visit
+            Log re-clusters visits per request and visits.py renumbers the ledger). Only `start`
+            is the key; `end` is recorded for display. See the `favorites` table in db.py.
+
+            This is the one write in the dashboard that says nothing about WHAT the animal is,
+            so it never touches a label, a species or an identity -- and nothing downstream
+            reads it."""
+            kind = str(data.get("kind") or "").strip().lower()
+            kw = {}
+            if kind == "detection":
+                kw["detection_id"] = data.get("detection_id")
+            elif kind == "visit":
+                kw["source"] = data.get("source")
+                kw["started_at"] = data.get("started_at") or data.get("start")
+            # Any other kind falls through with an empty key and is refused by db._fav_key below,
+            # so the validation lives in ONE place rather than being restated here.
+            conn = db.connect(cfg.db_path)
+            try:
+                if data.get("on") is False:
+                    self._json({"ok": True, "favorite": False,
+                                "removed": db.remove_favorite(conn, kind, **kw)})
+                    return
+                row = db.add_favorite(conn, kind, note=data.get("note"),
+                                      ended_at=(data.get("ended_at") or data.get("end")),
+                                      labeled_by=_labeler(data), **kw)
+                if "note" in data:      # present (incl. ""/null) = set the caption exactly
+                    row = db.set_favorite_note(conn, kind, data.get("note"), **kw) or row
+                self._json({"ok": True, "favorite": True, "row": row})
+            except ValueError as e:
+                self._json({"error": str(e)}, code=400)
             finally:
                 conn.close()
 

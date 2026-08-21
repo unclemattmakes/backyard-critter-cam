@@ -27,6 +27,7 @@
   body.viewer #view-indiv .gear,       /* queue confirm/correct/bulk controls */
   body.viewer #view-indiv input,
   body.viewer .ev-add,                 /* field-notebook entry form on profiles */
+  body.viewer .fav,                    /* the ♡ (the album itself still reads) */
   body.viewer #zones-sec { display:none !important; }
 
   /* The tappable ⓘ + its popover (infoDot in dashboard.js): the phone-reachable home for the
@@ -292,6 +293,12 @@
   .tally{cursor:pointer; transition:background .15s;}
   .tally:hover{background:var(--panel2);}
   .more{padding:18px 0 4px; text-align:center;}
+  /* The species name in a mixed photo grid is the drill-down into that species (it moved off the
+     whole tile, so a click on the photograph enlarges the photograph). Dotted underline = a link
+     that isn't loud enough to compete with the picture. */
+  .crop .obs-sp.clickable{ cursor:pointer; text-decoration:underline dotted var(--rule2);
+    text-underline-offset:2px; }
+  .crop .obs-sp.clickable:hover{ color:var(--gilt); text-decoration-color:var(--gilt); }
   .crop .obs-sp{margin-left:auto; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:62%; font-variant:small-caps; letter-spacing:.02em;}
   .daygrid{display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px;}
   .daycard{background:var(--panel); border:1px solid var(--rule); border-radius:4px; padding:14px 16px; cursor:pointer; transition:border-color .18s, transform .18s, box-shadow .18s;}
@@ -689,6 +696,51 @@
     border-radius:2px; padding:0 3px; font-size:8px; letter-spacing:.1em; text-transform:uppercase; }
   .vl-ind.clickable{ cursor:pointer; }
   .vl-ind.clickable:hover{ border-color:var(--gilt); background:rgba(201,162,75,.12); }
+
+  /* ---------- favourites: the ♡ and the album ----------
+     The heart rides on top of the picture (every photo app puts it there, so nobody has to be
+     told what it is) but stays quiet until you look at it — this is a reading surface first, and
+     a row of loud red hearts would out-shout the animals. Gilt when kept, like every other
+     "a human decided this" mark on the page. */
+  .fav{ position:absolute; top:6px; left:6px; z-index:3; width:26px; height:26px; padding:0;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; line-height:1;
+    font-size:14px; font-family:var(--serif); color:var(--ink);
+    background:rgba(16,13,7,.55); border:1px solid var(--rule2); border-radius:50%; opacity:.62;
+    transition:opacity .15s, color .15s, border-color .15s, transform .15s; }
+  .fav:hover{ opacity:1; color:var(--gilt); border-color:var(--gilt); transform:scale(1.09); }
+  .crop:hover .fav, .card:hover .fav{ opacity:1; }
+  .fav.on{ opacity:1; color:var(--gilt); border-color:rgba(201,162,75,.6); background:rgba(16,13,7,.78); }
+  /* Needs Review puts a full-width reason strip across the top of a crop; drop below it. */
+  .rv-tag ~ .fav{ top:26px; }
+
+  .fav-hint{ color:var(--faint); font-style:italic; font-size:13px; margin:-2px 0 14px; }
+  /* A kept visit is the Visit Log's own card with its caption underneath, so the two surfaces
+     never drift apart: the wrapper is the grid cell, the card is untouched. */
+  .fav-wrap{ display:flex; flex-direction:column; }
+  .fav-wrap .card{ flex:1 1 auto; }
+  .fav-trunc{ margin-top:6px; color:var(--faint); }
+  .fav-note{ margin-top:6px; padding:6px 9px; border:1px dashed var(--rule2); border-radius:3px;
+    background:rgba(0,0,0,.18); color:var(--dim); font-family:var(--serif); font-size:13px;
+    line-height:1.35; cursor:text; transition:border-color .15s; }
+  .fav-note:hover{ border-color:var(--gilt); }
+  .fav-note.blank .fav-note-txt{ color:var(--faint); font-style:italic; opacity:.85; }
+  .fav-by{ display:block; margin-top:3px; font-family:var(--mono); font-size:9px;
+    letter-spacing:.12em; text-transform:uppercase; color:var(--faint); }
+  .fav-note-in{ width:100%; padding:3px 5px; background:rgba(0,0,0,.3); color:inherit;
+    border:1px solid var(--rule2); border-radius:3px; font:inherit; }
+  /* Inside a crop tile the caption is the tile's last row, not a floating card. */
+  .crop .fav-note{ margin:0; border:0; border-top:1px solid var(--rule); border-radius:0; }
+  .crop.fav-item .ft{ flex-wrap:wrap; }
+  .fav-when{ padding:0 8px 7px; }
+  /* A favourite whose observations were purged: shown, never silently dropped. */
+  .fav-gone{ opacity:.8; }
+  .fav-gone-face{ height:120px; display:flex; align-items:center; justify-content:center;
+    color:var(--faint); font-size:22px; font-family:var(--mono);
+    background:repeating-linear-gradient(45deg,#191509,#191509 8px,#1c1910 8px,#1c1910 16px); }
+  /* VIEWER MODE: the album still reads (that is the point of an album), but a viewer cannot keep,
+     un-keep or caption — the server refuses those POSTs, so the controls must not pretend. */
+  body.viewer .fav-note{ cursor:default; pointer-events:none; }
+  body.viewer .fav-note.blank{ display:none; }
 
   /* ---------- render cost on the long scroll surfaces ----------
      The Visit Log and the crop grids can hold hundreds of cards; content-visibility lets the
