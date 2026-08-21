@@ -422,6 +422,45 @@ CREATE TABLE IF NOT EXISTS ignore_zones (
     deleted_at   TEXT                -- tombstone; live zones have NULL.
 );
 CREATE INDEX IF NOT EXISTS idx_ignore_zones_source ON ignore_zones(source, deleted_at);
+
+-- FAVOURITES (2026-08-20): the human's own "keep this one" mark, on a crop or on a visit.
+--
+-- Every other verdict the dashboard records is a CLAIM ABOUT THE ANIMAL -- species, identity,
+-- verified -- and feeds the models downstream. This one deliberately does not: it is taste, and
+-- nothing derived reads it. That separation is the point. A star must never be mistakable for a
+-- confirmed label, or "the cutest shot of Stan" quietly becomes training evidence that it IS Stan.
+--
+-- The KEY PER KIND is the load-bearing design here:
+--   'detection' -> detection_id. Detection rows are stable and append-only, so a star points at
+--                  the same crop forever. ON DELETE CASCADE because a purged crop (the furniture
+--                  sweeps do delete rows) leaves nothing for the star to be about.
+--   'visit'     -> (source, started_at). Visit IDS ARE NOT STABLE: the dashboard's visit list is
+--                  re-clustered from raw detections on every request (stats.visits_page never even
+--                  reads the visits table), and visits.py rebuilds that ledger from scratch, which
+--                  renumbers it. This is the same reason apply_visit_label takes source+span
+--                  instead of an id. `ended_at` is recorded as the span AS STARRED, for display,
+--                  but is deliberately NOT part of the key: a visit still in progress grows its
+--                  end, and a star must not slide off the visit someone put it on. The gallery
+--                  re-derives the CURRENT span from started_at (stats.favorites_page).
+CREATE TABLE IF NOT EXISTS favorites (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT    NOT NULL,   -- 'detection' (one crop) | 'visit' (one span on one camera).
+    detection_id INTEGER REFERENCES detections(id) ON DELETE CASCADE,  -- kind='detection' only.
+    source       TEXT,               -- kind='visit': which rig (matches detections.source).
+    started_at   TEXT,               -- kind='visit': span start, local ISO 8601 w/ offset. THE KEY.
+    ended_at     TEXT,               -- kind='visit': that span's end when starred (display only).
+    note         TEXT,               -- optional caption: why this one was worth keeping.
+    labeled_by   TEXT,               -- who starred it (self-reported, like life_events); NULL =
+                                     -- the operator, or before this browser named itself.
+    created_at   TEXT    NOT NULL    -- when it was starred (local ISO 8601 w/ offset).
+);
+-- One star per thing. The partial uniques are what make favouriting IDEMPOTENT, so a double-tap
+-- on a phone over a flaky LAN cannot leave two rows behind for the same crop or the same visit.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_favorites_detection
+    ON favorites(detection_id) WHERE kind = 'detection';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_favorites_visit
+    ON favorites(source, started_at) WHERE kind = 'visit';
+CREATE INDEX IF NOT EXISTS idx_favorites_created ON favorites(created_at);
 """
 
 
@@ -1358,6 +1397,145 @@ def life_events(conn: sqlite3.Connection, name: Optional[str] = None) -> list:
         return []
     return [{"id": r[0], "name": r[1], "event_date": r[2], "note": r[3],
              "labeled_by": r[4], "created_at": r[5]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# FAVOURITES -- "keep this one". See the `favorites` table comment in SCHEMA for why a crop is
+# keyed by its detection id and a visit by (source, started_at) rather than by a visit id.
+#
+# These helpers are deliberately the ONLY writers: kind is validated here, the key columns for
+# the other kind are forced to NULL, and starring is idempotent -- so a row can never end up
+# half-keyed (a 'visit' carrying a detection_id) no matter what a caller passes.
+# ---------------------------------------------------------------------------
+
+FAVORITE_KINDS = ("detection", "visit")
+_FAV_NOTE_MAX = 300
+
+
+def _fav_key(kind: str, detection_id=None, source=None, started_at=None):
+    """Validate and normalise a favourite's identity -> (kind, detection_id, source, started_at).
+    Raises ValueError for an unknown kind or a kind missing its key columns."""
+    k = str(kind or "").strip().lower()
+    if k not in FAVORITE_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(FAVORITE_KINDS)}")
+    if k == "detection":
+        try:
+            return k, int(detection_id), None, None
+        except (TypeError, ValueError):
+            raise ValueError("a detection favourite needs detection_id") from None
+    src, start = str(source or "").strip(), str(started_at or "").strip()
+    if not src or not start:
+        raise ValueError("a visit favourite needs source and started_at")
+    return k, None, src, start
+
+
+def add_favorite(conn: sqlite3.Connection, kind: str, *, detection_id=None, source=None,
+                 started_at=None, ended_at=None, note=None,
+                 labeled_by: Optional[str] = None) -> dict:
+    """Star a crop ({kind='detection', detection_id}) or a visit ({kind='visit', source,
+    started_at[, ended_at]}). Idempotent: starring something already starred keeps the original
+    row (and its created_at / labeled_by -- who first kept it is the fact worth preserving) and
+    only updates the note when a new one is given. Returns the row."""
+    k, det, src, start = _fav_key(kind, detection_id, source, started_at)
+    clean_note = (str(note).strip()[:_FAV_NOTE_MAX] or None) if note is not None else None
+    row = _favorite_row(conn, k, det, src, start)
+    if row is not None:
+        if clean_note is not None and clean_note != row["note"]:
+            conn.execute("UPDATE favorites SET note = ? WHERE id = ?", (clean_note, row["id"]))
+            conn.commit()
+            row["note"] = clean_note
+        return row
+    at = now_local_iso()
+    end = (str(ended_at).strip() or None) if ended_at else None
+    cur = conn.execute(
+        "INSERT INTO favorites (kind, detection_id, source, started_at, ended_at, note, "
+        "labeled_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (k, det, src, start, end, clean_note, labeled_by, at))
+    conn.commit()
+    return {"id": int(cur.lastrowid), "kind": k, "detection_id": det, "source": src,
+            "started_at": start, "ended_at": end, "note": clean_note,
+            "labeled_by": labeled_by, "created_at": at}
+
+
+def remove_favorite(conn: sqlite3.Connection, kind: str, *, detection_id=None, source=None,
+                    started_at=None) -> bool:
+    """Un-star. True if a row was removed, False if it wasn't starred (also idempotent)."""
+    k, det, src, start = _fav_key(kind, detection_id, source, started_at)
+    if k == "detection":
+        cur = conn.execute("DELETE FROM favorites WHERE kind = 'detection' AND detection_id = ?",
+                           (det,))
+    else:
+        cur = conn.execute("DELETE FROM favorites WHERE kind = 'visit' AND source = ? "
+                           "AND started_at = ?", (src, start))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def set_favorite_note(conn: sqlite3.Connection, kind: str, note, *, detection_id=None,
+                      source=None, started_at=None) -> Optional[dict]:
+    """Write (or clear, with note=None/'') the caption on an existing favourite. Returns the
+    updated row, or None if that thing isn't starred -- a note is not a way to star something."""
+    k, det, src, start = _fav_key(kind, detection_id, source, started_at)
+    row = _favorite_row(conn, k, det, src, start)
+    if row is None:
+        return None
+    clean = (str(note).strip()[:_FAV_NOTE_MAX] or None) if note is not None else None
+    conn.execute("UPDATE favorites SET note = ? WHERE id = ?", (clean, row["id"]))
+    conn.commit()
+    row["note"] = clean
+    return row
+
+
+_FAV_COLS = ("id, kind, detection_id, source, started_at, ended_at, note, labeled_by, created_at")
+
+
+def _fav_out(r) -> dict:
+    return {"id": r[0], "kind": r[1], "detection_id": r[2], "source": r[3], "started_at": r[4],
+            "ended_at": r[5], "note": r[6], "labeled_by": r[7], "created_at": r[8]}
+
+
+def _favorite_row(conn, kind, detection_id, source, started_at) -> Optional[dict]:
+    """The stored favourite for one already-normalised key, or None."""
+    if kind == "detection":
+        r = conn.execute(f"SELECT {_FAV_COLS} FROM favorites WHERE kind = 'detection' "
+                         "AND detection_id = ?", (detection_id,)).fetchone()
+    else:
+        r = conn.execute(f"SELECT {_FAV_COLS} FROM favorites WHERE kind = 'visit' "
+                         "AND source = ? AND started_at = ?", (source, started_at)).fetchone()
+    return _fav_out(r) if r else None
+
+
+def favorites(conn: sqlite3.Connection, kind: Optional[str] = None, limit: int = 500) -> list:
+    """The starred things, newest star first. Empty on a DB no writer has migrated yet -- the
+    read-only-clone contract every reader here follows (see life_events)."""
+    try:
+        if kind:
+            rows = conn.execute(f"SELECT {_FAV_COLS} FROM favorites WHERE kind = ? "
+                                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                                (str(kind).strip().lower(), int(limit))).fetchall()
+        else:
+            rows = conn.execute(f"SELECT {_FAV_COLS} FROM favorites "
+                                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                                (int(limit),)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [_fav_out(r) for r in rows]
+
+
+def favorite_keys(conn: sqlite3.Connection) -> dict:
+    """{"detections": {id, ...}, "visits": {(source, started_at), ...}} -- the whole star set in
+    two lookups, so a page of crops or visits can be flagged without a query per row. Empty (not
+    an error) on an unmigrated DB, so an old read-only clone renders with no stars rather than 500."""
+    out = {"detections": set(), "visits": set()}
+    try:
+        for r in conn.execute("SELECT kind, detection_id, source, started_at FROM favorites"):
+            if r[0] == "detection" and r[1] is not None:
+                out["detections"].add(int(r[1]))
+            elif r[0] == "visit":
+                out["visits"].add((r[2], r[3]))
+    except sqlite3.OperationalError:
+        pass
+    return out
 
 
 def departed_individuals(conn: sqlite3.Connection) -> dict:

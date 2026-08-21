@@ -255,7 +255,7 @@ function clipKeys(e){ if(e.key==='Escape') closeClipbox(); else if(e.key==='Arro
 /* small ▶ overlay markup for a thumbnail that has clip(s) behind it */
 const playBadge=(n)=>`<span class="play-badge sm" data-play></span>${n>1?`<span class="clip-count">${n} clips</span>`:''}`;
 
-const VIEWS=['live','visits','dispatch','behavior','indiv','calendar','seasons','cat'];
+const VIEWS=['live','visits','favorites','dispatch','behavior','indiv','calendar','seasons','cat'];
 let __curView='visits';   // the tab currently on screen (explore screens remember it as "back home")
 function show(v, fromHash){
   closeSettings();
@@ -270,6 +270,7 @@ function show(v, fromHash){
   syncLiveStreams();
   if(v==='cat') loadCatalogue();
   if(v==='visits') loadVisitsTab();
+  if(v==='favorites') loadFavorites();
   if(v==='dispatch') loadDispatch();
   if(v==='behavior') loadBehavior();
   if(v==='indiv') loadIndividuals();
@@ -738,6 +739,7 @@ function cropTile(r,name,tag){
     <img loading="lazy" src="${media(r.crop_path)}" alt="${esc(cap1(name||'crop'))}">
     ${stamp}
     ${tag?`<div class="rv-tag lbl">${esc(tag)}</div>`:''}
+    ${favHeart(r.favorite, `favCrop(this,${r.id})`)}
     <div class="ft"><span class="c">${Math.round((r.confidence||0)*100)}%</span>
       <span class="acts">
         <button class="b up" title="confirm" onclick="act(${r.id},'verify',this)">✓</button>
@@ -863,7 +865,16 @@ async function loadMoreObs(){
   const pn=$('#prof-photo-n');
   if(pn) pn.textContent=`${(o.total||0).toLocaleString()} total`;
   else $('#explore-sub').textContent=`${(o.total||0).toLocaleString()} total`;
-  if(!s.species) grid.querySelectorAll('.crop[data-sp]').forEach(el=>el.onclick=()=>explore('obs',{species:el.dataset.sp},cap1(el.dataset.sp)));
+  // Drill into a species from a mixed grid. This used to sit on the WHOLE tile, which is mostly
+  // photograph -- so "let me see that one bigger" and "show me every raccoon" were the same click,
+  // and the navigation won. It lives on the species name in the footer now: still one tap, but a
+  // tap at something that reads like a link, and the photo is free to just be a photo.
+  if(!s.species) grid.querySelectorAll('.crop[data-sp] .obs-sp').forEach(el=>{
+    const sp=el.closest('.crop').dataset.sp;
+    el.classList.add('clickable');
+    el.title=`see every ${cap1(sp)} photograph`;
+    el.onclick=e=>{ e.stopPropagation(); explore('obs',{species:sp},cap1(sp)); };
+  });
   const more=$('#obs-more'); if(more) more.innerHTML = s.offset<o.total ? `<button class="back" onclick="loadMoreObs()">Load more &middot; ${(o.total-s.offset).toLocaleString()} left</button>` : '';
 }
 function obsTile(r){
@@ -872,6 +883,7 @@ function obsTile(r){
   const v=r.verified;
   return `<div class="crop ${v===1?'v-1':v===0?'v-0':''}"${r.species?` data-sp="${esc(r.species)}"`:''} title="${esc(fmtDateTime(r.timestamp))}">
     <img loading="lazy" src="${media(r.crop_path)}" alt="${esc(sp)} · ${esc(fmtDateTime(r.timestamp))}">
+    ${favHeart(r.favorite, `favCrop(this,${r.id})`)}
     <div class="ft"><span class="c">${Math.round((conf||0)*100)}%</span><span class="obs-sp">${esc(sp)}</span></div>
   </div>`;
 }
@@ -911,7 +923,7 @@ function visitCard(v,i){
       <div class="vlabel-tools"></div>
     </div>`;
   return `<div class="card vcard" data-vi="${i}">
-    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}${narch?`<span class="arch-badge" title="${narch===nclips?'all':narch} of these clips play from the backup archive">archive</span>`:''}</div>
+    <div class="thumb playable" style="background-image:url('${v.rep_crop?media(v.rep_crop):''}')">${nclips?playBadge(nclips):''}${favHeart(v.favorite, `favVisit(this,${jarg(v.source)},${jarg(v.start)},${jarg(v.end)})`)}${narch?`<span class="arch-badge" title="${narch===nclips?'all':narch} of these clips play from the backup archive">archive</span>`:''}</div>
     <div class="body">
       <div class="common">${esc(cap1(v.title||'animal'))} ${inds}</div>
       <div class="latin" style="font-style:normal">${esc(fmtDateTime(v.start))}</div>
@@ -1113,6 +1125,178 @@ async function loadCastStrip(){
       title="${esc(cap1(c.id))} — ${c.n_crops.toLocaleString()} photos over ${c.nights} day${c.nights===1?'':'s'}${c.overdue?' · overdue (past their usual gap)':''}">
       ${c.crop?`<span class="cc-face" style="background-image:url('${media(c.crop)}')"></span>`:''}${esc(cap1(c.id))}${ago?`<small>${ago}</small>`:''}</button>`;
   }).join('');
+}
+
+/* ---------- FAVOURITES: "keep this one" ----------
+   The one control on this dashboard that makes no claim about the animal. Every other verdict
+   here -- ✓ confirmed, a corrected species, a name -- is evidence that feeds the models, which is
+   why they all carry attribution and why the server gates them. A ♡ is taste: nothing downstream
+   reads it, it is undone by tapping it again, and it can never be mistaken for a confirmed label.
+
+   A crop is kept by its detection id. A VISIT is kept by source + the moment it started, never by
+   a visit id: the Visit Log re-clusters visits out of raw detections on every request and visits.py
+   renumbers the ledger, so an id is not a handle that survives the week (the same reason the ✎
+   label tools post source+start+end). See the `favorites` table comment in db.py. */
+function favHeart(on, call, cls){
+  const yes = !!on;
+  return `<button class="fav${yes?' on':''}${cls?' '+cls:''}" type="button" aria-pressed="${yes?'true':'false'}"
+    aria-label="${yes?'Remove from favourites':'Add to favourites'}"
+    title="${yes?'kept — tap to remove':'keep this one'}"
+    onclick="event.stopPropagation();${call}">${yes?'♥':'♡'}</button>`;
+}
+async function favPost(body){
+  const r=await fetch('/api/favorite',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)}).then(x=>x.json());
+  if(r&&r.error) throw new Error(r.error);
+  return r;
+}
+/* Flip one heart. The button is the source of truth for its own state (.on), so this works for a
+   tile rendered by any of the four surfaces without any of them tracking a favourites list. */
+async function favToggle(btn, key){
+  if(!btn) return;
+  const want=!btn.classList.contains('on');
+  const restore=busyBtn(btn);
+  try{ await favPost(Object.assign({on:want}, key)); connOK(); }
+  catch(e){ connFail(); restore(); return; }
+  restore();
+  btn.classList.toggle('on',want);
+  btn.textContent = want?'♥':'♡';
+  btn.setAttribute('aria-pressed', want?'true':'false');
+  btn.setAttribute('aria-label', want?'Remove from favourites':'Add to favourites');
+  btn.title = want?'kept — tap to remove':'keep this one';
+  // On the gallery itself an un-kept item DIMS rather than vanishing: a mis-tap on a phone is
+  // undone by tapping the same heart again, instead of hunting the log for the photo you lost.
+  const item=btn.closest('.fav-wrap, .crop, .card');
+  if(item && document.querySelector('#view-favorites.on')){
+    item.style.transition='opacity .35s'; item.style.opacity = want?'' : '.3';
+  }
+}
+function favCrop(btn,id){ favToggle(btn,{kind:'detection',detection_id:id}); }
+function favVisit(btn,source,start,end){ favToggle(btn,{kind:'visit',source,start,end}); }
+
+/* A favourite's identity, carried on the note element so the note can be saved without threading
+   the whole record through an inline handler. */
+function favKeyAttrs(f){
+  return f.kind==='visit'
+    ? `data-kind="visit" data-source="${esc(f.source)}" data-start="${esc(f.started_at)}"`
+    : `data-kind="detection" data-det="${esc(f.detection_id)}"`;
+}
+function favKeyOf(el){
+  return el.dataset.kind==='visit'
+    ? {kind:'visit', source:el.dataset.source, start:el.dataset.start}
+    : {kind:'detection', detection_id:+el.dataset.det};
+}
+/* The caption: why this one was worth keeping -- the part a photo cannot say for itself, and the
+   part that is gone in a year if nobody writes it down (the same argument as the field notebook on
+   a profile page). Click to write, Enter to save, Escape to abandon. */
+function favNoteHTML(f){
+  const who=f.labeled_by?`<span class="fav-by">kept by ${esc(f.labeled_by)}</span>`:'';
+  return `<div class="fav-note${f.note?'':' blank'}" ${favKeyAttrs(f)} data-note="${esc(f.note||'')}"
+    ${f.labeled_by?`data-by="${esc(f.labeled_by)}"`:''}
+    role="button" tabindex="0" title="click to write why this one is worth keeping"
+    onclick="event.stopPropagation();favNoteEdit(this)"
+    onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();event.stopPropagation();favNoteEdit(this);}"
+    ><span class="fav-note-txt">${f.note?esc(f.note):'add a note…'}</span>${who}</div>`;
+}
+function favNoteRender(el){
+  const note=el.dataset.note||'';
+  const who=el.dataset.by?`<span class="fav-by">kept by ${esc(el.dataset.by)}</span>`:'';
+  el.classList.toggle('blank',!note);
+  el.innerHTML=`<span class="fav-note-txt">${note?esc(note):'add a note…'}</span>${who}`;
+}
+function favNoteEdit(el){
+  if(el.querySelector('input')) return;             // already editing
+  el.innerHTML='<input class="fav-note-in" maxlength="300" placeholder="why this one…">';
+  const inp=el.querySelector('input');
+  inp.value=el.dataset.note||'';
+  inp.focus(); inp.select();
+  let done=false;
+  const finish=async(save)=>{
+    if(done) return; done=true;                     // Enter fires blur too -- save once
+    const val=(inp.value||'').trim();
+    if(save && val!==(el.dataset.note||'')){
+      try{ await favPost(Object.assign({on:true, note:val}, favKeyOf(el))); connOK(); el.dataset.note=val; }
+      catch(e){ connFail(); }
+    }
+    favNoteRender(el);
+  };
+  inp.onkeydown=e=>{ e.stopPropagation();
+                     if(e.key==='Enter'){ e.preventDefault(); finish(true); }
+                     else if(e.key==='Escape'){ e.preventDefault(); finish(false); } };
+  inp.onblur=()=>finish(true);
+  inp.onclick=e=>e.stopPropagation();
+}
+
+async function loadFavorites(){
+  const body=$('#favorites-body'); if(!body) return;
+  let d;
+  try{ d=await fetchJSON('/api/favorites'); connOK(); }
+  catch(e){ connFail(); body.innerHTML=errEmpty('loadFavorites()'); return; }
+  const favs=d.favorites||[];
+  const head=`<h2 class="sec">Favourites <span class="n">${
+    favs.length?`${d.visits} visit${d.visits===1?'':'s'} · ${d.crops} photograph${d.crops===1?'':'s'}`
+              :'the things worth keeping'}</span></h2>`;
+  if(!favs.length){
+    body.innerHTML=head+`<p class="empty">Nothing kept yet — tap the ♡ on any visit card or
+      photograph and it lands here. <span style="text-decoration:underline;cursor:pointer"
+      onclick="show('visits')">Open the visit log</span> and start an album.</p>`;
+    return;
+  }
+  const vis=favs.filter(f=>f.kind==='visit'&&f.visit);
+  const crops=favs.filter(f=>f.kind==='detection'&&f.crop);
+  const gone=favs.filter(f=>f.gone);
+  // The kept visits reuse the Visit Log's own card AND its click-to-play wiring, so a card looks
+  // and behaves identically in both places. visitsData is repointed at them while this tab is on
+  // screen -- the same contract renderProfile uses for an individual's visits.
+  visitsData=vis.map(f=>f.visit);
+  body.innerHTML=head+
+    `<p class="fav-hint">A ♡ is only ever taste — it changes no label, and nothing downstream reads it.</p>`+
+    (vis.length?`<h2 class="sec">Kept Visits <span class="n">each card plays its clips</span></h2>
+      <div class="cards">${vis.map((f,i)=>`<div class="fav-wrap">${visitCard(f.visit,i)}${favTrunc(f.visit)}${favNoteHTML(f)}</div>`).join('')}</div>`:'')+
+    (crops.length?`<h2 class="sec">Kept Photographs <span class="n">${crops.length}</span></h2>
+      <div class="crops">${crops.map(favCropTile).join('')}</div>`:'')+
+    (gone.length?`<h2 class="sec">No Longer In The Log <span class="n">${gone.length}</span></h2>
+      <p class="fav-hint">Kept, and then the observations behind them were removed — a purge, or a
+        camera that no longer exists. Listed rather than silently dropped: a favourite that
+        vanishes without a word is worse than one that says so.</p>
+      <div class="crops">${gone.map(favGoneTile).join('')}</div>`:'');
+  wireVisitCards(body);
+}
+/* A visit so long the album's scan bound cut it short (stats._FAV_VISIT_SCAN_ROWS). Rare, and
+   said out loud rather than drawn as a shorter visit than the Visit Log shows for the same span. */
+function favTrunc(v){
+  return (v&&v.truncated)
+    ? `<div class="fav-trunc lbl">longer than this card can count — showing the first ${v.count.toLocaleString()} photographs</div>`
+    : '';
+}
+function favCropTile(f){
+  const c=f.crop||{};
+  const sp=c.species?cap1(c.species):'unidentified';
+  const when=c.timestamp?fmtDateTime(c.timestamp):'';
+  const who=c.individual?`<span class="obs-sp clickable" title="open ${esc(cap1(c.individual))}&#39;s profile"
+      onclick="event.stopPropagation();openProfile(${jarg(c.individual)})">${esc(cap1(c.individual))}</span>`:'';
+  return `<div class="crop fav-item" data-id="${c.id}">
+    <img loading="lazy" src="${media(c.crop_path)}" alt="${esc(sp)} · ${esc(when)}">
+    ${favHeart(true, `favCrop(this,${c.id})`)}
+    <div class="ft"><span class="c">${esc(sp)}</span>${who}</div>
+    <div class="fav-when lbl">${esc(when)}</div>
+    ${favNoteHTML(f)}
+  </div>`;
+}
+function favGoneTile(f){
+  const what=f.kind==='visit'
+    ? `a ${esc(f.source||'camera')} visit · ${esc(f.started_at?fmtDateTime(f.started_at):'')}`
+    : `photograph #${esc(f.detection_id)}`;
+  const call=f.kind==='visit'
+    ? `favVisit(this,${jarg(f.source)},${jarg(f.started_at)},${jarg(f.ended_at||f.started_at)})`
+    : `favCrop(this,${f.detection_id})`;
+  return `<div class="crop fav-item fav-gone">
+    <div class="fav-gone-face">—</div>
+    ${favHeart(true, call)}
+    <div class="ft"><span class="c">${what}</span></div>
+    <div class="fav-when lbl">kept ${esc(fmtDateTime(f.created_at))}${f.labeled_by?' · '+esc(f.labeled_by):''}</div>
+    ${f.note?`<div class="fav-note" style="cursor:default">${esc(f.note)}</div>`:''}
+  </div>`;
 }
 
 /* ---------- shared: species glyphs (calendar + dispatch) ---------- */
@@ -2917,12 +3101,21 @@ document.addEventListener('visibilitychange',()=>{
     img.src=gallery[idx].src; cap.textContent=captionFor(gallery[idx]);
   }
   function openFrom(el){
-    // The gallery is every crop/frame currently on the page, in document order, so ← → walk the
-    // strip you clicked from (a visit's crops, the cast, the explorer) without per-view wiring.
-    gallery=[...document.querySelectorAll('img[src*="/media/"]')].filter(x=>!lb.contains(x));
+    // ← → walk THE STRIP YOU CLICKED FROM. That used to mean "every /media/ image in the
+    // document", which was the same thing back when one grid was ever rendered -- but every tab
+    // keeps its DOM (views are toggled, not emptied), so arrowing off the end of a visit's
+    // photographs would silently walk into the Favourites album or a species sheet. Scope to the
+    // enclosing grid, then to the tab, and only then to the page.
+    const strip = el.closest('.crops, .refstrip, .profile-refs') || el.closest('.view') || document;
+    gallery=[...strip.querySelectorAll('img[src*="/media/"]')].filter(x=>!lb.contains(x));
     const at=gallery.indexOf(el);
-    gallery=gallery.length?gallery:[el];
-    showIdx(at<0?0:at); lb.classList.add('open');
+    // ...unless the clicked image is no longer IN the page. That happens when something re-renders
+    // the grid out from under the click, and the old code fell back to gallery[0] -- opening a
+    // photo the user never clicked, from whatever tab happened to be first in document order.
+    // Showing the clicked image alone is the only honest answer: never open something else.
+    if(at<0){ gallery=[el]; showIdx(0); }
+    else showIdx(at);
+    lb.classList.add('open');
   }
   function close(){ lb.classList.remove('open'); img.removeAttribute('src'); gallery=[]; idx=-1; }
   lb.addEventListener('click',e=>{ e.target===img? showIdx(idx+1) : close(); });  // image=next, backdrop=close
@@ -2934,11 +3127,20 @@ document.addEventListener('visibilitychange',()=>{
   });
   document.addEventListener('click',e=>{
     const t=e.target;
-    if(t&&t.tagName==='IMG'&&!lb.contains(t)&&/\/media\//.test(t.getAttribute('src')||'')){
-      e.preventDefault();
-      openFrom(t);
-    }
-  });
+    if(!(t&&t.tagName==='IMG'&&!lb.contains(t)&&/\/media\//.test(t.getAttribute('src')||''))) return;
+    // An image carrying its OWN click action means that action, not "enlarge": the cast badge
+    // opens a profile, an individual's thumb pins it as the badge. Leave those alone -- before
+    // this, they did BOTH, so one tap pinned an avatar and opened a lightbox on top of it.
+    if(t.onclick) return;
+    // Otherwise: enlarge, and let nothing else happen. CAPTURE + stopPropagation is what makes
+    // that true -- from the bubble phase this ran LAST, so an enclosing card (a crop tile in the
+    // photo grid, which drills into its species) had already navigated away, replacing the grid
+    // and leaving the lightbox to open on a detached image. That is the "I clicked a photo and it
+    // took me somewhere else" bug. stopPropagation halts the walk to other NODES, not the other
+    // document-level listeners, so the ⓘ popover still closes on the same click.
+    e.preventDefault(); e.stopPropagation();
+    openFrom(t);
+  }, true);
 })();
 
 /* ---------- info popovers: the tappable ⓘ ----------
