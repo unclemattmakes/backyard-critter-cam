@@ -800,6 +800,11 @@
   .cams-adv[open] summary{margin-bottom:8px;}
   .cams-msg{margin-top:10px; font-size:13px; font-style:italic; color:var(--dim);}
   .cams-msg.bad{color:var(--rust); font-style:normal;}
+  /* Move this rig: the pack subprocess's log tail, tailed live by packRefresh(). */
+  .pack-log{margin-top:10px; max-height:200px; overflow:auto; background:var(--panel2);
+    border:1px solid var(--rule2); border-radius:3px; padding:8px 10px;
+    font-size:11px; line-height:1.55; white-space:pre-wrap; word-break:break-all;
+    color:var(--dim);}
   @media (max-width:560px){
     .cams-row{flex-wrap:wrap;}
     .cams-row>span{flex-basis:100%;}

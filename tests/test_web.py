@@ -1310,3 +1310,110 @@ def test_a_junk_id_is_a_message_not_a_traceback(db_path):
             assert status in (400, 404), f"{junk!r} produced {status}"
     finally:
         web.shutdown(server)
+
+
+# ---- "move this rig": the dashboard face of migrate.py pack --------------------------
+# The endpoint is a thin spawn-and-tail over migrate.py, so what these pin is the part web.py
+# actually owns: validation BEFORE any process exists, one-pack-at-a-time, the loopback-only
+# start (the camera-password rule -- this writes gigabytes to a path of the caller's choosing),
+# and a status payload that tells an operator everything and a viewer almost nothing. The
+# spawn tests run a STUB migrate.py in a throwaway root -- never the real one, which on the
+# actual rig would happily start packing the actual rig into pytest's tmp dir.
+
+class _FakeProc:
+    def __init__(self, rc=None):
+        self._rc = rc
+
+    def poll(self):
+        return self._rc
+
+
+def test_pack_start_validates_before_any_process_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "_pack_job", None)
+    root = tmp_path / "proj"
+    root.mkdir()
+    body, code = web._pack_start("", False, root=root)
+    assert code == 400 and "destination" in body["error"]
+    body, code = web._pack_start("relative/folder", False, root=root)
+    assert code == 400 and "absolute" in body["error"]
+    body, code = web._pack_start(str(root / "bundle"), False, root=root)
+    assert code == 400 and "inside the project" in body["error"]
+    assert web._pack_job is None, "a refused request must not have spawned anything"
+
+
+def test_pack_start_refuses_a_second_concurrent_pack(tmp_path, monkeypatch):
+    """Two packs interleaving into two destinations would each hold the heavyio lock the other
+    waits on -- and double every byte of IO. One at a time, told as a 409 with the running dest."""
+    monkeypatch.setattr(web, "_pack_job", {"proc": _FakeProc(rc=None), "dest": "E:\\already",
+                                           "log": tmp_path / "x.log", "started": "t"})
+    body, code = web._pack_start(str(tmp_path / "second"), False, root=tmp_path / "proj")
+    assert code == 409
+    assert body["dest"] == "E:\\already"
+
+
+def test_pack_spawn_status_lifecycle_and_viewer_trim(tmp_path, monkeypatch):
+    """Against a STUB migrate.py: spawn, wait, and read back state/log through _pack_status --
+    the operator sees dest + log tail, a viewer only that something ran. Then a second pack is
+    allowed once the first has exited, and a failing stub reads back as failed with its code."""
+    monkeypatch.setattr(web, "_pack_job", None)
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "migrate.py").write_text(
+        "import sys\nprint('stub pack ran', flush=True)\nsys.exit(0)\n", encoding="utf-8")
+    dest = tmp_path / "bundle"
+
+    body, code = web._pack_start(str(dest), False, root=root)
+    assert code == 200 and body["ok"] is True
+    web._pack_job["proc"].wait(timeout=30)
+
+    s = web._pack_status(True, True)
+    assert s["state"] == "done" and s["returncode"] == 0
+    assert s["dest"] == str(dest)
+    assert any("stub pack ran" in line for line in s["log_tail"])
+
+    viewer = web._pack_status(False, False)
+    assert viewer["state"] == "done" and viewer["can_pack"] is False
+    assert "dest" not in viewer and "log_tail" not in viewer
+
+    # A finished job never blocks the next one -- and a failure is reported as one.
+    (root / "migrate.py").write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    body, code = web._pack_start(str(dest), True, root=root)
+    assert code == 200
+    web._pack_job["proc"].wait(timeout=30)
+    s = web._pack_status(True, True)
+    assert s["state"] == "failed" and s["returncode"] == 3
+
+
+def test_pack_endpoint_start_is_loopback_only(db_path, monkeypatch):
+    """The camera-password rule, applied to the disk: from anywhere but the rig itself, starting
+    a pack is refused up front -- and the status GET still answers, with can_pack saying no
+    before anyone clicks."""
+    monkeypatch.setattr(web, "_pack_job", None)
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, body = _post(port, "/api/migrate/pack", {"dest": "E:\\rig-move"})
+        assert status == 403 and "at the rig" in body["error"]
+        assert web._pack_job is None
+        status, s = _get(port, "/api/migrate/pack")
+        assert status == 200 and s["state"] == "idle" and s["can_pack"] is False
+    finally:
+        web.shutdown(server)
+
+
+def test_pack_endpoint_validation_reaches_the_form(db_path, monkeypatch):
+    """From loopback, a bad destination comes back as a 400 the form can show -- and no
+    subprocess was ever spawned for it (the real rig must not start packing over a typo)."""
+    monkeypatch.setattr(web, "_pack_job", None)
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        for bad in ("", "relative/path"):
+            status, body = _post(port, "/api/migrate/pack", {"dest": bad})
+            assert status == 400 and "error" in body, repr(bad)
+        assert web._pack_job is None
+    finally:
+        web.shutdown(server)

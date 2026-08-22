@@ -172,6 +172,9 @@
 <!-- Who is typing. Free text, this browser only — attribution for the verdicts this device
      records, because it cannot be added after the fact. refreshLabeler() fills it in. -->
 &middot; <span id="labeler-link" style="cursor:pointer;text-decoration:underline" onclick="labelerEdit()"></span>
+<!-- Operator-only (refreshRole() unhides it): the dashboard face of migrate.py — pack the
+     whole rig for a move to another machine, or an on-demand full backup. -->
+<span id="pack-link" hidden style="cursor:pointer;text-decoration:underline;margin-left:6px" onclick="openPack()">move this rig</span>
 <span id="role-entry" hidden style="margin-left:6px"><input type="password" placeholder="operator token…" style="padding:2px 6px;background:rgba(0,0,0,.3);border:1px solid var(--rule2);border-radius:3px;color:inherit;font:inherit;width:130px" onkeydown="if(event.key==='Enter')roleSave()"><button class="fr-x" style="margin:0 0 0 4px;padding:3px 8px" onclick="roleSave()">unlock</button></span></div>
 
 <!-- Camera settings (popped out from the Live plate's Settings button) -->
@@ -289,6 +292,35 @@
         <button class="gear" type="button" onclick="camCancel()">cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- Move this rig (footer link, operators only): the dashboard face of `migrate.py pack`.
+     The button spawns the pack as a subprocess and this panel tails its log; starting one is
+     loopback-only (the camera-password rule -- it writes gigabytes to a path of your choosing),
+     and packStatus() says so up front instead of after a refused click. Restore has no UI on
+     purpose: it runs on the NEW machine, where no rig -- and so no dashboard -- exists yet. -->
+<div id="pack" class="modal" hidden>
+  <div class="modal-backdrop" onclick="closePack()"></div>
+  <div class="modal-card panel instr" role="dialog" aria-modal="true" aria-label="Move this rig">
+    <button class="modal-x" type="button" onclick="closePack()" aria-label="Close">&#10005;</button>
+    <h3>Move this rig</h3>
+    <p class="hint">Pack everything this rig has recorded &mdash; database, photos, clips, reference portraits, labels, config &mdash; into one folder, ready for <code>python migrate.py restore</code> on the new machine. Same format as the weekly backup, and append-only: run it again and only what&rsquo;s new is added.</p>
+    <p class="hint" id="pack-local-note" hidden>Packing writes this rig&rsquo;s whole archive to a folder of your choosing, so like a camera password it can only be started <strong>at the rig itself</strong> &mdash; open this dashboard on the rig (<code>http://127.0.0.1:8000</code>) and start it there.</p>
+    <form id="pack-form" onsubmit="return packStart(event)">
+      <label class="cams-row"><span>Pack into</span>
+        <input id="pack-dest" maxlength="300" placeholder="F:\rig-move &mdash; a USB drive, share, or cloud-synced folder" autocomplete="off" spellcheck="false"></label>
+      <p class="hint cams-note">A path on <em>this rig&rsquo;s</em> machine. Packing is safe while the rig is recording; the panel will remind you about the quick second pass.</p>
+      <label class="cams-row cams-check"><span>Skip weights</span>
+        <input id="pack-noweights" type="checkbox"></label>
+      <p class="hint cams-note">Skips the ~1.3&nbsp;GB model-weights mirror; the new machine re-downloads them instead.</p>
+      <div class="cams-actions">
+        <button class="gear primary" type="submit" id="pack-go">pack now</button>
+      </div>
+    </form>
+    <div class="cams-msg" id="pack-msg" hidden></div>
+    <pre id="pack-log" class="pack-log" hidden></pre>
+    <p class="hint" id="pack-next" hidden></p>
   </div>
 </div>
 

@@ -23,6 +23,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -659,6 +660,93 @@ def _restore_archived_clip(backup_dest, clip_path: str, cache_root: Path):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Pack this rig from the dashboard ("move this rig", footer). Thin UI over
+# `migrate.py pack`: the button spawns it as a SUBPROCESS (same pattern as the
+# naming helper -- its heavyio waits and hour-long zip runs must not live inside
+# a request thread, and a dashboard restart must not kill a half-written
+# bundle), and status is read back by tailing the process's combined output.
+# Starting a pack is LOOPBACK-ONLY, the camera-password rule for the same
+# reason: this endpoint writes gigabytes to a filesystem path of the caller's
+# choosing, over plain HTTP with no login beyond the operator token -- so to
+# aim the rig's disk somewhere, be at the rig. Restore has no UI on purpose:
+# it runs on the NEW machine, where no rig and therefore no dashboard exists
+# yet -- it stays the one CLI command the restore checklist already teaches.
+# ---------------------------------------------------------------------------
+
+_pack_guard = threading.Lock()
+_pack_job: dict | None = None    # the one pack at a time, kept after exit so /status can report
+                                 # the outcome. A dashboard restart forgets it (state says idle)
+                                 # while the pack itself runs on: the log file stays the record.
+
+
+def _pack_start(dest_raw, no_weights: bool, *, root: Path | None = None) -> tuple[dict, int]:
+    """Validate `dest_raw` and spawn `migrate.py pack` toward it. Returns (json body, status).
+    Validation mirrors migrate.py's own refusals so the UI hears them as form errors instead of
+    as a subprocess that exits 1 -- but the subprocess still re-checks everything, because this
+    layer is a convenience, never the authority."""
+    global _pack_job
+    root = root or config.ROOT
+    dest_raw = str(dest_raw or "").strip()
+    if not dest_raw:
+        return {"error": "give a destination folder -- a USB drive, a network share, or a "
+                         "cloud-synced folder"}, 400
+    dest = Path(dest_raw).expanduser()
+    if not dest.is_absolute():
+        return {"error": "give an absolute path -- a relative one would land wherever the "
+                         "server happened to be started from"}, 400
+    if root in [dest, *dest.parents]:
+        return {"error": "that folder is inside the project -- pack the rig somewhere outside "
+                         "itself"}, 400
+    with _pack_guard:
+        if _pack_job is not None and _pack_job["proc"].poll() is None:
+            return {"error": "a pack is already running", "dest": _pack_job["dest"]}, 409
+        log_path = root / "logs" / "pack-from-dashboard.log"
+        log_path.parent.mkdir(exist_ok=True)
+        cmd = [sys.executable, str(root / "migrate.py"), "pack", str(dest)]
+        if no_weights:
+            cmd.append("--no-weights")
+        try:
+            # "w", not append: each pack's log is exactly that pack, so the status tail can
+            # never show a previous run's "finished" under a new run's spinner.
+            with open(log_path, "w", encoding="utf-8") as logf:
+                proc = subprocess.Popen(cmd, cwd=str(root), stdin=subprocess.DEVNULL,
+                                        stdout=logf, stderr=subprocess.STDOUT)
+        except OSError as e:
+            return {"error": f"could not start migrate.py: {e}"}, 500
+        _pack_job = {"proc": proc, "dest": str(dest), "log": log_path,
+                     "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    return {"ok": True, "dest": str(dest)}, 200
+
+
+def _pack_status(operator: bool, loopback: bool) -> dict:
+    """State of the pack job for the dashboard. `can_pack` is the up-front capability flag
+    (mirrors /api/cameras' can_set_credentials, so the form can say "do this at the rig" before
+    a refused submit, not after). A viewer learns only that a pack is or isn't running -- the
+    destination and the log say where this machine's disks are mounted, which is operator
+    detail."""
+    with _pack_guard:
+        job = _pack_job
+    out: dict = {"can_pack": bool(operator and loopback)}
+    if job is None:
+        out["state"] = "idle"
+        return out
+    rc = job["proc"].poll()
+    out["state"] = "running" if rc is None else ("done" if rc == 0 else "failed")
+    if not operator:
+        return out
+    out["dest"] = job["dest"]
+    out["started"] = job["started"]
+    if rc is not None:
+        out["returncode"] = rc
+    try:
+        lines = job["log"].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    out["log_tail"] = lines[-15:]
+    return out
+
+
 def _individual_profile(cfg, name: str) -> dict:
     """stats.individual_profile + a web-layer annotation: for each archived clip, whether it is
     actually reachable right now (`archive_ok` -- already restored locally, or its day's zip is
@@ -961,6 +1049,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     # curation chrome); the server refuses viewer writes regardless, in do_POST.
                     self._json({"operator": self._is_operator(),
                                 "split": bool(getattr(cfg, "operator_token", None))})
+                elif path == "/api/migrate/pack":
+                    # The "move this rig" panel's poll: pack-job state, plus (operator only)
+                    # the destination and the tail of migrate.py's own log.
+                    self._json(_pack_status(self._is_operator(), self._is_loopback()))
                 elif path == "/api/live/now":
                     self._json(_live_now(cfg, self._src()))
                 elif path == "/api/crops":
@@ -1117,7 +1209,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 return
             try:
                 if path not in ("/api/camera", "/api/zones", "/api/zones/delete",
-                                "/api/cameras/save", "/api/cameras/delete"):
+                                "/api/cameras/save", "/api/cameras/delete",
+                                "/api/migrate/pack"):
                     stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
                     clear_api_cache()            # ...and on the next poll of every cached endpoint
                 if path == "/api/camera":
@@ -1131,6 +1224,21 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._camera_save(data)
                 elif path == "/api/cameras/delete":
                     self._camera_delete(data)
+                elif path == "/api/migrate/pack":
+                    # Start `migrate.py pack` toward data["dest"]. Loopback-only, the camera-
+                    # password rule (see the _pack_start section for the whole reasoning): this
+                    # writes gigabytes to a path of the caller's choosing, so to aim the rig's
+                    # disk somewhere, be at the rig.
+                    if not self._is_loopback():
+                        self._json({"error": "packing writes this rig's whole archive to a "
+                                             "folder of your choosing, so it can only be "
+                                             "started at the rig itself -- open this "
+                                             "dashboard on the rig (http://127.0.0.1:8000) "
+                                             "and click it there"}, code=403)
+                    else:
+                        body, code = _pack_start(data.get("dest"),
+                                                 bool(data.get("no_weights")))
+                        self._json(body, code=code)
                 elif path == "/api/individual/avatar":
                     # Pin (or clear, with crop=null) an individual's badge photo.
                     conn = db.connect(cfg.db_path)
