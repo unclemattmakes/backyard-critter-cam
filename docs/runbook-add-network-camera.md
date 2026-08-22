@@ -30,6 +30,11 @@ Two consequences worth knowing before you start:
 
 - **Find the address in the camera's own app**, not by scanning. Reolink: Settings → Network →
   Advanced shows Connection Type and the current IP.
+- **Don't read anything into a freshly booted camera's first pings.** On 2026-08-21 a camera
+  two minutes out of a reboot answered at 34–75 ms against the other one's 5 ms, which looked
+  like a bad cable and was not: twelve samples later the two were identical (6 ms vs 7 ms, no
+  loss). The first couple of pings include ARP resolution and whatever the camera is still
+  doing to itself. Measure again before believing a difference.
 - **The ARP cache is not a device inventory.** `arp -a` lists hosts this box has recently
   *talked to*, so a camera nobody has contacted is simply absent from it. On 2026-08-21 the new
   camera answered ping at 5 ms and did not appear in ARP at all.
@@ -68,8 +73,12 @@ This is the step that looks like a network fault and is not.
 
 ```
 set CAM_PASS=...
-python tools/camprobe.py 192.168.0.105 --user rig
+.venv\Scripts\python.exe tools/camprobe.py 192.168.0.105 --user rig
 ```
+
+(Use the venv's interpreter, or activate the venv first. A bare `python` on this rig is the
+system one and has no OpenCV — the tool says so rather than throwing a traceback, but it is a
+confusing thing to hit while you are already debugging a camera.)
 
 `tools/camprobe.py` walks the failure modes in the order they happen — port, then RTSP
 challenge, then credentials, then which stream paths exist — and ends with a ready-to-paste
@@ -91,12 +100,18 @@ that was about to change.
 
 ### Sub-stream or main
 
-Measured on the RLC-810A, 15 s of sustained decode after a warmup, on a 12-core box:
+Measured on two RLC-810As, sustained decode after a warmup, on a 12-core box:
 
 | Stream | Resolution | Sustained | Decode cost |
 |---|---|---|---|
-| `h264Preview_01_sub` | 640×360 | 10.0 fps | 1.2% of one core |
-| `h264Preview_01_main` | 3840×2160 | 25.0 fps | 68.4% of one core |
+| `h264Preview_01_sub` | 640×360 | 10.0 fps | ~1% of one core |
+| `h264Preview_01_main` | 3840×2160 | 25 fps | 68–88% of one core |
+| `h265Preview_01_main` | 3840×2160 | 25 fps | **75% of one core** |
+
+**Ask for H.265 on a main stream.** Same sensor, same resolution, same frame rate, measurably
+cheaper to decode than the H.264 path on the same camera (75.3% vs 87.5% of a core, measured
+back to back on 2026-08-21). Only the decode differs — clips are re-encoded by the recorder
+either way, so nothing downstream knows or cares which path fed it.
 
 Main is affordable — but decode is not the whole cost, and two other things matter more:
 
@@ -125,7 +140,11 @@ cfg.cameras = [
   does not name inherits the same-named `Config` value, so the glass door keeps its 1920×1080,
   its `CONTRAST: 48`, its `motion_min_area` 1800 — and `backend=None` on an int `src` still
   resolves to DirectShow on Windows.
-- **Each camera needs a unique `source`.** It is the key everything downstream splits on.
+- **Each camera needs a unique `source`, and it is effectively permanent.** It is the key
+  everything downstream splits on — stamped on every detection, every visit, every clip path
+  and every re-ID row — so renaming it later orphans everything already written under the old
+  name. While the camera is still a dry run on a bench, the only rows are of a carpet and the
+  name is free to change. Name it for where it will actually point, **before** it goes up.
 - **`motion_min_area` is full-frame pixels** and therefore resolution-dependent. The gate runs
   on a ~640 px-wide downscaled copy but converts blob areas *back* to full-frame pixels before
   comparing, so the knob always means the same thing — which is exactly why a new camera at a
@@ -196,7 +215,14 @@ temporary aim fails silently after the move.
 - **Turn the OSD off** — watermark, timestamp and device name are burned into the frame. Two
   reasons: they land in every crop, and the clock changes every second, which at 640×360 is a
   few hundred pixels of permanent motion against a 200 px trigger. If a new camera fires
-  constantly on an empty scene, the burned-in clock is the first suspect.
+  constantly on an empty scene, the burned-in clock is the first suspect. **It is a per-camera
+  setting** — clearing it on one camera does nothing for the next one, and the second RLC-810A
+  arrived with its OSD on exactly like the first.
+- **Keep one camera's IR illuminator out of the other's frame.** Two cameras covering one yard
+  want to look *across* it, not *at* each other. An IR ring sitting in another camera's field
+  of view blows out that region of every night image permanently — the same reason the README
+  says to mount illuminators off-axis from their own lens. Cheap to notice now, in the test
+  frames, and expensive to notice after both are on brackets.
 - **Ignore zones**, drawn in the dashboard's Instrument Panel — and remember zones match by
   IoU ≥ 0.45, so a zone drawn *around* an area is inert. Fit them to the repeated box.
 - **Revisit sub vs main** now that the framing is final.
