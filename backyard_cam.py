@@ -1891,7 +1891,21 @@ def run(cfg: config.Config) -> None:
                 pass
         if any(_eff(s, cfg, "record_clips") for s in specs):
             print(f"  behaviour clips: ON -- short videos to {_rel(cfg.clips_dir)}/<source>/ "
-                  f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, cap {cfg.clip_max_s:g}s).")
+                  f"(pre {cfg.clip_pre_roll_s:g}s / post {cfg.clip_post_roll_s:g}s, "
+                  f"cap {cfg.clip_max_s:g}s, {clips.effective_codec(cfg)}).")
+            # Loud on purpose. 2026-08-21 ffmpeg disappeared off PATH and the rig quietly recorded
+            # a full day of mp4v: unplayable in a browser (so every dashboard view pays a
+            # transcode) and several times larger, on a clips budget that is already pruning. The
+            # old signal was one info line among ~1 MB/day of detection lines. Say what broke,
+            # what it costs, and how to fix it -- in the block that prints on every single start.
+            if clips.ffmpeg_missing(cfg):
+                print("  *** ffmpeg is NOT on PATH -- clips are recording as mp4v.")
+                print("  ***   cost: no browser can play mp4v, so the dashboard transcodes every")
+                print("  ***         view, and the files are several times larger while the clip")
+                print("  ***         budget prunes the oldest footage to stay under its cap.")
+                print("  ***   also: the stitched highlight reel (reel.py) cannot build at all.")
+                print("  ***   fix : winget install Gyan.FFmpeg   then restart the rig, and")
+                print("  ***         re-encode the gap with clips.convert_legacy_to_h264().")
 
         # Ignore zones (static false-fire spots): DB-backed and dashboard-editable, one store
         # shared by the web server and every capture thread. config.ignore_zones seeds the table
