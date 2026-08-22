@@ -6,7 +6,10 @@ which stream paths actually exist on it, what does each one cost to decode, and 
 motion_min_area does that resolution want. Read-only -- it opens streams and reads frames,
 and writes nothing but the test frames you ask for.
 
-    python tools/camprobe.py 192.168.0.105 --user rig            # CAM_PASS from the environment
+Run it with the project's venv interpreter (a bare `python` on the rig is the system one, which
+has no OpenCV -- it says so rather than throwing a traceback):
+
+    .venv\\Scripts\\python.exe tools/camprobe.py 192.168.0.105 --user rig   # CAM_PASS from the env
     python tools/camprobe.py 192.168.0.105 --user rig --password swordfish
     python tools/camprobe.py 192.168.0.105 --user rig --path h264Preview_01_sub
     python tools/camprobe.py --url rtsp://rig:swordfish@192.168.0.105:554/h264Preview_01_sub
@@ -40,9 +43,24 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))               # tools/ sits one below the project root
 
-import cv2                                   # noqa: E402
-import config                                # noqa: E402
-from backyard_cam import _safe_src           # noqa: E402  (one masking rule, not two)
+VENV_PY = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+try:
+    import cv2                                   # noqa: E402
+    import config                                # noqa: E402
+    from backyard_cam import _safe_src           # noqa: E402  (one masking rule, not two)
+except ModuleNotFoundError as exc:               # pragma: no cover - depends on the interpreter
+    # A bare `python` is not this project's interpreter: on the rig it resolves to the system
+    # Python, which has no OpenCV. Fail with the command to run instead of a raw traceback --
+    # this tool gets reached for while something is already going wrong with a camera, which is
+    # the worst moment to also have to debug an environment. (Same spirit as config.py's
+    # version check.)
+    raise SystemExit(
+        f"camprobe needs this project's virtualenv -- no module named {exc.name!r}.\n\n"
+        f"Run it with the venv's interpreter rather than a bare `python`:\n\n"
+        f"    {VENV_PY} tools/camprobe.py ...\n\n"
+        f"(or activate the venv first, which is what the README's commands assume)"
+    )
 
 # Stream paths worth trying when you don't know the camera. One entry per (vendor, stream), in
 # the order a wildlife rig wants to see them: the cheap sub-stream first, because that is the
