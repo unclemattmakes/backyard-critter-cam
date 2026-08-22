@@ -56,6 +56,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import db
+import heavyio
 from config import CONFIG, ROOT
 
 log = logging.getLogger("backup")
@@ -542,6 +543,18 @@ def main() -> int:
 
     t0 = time.monotonic()
     today = date.today()
+
+    # Take the heavy-io lock before writing a byte, and hold it until Drive has finished UPLOADING
+    # (see the release at the bottom of main). A dry run moves nothing, so it never waits.
+    #
+    # This is here because of 2026-08-21: a hand-run backup wrote 5.5 GB of zips 13:41-13:50, the
+    # 14:00 GPU batch started on top of Drive's upload of them, and the box bugchecked 0x1E at
+    # ~14:23 -- chkdsk then rebuilt this project's own directory index and put 1,032 files in
+    # C:ound.001. The 08-19 crash that corrupted backyard.db had the same shape. heavyio.py has
+    # the full reasoning; the short version is that the two jobs no longer overlap.
+    if not args.dry_run:
+        heavyio.acquire("backup", wait_s=3600, note=f"backup.py -> {dest}")
+
     log.info("backup starting: %s -> %s%s", ROOT, dest, " (DRY RUN)" if args.dry_run else "")
     failures = 0
 
@@ -601,6 +614,18 @@ def main() -> int:
         (dest / "README.txt").write_text(README, encoding="utf-8")
     log.info("backup %s in %.1f s (%d failure(s))",
              "FAILED" if failures else "finished", time.monotonic() - t0, failures)
+
+    # The zips being on disk is NOT the end of the job. Drive uploads them on its own schedule --
+    # 5.5 GB of them on 2026-08-21, still going 30+ minutes after this line would have printed
+    # "finished". Holding the lock across the upload is the entire point: the next heavy job waits
+    # for the network to go quiet, not just for the writing to stop. Fails open on a timeout.
+    if not args.dry_run:
+        try:
+            heavyio.wait_drive_quiet(timeout_s=3600)
+        except Exception:
+            log.exception("waiting for the cloud upload to settle failed")  # never sink a backup
+        finally:
+            heavyio.release("backup")
     return 1 if failures else 0
 
 

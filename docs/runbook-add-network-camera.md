@@ -124,6 +124,19 @@ Start on the sub-stream to prove the plumbing; switch when the camera is in its 
 
 ## Phase 5: write the spec
 
+**Or do it in the dashboard.** Since 2026-08-22 the camera list lives in the `cameras` DB table
+and `config_local.py` only seeds it, so the normal route is now the **cameras** button at the top
+right of Live Observation: add, edit, remove, and set the login there. The rest of this phase is
+still worth reading — it is the same fields, and it explains *why* the name is permanent and what
+`motion_min_area` means — but you no longer have to edit Python to add a camera.
+
+Two constraints the panel enforces rather than documents: the short name is disabled on an edit
+(it is stamped on everything already recorded), and a **password can only be set from the rig
+machine**, because this dashboard is plain HTTP with no login.
+
+The config route below still works, and is what you want for the very first camera on a fresh
+install — or for reading what a running rig is configured with.
+
 ```python
 from config import CameraSpec
 
