@@ -67,6 +67,10 @@ async function refreshRole(){
   let r; try{ r=await fetch('/api/role').then(x=>x.json()); }catch(e){ return; }
   window.__role=r;
   document.body.classList.toggle('viewer', r.split && !r.operator);
+  // "move this rig" (migrate.py pack) is operator chrome; the server enforces the
+  // loopback-only start regardless — hiding it from viewers is comfort, not the gate.
+  const pk=document.getElementById('pack-link');
+  if(pk) pk.hidden=!r.operator;
   const el=document.getElementById('role-link');
   if(el){
     if(!r.split){ el.hidden=true; }
@@ -3007,6 +3011,67 @@ async function zoneAdd(x1,y1,x2,y2){
 
 function openCameras(){ const m=$('#cameras'); if(!m) return; m.hidden=false; camCancel(); loadCamsAdmin(); }
 function closeCameras(){ const m=$('#cameras'); if(m) m.hidden=true; }
+
+/* ---------- Move this rig: the dashboard face of `migrate.py pack` ----------
+   The server spawns the pack as a subprocess and we poll /api/migrate/pack for its state and
+   log tail — so closing this panel (or the whole browser) abandons nothing: the pack runs to
+   completion on the rig and the panel picks it back up on reopen. Starting one is loopback-only
+   (can_pack), the camera-password rule; the panel says so up front instead of after a refused
+   click. The two-pass reminder is rendered on DONE, not buried in a doc: the moment it matters
+   is the moment the first pass finishes. */
+let packTimer=null;
+function openPack(){ const m=$('#pack'); if(!m) return; m.hidden=false; packMsg(''); packRefresh(); }
+function closePack(){ const m=$('#pack'); if(m) m.hidden=true;
+  if(packTimer){ clearTimeout(packTimer); packTimer=null; } }
+function packMsg(t,bad){ const el=$('#pack-msg'); if(!el) return;
+  el.textContent=t||''; el.hidden=!t; el.classList.toggle('bad',!!bad); }
+function packNextSteps(dest){
+  return 'Packed. If the rig was recording meanwhile, the newest minutes postdate the '
+    +'database snapshot: stop the rig, run one more pack (seconds — only the delta is added), '
+    +'then on the new machine clone the repo, run setup, and:  python migrate.py restore '
+    +(dest||'<that folder>');
+}
+async function packRefresh(){
+  const m=$('#pack'); if(!m||m.hidden) return;          // panel closed — stop polling
+  let s; try{ s=await fetch('/api/migrate/pack').then(r=>r.json()); }catch(e){ return; }
+  const form=$('#pack-form'), note=$('#pack-local-note'), go=$('#pack-go'),
+        log=$('#pack-log'), next=$('#pack-next');
+  if(note) note.hidden=!!s.can_pack;
+  const running=s.state==='running';
+  if(go) go.disabled=running || !s.can_pack;
+  if(form) form.hidden=!s.can_pack && s.state==='idle';  // not at the rig: just the explanation
+  if(log){
+    const tail=(s.log_tail||[]).join('\n');
+    log.hidden=!tail; log.textContent=tail;
+    if(!log.hidden) log.scrollTop=log.scrollHeight;
+  }
+  if(next) next.hidden=true;
+  if(running){
+    packMsg('packing into '+(s.dest||'…')+' — safe to close this panel; the pack runs on the rig.');
+    packTimer=setTimeout(packRefresh, 2000);
+  }else if(s.state==='done'){
+    packMsg('');
+    if(next){ next.hidden=false; next.textContent=packNextSteps(s.dest); }
+  }else if(s.state==='failed'){
+    packMsg('the pack FAILED (exit '+s.returncode+') — the log above says why; the full record '
+      +'is logs/pack-from-dashboard.log on the rig.', true);
+  }
+}
+async function packStart(ev){
+  if(ev) ev.preventDefault();
+  const inp=$('#pack-dest'), dest=(inp&&inp.value||'').trim();
+  if(!dest){ if(inp) inp.focus(); return false; }
+  const go=$('#pack-go'); if(go) go.disabled=true;
+  let r; try{
+    r=await fetch('/api/migrate/pack',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dest, no_weights: !!($('#pack-noweights')&&$('#pack-noweights').checked)})
+    }).then(x=>x.json());
+  }catch(e){ if(go) go.disabled=false; connFail(); return false; }
+  if(r.error){ if(go) go.disabled=false; packMsg(r.error,true); return false; }
+  packMsg('packing into '+r.dest+' …');
+  packRefresh();
+  return false;
+}
 function camsMsg(t,bad){ const el=$('#cams-msg'); if(!el) return;
   el.textContent=t||''; el.hidden=!t; el.classList.toggle('bad',!!bad); }
 

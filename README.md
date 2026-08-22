@@ -902,6 +902,12 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
   works pointed straight at your **weekly cloud backup folder**: recovering from a dead
   machine is the same command, you just lose whatever the last backup missed. And because
   these archives are append-only, re-running `pack` only adds the delta.
+- **Or pack from the dashboard.** The footer's **move this rig** link (operators) runs the
+  same pack from the browser: pick a destination, watch the log live, and get the second-pass
+  reminder the moment it finishes. Like a camera password, *starting* one only works from the
+  rig machine itself (`http://127.0.0.1:8000`) — it writes gigabytes to a path of your
+  choosing, so to aim the rig's disk somewhere, be at the rig. Restore deliberately has no
+  UI: it runs on the **new** machine, where no rig — and so no dashboard — exists yet.
 - **Packing beside a running rig is safe, but do it in two passes.** The database snapshot
   uses SQLite's backup API (consistent even mid-write) and anything written in the last
   minute is deliberately left for the next pass — the recorder writes clips in place at
