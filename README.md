@@ -51,7 +51,9 @@ see [Try it on footage you already have](#try-it-on-footage-you-already-have).
   suggest-confirm loop
 - [Behaviour clips (phase 4 capture)](#behaviour-clips-phase-4-capture) ·
   [Behaviour analysis (phase 4)](#behaviour-analysis-phase-4)
-- [Output](#output) · [Backups](#backups) · [A morning email](#a-morning-email) ·
+- [Output](#output) · [Backups](#backups) ·
+  [Moving the rig to a new machine](#moving-the-rig-to-a-new-machine) ·
+  [A morning email](#a-morning-email) ·
   [Database schema](#database-schema) · [Configuration](#configuration)
 - [Security & privacy](#security--privacy) — there is no login; read this before the dashboard
   leaves your machine
@@ -838,7 +840,9 @@ then:
   cloud far faster than ~2,000 loose JPEGs. The **database** is snapshotted with SQLite's
   backup API on a read-only connection (safe while the rig is running), integrity-checked,
   then deflated (~40% smaller); a `meta-<date>.zip` picks up the small stuff (re-ID artifacts,
-  tuning shots, logs, your `config_local.py`).
+  tuning shots, logs, your `config_local.py`, the certified reference photos and their crops,
+  and the database's import/static-dropped ledgers — the import ledger is what stops a
+  restored rig from double-importing the trail cam's card).
 - **The backup outlives the clip pruner.** `clips/` is a rolling window (`clips_max_gb`), so
   run the backup at least **weekly**: each day folder is archived the morning after it
   completes, well inside the ~two-week prune horizon, and an existing archive is never rebuilt
@@ -847,8 +851,9 @@ then:
   dump the card arrives in two batches, because the card goes straight back in the camera and
   the rest of that day comes off it next time. Archives only ever grow.
 - **Idempotent** — run it as often as you like; finished days are skipped in seconds. Restore
-  instructions land in a `README.txt` beside the archives (short version: unzip everything
-  into the project root).
+  instructions land in a `README.txt` beside the archives — and restoring is automated:
+  `python migrate.py restore <backup folder>` from a fresh clone reassembles the whole rig
+  (see [Moving the rig to a new machine](#moving-the-rig-to-a-new-machine)).
 - **Four things beyond the media**, because "the weights re-download themselves" is only true
   for some of them and a database is not the same thing as a readable record:
   - `weights-archive.zip` — a **one-time** mirror of the model weights (MegaDetector plus the
@@ -874,6 +879,52 @@ Schedule it weekly with Windows Task Scheduler (runs as you, no admin needed):
 schtasks /Create /TN "Backyard critter-cam backup" /SC WEEKLY /D MON /ST 03:30 `
     /TR "C:\path\to\backyard\.venv\Scripts\pythonw.exe C:\path\to\backyard\backup.py"
 ```
+
+---
+
+## Moving the rig to a new machine
+
+A rig accumulates the one thing a fresh clone can't give you — months of database, crops,
+clips, hand-certified reference photos and labels — so sooner or later the question is how to
+carry all of it to a new PC. `migrate.py` is that move, as two halves of one operation:
+
+```powershell
+# OLD machine — write a complete, current bundle (USB drive, network share, synced folder):
+.\.venv\Scripts\python.exe migrate.py pack F:\rig-move
+
+# NEW machine — clone the repo, run setup.bat/setup.sh, then from the project root:
+.\.venv\Scripts\python.exe migrate.py restore F:\rig-move
+```
+
+- **`pack` writes the exact same layout as the weekly backup** (per-day media zips, an
+  integrity-checked database snapshot, the meta zip, the one-time weights mirror) — plus
+  *today's* folders, which the weekly run leaves for tomorrow. One format, so `restore` also
+  works pointed straight at your **weekly cloud backup folder**: recovering from a dead
+  machine is the same command, you just lose whatever the last backup missed. And because
+  these archives are append-only, re-running `pack` only adds the delta.
+- **Packing beside a running rig is safe, but do it in two passes.** The database snapshot
+  uses SQLite's backup API (consistent even mid-write) and anything written in the last
+  minute is deliberately left for the next pass — the recorder writes clips in place at
+  their final name, and a half file sealed into an append-only archive would block the whole
+  one forever. So: pack while the rig runs (the slow bulk), **stop the rig, pack once more**
+  (seconds), then restore from that.
+- **`restore` is the judgement a 2 a.m. hand-restore forgets.** It refuses to run where a
+  `backyard.db` already lives (it moves rigs, it doesn't merge them), `quick_check`s the
+  database snapshot *before* installing it (falling back to the next-oldest snapshot if the
+  newest is corrupt), never overwrites an existing file (so an interrupted restore is just
+  re-run, and a `config_local.py` you already wrote wins over the old machine's), installs
+  the database **last and atomically**, then cross-checks the rows against the restored
+  files and prints the new-machine checklist.
+- **Only the clips the old machine still held are restored.** The archive deliberately
+  outlives the clip pruner, so it holds more footage than any one disk should; pruned clips
+  keep their DB rows and stay playable straight out of the backup zips (the dashboard's
+  archive path), exactly as before the move.
+- **What never migrates, on purpose:** the `.venv` and CUDA build (per-machine — run setup),
+  scheduled tasks (they live in the OS; re-register the weekly backup on the new machine and
+  **disable it on the old one**, or the two rigs will interleave writes into one archive),
+  and caches that rebuild themselves (`clips_web/`, `archive_cache/`, `refimg_store/`).
+  `--dry-run` on either half says exactly what it would do first; `--no-weights` skips the
+  ~1.3 GB weights mirror if you'd rather re-download.
 
 ---
 

@@ -31,9 +31,12 @@ Design notes (why it looks the way it does):
   schedule (Task Scheduler, Monday 03:30) is deliberately tighter than "monthly" because of
   the pruning window above -- a month between runs would lose whatever clips_max_gb ate.
 
-Restore: unzip every archive into the project root (the folder layout inside the zips matches
-the project -- clips/2026-06-09/..., crops/...), then unzip the newest db snapshot beside the
-code. The README.txt this script drops in the destination says the same thing.
+Restore: `python migrate.py restore <dest>` from a fresh clone reassembles the rig from these
+archives (and the same tool's `pack` writes a right-now bundle in this exact format, for moving
+machines without waiting on the weekly run). By hand it is: unzip every archive into the project
+root (the folder layout inside the zips matches the project -- clips/2026-06-09/..., crops/...),
+then unzip the newest db snapshot beside the code. The README.txt this script drops in the
+destination says the same thing.
 
 Usage:
     python backup.py                 # destination from config (backup_dest in config_local.py)
@@ -73,22 +76,49 @@ DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # that anything ELSE appearing under a media root is still surfaced as the surprise it is.
 NOT_ARCHIVED = frozenset({"reels"})
 
-# Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID artifacts,
-# tracklet thumbnails, tuning shots, logs, reports, and the machine's private config. All cheap,
-# all annoying to lose. (Weights and .venv are deliberately absent: re-downloadable.)
-META_ITEMS: tuple[Path, ...] = (
-    ROOT / "reid",
-    CONFIG.clip_crops_dir,
-    ROOT / "tuning",
-    ROOT / "logs",
-    ROOT / "reports",
-    ROOT / "config_local.py",
-    # What torch/ultralytics build this machine actually resolved (written by setup.bat/setup.sh).
-    # Gitignored, so this snapshot is its only copy -- and it is the provenance for every number
-    # in reports/ and every stored embedding: "setup picks a build per machine" must not mean
-    # "nobody knows which build produced these".
-    ROOT / "environment.lock.txt",
-)
+def meta_items() -> tuple[Path, ...]:
+    """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
+    artifacts, tracklet thumbnails, tuning shots, logs, reports, and the machine's private
+    config. All cheap, all annoying to lose. (Weights and .venv are deliberately absent:
+    re-downloadable.) A function, not a constant, because two entries only exist at run time:
+    the DB's sidecar ledgers are per-source files that appear as sources appear."""
+    return (
+        ROOT / "reid",
+        CONFIG.clip_crops_dir,
+        ROOT / "tuning",
+        ROOT / "logs",
+        ROOT / "reports",
+        ROOT / "config_local.py",
+        # What torch/ultralytics build this machine actually resolved (written by setup.bat/setup.sh).
+        # Gitignored, so this snapshot is its only copy -- and it is the provenance for every number
+        # in reports/ and every stored embedding: "setup picks a build per machine" must not mean
+        # "nobody knows which build produced these".
+        ROOT / "environment.lock.txt",
+        # The certified identity reference batches (refcam.py) -- hand-held photos, the one media
+        # tree that is NOT under a media root and NOT regenerable: lose them and the
+        # identity_references rows point at nothing, and the era-invariant evidence (Notch's ear
+        # notch, photographed) is gone. reference_crops/ rides along even though it is re-cuttable
+        # (`refcam.py --apply --crop`): identity_reference_crops rows point into it by path, it is
+        # a few dozen JPEGs, and re-cutting needs a working detector -- the same "cheap, annoying
+        # to lose" bar clip_crops/ already clears.
+        CONFIG.reference_dir,
+        CONFIG.reference_crops_dir,
+        # The DB's plain-text sidecar ledgers. The import ledger is what dedupes a trail-cam
+        # re-import (the card keeps files across dumps), so a restore without it would duplicate
+        # the next import; the static-dropped ledger is the append-only record of what a
+        # staticfilter sweep deleted. Both live beside the DB and neither is inside it.
+        *sorted(CONFIG.db_path.parent.glob(f"{CONFIG.db_path.name}.imported-*.txt")),
+        *sorted(CONFIG.db_path.parent.glob(f"{CONFIG.db_path.name}.static-dropped-*.txt")),
+    )
+
+
+def _mtime_before(p: Path, cutoff_epoch: float) -> bool:
+    """True if `p` was last written before `cutoff_epoch`. A file that vanishes between listing
+    and stat (the pruner) counts as not-settled: it is about to not exist, so leave it alone."""
+    try:
+        return p.stat().st_mtime <= cutoff_epoch
+    except OSError:
+        return False
 
 
 def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
@@ -123,12 +153,16 @@ def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
     return out
 
 
-def zip_tree(src_dir: Path, out_zip: Path, arc_root: Path, compression: int, dry_run: bool) -> tuple[int, int]:
+def zip_tree(src_dir: Path, out_zip: Path, arc_root: Path, compression: int, dry_run: bool,
+             files: list[Path] | None = None) -> tuple[int, int]:
     """Zip src_dir (recursively) to out_zip; arcnames are relative to arc_root so extracting
     into the project root restores the original layout. Written to a .tmp then renamed, so a
     crash never leaves a plausible-looking half archive. A file that vanishes mid-zip (the
-    clips pruner racing us) is logged and skipped, not fatal. Returns (files, bytes) added."""
-    files = [p for p in sorted(src_dir.rglob("*")) if p.is_file()]
+    clips pruner racing us) is logged and skipped, not fatal. A caller that has already decided
+    WHICH files belong (archive_media's settle window) passes them in; default is everything.
+    Returns (files, bytes) added."""
+    if files is None:
+        files = [p for p in sorted(src_dir.rglob("*")) if p.is_file()]
     total = sum(p.stat().st_size for p in files)
     if dry_run:
         log.info("would create %s  (%d files, %.1f MB)", out_zip.name, len(files), total / 2**20)
@@ -188,9 +222,16 @@ def add_to_zip(new_files: list[Path], out_zip: Path, arc_root: Path, compression
     return n, total
 
 
-def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool) -> dict:
+def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
+                  include_today: bool = False, settle_s: float = 0.0) -> dict:
     """Per-day archives for one media root (clips/crops/frames). Today's folder is skipped -- it's
-    still being written to; the next run finalizes it. A past day that is already archived is
+    still being written to; the next run finalizes it. `include_today` (migrate.py's pack) archives
+    it anyway: a half day sealed today is merely topped up by the next run, because these archives
+    are append-only either way. `settle_s` skips any file written within the last N seconds: the
+    recorder writes each mp4 IN PLACE at its final name, and a half-written file archived under
+    that name would block the finished one from ever merging in (the diff is by name). The weekly
+    backup leaves it 0 -- yesterday's files have settled by 03:30. A past day that is already
+    archived is
     normally skipped outright, but any file its source folder holds and its archive doesn't gets
     MERGED in, because a past day is not as frozen as it looks: a trail-cam SD import backfills
     every date the card recorded, and the dump day gets a second batch a few days later when the
@@ -203,11 +244,19 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool) 
         log.warning("removing leftover partial from an interrupted run: %s", stale.name)
         stale.unlink()
     for day, stem in day_dirs(src_root):
-        if day.name >= today.isoformat():
+        if not include_today and day.name >= today.isoformat():
             log.info("skipping %s (still today -- archived on the next run)",
                      day.relative_to(src_root.parent))
             continue
         source = [p for p in sorted(day.rglob("*")) if p.is_file()]
+        if settle_s > 0:
+            cutoff = time.time() - settle_s
+            settled = [p for p in source if _mtime_before(p, cutoff)]
+            if len(settled) < len(source):
+                log.info("%s: %d file(s) written in the last %.0fs -- left for the next pass "
+                         "(a file still being written must not be sealed under its final name)",
+                         day.relative_to(src_root.parent), len(source) - len(settled), settle_s)
+            source = settled
         if not source:
             continue  # a pruned-empty leftover folder; nothing to archive
         out_zip = out_dir / f"{stem}.zip"
@@ -229,7 +278,7 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool) 
             stats["merged"] += 1
         else:
             n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
-                            dry_run=dry_run)
+                            dry_run=dry_run, files=source)
             stats["created"] += 1
         stats["files"] += n
         stats["bytes"] += b
@@ -268,10 +317,10 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
 
 
 def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
-    """One deflated zip of all the small side content (META_ITEMS). Rewritten whole every run --
+    """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
     it's tens of MB, and 'always current, always complete' beats clever here."""
     out_zip = out_dir / f"meta-{today.isoformat()}.zip"
-    present = [p for p in META_ITEMS if p.exists()]
+    present = [p for p in meta_items() if p.exists()]
     if dry_run:
         log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
         return
@@ -287,6 +336,13 @@ def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
                     n += 1
                 except FileNotFoundError:
                     log.warning("vanished while zipping: %s", p)
+                except ValueError:
+                    # An item config_local.py repointed outside the project root cannot be given a
+                    # project-relative arcname (restoring it would have nowhere honest to land).
+                    # Archive what can be, and say what can't -- once per item, at its first file.
+                    log.warning("%s lives outside the project root -- not archived; back that "
+                                "folder up by hand", item)
+                    break
     os.replace(tmp, out_zip)
     log.info("created %s  (%d files, %.1f MB)", out_zip.name, n, out_zip.stat().st_size / 2**20)
 
@@ -489,7 +545,9 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
               are NOT here: each is stitched from these clips and rebuilds itself on demand.
   crops/      one zip per calendar day of detection crops (JPEGs)
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
-              meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config
+              meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config,
+                                        certified reference photos, the DB's import and
+                                        static-dropped ledgers
               weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging
                                         Face checkpoints); never rebuilt -- insurance for
                                         the day a hub repo disappears
@@ -502,7 +560,14 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
               backup task itself has stopped -- that staleness IS the alarm.
   backup.log  what happened on every run
 
-RESTORE onto a fresh machine:
+RESTORE onto a fresh machine (the automated way):
+  1. git clone the repo, set up .venv per the README (weights re-download themselves).
+  2. From the project root:  python migrate.py restore <this folder>
+     It extracts everything below into place, integrity-checks the database before
+     installing it, restores only the clips the old rig still held (the pruned ones stay
+     playable straight out of these zips), and prints the new-machine checklist.
+
+RESTORE by hand (if you'd rather see every step):
   1. git clone the repo, set up .venv per the README (weights re-download themselves).
   2. Extract EVERY zip in clips/ and crops/ into the project root (each contains its own
      clips/<date>/... or crops/<date>/... paths, so they land in place).
