@@ -41,9 +41,15 @@ hand restore forgets at 2am:
 * Nothing is ever overwritten. An existing file is kept and counted, so an interrupted restore
   is simply re-run; a config_local.py you already wrote on the new machine wins over the old
   machine's copy (loudly).
-* The database lands LAST, atomically. Its presence is the "restore finished" marker, which is
-  also why restore REFUSES to run at all where a backyard.db already lives: this tool moves a
-  rig onto a machine, it does not merge two rigs.
+* The database lands LAST, atomically. Its presence is the "restore finished" marker.
+* Where a backyard.db ALREADY lives, restore never merges and never quietly replaces: it says
+  what is here (rows, newest detection, which trees), warns that restoring replaces it, and --
+  only on an explicit yes -- offers to pack the previous rig into a portable backup first, then
+  moves the previous rig WHOLE into replaced-rig-<timestamp>/ inside the project before
+  restoring. Nothing is deleted by this tool, ever: "deleting old material is a decision the
+  rig never makes for you" holds for whole rigs too, so the replaced folder is yours to keep
+  or delete once the restored rig has proven itself. Non-interactively (no TTY) the old hard
+  refusal stands unless --replace plus an explicit --backup-to/--no-backup say otherwise.
 * After install, the restored DB is cross-checked against the restored files (do the rows'
   crop/clip paths actually exist here?) and a new-machine checklist is printed -- the .venv,
   camera index, scheduled tasks and backup destination are per-machine and no archive can
@@ -99,10 +105,13 @@ CROSS_CHECK_SAMPLE = 2000
 
 
 # ------------------------------------------------------------------------------------- pack
-def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True) -> int:
+def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True,
+         announce: bool = True) -> int:
     """Write a complete, current bundle of this rig into `dest`, in backup.py's exact format.
     Append-only like the weekly run, so re-running only adds the delta. Safe beside a live rig
-    (backup-API DB snapshot; sub-minute-old media left for the next pass)."""
+    (backup-API DB snapshot; sub-minute-old media left for the next pass). `announce=False`
+    suppresses the what-next print -- for the safety pack restore runs mid-replace, whose next
+    step is the restore itself, not a move."""
     if ROOT in [dest, *dest.parents]:
         raise SystemExit(f"Refusing to pack the rig into itself: {dest}")
     if not CONFIG.db_path.exists():
@@ -163,7 +172,7 @@ def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True) -> 
 
     log.info("pack %s in %.1f s (%d failure(s))",
              "FAILED" if failures else "finished", time.monotonic() - t0, failures)
-    if not failures:
+    if not failures and announce:
         print(f"\nPacked this rig into: {dest}"
               + ("\n(dry run -- nothing was written)" if dry_run else ""))
         print(f"""Next:
@@ -401,21 +410,172 @@ This machine is not the old machine. Before first launch:
 """.rstrip()
 
 
-def restore(src: Path, *, dry_run: bool = False, include_weights: bool = True) -> int:
+def _interactive() -> bool:
+    """Is there a human on stdin to ask? A pipe or a scheduler is not one, and the replace flow
+    then demands its answers as flags instead of assuming any."""
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def _ask_yn(question: str, *, default: bool) -> bool:
+    """One y/N (or Y/n) question on stdin. EOF or an unreadable answer takes the DEFAULT, and
+    for the replace question the default is No -- a closed pipe must never count as consent."""
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        answer = input(question + suffix).strip().lower()
+    except EOFError:
+        return default
+    if answer in ("y", "yes"):
+        return True
+    if answer in ("n", "no"):
+        return False
+    return default
+
+
+def _existing_rig_summary() -> str:
+    """What is already living here, in one glance: the DB's size, row count and newest
+    detection, plus which recorded trees exist -- so the replace decision is made about a
+    KNOWN thing ('141,203 detections, newest last night'), never about a filename."""
+    line = f"{CONFIG.db_path.name}"
+    try:
+        line += f" ({CONFIG.db_path.stat().st_size / 2**20:.1f} MB"
+        conn = db.connect_readonly(CONFIG.db_path)
+        if conn is not None:
+            try:
+                n = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+                newest = conn.execute("SELECT MAX(timestamp) FROM detections").fetchone()[0]
+                line += f", {n} detections, newest {newest or 'none'}"
+            except sqlite3.DatabaseError:
+                line += ", unreadable as a rig database"
+            finally:
+                conn.close()
+        line += ")"
+    except OSError:
+        pass
+    trees = [p.name for p in _previous_rig_items() if p.is_dir()]
+    if trees:
+        line += f", plus {', '.join(trees)}/"
+    return line
+
+
+def _previous_rig_items() -> list[Path]:
+    """Everything the PREVIOUS rig recorded -- what moving it aside must carry. The line is
+    'recorded by the rig' vs 'belongs to the machine': the DB and its sidecar ledgers, the
+    media and identity trees its rows point into, and its eval artifacts move; config_local.py,
+    logs/, tuning/, weights and the .venv stay, exactly the split pack/restore already draws."""
+    c = CONFIG
+    items = [
+        c.db_path,
+        c.db_path.with_name(c.db_path.name + "-wal"),
+        c.db_path.with_name(c.db_path.name + "-shm"),
+        *sorted(c.db_path.parent.glob(f"{c.db_path.name}.imported-*.txt")),
+        *sorted(c.db_path.parent.glob(f"{c.db_path.name}.static-dropped-*.txt")),
+        c.crops_dir, c.frames_dir, c.clips_dir, c.clip_crops_dir,
+        ROOT / "reid",
+        c.reference_dir, c.reference_crops_dir,
+        getattr(c, "refimg_store_dir", ROOT / "refimg_store"),
+        ROOT / "reports",
+    ]
+    return [p for p in items if p.exists()]
+
+
+def _replace_previous_rig(src: Path, replace_existing: bool | None, backup_first: bool | None,
+                          backup_dest: Path | None) -> tuple[Path, Path | None]:
+    """The warn -> confirm -> optional safety pack -> move-aside flow for restoring onto a
+    machine that already has a rig. Returns (where the previous rig now lives, where its safety
+    pack went or None). Raises SystemExit -- with nothing touched -- on any 'no'.
+
+    'Replace' here NEVER deletes: the previous rig is moved whole into replaced-rig-<stamp>/
+    inside the project (same volume, so it is a rename, not a copy), because deleting old
+    material is a decision the rig never makes for you -- least of all on one keystroke. The
+    offered pack is the portable, off-this-disk copy on top of that."""
+    summary = _existing_rig_summary()
+    interactive = _interactive()
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    moved_to = ROOT / f"replaced-rig-{stamp}"
+
+    print(f"\nThere is already a rig here: {summary}")
+    print("Restoring will REPLACE it -- the previous rig's database and recorded media stop\n"
+          "being this machine's rig. Nothing is deleted: the previous rig is moved whole into\n"
+          f"  {moved_to.name}{os.sep}\n"
+          "inside the project, yours to keep or delete once the restored rig has proven itself.\n"
+          "(If the previous rig is RUNNING on this machine right now, stop it before going on.)")
+    if replace_existing is None:
+        if not interactive:
+            raise SystemExit(
+                "There is already a rig here, and no terminal to ask about it. Nothing was "
+                "changed. Re-run interactively to be walked through replacing it, or say it "
+                "outright: --replace with either --backup-to FOLDER or --no-backup.")
+        replace_existing = _ask_yn(f"Replace it with the rig from {src}?", default=False)
+    if not replace_existing:
+        raise SystemExit("Left everything exactly as it was.")
+
+    if backup_first is None:
+        if not interactive:
+            raise SystemExit(
+                "--replace on its own is not enough without a terminal: say what happens to "
+                "the previous rig's data first -- --backup-to FOLDER (a portable pack of it) "
+                "or --no-backup (the move into the replaced-rig folder is then its only "
+                "copy). Nothing was changed.")
+        backup_first = _ask_yn("Pack the previous rig into a portable backup first "
+                               "(recommended)?", default=True)
+    packed_to = None
+    if backup_first:
+        if backup_dest is None:
+            default_dest = ROOT.parent / f"backyard-previous-rig-{stamp[:8]}"
+            try:
+                typed = input(f"Where should that backup go? [{default_dest}] ").strip()
+            except EOFError:
+                typed = ""
+            backup_dest = Path(typed).expanduser() if typed else default_dest
+        print(f"\nPacking the previous rig into {backup_dest} first...")
+        if pack(backup_dest, include_weights=False, announce=False) != 0:
+            raise SystemExit("The safety pack FAILED (its log says why), so nothing was "
+                             "replaced. Fix that or answer --no-backup, then re-run.")
+        packed_to = backup_dest
+
+    moved_to.mkdir()
+    for item in _previous_rig_items():
+        # shutil.move, not rename: rename is what actually happens (same volume), but a media
+        # dir repointed onto another drive by config_local.py must still arrive, not error.
+        shutil.move(str(item), str(moved_to / item.name))
+        log.info("previous rig: moved %s -> %s%s%s", item.name, moved_to.name, os.sep, item.name)
+    print(f"Previous rig moved to {moved_to}{os.sep}"
+          + (f"  (and packed at {packed_to})" if packed_to else ""))
+    return moved_to, packed_to
+
+
+def restore(src: Path, *, dry_run: bool = False, include_weights: bool = True,
+            replace_existing: bool | None = None, backup_first: bool | None = None,
+            backup_dest: Path | None = None) -> int:
     """Reassemble a rig here from a pack bundle or a weekly backup folder (same format). Media
     first, database last and atomically -- its arrival is what marks the restore finished, so
-    an interrupted run is simply re-run and picks up where it stopped."""
+    an interrupted run is simply re-run and picks up where it stopped. Onto a machine that
+    already has a rig, the _replace_previous_rig flow runs first (warn, confirm, optional
+    safety pack, move the previous rig aside); the three keyword flags pre-answer its
+    questions for scripted use."""
     if not src.is_dir():
         raise SystemExit(f"Not a folder: {src}")
     if ROOT in [src, *src.parents]:
         raise SystemExit(f"The source folder is inside the project ({src}) -- restore reads a "
                          "bundle from OUTSIDE the rig it rebuilds (a USB drive, a share, the "
                          "cloud-synced backup folder).")
+    replaced_note = ""
     if CONFIG.db_path.exists():
-        raise SystemExit(
-            f"There is already a rig here: {CONFIG.db_path} exists. This tool moves a rig onto "
-            "a machine; it does not merge two rigs. If replacing this one is really what you "
-            "want, move backyard.db (and its -wal/-shm siblings) aside yourself, then re-run.")
+        if dry_run:
+            print(f"\nThere is already a rig here: {_existing_rig_summary()}\n"
+                  "A real restore would offer to replace it: confirm, optionally pack the "
+                  "previous rig into a portable backup, then move it whole into a "
+                  "replaced-rig-<timestamp>/ folder (nothing deleted) before restoring. "
+                  "Nothing was changed, and the plan below assumes that clean slate cannot "
+                  "be shown honestly -- re-run --dry-run after replacing, or just run the "
+                  "restore.")
+            return 0
+        moved_to, packed_to = _replace_previous_rig(src, replace_existing, backup_first,
+                                                    backup_dest)
+        replaced_note = (f"previous rig: kept whole at {moved_to}{os.sep}"
+                         + (f", safety pack at {packed_to}" if packed_to else
+                            " (its only copy -- delete it only once the restored rig has "
+                            "proven itself)"))
     for sibling in (CONFIG.db_path.with_name(CONFIG.db_path.name + "-wal"),
                     CONFIG.db_path.with_name(CONFIG.db_path.name + "-shm")):
         if sibling.exists():
@@ -545,6 +705,8 @@ def restore(src: Path, *, dry_run: bool = False, include_weights: bool = True) -
 
     print(f"\nRestore finished in {time.monotonic() - t0:.1f} s. Cross-checking the database "
           "against the restored files:")
+    if replaced_note:
+        print(f"  {replaced_note}")
     for line in _cross_check(keep):
         print(f"  {line}")
     print(CHECKLIST)
@@ -569,6 +731,21 @@ def main() -> int:
                                             "from the weekly backup folder")
     p_rest.add_argument("src", type=Path, help="the folder pack/backup.py wrote (holds clips/, "
                                                "crops/, snapshots/)")
+    # Restoring where a rig already lives: interactively you are walked through it (warn ->
+    # confirm -> optional safety pack -> the previous rig moves whole into replaced-rig-<ts>/,
+    # never deleted). These three pre-answer the questions for scripted use -- and --replace
+    # alone is deliberately not enough: what happens to the previous data must be said.
+    p_rest.add_argument("--replace", action="store_true",
+                        help="replace an existing rig here without asking (requires "
+                             "--backup-to or --no-backup; the previous rig still moves into "
+                             "replaced-rig-<timestamp>/, never deleted)")
+    grp = p_rest.add_mutually_exclusive_group()
+    grp.add_argument("--backup-to", type=Path, metavar="FOLDER",
+                     help="before replacing, pack the previous rig into FOLDER "
+                          "(a portable backup in the standard format)")
+    grp.add_argument("--no-backup", action="store_true",
+                     help="replace without a portable pack of the previous rig -- the "
+                          "replaced-rig-<timestamp>/ folder becomes its only copy")
     for p in (p_pack, p_rest):
         p.add_argument("--dry-run", action="store_true",
                        help="say what would be done; write nothing")
@@ -593,7 +770,11 @@ def main() -> int:
 
     if args.cmd == "pack":
         return pack(args.dest, dry_run=args.dry_run, include_weights=not args.no_weights)
-    return restore(args.src, dry_run=args.dry_run, include_weights=not args.no_weights)
+    return restore(args.src, dry_run=args.dry_run, include_weights=not args.no_weights,
+                   replace_existing=True if args.replace else None,
+                   backup_first=(True if args.backup_to else
+                                 (False if args.no_backup else None)),
+                   backup_dest=args.backup_to)
 
 
 if __name__ == "__main__":

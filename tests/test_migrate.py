@@ -554,3 +554,180 @@ def test_meta_item_outside_the_project_warns_and_archives_the_rest(env, tmp_path
     assert "config_local.py" in names
     assert "reference_crops/Alpha/portrait_crop.jpg" in names   # the inside item still lands
     assert not any("photos-on-another-drive" in n for n in names)
+
+
+# --- restoring where a rig already lives ---------------------------------------------------
+# "Replace" never deletes: the previous rig moves WHOLE into replaced-rig-<stamp>/ inside the
+# project, and the optional safety pack is a portable copy on top of that. What these pin, in
+# order of expense: declining changes nothing; nothing proceeds non-interactively without the
+# explicit flags; the move carries the previous rig's data byte-for-byte; the safety pack is a
+# pack OF THE PREVIOUS rig (not the bundle's); and the machine's own config never moves.
+
+def _existing_rig(new: Path) -> None:
+    """A small rig already living on the 'new' machine: one detection, its crop, a reference --
+    distinct bytes from build_old_rig's so the two rigs can never be confused in asserts."""
+    _file(new, f"crops/{D0}/mine.jpg", b"the-new-machines-own-crop")
+    _add_detection(new, f"crops/{D0}/mine.jpg", f"{D0}T07:00:00")
+    _file(new, "reference/Beta/portrait.jpg", b"beta")
+    _file(new, "config_local.py", b"# this machine's own config\n")
+
+
+def test_replace_via_flags_moves_the_previous_rig_aside(env, tmp_path, capsys):
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    assert migrate.restore(dest, replace_existing=True, backup_first=False) == 0
+
+    replaced = list(new.glob("replaced-rig-*"))
+    assert len(replaced) == 1
+    # The previous rig arrived whole -- db and files, byte for byte.
+    assert (replaced[0] / "crops" / D0 / "mine.jpg").read_bytes() == b"the-new-machines-own-crop"
+    assert (replaced[0] / "reference/Beta/portrait.jpg").read_bytes() == b"beta"
+    prev = sqlite3.connect(f"file:{(replaced[0] / 'backyard.db').as_posix()}?mode=ro", uri=True)
+    try:
+        assert prev.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 1
+    finally:
+        prev.close()
+    # The restored rig is the bundle's, on a clean slate.
+    now = sqlite3.connect(f"file:{(new / 'backyard.db').as_posix()}?mode=ro", uri=True)
+    try:
+        assert now.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 2
+    finally:
+        now.close()
+    assert not (new / "crops" / D0 / "mine.jpg").exists()
+    # The machine's own config is machine state, not rig state: it stays, and it wins.
+    assert (new / "config_local.py").read_bytes() == b"# this machine's own config\n"
+    assert "kept whole at" in capsys.readouterr().out
+
+
+def test_replace_with_backup_first_packs_the_previous_rig(env, tmp_path):
+    """The safety pack must hold the PREVIOUS rig -- the one about to be replaced -- in the
+    standard format, so `migrate.py restore` can bring it back like any other bundle."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    prevpack = tmp_path / "previous-rig-pack"
+    assert migrate.restore(dest, replace_existing=True, backup_first=True,
+                           backup_dest=prevpack) == 0
+
+    snaps = sorted((prevpack / "snapshots").glob("backyard-db-*.zip"))
+    assert snaps, "the safety pack wrote no database snapshot"
+    with zipfile.ZipFile(snaps[-1]) as zf:
+        (prevpack / "check.db").write_bytes(zf.read(zf.namelist()[0]))
+    packed = sqlite3.connect(f"file:{(prevpack / 'check.db').as_posix()}?mode=ro", uri=True)
+    try:
+        assert packed.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 1
+    finally:
+        packed.close()
+    assert (new / "backyard.db").is_file()
+    assert list(new.glob("replaced-rig-*")), "the move-aside still happens with a backup"
+
+
+def test_replace_prompt_defaults_to_no_and_declining_changes_nothing(env, tmp_path, monkeypatch):
+    """A bare Enter on the replace question is a NO -- the destructive answer is never the
+    default -- and a declined replace leaves every byte where it was."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    before = (new / "backyard.db").read_bytes()
+    monkeypatch.setattr(migrate, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    with pytest.raises(SystemExit, match="Left everything"):
+        migrate.restore(dest)
+
+    assert (new / "backyard.db").read_bytes() == before
+    assert not list(new.glob("replaced-rig-*"))
+    assert (new / "crops" / D0 / "mine.jpg").exists()
+
+
+def test_replace_prompt_yes_then_no_backup_restores(env, tmp_path, monkeypatch):
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    monkeypatch.setattr(migrate, "_interactive", lambda: True)
+    answers = iter(["y", "n"])                      # replace? yes; pack a backup first? no
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    assert migrate.restore(dest) == 0
+
+    assert list(new.glob("replaced-rig-*"))
+    now = sqlite3.connect(f"file:{(new / 'backyard.db').as_posix()}?mode=ro", uri=True)
+    try:
+        assert now.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 2
+    finally:
+        now.close()
+
+
+def test_replace_without_a_terminal_requires_explicit_answers(env, tmp_path, monkeypatch):
+    """No TTY and no flags: the old hard refusal. --replace alone is still not enough -- what
+    happens to the previous rig's data must be said (--backup-to or --no-backup)."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    monkeypatch.setattr(migrate, "_interactive", lambda: False)
+    with pytest.raises(SystemExit, match="already a rig here"):
+        migrate.restore(dest)
+    with pytest.raises(SystemExit, match="--no-backup"):
+        migrate.restore(dest, replace_existing=True)
+    assert not list(new.glob("replaced-rig-*"))
+    assert (new / "crops" / D0 / "mine.jpg").exists()
+
+
+def test_replace_aborts_whole_if_the_safety_pack_fails(env, tmp_path, monkeypatch):
+    """A failed safety pack must stop the replace cold: the point of packing first is that the
+    previous rig is safe BEFORE anything moves."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    monkeypatch.setattr(migrate, "pack", lambda *a, **k: 1)
+    with pytest.raises(SystemExit, match="safety pack FAILED"):
+        migrate.restore(dest, replace_existing=True, backup_first=True,
+                        backup_dest=tmp_path / "wontmatter")
+    assert not list(new.glob("replaced-rig-*"))
+    assert (new / "crops" / D0 / "mine.jpg").exists()
+
+
+def test_dry_run_on_an_existing_rig_changes_nothing_and_says_why(env, tmp_path, capsys):
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+
+    use(new)
+    _existing_rig(new)
+    before = (new / "backyard.db").read_bytes()
+    assert migrate.restore(dest, dry_run=True) == 0
+
+    assert (new / "backyard.db").read_bytes() == before
+    assert not list(new.glob("replaced-rig-*"))
+    assert "already a rig here" in capsys.readouterr().out

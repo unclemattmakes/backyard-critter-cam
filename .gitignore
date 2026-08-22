@@ -70,6 +70,11 @@ weights/
 *.imported-*.txt
 *.static-dropped-*.txt
 
+# ===== A previous rig this machine replaced (migrate.py restore over an existing rig) =====
+# The whole previous rig -- db, crops, clips, references -- moved aside, never deleted.
+# Yours to remove once the restored rig has proven itself.
+replaced-rig-*/
+
 # ===== Local private config (real coordinates / machine-specific overrides) =====
 config_local.py
 

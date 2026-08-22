@@ -914,13 +914,19 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
   their final name, and a half file sealed into an append-only archive would block the whole
   one forever. So: pack while the rig runs (the slow bulk), **stop the rig, pack once more**
   (seconds), then restore from that.
-- **`restore` is the judgement a 2 a.m. hand-restore forgets.** It refuses to run where a
-  `backyard.db` already lives (it moves rigs, it doesn't merge them), `quick_check`s the
+- **`restore` is the judgement a 2 a.m. hand-restore forgets.** It `quick_check`s the
   database snapshot *before* installing it (falling back to the next-oldest snapshot if the
   newest is corrupt), never overwrites an existing file (so an interrupted restore is just
   re-run, and a `config_local.py` you already wrote wins over the old machine's), installs
   the database **last and atomically**, then cross-checks the rows against the restored
   files and prints the new-machine checklist.
+- **Restoring where a rig already lives never merges and never quietly replaces.** Restore
+  says what's here (rows, newest detection, which trees), warns that restoring replaces it,
+  and — only on an explicit yes — offers to **pack the previous rig into a portable backup
+  first**, then moves it *whole* into a `replaced-rig-<timestamp>/` folder before restoring.
+  Nothing is ever deleted: the replaced folder is yours to remove once the restored rig has
+  proven itself. Scripted use must say it outright (`--replace` plus `--backup-to FOLDER` or
+  `--no-backup`); with no terminal and no flags, the old hard refusal stands.
 - **Only the clips the old machine still held are restored.** The archive deliberately
   outlives the clip pruner, so it holds more footage than any one disk should; pruned clips
   keep their DB rows and stay playable straight out of the backup zips (the dashboard's
