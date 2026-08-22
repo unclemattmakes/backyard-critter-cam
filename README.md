@@ -925,6 +925,13 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
   and caches that rebuild themselves (`clips_web/`, `archive_cache/`, `refimg_store/`).
   `--dry-run` on either half says exactly what it would do first; `--no-weights` skips the
   ~1.3 GB weights mirror if you'd rather re-download.
+- **The new machine doesn't need the old machine's camera.** A configured camera that isn't
+  there is retried forever, never fatal — and a rig with no camera at all still serves the
+  entire migrated archive via `--serve-only`. Drop the departed camera from
+  `config_local.py`, and your history is untouched either way: everything keys off the
+  `source` column, so a retired camera simply stops adding rows. A replacement camera on the
+  **same view** should reuse the old source name (continuous timeline); a new angle gets a
+  new name.
 
 ---
 

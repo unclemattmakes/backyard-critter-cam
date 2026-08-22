@@ -383,6 +383,13 @@ This machine is not the old machine. Before first launch:
                                        this machine's cloud-synced folder -- ideally the same
                                        archive family you just restored from, so the weekly
                                        backup continues it and pruned-clip playback works.
+    No camera on this machine (yet)? Nothing breaks: drop the old machine's USB CameraSpec /
+    camera_index so the log isn't an endless reconnect loop, and browse the whole archive with
+    `python backyard_cam.py --serve-only` until a camera arrives. History is safe either way --
+    everything keys off the source column, so a retired camera just stops adding rows. When a
+    replacement camera points at the SAME view, reuse its source name and the timeline stays
+    continuous; a new angle deserves a new name. (setup_selfheal.bat exists solely to un-wedge
+    a USB camera -- a rig without one can skip re-registering it.)
  3. Scheduled jobs live in the OS, not the repo. Re-register the ones you used: the weekly
     backup.py task (README "Backups"), setup_selfheal.bat, newsletter.py if you run the
     morning email.
