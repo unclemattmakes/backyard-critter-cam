@@ -552,6 +552,39 @@ def _backend_for(spec: config.CameraSpec, cfg: config.Config) -> int:
     return cv2.CAP_ANY
 
 
+# Secret-looking query parameters (an ESP32-CAM or a DVR may carry the login there instead of
+# in the netloc): ?pwd=... / &token=... . The name is kept, the value is not.
+_URL_SECRET_QS = re.compile(r"(?i)(?<=[?&])(pass(?:word)?|pwd|token|auth|secret|key)=[^&]*")
+
+
+def _safe_src(src: int | str) -> str:
+    """A CameraSpec's `src` rendered for a HUMAN to read, with any credentials masked.
+
+    A networked camera's src carries its password in the URL (rtsp://user:pass@host/...), and
+    every line that prints one goes to the console AND to logs/backyard_cam.log -- which
+    backup.py sweeps into the meta zip and off the machine, and which is what gets pasted into
+    an issue when something breaks. So each human-facing print of a src goes through here; the
+    real URL is handed to VideoCapture untouched.
+
+    The USERNAME survives -- it is exactly what you need to see when a camera rejects a login --
+    and the password does not. A plain int webcam index has nothing to hide and comes back
+    unchanged, so the single-camera case reads as it always did.
+
+    Returns the repr (quoted for a URL, bare for an index), because it replaces `!r` at the
+    call sites."""
+    if not isinstance(src, str):
+        return repr(src)
+    out = src
+    scheme, sep, rest = out.partition("://")
+    if sep and "@" in rest:
+        # rpartition, not partition: a password may itself contain '@', and it is the LAST one
+        # that delimits the host.
+        creds, _, host = rest.rpartition("@")
+        user, colon, _pw = creds.partition(":")
+        out = f"{scheme}://{user}{':***' if colon else ''}@{host}"
+    return repr(_URL_SECRET_QS.sub(r"\1=***", out))
+
+
 def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCapture | None:
     """Open ONE camera from its CameraSpec, warm it up, and return the VideoCapture (or None if it
     won't open). Handles a local webcam index (DirectShow on Windows) and a networked stream URL
@@ -1442,14 +1475,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             # Couldn't open on the first try -- but don't bail. An IP cam may still be booting, and
             # a local USB cam may be mid-suspend (the box was in Modern Standby when we launched).
             # reconnect_capture retries forever (honouring stop_event), so we recover once it wakes.
-            print(f"{tag} could not open camera src={spec.src!r} yet -- will keep trying to connect."
+            print(f"{tag} could not open camera src={_safe_src(spec.src)} yet -- will keep trying to connect."
                   + ("" if spec.is_url else "  (if it never opens, `python backyard_cam.py "
                      "--list-cameras` finds the right index)"))
             db.record_coverage(cfg.db_path, spec.source, "down", "waiting-to-open")
             cap = reconnect_capture(spec, cfg, stop_event)
         if cap is None:
             return                                  # only reached when we're shutting down
-        print(f"{tag} open ({spec.src!r}).")
+        print(f"{tag} open ({_safe_src(spec.src)}).")
         # The COVERAGE LEDGER: written at the rare transitions only (open / read-failure /
         # reconnect / stop), so every later absence claim -- "no robin this night", "overdue" --
         # can know whether the camera was even watching. record_coverage never raises and uses
@@ -1864,7 +1897,7 @@ def run(cfg: config.Config) -> None:
 
         n = len(specs)
         print(f"  {n} camera{'' if n == 1 else 's'}: "
-              + ", ".join(f"{s.display_name} ({s.src!r})" for s in specs))
+              + ", ".join(f"{s.display_name} ({_safe_src(s.src)})" for s in specs))
         if cfg.latitude is not None and cfg.longitude is not None:
             try:
                 st = daynight.sun_times(cfg.latitude, cfg.longitude)
