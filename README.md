@@ -311,6 +311,20 @@ for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Pe
 (resolution, `motion_min_area`, day/night profile, `record_clips`) default to the global config;
 only override what differs. Each camera needs a **unique `source`**.
 
+**Adding one, step by step:** [docs/runbook-add-network-camera.md](docs/runbook-add-network-camera.md)
+is the operational sequence — including the two that look like faults and aren't (RTSP ships
+*disabled* on some cameras and needs a **reboot** after enabling; the vendor app's login is
+often an account with the vendor, not a user on the camera, so RTSP rejects it). Probe a camera
+before you write its URL into a config with:
+
+```
+python tools/camprobe.py <ip> --user <camera-user>      # CAM_PASS from the environment
+```
+
+It walks port → RTSP challenge → credentials → which stream paths exist, measures what each
+stream costs to decode, suggests a `motion_min_area` for its resolution, and saves a test frame.
+Passwords are masked in everything it prints.
+
 - **Networked cameras** are opened through OpenCV's FFMPEG backend with a 1-frame buffer (so the
   stream can't lag behind the detector), forced to **TCP** transport, and reconnected with
   **indefinite backoff** (a network blip is transient — unlike a USB unplug, which gives up after

@@ -718,3 +718,69 @@ def test_veto_census_line_reaches_the_log_from_the_real_loop(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "veto census:" in out
     assert "box(es) judged" in out
+
+
+# ---- _safe_src: a camera password must never reach the log ---------------------------
+#
+# A networked camera's src IS its credential (rtsp://user:pass@host/...), and the three lines
+# that print one -- the startup banner, the could-not-open retry, the open/reconnect notice --
+# land in logs/backyard_cam.log, which backup.py sweeps off the machine and which is what gets
+# pasted into an issue. The password is masked; the username is not, because a rejected login
+# is the failure you most need that line to explain.
+
+REOLINK = "rtsp://rig:hunter2@192.168.0.105:554/h264Preview_01_sub"
+
+
+def test_int_index_is_unchanged():
+    """The single-camera case has nothing to hide and must read exactly as it always did."""
+    assert backyard_cam._safe_src(1) == "1"
+    assert backyard_cam._safe_src(0) == "0"
+
+
+def test_rtsp_password_is_masked_and_everything_else_survives():
+    out = backyard_cam._safe_src(REOLINK)
+    assert "hunter2" not in out
+    assert out == "'rtsp://rig:***@192.168.0.105:554/h264Preview_01_sub'"
+
+
+def test_username_survives_because_a_rejected_login_is_the_thing_you_debug():
+    assert "rig" in backyard_cam._safe_src(REOLINK)
+
+
+def test_password_containing_an_at_sign_is_still_fully_masked():
+    """The LAST '@' delimits the host, so a password with one in it must not split early and
+    leave its own tail in the log (str.partition would; rpartition does not)."""
+    out = backyard_cam._safe_src("rtsp://rig:p@ss@192.168.0.105:554/stream")
+    assert "p@ss" not in out and "ss@" not in out.replace("***@", "")
+    assert out == "'rtsp://rig:***@192.168.0.105:554/stream'"
+
+
+def test_url_without_credentials_is_untouched():
+    url = "http://192.168.1.51:81/stream"
+    assert backyard_cam._safe_src(url) == repr(url)
+
+
+def test_username_only_url_keeps_its_shape():
+    """No colon means no password to hide -- don't invent a ':***' that was never there."""
+    assert backyard_cam._safe_src("rtsp://rig@host/stream") == "'rtsp://rig@host/stream'"
+
+
+def test_local_file_path_source_is_untouched():
+    """A plain file path is a legal src (the README's canned-video demo) and has no netloc."""
+    path = r"C:/downloads/raccoon_visit.mp4"
+    assert backyard_cam._safe_src(path) == repr(path)
+
+
+def test_secret_query_parameter_is_masked_by_name():
+    """Some cameras carry the login in the query string instead of the netloc."""
+    out = backyard_cam._safe_src("http://cam.local/stream?user=rig&pwd=hunter2&res=hd")
+    assert "hunter2" not in out
+    assert "pwd=***" in out and "res=hd" in out
+
+
+def test_no_print_site_still_formats_a_raw_src():
+    """The guard that outlives this change: masking helps only if EVERY human-facing print goes
+    through it, so a new `{spec.src!r}` added later should fail here rather than quietly write a
+    password into the log for a week before anyone notices."""
+    source = Path(backyard_cam.__file__).read_text(encoding="utf-8")
+    assert "src!r" not in source
