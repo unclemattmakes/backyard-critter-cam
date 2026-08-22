@@ -33,9 +33,16 @@ pillow>=10,<12
 # The general-CLIP "is this even an animal?" gate (clipfilter.py) imports open_clip directly;
 # declared in its own right rather than ridden in as a pybioclip dependency.
 open_clip_torch>=2.24,<3
-# Sun-driven day/night camera profiles (daynight.py). Without it the rig still runs, but
-# current_period() can't resolve dawn/dusk and the profiles disable (camera just auto-exposes).
+# Sun-driven day/night camera profiles (daynight.py), and the batch's own start time
+# (sunsched.py aims it at the late-afternoon glare window, sunset-2.5h). Without it the rig still
+# runs, but current_period() can't resolve dawn/dusk and the profiles disable (camera just
+# auto-exposes), and the batch keeps whatever start time it last had.
 astral>=3.2,<4
+# Process inspection for the self-healing pair: rigwatch.py asks whether backyard_cam.py is still
+# alive before restarting it, and heavyio.py uses it to reap a lock whose owner died and to watch
+# the cloud client's io counters. NOT optional for rigwatch -- without it rig_pids() cannot tell a
+# live rig from a dead one, and it refuses to act rather than restart a healthy rig every 5 min.
+psutil>=5.9,<8
 # Species classifier (classify.py): BioCLIP 2 zero-shot. NOTE the PyPI distribution is named
 # `pybioclip` but it imports as `bioclip`. Reuses the separately-installed cu130 torch (header).
 pybioclip>=2.1,<3

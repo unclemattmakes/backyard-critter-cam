@@ -76,6 +76,12 @@ config_local.py
 # ===== Runtime status (live-naming helper heartbeat; regenerated each run) =====
 .naming_status.json
 .naming_status.tmp
+# Runtime state for the self-healing bits: who holds the heavy-io lock (heavyio.py),
+# whether a human stopped the rig on purpose, and the restart-storm counter (rigwatch.py).
+# All three are about THIS machine right now; none of it means anything in the repo.
+.locks/
+.rig_pause
+.rigwatch_state.json
 
 # ===== What setup actually resolved on THIS machine (torch build, ultralytics, ...) =====
 # Machine-specific provenance for the numbers this machine computes; backup.py archives it
