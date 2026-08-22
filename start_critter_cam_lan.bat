@@ -26,7 +26,17 @@ echo      On this PC, click the live VIDEO window and press  Q.
 echo      (Or just close that window.)  Everything stops together.
 echo   ===============================================================
 echo.
-start "Backyard Critter Cam - log (you can ignore or minimize this)" ".venv\Scripts\python.exe" backyard_cam.py --serve --host 0.0.0.0
+REM Starting by hand clears the "stopped on purpose" marker, so rigwatch.py will bring the rig
+REM back if it dies from here on -- the same contract start_critter_cam.bat has always had. This
+REM launcher was missing BOTH halves of it: it never cleared the marker and never wrote one, so a
+REM LAN start left a stale marker standing (rig up but unguarded) and a LAN 'q' was not respected
+REM as a deliberate stop. rigwatch also self-heals a stale marker now, but write it correctly here.
+if exist ".rig_pause" del /q ".rig_pause"
+
+REM Run python INSIDE a cmd /k so the log window stays open on an abnormal exit instead of
+REM vanishing without a trace; on a normal stop ('q' / closing the video window) python exits 0,
+REM we drop the pause marker so the watchdog leaves it alone, and close the window ourselves.
+start "Backyard Critter Cam - log (you can ignore or minimize this)" /min cmd /k ".venv\Scripts\python.exe backyard_cam.py --serve --host 0.0.0.0 & if errorlevel 1 (echo. & echo   *** The app exited abnormally -- the error is above and in logs\backyard_cam.log. & echo   *** This window is kept open on purpose; close it when you are done reading. & echo.) else (echo stopped from the video window > .rig_pause & exit)"
 
 REM Wait until the dashboard is actually answering (poll the port) rather than guessing a fixed
 REM delay -- the very first run downloads the detector model and can take a while, and we never
