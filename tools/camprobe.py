@@ -48,7 +48,7 @@ VENV_PY = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/py
 try:
     import cv2                                   # noqa: E402
     import config                                # noqa: E402
-    from backyard_cam import _safe_src           # noqa: E402  (one masking rule, not two)
+    from cameras import parse_stream_url         # noqa: E402  (one URL parser, not two)
 except ModuleNotFoundError as exc:               # pragma: no cover - depends on the interpreter
     # A bare `python` is not this project's interpreter: on the rig it resolves to the system
     # Python, which has no OpenCV. Fail with the command to run instead of a raw traceback --
@@ -163,27 +163,15 @@ def suggested_motion_area(cfg, w: int, h: int) -> int:
 def parse_rtsp_url(url: str) -> tuple[str, str, str, int, str] | None:
     """Split rtsp://[user[:pass]@]host[:port]/path into its parts, or None if it isn't one.
 
-    rpartition on the '@', because a password may legally contain one and it is the LAST '@'
-    that delimits the host. Splitting on the first would hand back a truncated password and a
-    nonsense hostname -- and that failure looks exactly like a wrong password, which is the
-    most expensive thing it could possibly be mistaken for.
+    The parsing itself is cameras.parse_stream_url -- the same one the rig uses to decompose a
+    camera URL into its DB columns, so a URL that camprobe accepts is a URL the camera list can
+    store. This wrapper only narrows it to RTSP and flattens it to the tuple main() wants.
     """
-    if not url.lower().startswith("rtsp://"):
+    parts = parse_stream_url(url, schemes=("rtsp",))
+    if parts is None:
         return None
-    rest = url[len("rtsp://"):]
-    user = pw = ""
-    if "@" in rest:
-        creds, _, rest = rest.rpartition("@")
-        user, _, pw = creds.partition(":")
-    hostport, _, path = rest.partition("/")
-    host, _, port = hostport.partition(":")
-    if not host:
-        return None
-    try:
-        port_n = int(port) if port else 554
-    except ValueError:
-        return None
-    return user, pw, host, port_n, path
+    return (parts["username"] or "", parts["password"] or "", parts["url_host"],
+            parts["url_port"] or 554, parts["url_path"] or "")
 
 
 def probe_path(host, port, user, pw, label, path, args, cfg) -> dict | None:

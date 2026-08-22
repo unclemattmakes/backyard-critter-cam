@@ -311,6 +311,22 @@ for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Pe
 (resolution, `motion_min_area`, day/night profile, `record_clips`) default to the global config;
 only override what differs. Each camera needs a **unique `source`**.
 
+**Or add one without editing Python.** Since 2026-08-22 the camera list lives in the database and
+the block above only **seeds** it the first time. The dashboard's **cameras** button (top right of
+Live Observation) adds, edits and removes cameras — name, address, stream path, login, resolution,
+motion area. Two things it deliberately does not pretend:
+
+- **A change applies at the next restart, not immediately.** Each camera gets its own capture
+  thread when the rig starts, so unlike ignore zones a camera cannot be attached to a running rig.
+  The panel says so.
+- **A camera's short name is permanent.** It is stamped on every detection, visit and clip folder
+  recorded under it, so renaming would orphan all of it. Removing a camera keeps those rows, and
+  re-adding the same short name reattaches to them.
+
+A camera **password** can only be set from the rig machine itself, never over the network — see
+[SECURITY.md](SECURITY.md#camera-credentials--the-one-exception). Everything else is editable from
+any device an operator can reach.
+
 **Adding one, step by step:** [docs/runbook-add-network-camera.md](docs/runbook-add-network-camera.md)
 is the operational sequence — including the two that look like faults and aren't (RTSP ships
 *disabled* on some cameras and needs a **reboot** after enabling; the vendor app's login is

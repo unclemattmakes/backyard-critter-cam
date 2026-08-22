@@ -14,6 +14,29 @@ read-only mode, no audit trail of who did what, and no undo for a delete.
 
 So the boundary is the network, and only the network.
 
+## Camera credentials — the one exception
+
+Since 2026-08-22 the dashboard can manage the camera list, and a networked camera's login is a
+real secret: an RTSP URL *is* `rtsp://user:pass@host/path`. That is the only credential this
+software stores, and it gets narrower rules than everything else above.
+
+- **Setting one requires loopback.** Every other edit in this dashboard is available to anyone
+  who can reach the port; typing a camera password is not. It must come from the machine running
+  the rig. The dashboard is plain HTTP with no login, so a password entered from a phone would
+  cross the network in the clear, to a server that would have accepted it from anyone else on
+  that network. Requiring loopback removes that exposure rather than mitigating it.
+- **There is no read path.** The password column is never selected by the query that lists
+  cameras, so no API response, log line, or error message can carry it. What the dashboard shows
+  is `has_password: true`. The edit form is blank even when a password is set, and submitting it
+  blank leaves the stored one alone.
+- **It is stored in cleartext** in `backyard.db`, alongside the same secret that has always sat
+  in cleartext in `config_local.py`. If you back the database up, you are backing that up too.
+  Encrypting it would not change who can read it: anyone who can read the database file can read
+  the rig's config file next to it.
+- **Give the camera its own account.** Make a dedicated user on the camera rather than reusing
+  its admin login — most cameras support this, and it means the credential on disk cannot also
+  reconfigure the camera.
+
 ## How the network boundary is enforced
 
 By default `web_host` is `127.0.0.1` — the dashboard is reachable only from the machine running

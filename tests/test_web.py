@@ -999,3 +999,314 @@ def test_dossier_caps_the_crop_strip_sharpest_first(conn, db_path):
     out = web._reid_dossier(cfg, big)
     assert len(out["crops"]) == web.DOSSIER_MAX_CROPS
     assert out["n_crops"] == web.DOSSIER_MAX_CROPS + 12
+
+
+# ---- camera management: the list the dashboard edits ---------------------------------
+#
+# The security-critical half of this feature is a NEGATIVE: no response may ever carry a camera
+# password. The dashboard binds 0.0.0.0 on this rig with no login, and GETs are not gated at all,
+# so "the operator token protects it" would be false in the direction the secret travels. What
+# protects it is that nothing selects the column (db.list_cameras) and that writing one requires
+# loopback. Both are asserted here.
+
+def _cam_cfg(db_path, **kw):
+    return _rq_cfg(db_path, web_host="127.0.0.1", web_port=0, **kw)
+
+
+def _cam_server(cfg):
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+NET_CAM = {"source": "yard_ir", "kind": "network", "name": "Yard",
+           "url_host": "192.168.0.105", "url_port": 554,
+           "url_path": "h264Preview_01_sub", "username": "rig", "motion_min_area": 200}
+
+
+@pytest.mark.parametrize("peer,expected", [
+    ("127.0.0.1", True), ("::1", True), ("127.0.0.5", True),
+    ("192.168.0.50", False), ("10.0.0.1", False), ("", False), ("not-an-ip", False),
+])
+def test_loopback_rule_fails_closed(peer, expected):
+    """Anything unparseable must read as NOT loopback -- this gates writing a password."""
+    assert web._is_loopback_client(peer) is expected
+
+
+def test_save_then_list_a_camera(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        status, body = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        assert status == 200 and body["ok"]
+        assert body["pending_restart"] is True      # saved, NOT live
+        status, body = _get(port, "/api/cameras")
+        rows = [r for r in body["rows"] if r["source"] == "yard_ir"]
+        assert rows and rows[0]["url_host"] == "192.168.0.105"
+        assert rows[0]["has_password"] is True
+    finally:
+        web.shutdown(server)
+
+
+def test_no_response_anywhere_carries_the_password(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        _, listed = _get(port, "/api/cameras")
+        assert "hunter2" not in json.dumps(saved)
+        assert "hunter2" not in json.dumps(listed)
+    finally:
+        web.shutdown(server)
+
+
+def test_a_camera_password_cannot_be_set_over_the_network(db_path, monkeypatch):
+    """The whole access control on the one secret in this database."""
+    cfg = _cam_cfg(db_path)
+    monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        status, body = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        assert status == 403 and "from the rig itself" in body["error"]
+        # ...and everything else about a camera still saves fine from the same client.
+        status, body = _post(port, "/api/cameras/save", NET_CAM)
+        assert status == 200 and body["ok"]
+    finally:
+        web.shutdown(server)
+
+
+def test_clearing_a_password_is_equally_restricted(db_path, monkeypatch):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, _ = _post(port, "/api/cameras/save",
+                          dict(NET_CAM, id=saved["camera"]["id"], clear_password=True))
+        assert status == 403
+    finally:
+        web.shutdown(server)
+
+
+def test_renaming_a_camera_is_refused_with_a_reason(db_path):
+    """source is stamped on every detection, visit and clip path; a rename orphans all of it."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", NET_CAM)
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, id=saved["camera"]["id"], source="renamed"))
+        assert status == 400 and "permanent" in body["error"]
+    finally:
+        web.shutdown(server)
+
+
+def test_an_edit_without_a_password_keeps_the_stored_one(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        _post(port, "/api/cameras/save",
+              dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.0.199"))
+        _, listed = _get(port, "/api/cameras")
+        row = [r for r in listed["rows"] if r["source"] == "yard_ir"][0]
+        assert row["url_host"] == "192.168.0.199" and row["has_password"] is True
+    finally:
+        web.shutdown(server)
+
+
+def test_the_last_camera_cannot_be_deleted(db_path):
+    """A rig with no cameras exits at the next start; two clicks from a phone must not do that."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, only = _post(port, "/api/cameras/save", NET_CAM)
+        status, body = _post(port, "/api/cameras/delete", {"id": only["camera"]["id"]})
+        assert status == 400 and "only camera" in body["error"]
+        _post(port, "/api/cameras/save", dict(NET_CAM, source="cam02", url_host="192.168.0.107"))
+        status, _ = _post(port, "/api/cameras/delete", {"id": only["camera"]["id"]})
+        assert status == 200
+    finally:
+        web.shutdown(server)
+
+
+def test_deleting_an_unknown_camera_is_404(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _post(port, "/api/cameras/save", NET_CAM)
+        _post(port, "/api/cameras/save", dict(NET_CAM, source="cam02"))
+        status, _ = _post(port, "/api/cameras/delete", {"id": 4242})
+        assert status == 404
+    finally:
+        web.shutdown(server)
+
+
+def test_a_bad_field_comes_back_as_a_readable_message(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, source="front yard"))
+        assert status == 400 and "letters, digits" in body["error"]
+    finally:
+        web.shutdown(server)
+
+
+# ---- the retargeting hole (found in adversarial review, 2026-08-22) ------------------
+#
+# The loopback rule protects WRITING a password. It did not protect MOVING one: an edit that
+# changed only url_host kept the stored credential, so any operator on the network could repoint
+# a camera at a host they control and let the rig deliver the secret at the next restart. The URL
+# is where the secret gets sent, so changing it is a credential operation.
+
+def test_moving_a_camera_with_a_stored_password_needs_loopback(db_path, monkeypatch):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        cam_id = saved["camera"]["id"]
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, id=cam_id, url_host="attacker.example"))
+        assert status == 403 and "sent to wherever it points" in body["error"]
+        # and the row did not move
+        _, listed = _get(port, "/api/cameras")
+        assert [r for r in listed["rows"] if r["source"] == "yard_ir"][0]["url_host"] \
+            == "192.168.0.105"
+    finally:
+        web.shutdown(server)
+
+
+def test_moving_a_camera_without_a_stored_password_is_ordinary(db_path, monkeypatch):
+    """Nothing to leak, so this stays editable from anywhere -- the restriction is about the
+    secret, not about cameras."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", NET_CAM)
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, _ = _post(port, "/api/cameras/save",
+                          dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.0.200"))
+        assert status == 200
+    finally:
+        web.shutdown(server)
+
+
+def test_a_falsy_password_does_not_slip_past_the_gate(db_path, monkeypatch):
+    """db.py treats any non-None, non-empty value as a password write, so a JSON 0 or false must
+    count as one here too -- bool() would have waved it through AND stored it."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        for falsy in (0, False, []):
+            status, _ = _post(port, "/api/cameras/save",
+                              dict(NET_CAM, id=saved["camera"]["id"], password=falsy))
+            assert status == 403, f"{falsy!r} slipped past the loopback gate"
+    finally:
+        web.shutdown(server)
+
+
+def test_disabling_the_last_camera_is_refused_too(db_path):
+    """Otherwise it is a trivial bypass of the last-camera delete guard: disable, then delete."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, only = _post(port, "/api/cameras/save", NET_CAM)
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, id=only["camera"]["id"], enabled=False))
+        assert status == 400 and "only camera" in body["error"]
+    finally:
+        web.shutdown(server)
+
+
+def test_a_password_without_a_username_is_refused(db_path):
+    """It would be stored, reported as 'password set', and then silently dropped when the URL is
+    assembled -- a camera that fails to authenticate for no visible reason."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        body = dict(NET_CAM, password="hunter2")
+        body.pop("username")
+        status, out = _post(port, "/api/cameras/save", body)
+        assert status == 400 and "username" in out["error"]
+    finally:
+        web.shutdown(server)
+
+
+def test_a_login_hidden_in_the_stream_path_is_refused(db_path):
+    """url_path IS returned to every operator and is settable without loopback, so it must not
+    become a second, unguarded place to put a credential."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        for bad in ("stream?pwd=hunter2", "rig:hunter2@10.0.0.9/stream"):
+            status, out = _post(port, "/api/cameras/save",
+                                dict(NET_CAM, source="probe", url_path=bad))
+            assert status == 400, bad
+            assert "login" in out["error"] or "'@'" in out["error"]
+    finally:
+        web.shutdown(server)
+
+
+def test_a_viewer_gets_the_live_grid_but_not_the_management_payload(db_path, monkeypatch):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        monkeypatch.setattr(web, "_operator_decision", lambda *a, **k: False)
+        status, body = _get(port, "/api/cameras")
+        assert status == 200
+        assert "cameras" in body and "primary" in body      # the Live grid still works
+        assert body["manageable"] is False
+        assert "rows" not in body and "pending_restart" not in body
+    finally:
+        web.shutdown(server)
+
+
+def test_pending_restart_is_actually_computed(db_path):
+    """Asserted in both directions, so a constant False (or True) fails."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        # The running camera IS cfg.source with no DB rows at all -> nothing stored differs.
+        _, before = _get(port, "/api/cameras")
+        assert before["pending_restart"] is True     # DB is empty, rig is running one camera
+        _post(port, "/api/cameras/save", dict(NET_CAM, source=cfg.source, kind="local",
+                                              device_index=0))
+        _, after = _get(port, "/api/cameras")
+        assert after["pending_restart"] is True      # just written, after server start
+    finally:
+        web.shutdown(server)
+
+
+def test_a_junk_id_is_a_message_not_a_traceback(db_path):
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        for junk in ({}, [], "abc"):
+            status, _ = _post(port, "/api/cameras/save", dict(NET_CAM, id=junk))
+            assert status in (400, 404), f"{junk!r} produced {status}"
+    finally:
+        web.shutdown(server)
