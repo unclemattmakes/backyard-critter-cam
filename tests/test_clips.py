@@ -691,3 +691,49 @@ def test_prune_gate_only_guards_the_sources_named_irreplaceable(clip_cfg, clip_c
                               clips_max_gb=_mib_budget(1),
                               clips_irreplaceable_sources=("trail_cam_sd",))
     assert clips.prune_clips(cfg, clip_conn) == 1
+
+
+# --------------------------------------------------------------------------- codec reporting
+# 2026-08-21: ffmpeg vanished off PATH and the rig recorded a full day of mp4v unnoticed, because
+# the only signal was a warning printed solely in the broken case. These pin the always-printed
+# replacement: what the recorder will ACTUALLY write, whatever the config asked for.
+
+def test_effective_codec_reports_h264_when_ffmpeg_is_present(clip_cfg, monkeypatch):
+    monkeypatch.setattr(clips, "_FFMPEG", "/usr/bin/ffmpeg")
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    assert clips.effective_codec(cfg) == "H.264"
+    assert clips.ffmpeg_missing(cfg) is False
+
+
+def test_effective_codec_reports_the_mp4v_fallback_when_ffmpeg_is_gone(clip_cfg, monkeypatch):
+    """The silent-degradation case: config still says h264, but what lands on disk is mp4v."""
+    monkeypatch.setattr(clips, "_FFMPEG", None)
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    assert clips.effective_codec(cfg) == "mp4v"
+    assert clips.ffmpeg_missing(cfg) is True
+
+
+def test_ffmpeg_missing_is_false_when_mp4v_was_actually_asked_for(clip_cfg, monkeypatch):
+    """Deliberately choosing the cv2 writer is not a degradation -- don't cry wolf about it."""
+    monkeypatch.setattr(clips, "_FFMPEG", None)
+    cfg = dataclasses.replace(clip_cfg, clip_codec="mp4v")
+    assert clips.effective_codec(cfg) == "mp4v"
+    assert clips.ffmpeg_missing(cfg) is False
+
+
+def test_effective_codec_mirrors_the_recorders_fourcc_length_fallback(clip_cfg, monkeypatch):
+    """A 3-char codec makes ClipRecorder fall back to mp4v; the banner must say mp4v too, or it
+    would report a codec that never gets written."""
+    monkeypatch.setattr(clips, "_FFMPEG", "/usr/bin/ffmpeg")
+    assert clips.effective_codec(dataclasses.replace(clip_cfg, clip_codec="vp9")) == "mp4v"
+
+
+def test_missing_ffmpeg_is_announced_once_per_process_not_once_per_camera(
+        clip_cfg, clip_conn, capsys, monkeypatch):
+    """Three cameras used to mean three identical warnings per restart -- noise, not signal."""
+    monkeypatch.setattr(clips, "_FFMPEG", None)
+    monkeypatch.setattr(clips, "_WARNED_NO_FFMPEG", False)
+    cfg = dataclasses.replace(clip_cfg, clip_codec="h264")
+    for source in ("glass_door_cam", "yard_ir", "cam02"):
+        clips.ClipRecorder(cfg, clip_conn, source=source)
+    assert capsys.readouterr().out.count("ffmpeg not found on PATH") == 1

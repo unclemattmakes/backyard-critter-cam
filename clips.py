@@ -54,9 +54,31 @@ _RING_FPS_CAP = 30
 # capture rate (no backpressure at 720p/~10-15 fps); '-bf 0' keeps the written frame count exact.
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
+_WARNED_NO_FFMPEG = False       # module-level so the missing-ffmpeg warning is once per process
 _X264_PRESET = "veryfast"
 _X264_CRF = "23"
 _H264_ALIASES = {"h264", "libx264", "avc1", "x264"}
+
+
+def effective_codec(cfg) -> str:
+    """The codec a recorder built from `cfg` will REALLY write -- 'H.264' only when h264 was asked
+    for AND ffmpeg is on PATH, otherwise the OpenCV fourcc it falls back to.
+
+    Exists so the startup banner can state the codec on EVERY run. 2026-08-21 ffmpeg vanished off
+    PATH (chkdsk rebuilt a directory index after a 0x1E bugcheck and took the winget package tree
+    with it) and the rig recorded mp4v for a day without anyone noticing: the only signal was a
+    warning that appears solely in the broken case, and you cannot notice a line that ISN'T there.
+    A codec printed every time is a line whose CHANGE is visible."""
+    want_h264 = str(cfg.clip_codec).lower() in _H264_ALIASES
+    if want_h264:
+        return "H.264" if _FFMPEG is not None else "mp4v"
+    codec = str(cfg.clip_codec)
+    return codec if len(codec) == 4 else "mp4v"      # same fourcc-length fallback the recorder uses
+
+
+def ffmpeg_missing(cfg) -> bool:
+    """True in the one case that degrades silently: h264 configured, ffmpeg not on PATH."""
+    return str(cfg.clip_codec).lower() in _H264_ALIASES and _FFMPEG is None
 
 
 class _FfmpegWriter:
@@ -354,7 +376,12 @@ class ClipRecorder:
             print(f"[clips] clip_codec '{cfg.clip_codec}' is not a 4-character fourcc -- "
                   f"recording 'mp4v' instead.")
             self.cv2_codec = "mp4v"
-        if want_h264 and _FFMPEG is None:
+        # Once per PROCESS, not once per ClipRecorder: with three cameras this fired three times
+        # per restart, which reads as noise rather than signal. The loud version lives in the
+        # startup banner (backyard_cam.py) -- this stays for anyone building a recorder directly.
+        global _WARNED_NO_FFMPEG
+        if want_h264 and _FFMPEG is None and not _WARNED_NO_FFMPEG:
+            _WARNED_NO_FFMPEG = True
             print("[clips] ffmpeg not found on PATH -- recording mp4v instead of H.264 "
                   "(clips still record; the dashboard will transcode them for playback).")
         ring_len = max(1, int(self.pre_roll * _RING_FPS_CAP) + 5)
