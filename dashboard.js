@@ -391,8 +391,14 @@ function sendAuto(autoKey,on,slider){
    change it); LIVE.primary is the main feed the masthead period/coords come from. A single-camera
    rig has one pane and behaves exactly as before. */
 let LIVE={ cams:[], sel:null, primary:null };
+/* Camera MANAGEMENT state (the editable list); see the block near openCameras(). */
+let CAMS={rows:[],pending:false,manageable:false,canSecret:false,editing:null};
 async function loadCameras(){
   let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
+  // The same payload carries whether this client may manage cameras at all (operator) and
+  // whether it may set a password (loopback). Viewers never see the button.
+  CAMS.manageable=!!d.manageable; CAMS.canSecret=!!d.can_set_credentials;
+  const camBtn=$('#cams-open'); if(camBtn) camBtn.hidden=!CAMS.manageable;
   const cams=d.cameras||[];
   if(!cams.length) return;
   LIVE.cams=cams; LIVE.primary=d.primary||cams[0].source;
@@ -2984,9 +2990,184 @@ async function zoneAdd(x1,y1,x2,y2){
 })();
 
 /* ---------- settings popout (scoped to the selected camera) ---------- */
+/* ---------- camera management -------------------------------------------------------
+   The camera list lives in the `cameras` DB table since 2026-08-22; config_local.py only seeds
+   it. Two properties this UI exists to communicate, both of which are easy to get wrong:
+
+     * A SAVE IS NOT LIVE. The rig reads the list once at startup and gives each camera its own
+       capture thread, so an edit lands on the next restart. Ignore zones apply immediately and
+       cameras do not, and someone who assumes otherwise re-types a password that was already
+       right. Hence the banner, and "saved — restart to apply" rather than "done".
+     * THE SHORT NAME IS PERMANENT. It is stamped on every detection, visit and clip folder, so
+       the field is disabled on an edit rather than merely ignored by the server.
+
+   The password is WRITE-ONLY: the server never sends one back (nothing selects the column), so
+   the field is always blank on open and an empty submit means "leave it alone". Setting one is
+   loopback-only, and can_set_credentials tells us whether THIS browser may. */
+
+function openCameras(){ const m=$('#cameras'); if(!m) return; m.hidden=false; camCancel(); loadCamsAdmin(); }
+function closeCameras(){ const m=$('#cameras'); if(m) m.hidden=true; }
+function camsMsg(t,bad){ const el=$('#cams-msg'); if(!el) return;
+  el.textContent=t||''; el.hidden=!t; el.classList.toggle('bad',!!bad); }
+
+async function loadCamsAdmin(){
+  let d; try{ d=await fetch('/api/cameras').then(r=>r.json()); }catch(e){
+    camsMsg('Could not reach the rig.',true); return; }
+  CAMS.rows=d.rows||[]; CAMS.pending=!!d.pending_restart;
+  CAMS.manageable=!!d.manageable; CAMS.canSecret=!!d.can_set_credentials;
+  if(!CAMS.manageable){
+    // The server withholds `rows` from a viewer, so an empty list here is a permissions answer,
+    // not "there are no cameras". Say which.
+    camsMsg('Editing cameras needs the operator token — enter it from the footer link.');
+    const add=$('#cams-add'); if(add) add.hidden=true;
+  }
+  renderCams();
+}
+
+function renderCams(){
+  const list=$('#cams-list'); if(!list) return;
+  const running=new Set((LIVE.cams||[]).map(c=>c.source));
+  const banner=$('#cams-restart');
+  if(banner){
+    banner.hidden=!CAMS.pending;
+    banner.textContent='Saved. These changes reach the rig the next time it restarts — '
+      + 'a camera needs its own capture thread, so unlike ignored spots it cannot be added to a running rig.';
+  }
+  list.innerHTML = CAMS.rows.map(c=>{
+    const addr = c.kind==='local' ? ('USB index '+(c.device_index!=null?c.device_index:'?'))
+      : `${esc(c.url_scheme||'rtsp')}://${esc(c.url_host||'')}${c.url_port?':'+c.url_port:''}/${esc(c.url_path||'')}`;
+    const flags=[];
+    if(!c.enabled) flags.push('<span class="cam-flag off">disabled</span>');
+    if(!running.has(c.source)) flags.push('<span class="cam-flag off">not running</span>');
+    if(c.kind==='network') flags.push(c.has_password
+      ? '<span class="cam-flag">password set</span>'
+      : '<span class="cam-flag warn">no password</span>');
+    if(c.created_by==='config') flags.push('<span class="cam-flag">from config</span>');
+    return `<div class="cam-row">
+      <div class="cam-main">
+        <span class="cam-name">${esc(c.name||c.source)}</span>
+        <span class="cam-src">${esc(c.source)}</span>
+        <span class="cam-addr">${addr}</span>
+      </div>
+      <div class="cam-flags">${flags.join('')}</div>
+      <div class="cam-buttons">
+        <button class="gear" type="button" onclick="camEdit(${c.id|0})">edit</button>
+        <button class="gear" type="button" onclick="camDelete(${c.id|0})">remove</button>
+      </div>
+    </div>`;
+  }).join('') || '<p class="zone-empty">No cameras yet.</p>';
+}
+
+function camKindChanged(){
+  const net = $('#cam-kind').value === 'network';
+  $('#cam-net-fields').hidden = !net;
+  $('#cam-local-fields').hidden = net;
+  const note=$('#cam-pw-note');
+  if(note){
+    note.innerHTML = CAMS.canSecret
+      ? 'Stored on the rig and never sent back to a browser &mdash; this box stays blank even when a password <em>is</em> set. Leave it blank to keep the current one.'
+      : '<strong>You cannot set a password from here.</strong> Camera passwords can only be entered on the rig machine itself, because this dashboard is served over the network without encryption. Everything else on this form saves normally.';
+    note.classList.toggle('bad', !CAMS.canSecret);
+  }
+  const pw=$('#cam-password'); if(pw){ pw.disabled=!CAMS.canSecret; }
+}
+
+function camForm(show){ const f=$('#cams-form'); if(f) f.hidden=!show;
+  const b=$('#cams-add'); if(b) b.hidden=show; }
+
+function camNew(){
+  CAMS.editing=null;
+  $('#cams-form-title').textContent='New camera';
+  ['cam-id','cam-name','cam-source','cam-host','cam-port','cam-path','cam-username',
+   'cam-password','cam-device-index','cam-fw','cam-fh','cam-area'].forEach(id=>{ const el=$('#'+id); if(el) el.value=''; });
+  $('#cam-source').disabled=false;
+  $('#cam-source-row').hidden=false;
+  $('#cam-source-note').hidden=false;
+  $('#cam-kind').value='network';
+  $('#cam-clips').value=''; $('#cam-enabled').checked=true;
+  camKindChanged(); camsMsg(''); camForm(true);
+}
+
+function camEdit(id){
+  const c=CAMS.rows.find(r=>r.id===id); if(!c) return;
+  CAMS.editing=c;
+  $('#cams-form-title').textContent='Edit '+(c.name||c.source);
+  $('#cam-id').value=c.id;
+  $('#cam-name').value=c.name||'';
+  $('#cam-source').value=c.source;
+  // Permanent, so it is disabled rather than merely rejected by the server on submit.
+  $('#cam-source').disabled=true;
+  $('#cam-source-note').hidden=false;
+  $('#cam-kind').value=c.kind||'network';
+  $('#cam-device-index').value=(c.device_index!=null?c.device_index:'');
+  $('#cam-host').value=c.url_host||''; $('#cam-port').value=(c.url_port!=null?c.url_port:'');
+  $('#cam-path').value=c.url_path||''; $('#cam-username').value=c.username||'';
+  $('#cam-password').value='';                    // never prefilled: the server does not send it
+  $('#cam-fw').value=(c.frame_width!=null?c.frame_width:'');
+  $('#cam-fh').value=(c.frame_height!=null?c.frame_height:'');
+  $('#cam-area').value=(c.motion_min_area!=null?c.motion_min_area:'');
+  // '' = inherit, and null really does mean inherit -- not "off".
+  $('#cam-clips').value = c.record_clips===null||c.record_clips===undefined ? ''
+                        : (c.record_clips ? '1' : '0');
+  $('#cam-enabled').checked = c.enabled!==false;
+  camKindChanged(); camsMsg(''); camForm(true);
+}
+
+function camCancel(){ camForm(false); camsMsg(''); CAMS.editing=null; }
+
+function camSave(ev){
+  if(ev) ev.preventDefault();
+  const num=id=>{ const v=($('#'+id).value||'').trim(); return v===''?null:Number(v); };
+  const body={
+    kind: $('#cam-kind').value,
+    name: ($('#cam-name').value||'').trim() || null,
+    frame_width: num('cam-fw'), frame_height: num('cam-fh'),
+    motion_min_area: num('cam-area'),
+    record_clips: ($('#cam-clips').value===''? null : $('#cam-clips').value==='1'),
+    enabled: $('#cam-enabled').checked,
+  };
+  if(CAMS.editing) body.id=CAMS.editing.id;
+  else body.source=($('#cam-source').value||'').trim();
+  if(body.kind==='local'){ body.device_index=num('cam-device-index'); }
+  else{
+    body.url_scheme='rtsp';
+    body.url_host=($('#cam-host').value||'').trim();
+    body.url_port=num('cam-port');
+    body.url_path=($('#cam-path').value||'').trim() || null;
+    body.username=($('#cam-username').value||'').trim() || null;
+    const pw=$('#cam-password').value||'';
+    if(pw) body.password=pw;                      // absent = keep whatever is stored
+  }
+  fetch('/api/cameras/save',{method:'POST',headers:{'Content-Type':'application/json'},
+                             body:JSON.stringify(body)})
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{
+      if(!ok){ camsMsg(d.error||'Could not save that camera.',true); return; }
+      $('#cam-password').value='';                // don't leave a secret sitting in the DOM
+      camCancel();
+      loadCamsAdmin();
+    })
+    .catch(()=>camsMsg('Could not reach the rig.',true));
+  return false;
+}
+
+function camDelete(id){
+  const c=CAMS.rows.find(r=>r.id===id); if(!c) return;
+  if(!confirm(`Remove ${c.name||c.source}?\n\nThe photos, visits and clips it already recorded are kept — they stay filed under "${c.source}". Adding a camera with that same short name later reattaches to them.`)) return;
+  fetch('/api/cameras/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+                               body:JSON.stringify({id})})
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{ if(!ok){ camsMsg(d.error||'Could not remove that camera.',true); return; }
+                      // Close an edit form still bound to the row we just removed: saving it
+                      // afterwards would recreate the camera by undelete.
+                      if(CAMS.editing && CAMS.editing.id===id) camCancel();
+                      loadCamsAdmin(); })
+    .catch(()=>camsMsg('Could not reach the rig.',true));
+}
+
 function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); loadZones(); }
 function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
-document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSettings(); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeSettings(); closeCameras(); } });
 
 /* ---------- boot ---------- */
 buildControls();

@@ -49,7 +49,12 @@
         <div id="live-grid" class="live-grid"></div>
         <div class="cap">
           <span class="lbl" id="live-caption">Live observation</span>
-          <span class="cap-right"><span class="lbl" id="cap-period">live</span></span>
+          <span class="cap-right">
+            <!-- Operator-only: loadCameras() unhides it from the `manageable` flag on
+                 /api/cameras. Adding a camera used to mean editing config_local.py by hand. -->
+            <button class="gear cams-open" id="cams-open" type="button" hidden
+                    onclick="openCameras()" title="Add, edit or remove cameras">cameras</button>
+            <span class="lbl" id="cap-period">live</span></span>
         </div>
       </div>
       <aside class="panel latest" id="latest"><p class="empty" style="padding:20px">Awaiting the first visitor&hellip;</p></aside>
@@ -197,6 +202,93 @@
       <div class="zone-list" id="zone-list"></div>
       <div class="zone-msg" id="zone-msg" hidden></div>
     </div>
+  </div>
+</div>
+
+<!-- Camera management. The list used to live in config_local.py, so adding a camera meant
+     editing Python; since 2026-08-22 the `cameras` DB table owns it and config only seeds.
+     Two things this panel must keep saying out loud:
+       * changes DO NOT apply live -- the rig gives each camera a capture thread at startup, so
+         a save is a save, and the banner says a restart is pending;
+       * a camera's name is permanent, because it is stamped on every detection, visit and clip
+         path already recorded under it. -->
+<div id="cameras" class="modal" hidden>
+  <div class="modal-backdrop" onclick="closeCameras()"></div>
+  <div class="modal-card panel instr cams" role="dialog" aria-modal="true" aria-label="Cameras">
+    <button class="modal-x" type="button" onclick="closeCameras()" aria-label="Close">&#10005;</button>
+    <h3>Cameras</h3>
+    <p class="hint">The cameras this rig watches. Add a USB camera by its index, or a networked one by its address &mdash; <em>The Backyard Critter Cam</em> speaks RTSP directly, so no extra software is needed on the camera.</p>
+    <div class="cams-banner" id="cams-restart" hidden></div>
+    <!-- Outside the form on purpose: the form is hidden unless you are adding or editing, and a
+         failed load or a refused delete has to be visible in the list view too. -->
+    <div class="cams-msg" id="cams-msg" hidden></div>
+    <div class="cams-list" id="cams-list"></div>
+    <div class="cams-actions">
+      <button class="gear" type="button" id="cams-add" onclick="camNew()">add a camera</button>
+    </div>
+
+    <form class="cams-form" id="cams-form" hidden onsubmit="return camSave(event)">
+      <h4 id="cams-form-title">New camera</h4>
+      <input type="hidden" id="cam-id">
+      <label class="cams-row"><span>Name</span>
+        <input id="cam-name" maxlength="80" placeholder="Yard (night IR)" autocomplete="off"></label>
+      <label class="cams-row" id="cam-source-row"><span>Short name</span>
+        <input id="cam-source" maxlength="40" placeholder="yard_ir" autocomplete="off"
+               spellcheck="false"></label>
+      <p class="hint cams-note" id="cam-source-note">Letters, digits, <code>_</code> and <code>-</code> only. This is stamped on every photo, visit and clip folder from this camera, so it <strong>cannot be changed later</strong> &mdash; name it for where the camera will actually point.</p>
+      <label class="cams-row"><span>Type</span>
+        <select id="cam-kind" onchange="camKindChanged()">
+          <option value="network">Networked (RTSP / HTTP)</option>
+          <option value="local">USB camera on this machine</option>
+        </select></label>
+
+      <div id="cam-local-fields" hidden>
+        <label class="cams-row"><span>Device index</span>
+          <input id="cam-device-index" type="number" min="0" max="64" placeholder="1"></label>
+        <p class="hint cams-note">Run <code>python backyard_cam.py --list-cameras</code> on the rig to find it. The built-in webcam is usually 0.</p>
+      </div>
+
+      <div id="cam-net-fields">
+        <label class="cams-row"><span>Address</span>
+          <input id="cam-host" maxlength="200" placeholder="192.168.0.105" autocomplete="off"
+                 spellcheck="false"></label>
+        <label class="cams-row"><span>Port</span>
+          <input id="cam-port" type="number" min="1" max="65535" placeholder="554"></label>
+        <label class="cams-row"><span>Stream path</span>
+          <input id="cam-path" maxlength="200" placeholder="h264Preview_01_sub"
+                 autocomplete="off" spellcheck="false"></label>
+        <label class="cams-row"><span>Username</span>
+          <input id="cam-username" maxlength="100" placeholder="rig" autocomplete="off"></label>
+        <label class="cams-row"><span>Password</span>
+          <input id="cam-password" type="password" autocomplete="new-password"
+                 placeholder="leave blank to keep the stored one"></label>
+        <p class="hint cams-note" id="cam-pw-note"></p>
+      </div>
+
+      <details class="cams-adv">
+        <summary>Advanced</summary>
+        <label class="cams-row"><span>Frame width</span>
+          <input id="cam-fw" type="number" min="16" max="16384" placeholder="inherit"></label>
+        <label class="cams-row"><span>Frame height</span>
+          <input id="cam-fh" type="number" min="16" max="16384" placeholder="inherit"></label>
+        <label class="cams-row"><span>Motion area</span>
+          <input id="cam-area" type="number" min="1" placeholder="inherit"></label>
+        <p class="hint cams-note">Motion area is in pixels of the <em>full frame</em>, so it scales with resolution &mdash; a value copied from a 1080p camera is nine times too strict on a 640&times;360 one, and the camera simply never triggers. Leave blank to inherit, or use the number <code>tools/camprobe.py</code> suggests.</p>
+        <label class="cams-row"><span>Record clips</span>
+          <select id="cam-clips">
+            <option value="">inherit the global setting</option>
+            <option value="1">on</option>
+            <option value="0">off</option>
+          </select></label>
+        <label class="cams-row cams-check"><span>Enabled</span>
+          <input id="cam-enabled" type="checkbox" checked></label>
+      </details>
+
+      <div class="cams-actions">
+        <button class="gear primary" type="submit">save</button>
+        <button class="gear" type="button" onclick="camCancel()">cancel</button>
+      </div>
+    </form>
   </div>
 </div>
 

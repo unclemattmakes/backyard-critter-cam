@@ -30,6 +30,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import cameras
 import clips
 import config
 import daynight
@@ -550,39 +551,6 @@ def _backend_for(spec: config.CameraSpec, cfg: config.Config) -> int:
     if b == "dshow" and sys.platform == "win32":
         return cv2.CAP_DSHOW
     return cv2.CAP_ANY
-
-
-# Secret-looking query parameters (an ESP32-CAM or a DVR may carry the login there instead of
-# in the netloc): ?pwd=... / &token=... . The name is kept, the value is not.
-_URL_SECRET_QS = re.compile(r"(?i)(?<=[?&])(pass(?:word)?|pwd|token|auth|secret|key)=[^&]*")
-
-
-def _safe_src(src: int | str) -> str:
-    """A CameraSpec's `src` rendered for a HUMAN to read, with any credentials masked.
-
-    A networked camera's src carries its password in the URL (rtsp://user:pass@host/...), and
-    every line that prints one goes to the console AND to logs/backyard_cam.log -- which
-    backup.py sweeps into the meta zip and off the machine, and which is what gets pasted into
-    an issue when something breaks. So each human-facing print of a src goes through here; the
-    real URL is handed to VideoCapture untouched.
-
-    The USERNAME survives -- it is exactly what you need to see when a camera rejects a login --
-    and the password does not. A plain int webcam index has nothing to hide and comes back
-    unchanged, so the single-camera case reads as it always did.
-
-    Returns the repr (quoted for a URL, bare for an index), because it replaces `!r` at the
-    call sites."""
-    if not isinstance(src, str):
-        return repr(src)
-    out = src
-    scheme, sep, rest = out.partition("://")
-    if sep and "@" in rest:
-        # rpartition, not partition: a password may itself contain '@', and it is the LAST one
-        # that delimits the host.
-        creds, _, host = rest.rpartition("@")
-        user, colon, _pw = creds.partition(":")
-        out = f"{scheme}://{user}{':***' if colon else ''}@{host}"
-    return repr(_URL_SECRET_QS.sub(r"\1=***", out))
 
 
 def open_capture(spec: config.CameraSpec, cfg: config.Config) -> cv2.VideoCapture | None:
@@ -1475,14 +1443,14 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
             # Couldn't open on the first try -- but don't bail. An IP cam may still be booting, and
             # a local USB cam may be mid-suspend (the box was in Modern Standby when we launched).
             # reconnect_capture retries forever (honouring stop_event), so we recover once it wakes.
-            print(f"{tag} could not open camera src={_safe_src(spec.src)} yet -- will keep trying to connect."
+            print(f"{tag} could not open camera src={cameras.safe_src(spec.src)} yet -- will keep trying to connect."
                   + ("" if spec.is_url else "  (if it never opens, `python backyard_cam.py "
                      "--list-cameras` finds the right index)"))
             db.record_coverage(cfg.db_path, spec.source, "down", "waiting-to-open")
             cap = reconnect_capture(spec, cfg, stop_event)
         if cap is None:
             return                                  # only reached when we're shutting down
-        print(f"{tag} open ({_safe_src(spec.src)}).")
+        print(f"{tag} open ({cameras.safe_src(spec.src)}).")
         # The COVERAGE LEDGER: written at the rare transitions only (open / read-failure /
         # reconnect / stop), so every later absence claim -- "no robin this night", "overdue" --
         # can know whether the camera was even watching. record_coverage never raises and uses
@@ -1822,7 +1790,12 @@ def run(cfg: config.Config) -> None:
     """Drive every configured camera at once: one capture thread each, sharing one MegaDetector and
     one dashboard. Single-camera mode is just the N=1 case (cfg.camera_specs() synthesizes one spec
     from the flat fields), so existing setups behave exactly as before."""
-    specs = cfg.camera_specs()
+    # The DB connection comes FIRST now, because the camera list lives in it: db.connect ensures
+    # the schema, then cameras.load_specs seeds that table from config (once per source, ever)
+    # and returns what the table says. config_local.py's cfg.cameras is a seed from here on --
+    # the dashboard owns the list, and load_specs' notes say so out loud when the two disagree.
+    conn = db.connect(cfg.db_path)                  # also reused for the shutdown rebuild
+    specs, camera_notes = cameras.load_specs(cfg, conn)
     seen = set()
     for s in specs:                                 # a duplicate source would silently merge two cams
         if s.source in seen:
@@ -1838,10 +1811,16 @@ def run(cfg: config.Config) -> None:
 
     # Networked cams read rtsp:// through FFMPEG; force TCP transport (UDP packet loss tears H.264
     # frames). Must be set before any VideoCapture opens a stream -- so set it here, once, up front.
-    if any(isinstance(s.src, str) and s.src.lower().startswith("rtsp") for s in specs):
-        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+    #
+    # UNCONDITIONALLY, and that matters. This used to be guarded by `if any(spec is rtsp)` over the
+    # STARTUP spec list, which was fine while the only way to get an RTSP camera was to write one
+    # into config_local.py before launching. Now a camera can be added from the dashboard, and a
+    # rig that booted with only a USB cam would have opened that first RTSP camera over FFmpeg's
+    # default UDP -- i.e. exactly the torn-H.264 packet loss this line exists to prevent, on the
+    # camera whose setup you were least likely to suspect. The variable is inert without an rtsp
+    # URL, so there was never anything to gain by asking first.
+    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
-    conn = db.connect(cfg.db_path)                  # ensures schema first; reused for the shutdown rebuild
     server = None
     frame_buffers: dict = {}
     control_bridges: dict = {}
@@ -1897,7 +1876,13 @@ def run(cfg: config.Config) -> None:
 
         n = len(specs)
         print(f"  {n} camera{'' if n == 1 else 's'}: "
-              + ", ".join(f"{s.display_name} ({_safe_src(s.src)})" for s in specs))
+              + ", ".join(f"{s.display_name} ({cameras.safe_src(s.src)})" for s in specs))
+        # Where that list came from, and anything surprising about it: a first seed, a config
+        # entry the database has since overridden, or the no-cameras-left fallback. Printed here
+        # rather than swallowed, because "I edited config_local.py and nothing changed" is the
+        # single most likely confusion once the dashboard owns this list.
+        for note in camera_notes:
+            print(f"  {note}")
         if cfg.latitude is not None and cfg.longitude is not None:
             try:
                 st = daynight.sun_times(cfg.latitude, cfg.longitude)
@@ -1925,7 +1910,7 @@ def run(cfg: config.Config) -> None:
                 frame_buffers[s.source] = web.FrameBuffer()
                 control_bridges[s.source] = web.CameraControlBridge()
             try:
-                server = web.start(cfg, frame_buffers, control_bridges, zone_store)
+                server = web.start(cfg, frame_buffers, control_bridges, zone_store, specs)
                 print(f"  dashboard: http://{cfg.web_host}:{cfg.web_port}  (open in a browser)\n")
             except OSError as e:
                 print(f"  [web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
@@ -2014,11 +1999,27 @@ def serve_only(cfg: config.Config) -> int:
     tab -- Visit Log, Dispatch, Calendar, Individuals, Catalogue -- reads the DB exactly as
     usual. This is the "browse footage you imported" and "read an old archive on a laptop"
     mode: it starts in seconds because the heavy imports the capture path needs never run."""
-    frame_buffers = {s.source: web.FrameBuffer() for s in cfg.camera_specs()}
-    control_bridges = {s.source: web.CameraControlBridge() for s in cfg.camera_specs()}
+    # No rig here, so there is no running camera list to hand the server: the synthetic panes come
+    # from config, and make_server falls back to the same source when specs is None. (The camera
+    # MANAGEMENT panel still works -- it reads the DB directly -- which is what lets someone fix a
+    # camera's address on a rig that is currently refusing to start.)
+    # The DB list, not the config list. This mode exists to browse an archive -- and to fix a
+    # rig that will not start, which is exactly when the two disagree and exactly when showing
+    # the config's idea of the cameras would be most misleading.
+    try:
+        conn = db.connect(cfg.db_path)
+        try:
+            specs, _notes = cameras.load_specs(cfg, conn)
+        finally:
+            conn.close()
+    except Exception as exc:                        # an archive on a laptop, a read-only DB
+        print(f"  (camera list unavailable, using config: {exc})")
+        specs = list(cfg.camera_specs())
+    frame_buffers = {s.source: web.FrameBuffer() for s in specs}
+    control_bridges = {s.source: web.CameraControlBridge() for s in specs}
     zone_store = web.IgnoreZoneStore.load(cfg)
     try:
-        server = web.start(cfg, frame_buffers, control_bridges, zone_store)
+        server = web.start(cfg, frame_buffers, control_bridges, zone_store, specs)
     except OSError as e:
         print(f"[web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
         print("[web] is another rig already serving? Try --port N.")

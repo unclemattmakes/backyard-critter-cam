@@ -737,7 +737,35 @@ def _zones_payload(cfg, source: str, bridge_snap: dict) -> dict:
             "iou": getattr(cfg, "ignore_zone_iou", 0.45)}
 
 
-def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None):
+def _cameras_admin(cfg, running_sources, started_at: str):
+    """The stored camera list, plus whether the rig is running something different from it.
+
+    `pending_restart` is the honest half of this feature. Unlike ignore zones, a camera change
+    does NOT apply live -- the rig reads the list once at startup and gives each camera a capture
+    thread -- so the dashboard has to say so, or an operator edits a URL, sees the old picture,
+    and edits it again somewhere worse. It is true when the enabled set no longer matches what is
+    actually running, or when any live row was written after this server started.
+
+    Never returns a password: db.list_cameras does not select the column at all."""
+    conn = db.connect(cfg.db_path)
+    try:
+        rows = db.list_cameras(conn)
+    finally:
+        conn.close()
+    enabled = [r for r in rows if r["enabled"]]
+    pending = sorted(r["source"] for r in enabled) != sorted(running_sources)
+    if not pending:
+        since = db.parse_local(started_at) if started_at else None
+        for r in enabled:
+            stamp = db.parse_local(r["updated_at"] or r["created_at"] or "")
+            if since and stamp and stamp > since:
+                pending = True
+                break
+    return rows, pending
+
+
+def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None,
+                specs=None):
     """`frame_buffers` / `control_bridges` are dicts keyed by camera `source` -- one entry per
     live camera. A single-camera rig passes one-entry dicts; the Live tab then shows one pane.
     The dashboard discovers the cameras via /api/cameras and routes /stream.mjpg, /snapshot.jpg,
@@ -746,7 +774,14 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
 
     `zone_store` is the rig's shared IgnoreZoneStore (the capture threads read the same instance,
     so a zone edit takes effect on the next frame). None -- tests, or any caller without a rig --
-    builds a private one from the DB; edits then persist but nothing live is watching them."""
+    builds a private one from the DB; edits then persist but nothing live is watching them.
+
+    `specs` is the CameraSpec list the rig is ACTUALLY RUNNING. It has to be passed in rather
+    than re-read from cfg.camera_specs(), because since 2026-08-22 the camera list lives in the
+    database and config only seeds it -- so a camera added from the dashboard exists in neither
+    cfg.cameras nor anything derivable from it, and reading config here would give a pane the
+    wrong name, the wrong network flag, or no pane at all. None falls back to config for
+    serve-only callers and tests, which have no rig to ask."""
     if zone_store is None:
         zone_store = IgnoreZoneStore.load(cfg)
     if not frame_buffers:
@@ -767,7 +802,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
     # The primary camera (the Live tab's default / "Plate I"): the one matching cfg.source if it's
     # among the live cameras, else the first one. Insertion order of frame_buffers = camera order.
     primary = cfg.source if cfg.source in frame_buffers else next(iter(frame_buffers))
-    _specs = {s.source: s for s in cfg.camera_specs()}
+    _specs = {s.source: s for s in (specs if specs is not None else cfg.camera_specs())}
     _cam_order = [primary] + [s for s in frame_buffers if s != primary]
     cameras_meta = [{"source": s, "primary": s == primary,
                      "name": (_specs[s].display_name if s in _specs else s),
@@ -775,6 +810,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     for s in _cam_order]
     # Each live pane opens its own MJPEG stream, so scale the concurrent-stream cap with the camera
     # count (the flat _MAX_STREAMS=6 was sized for one camera + a few viewers).
+    # When this process started serving. _cameras_admin compares stored rows against it to
+    # decide whether a restart is pending -- a camera edit does not apply live, and the dashboard
+    # has to say so rather than leaving someone staring at the old picture.
+    server_started_at = db.now_local_iso()
     stream_slots = threading.BoundedSemaphore(max(_MAX_STREAMS, 4 * len(frame_buffers)))
 
     class Handler(BaseHTTPRequestHandler):
@@ -894,7 +933,22 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._json(control_bridges[self._src()].snapshot())
                 elif path == "/api/cameras":
                     # The live cameras, for the dashboard to build one feed pane per camera.
-                    self._json({"cameras": cameras_meta, "primary": primary})
+                    # `cameras` is exactly what it always was -- source/primary/name/network and
+                    # never a URL -- because GETs are not gated and every LAN viewer reads this.
+                    # The management half (`rows`) is added only for an operator, and even then
+                    # carries has_password rather than any password.
+                    body = {"cameras": cameras_meta, "primary": primary,
+                            "manageable": self._is_operator()}
+                    if body["manageable"]:
+                        rows, pending = _cameras_admin(cfg, list(frame_buffers),
+                                                       server_started_at)
+                        body["rows"] = rows
+                        body["pending_restart"] = pending
+                        # Whether THIS client may set a password: credential writes are
+                        # loopback-only, so the form can say "do this at the rig" up front
+                        # instead of after a refused save.
+                        body["can_set_credentials"] = self._is_loopback()
+                    self._json(body)
                 elif path == "/api/zones":
                     src = self._src()
                     self._json(_zones_payload(cfg, src, control_bridges[src].snapshot()))
@@ -1062,7 +1116,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                                      "(dashboard footer) to edit", "viewer": True}, code=403)
                 return
             try:
-                if path not in ("/api/camera", "/api/zones", "/api/zones/delete"):
+                if path not in ("/api/camera", "/api/zones", "/api/zones/delete",
+                                "/api/cameras/save", "/api/cameras/delete"):
                     stats.clear_digest_cache()   # label/name edits must show on the next Dispatch
                     clear_api_cache()            # ...and on the next poll of every cached endpoint
                 if path == "/api/camera":
@@ -1072,6 +1127,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._zone_add(data)
                 elif path == "/api/zones/delete":
                     self._zone_delete(data)
+                elif path == "/api/cameras/save":
+                    self._camera_save(data)
+                elif path == "/api/cameras/delete":
+                    self._camera_delete(data)
                 elif path == "/api/individual/avatar":
                     # Pin (or clear, with crop=null) an individual's badge photo.
                     conn = db.connect(cfg.db_path)
@@ -1166,6 +1225,147 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             removed = zone_store.remove(zid)
             self._json({"ok": removed} if removed
                        else {"ok": False, "error": "no such zone"}, code=200 if removed else 404)
+
+        def _is_loopback(self) -> bool:
+            """True when the request came from the rig box itself.
+
+            This is the entire access control on a camera PASSWORD, and it is deliberate. This
+            dashboard binds 0.0.0.0 on this rig, serves plain HTTP, and has no login at all
+            unless cfg.operator_token is set -- so a password typed on a phone would cross the
+            Wi-Fi in cleartext, to a server that would have accepted it from anyone on that
+            Wi-Fi. Requiring loopback means "to give the rig a camera's password, be at the rig".
+            It costs an operator one walk and removes the exposure rather than mitigating it.
+
+            Everything else about a camera -- adding it, renaming, resolution, motion area,
+            enabling, deleting -- stays editable from anywhere an operator can reach, because
+            none of it is a secret."""
+            return _is_loopback_client(
+                self.client_address[0] if self.client_address else "")
+
+        def _camera_save(self, data):
+            """Create or edit one camera. With "id" it edits, without it creates.
+
+            SOURCE IS WRITE-ONCE. It is the partition key of detections, visits, coverage_events,
+            ignore_zones, view_epochs and the clips/<source>/ directory on disk, so an edit that
+            changed it would orphan everything already recorded under the old name. An attempt to
+            change it is refused with an explanation rather than silently ignored.
+
+            A password in the body requires loopback (see _is_loopback). An ABSENT password on an
+            edit leaves the stored one alone -- the form can never show the operator what is
+            stored, so submitting it must not be able to wipe it. Clearing takes an explicit
+            clear_password."""
+            # What counts as "setting a password" must match db.update_camera EXACTLY, or the
+            # gate and the writer disagree: db treats any non-None, non-empty value as a write,
+            # so bool() here would wave a JSON `0` or `false` past the check and still store it.
+            pw = data.get("password")
+            wants_secret = (pw is not None and pw != "") or bool(data.get("clear_password"))
+            fields = dict(
+                kind=data.get("kind"), name=data.get("name"),
+                device_index=data.get("device_index"), url_scheme=data.get("url_scheme"),
+                url_host=data.get("url_host"), url_port=data.get("url_port"),
+                url_path=data.get("url_path"), username=data.get("username"),
+                frame_width=data.get("frame_width"), frame_height=data.get("frame_height"),
+                motion_min_area=data.get("motion_min_area"),
+                record_clips=data.get("record_clips"),
+                enabled=bool(data.get("enabled", True)))
+            conn = db.connect(cfg.db_path)
+            try:
+                # PRESENT, not merely truthy: an id of {} or [] or 0 is a client bug, and
+                # falling through to the create branch would silently make a SECOND camera
+                # instead of editing the one that was asked for.
+                if data.get("id") is not None:
+                    existing = db.get_camera(conn, data["id"])
+                    if existing is None:
+                        self._json({"error": "no such camera"}, code=404)
+                        return
+                    asked = str(data.get("source") or existing["source"])
+                    if asked != existing["source"]:
+                        self._json({"error": f"a camera's name is permanent once it has recorded "
+                                             f"anything -- {existing['source']!r} is stamped on "
+                                             f"its detections, visits and clip folder. Add a new "
+                                             f"camera instead."}, code=400)
+                        return
+                    # MOVING A CREDENTIAL IS A CREDENTIAL OPERATION. The loopback rule below
+                    # protects WRITING a password, but the stored one survives an edit that
+                    # changes only the address -- so without this, any operator on the network
+                    # could repoint a camera at a host they control, keep the password, and let
+                    # the rig hand it over at the next restart. The URL is where the secret gets
+                    # sent; changing it is changing the secret's destination.
+                    if existing["has_password"] and not wants_secret:
+                        def _same(a, b):
+                            norm = lambda v: "" if v is None or v == "" else str(v)
+                            return norm(a) == norm(b)
+                        if any(not _same(data.get(k), existing.get(k)) for k in
+                               ("kind", "url_scheme", "url_host", "url_port", "url_path",
+                                "username")):
+                            wants_secret = True
+                    if wants_secret and not self._is_loopback():
+                        self._json({"error":
+                                    "This camera's login can only be changed from the rig "
+                                    "itself, not over the network -- and that includes moving it "
+                                    "to a different address, because its stored password would "
+                                    "be sent to wherever it points. Open the dashboard on the "
+                                    "rig machine to change this one."}, code=403)
+                        return
+                    if not fields["enabled"] and existing["enabled"]:
+                        others = [r for r in db.list_cameras(conn)
+                                  if r["enabled"] and r["id"] != existing["id"]]
+                        if not others:
+                            self._json({"error": "this is the only camera left -- turning it off "
+                                                 "would leave the rig nothing to watch, and it "
+                                                 "stops at the next restart."}, code=400)
+                            return
+                    row = db.update_camera(conn, existing["id"], password=pw,
+                                           clear_password=bool(data.get("clear_password")),
+                                           **fields)
+                else:
+                    if wants_secret and not self._is_loopback():
+                        self._json({"error": "camera passwords can only be set from the rig "
+                                             "itself, not over the network -- add the camera "
+                                             "here without one, then set its password from the "
+                                             "rig machine."}, code=403)
+                        return
+                    row = db.add_camera(conn, source=data.get("source"), password=pw, **fields)
+            except (ValueError, TypeError) as e:
+                # TypeError as well: a JSON id of {} or [] reaches int() and would otherwise be a
+                # 500 with a traceback rather than a message about the field.
+                self._json({"error": str(e)}, code=400)
+                return
+            finally:
+                conn.close()
+            # Deliberately not "ok, it's live": it is saved, and the rig picks it up on the next
+            # start. Saying otherwise is how someone ends up re-typing a password that was right.
+            self._json({"ok": True, "camera": row, "pending_restart": True})
+
+        def _camera_delete(self, data):
+            """Soft-delete one camera: {"id": n}. The row is tombstoned, not removed -- that is
+            what stops config_local.py's seed putting it back on the next start, and what makes
+            re-adding the same name reattach to the rows already recorded under it.
+
+            Refuses the last enabled camera: a rig with none exits as soon as its final capture
+            thread ends, so this would otherwise be a two-click way to make the box unstartable
+            from a phone."""
+            try:
+                cam_id = int(data.get("id"))
+            except (TypeError, ValueError):
+                self._json({"error": "id (integer) is required"}, code=400)
+                return
+            conn = db.connect(cfg.db_path)
+            try:
+                enabled = [r for r in db.list_cameras(conn) if r["enabled"]]
+                target = db.get_camera(conn, cam_id)
+                if target is None:
+                    self._json({"error": "no such camera"}, code=404)
+                    return
+                if target["enabled"] and len(enabled) <= 1:
+                    self._json({"error": "this is the only camera left -- add another before "
+                                         "removing it, or the rig has nothing to watch and will "
+                                         "stop at the next restart."}, code=400)
+                    return
+                removed = db.remove_camera(conn, cam_id)
+            finally:
+                conn.close()
+            self._json({"ok": True, "camera": removed, "pending_restart": True})
 
         def _unblend_label(self, data):
             """Assign an individual to an un-blend cluster: {"track_ids": [...], "name": "Notch"}
@@ -1563,6 +1763,18 @@ def _labeler(data) -> str | None:
     be back-filled honestly (db.py refuses to invent provenance), so every write path that takes
     a human verdict passes through here."""
     return str((data or {}).get("logged_by") or "").strip()[:40] or None
+
+
+def _is_loopback_client(peer_host) -> bool:
+    """Is this peer the rig box itself? Pure, so the refusal path is testable without arranging a
+    non-loopback socket (every test client is 127.0.0.1, which would always pass).
+
+    Anything unparseable is NOT loopback. That direction matters: this gates writing a camera
+    password, so an address we cannot understand must fail closed."""
+    try:
+        return ipaddress.ip_address(str(peer_host or "")).is_loopback
+    except ValueError:
+        return False
 
 
 def _operator_decision(token_cfg, peer_host, sent_token) -> bool:
@@ -2292,8 +2504,9 @@ def _prewarm(cfg):
         print(f"[web] prewarm skipped: {e}")
 
 
-def start(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None):
-    server = make_server(cfg, frame_buffers, control_bridges, zone_store)
+def start(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None,
+          specs=None):
+    server = make_server(cfg, frame_buffers, control_bridges, zone_store, specs)
     threading.Thread(target=server.serve_forever, name="webdash", daemon=True).start()
     threading.Thread(target=_prewarm, args=(cfg,), name="web-prewarm", daemon=True).start()
     return server

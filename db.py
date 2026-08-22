@@ -423,6 +423,50 @@ CREATE TABLE IF NOT EXISTS ignore_zones (
 );
 CREATE INDEX IF NOT EXISTS idx_ignore_zones_source ON ignore_zones(source, deleted_at);
 
+-- CAMERAS (2026-08-22): the live camera list, so a camera can be added from the dashboard
+-- instead of by editing config_local.py. Same migration shape as ignore_zones above: the table
+-- is the runtime source of truth, config.cameras only SEEDS it (see seed_cameras), and rows are
+-- soft-deleted so a tombstone stops the seed resurrecting a camera someone removed in the UI.
+--
+-- Unlike zones, camera changes DO NOT apply live -- the rig reads this list once at startup and
+-- gives each camera a capture thread. The dashboard says "restart to apply" rather than
+-- pretending otherwise.
+--
+-- SOURCE IS WRITE-ONCE. It is the partition key of the whole system: detections.source,
+-- visits.source, coverage_events.source, ignore_zones.source, view_epochs.source, and the
+-- clips/<source>/<date>/ path on disk. Renaming one orphans everything already recorded under
+-- the old name, so there is no update path for it and UNIQUE deliberately spans tombstones --
+-- re-adding a deleted source is an UNDELETE of its row, never a second row.
+--
+-- THE URL IS STORED IN PIECES, credentials separate. A networked camera's src is
+-- rtsp://user:pass@host:port/path, i.e. the URL *is* the credential. Keeping username and
+-- password in their own columns means every other consumer -- the API payload, the dashboard,
+-- the startup banner, an error message -- can be handed a URL that never contained a secret.
+-- `password` is the ONLY secret this database holds; see cameras.py for the rules about it.
+CREATE TABLE IF NOT EXISTS cameras (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT    NOT NULL UNIQUE,  -- matches detections.source. WRITE-ONCE; spans tombstones.
+    name          TEXT,                     -- dashboard display name; NULL falls back to source.
+    kind          TEXT    NOT NULL,         -- 'local' (a USB index) | 'network' (a stream URL).
+    device_index  INTEGER,                  -- kind='local': the cv2.VideoCapture index.
+    url_scheme    TEXT,                     -- kind='network': 'rtsp' | 'http' | 'https'.
+    url_host      TEXT,                     -- host or IP, no credentials, no scheme.
+    url_port      INTEGER,                  -- NULL = the scheme's default (554 / 80).
+    url_path      TEXT,                     -- everything after the host, no leading slash.
+    username      TEXT,                     -- camera account, NOT a vendor/cloud login.
+    password      TEXT,                     -- write-only: never returned by any API. See cameras.py.
+    frame_width   INTEGER,                  -- NULL on every override below = inherit Config,
+    frame_height  INTEGER,                  -- exactly as a CameraSpec field left at None does.
+    motion_min_area INTEGER,                -- FULL-FRAME pixels, so it is resolution-dependent.
+    record_clips  INTEGER,                  -- NULL = inherit; 0 = off; 1 = on.
+    enabled       INTEGER NOT NULL DEFAULT 1,  -- 0 keeps the row but stops the rig opening it.
+    created_by    TEXT    NOT NULL DEFAULT 'web',  -- 'web' (dashboard) | 'config' (seeded).
+    created_at    TEXT    NOT NULL,         -- local ISO 8601 w/ offset.
+    updated_at    TEXT,                     -- last edit; NULL if never edited since creation.
+    deleted_at    TEXT                      -- tombstone; live cameras have NULL.
+);
+CREATE INDEX IF NOT EXISTS idx_cameras_live ON cameras(deleted_at, id);
+
 -- FAVOURITES (2026-08-20): the human's own "keep this one" mark, on a crop or on a visit.
 --
 -- Every other verdict the dashboard records is a CLAIM ABOUT THE ANIMAL -- species, identity,
@@ -2217,6 +2261,320 @@ def seed_ignore_zones(conn: sqlite3.Connection, zones_by_source) -> int:
                 "VALUES (?, ?, ?, ?, ?, ?, 'config', ?)",
                 (source, x1, y1, x2, y2, None, now_local_iso()))
             n += 1
+    if n:
+        conn.commit()
+    return n
+
+
+# ---- Cameras (the live camera list, dashboard-editable) ----------------------------
+#
+# THE ONE RULE ABOUT THE PASSWORD. cameras.password is the only secret this database holds, and
+# it leaves by exactly one route: camera_password(), which the rig calls at startup to build the
+# capture URL. It is deliberately NOT in _CAMERA_COLS, so no listing, no API payload, no log line
+# and no error message can carry it by accident -- the SELECT simply never fetches it. Adding it
+# to that column list would leak it to all of those at once. Don't. What callers get instead is
+# the boolean has_password, which is enough to render "set" vs "not set" in a form.
+
+_CAMERA_COLS = ("id, source, name, kind, device_index, url_scheme, url_host, url_port, "
+                "url_path, username, frame_width, frame_height, motion_min_area, "
+                "record_clips, enabled, created_by, created_at, updated_at, "
+                "(password IS NOT NULL AND password != '') AS has_password")
+
+CAMERA_KINDS = ("local", "network")
+CAMERA_URL_SCHEMES = ("rtsp", "http", "https")
+
+
+def _camera_row(row) -> dict:
+    return {"id": int(row[0]), "source": row[1], "name": row[2], "kind": row[3],
+            "device_index": None if row[4] is None else int(row[4]),
+            "url_scheme": row[5], "url_host": row[6],
+            "url_port": None if row[7] is None else int(row[7]),
+            "url_path": row[8], "username": row[9],
+            "frame_width": None if row[10] is None else int(row[10]),
+            "frame_height": None if row[11] is None else int(row[11]),
+            "motion_min_area": None if row[12] is None else int(row[12]),
+            "record_clips": None if row[13] is None else bool(row[13]),
+            "enabled": bool(row[14]), "created_by": row[15], "created_at": row[16],
+            "updated_at": row[17], "has_password": bool(row[18])}
+
+
+def clean_camera_source(source) -> str:
+    """Validate a camera `source`, which is far more than a label: it is the partition key of
+    detections/visits/coverage_events/ignore_zones/view_epochs AND the literal directory name
+    under clips/. Restricting it to a filesystem-safe word here means the DB label and the folder
+    on disk can never disagree -- clips._safe_source would otherwise silently rewrite 'front yard'
+    to 'front_yard' and the two would drift apart."""
+    src = str(source or "").strip()
+    if not src:
+        raise ValueError("source is required")
+    if len(src) > 40:
+        raise ValueError("source is too long (40 characters max)")
+    if not src[0].isalnum():
+        raise ValueError("source must start with a letter or a digit")
+    if not all(c.isalnum() or c == "_" for c in src):
+        raise ValueError("source may only contain letters, digits and underscore")
+    # Deliberately NOT hyphens. clips._safe_source turns every non-alphanumeric character into
+    # '_' to make a directory name, so 'yard-ir' and 'yard_ir' would be two different sources
+    # sharing one clips/<source>/ folder -- and therefore one prune budget, silently evicting
+    # each other's footage. Restricting the input is the only place that stays true.
+    return src
+
+
+def _clean_camera_text(value, field: str, limit: int):
+    """Strip, length-cap, and REFUSE control characters. A newline in a hostname would otherwise
+    end up spliced into an RTSP URL, and control bytes in a name reach a log file and a web page."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in s):
+        raise ValueError(f"{field} may not contain control characters")
+    return s[:limit]
+
+
+def _clean_camera_int(value, field: str, lo=None, hi=None):
+    """None/'' -> None (meaning 'inherit the Config default'), anything else a bounded int."""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a whole number")
+    if lo is not None and n < lo:
+        raise ValueError(f"{field} must be at least {lo}")
+    if hi is not None and n > hi:
+        raise ValueError(f"{field} must be at most {hi}")
+    return n
+
+
+def _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
+                         username, name, frame_width, frame_height, motion_min_area) -> dict:
+    """Everything except source/password/record_clips/enabled, validated by kind."""
+    k = str(kind or "").strip().lower()
+    if k not in CAMERA_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(CAMERA_KINDS)}")
+    out = {"kind": k, "name": _clean_camera_text(name, "name", 80),
+           "frame_width": _clean_camera_int(frame_width, "frame width", 16, 16384),
+           "frame_height": _clean_camera_int(frame_height, "frame height", 16, 16384),
+           "motion_min_area": _clean_camera_int(motion_min_area, "motion area", 1, 100_000_000),
+           "device_index": None, "url_scheme": None, "url_host": None,
+           "url_port": None, "url_path": None, "username": None}
+    if k == "local":
+        idx = _clean_camera_int(device_index, "device index", 0, 64)
+        if idx is None:
+            raise ValueError("a local camera needs a device index (--list-cameras finds it)")
+        out["device_index"] = idx
+    else:
+        scheme = (str(url_scheme or "rtsp").strip().lower() or "rtsp")
+        if scheme not in CAMERA_URL_SCHEMES:
+            raise ValueError(f"scheme must be one of {', '.join(CAMERA_URL_SCHEMES)}")
+        host = _clean_camera_text(url_host, "host", 200)
+        if not host:
+            raise ValueError("a network camera needs a host or IP address")
+        if any(c in host for c in " /@?#"):
+            raise ValueError("host should be just the address -- no scheme, credentials or path")
+        out["url_scheme"] = scheme
+        out["url_host"] = host
+        out["url_port"] = _clean_camera_int(url_port, "port", 1, 65535)
+        path = (_clean_camera_text(url_path, "stream path", 200) or "").lstrip("/") or None
+        if path:
+            low = path.lower()
+            if "@" in path:
+                raise ValueError("stream path may not contain '@' -- put the login in the "
+                                 "username and password fields, not in the path")
+            if any(k in low for k in ("password=", "passwd=", "pwd=", "token=",
+                                      "auth=", "secret=", "apikey=", "key=")):
+                raise ValueError("stream path looks like it carries a login -- put it in the "
+                                 "username and password fields instead")
+        out["url_path"] = path
+        out["username"] = _clean_camera_text(username, "username", 100)
+    return out
+
+
+
+def _require_username_for_password(kind, username, password, had_password=False):
+    """A stored password is only ever reachable through a username: cameras._userinfo builds
+    'user:pass@' and returns nothing at all when there is no user. Storing one without the other
+    means the dashboard says "password set" about a credential the rig will never send -- a
+    camera that fails to authenticate with no visible reason. Refuse the combination at the door."""
+    if kind != "network":
+        return
+    if (password or had_password) and not username:
+        raise ValueError("a camera password needs a username to go with it")
+
+
+def list_cameras(conn: sqlite3.Connection, include_disabled: bool = True) -> list:
+    """Live (non-tombstoned) cameras, oldest first. Never includes the password."""
+    sql = f"SELECT {_CAMERA_COLS} FROM cameras WHERE deleted_at IS NULL"
+    if not include_disabled:
+        sql += " AND enabled = 1"
+    return [_camera_row(r) for r in conn.execute(sql + " ORDER BY id")]
+
+
+def get_camera(conn: sqlite3.Connection, camera_id) -> Optional[dict]:
+    row = conn.execute(f"SELECT {_CAMERA_COLS} FROM cameras WHERE id = ? AND deleted_at IS NULL",
+                       (int(camera_id),)).fetchone()
+    return None if row is None else _camera_row(row)
+
+
+def camera_password(conn: sqlite3.Connection, source: str) -> Optional[str]:
+    """THE ONLY read path for a stored camera password. Called by cameras.py when it assembles a
+    capture URL at rig startup, and by nothing else -- in particular by nothing that answers an
+    HTTP request. If you find yourself calling this from web.py, the design has gone wrong."""
+    row = conn.execute("SELECT password FROM cameras WHERE source = ? AND deleted_at IS NULL",
+                       (str(source),)).fetchone()
+    return None if row is None or not row[0] else str(row[0])
+
+
+def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_index=None,
+               url_scheme=None, url_host=None, url_port=None, url_path=None,
+               username=None, password=None, frame_width=None, frame_height=None,
+               motion_min_area=None, record_clips=None, enabled=True,
+               created_by: str = "web") -> dict:
+    """Insert one camera and return its stored row (without the password).
+
+    Re-adding a TOMBSTONED source is an UNDELETE of that row, not a second row: `source` is
+    UNIQUE across tombstones on purpose, because the old rows under that name -- detections,
+    visits, a clips/<source>/ directory -- still exist and still belong to whatever camera
+    carried it. A live duplicate is refused outright."""
+    src = clean_camera_source(source)
+    fields = _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
+                                  username, name, frame_width, frame_height, motion_min_area)
+    pw = None if password is None or password == "" else str(password)
+    _require_username_for_password(fields["kind"], fields["username"], pw)
+    rc = None if record_clips is None else (1 if record_clips else 0)
+    at = now_local_iso()
+    existing = conn.execute("SELECT id, deleted_at FROM cameras WHERE source = ?",
+                            (src,)).fetchone()
+    if existing is not None and existing[1] is None:
+        raise ValueError(f"a camera named {src!r} already exists")
+    if existing is not None:
+        # Undelete. Everything the form supplied wins; an omitted password keeps the old one,
+        # which is what makes "I deleted that camera by mistake" a one-click recovery.
+        # EVERY column the caller can supply, or the undeleted row keeps a stale value from
+        # whatever it was before it was removed -- a camera that comes back at the old
+        # resolution and the old motion trigger, with nothing on screen to say so. The SET list
+        # and `args` below must stay in lockstep; a test asserts the whole row, not a sample.
+        sets = ("name = ?, kind = ?, device_index = ?, url_scheme = ?, url_host = ?, "
+                "url_port = ?, url_path = ?, username = ?, frame_width = ?, frame_height = ?, "
+                "motion_min_area = ?, record_clips = ?, enabled = ?, updated_at = ?, "
+                "deleted_at = NULL")
+        args = [fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
+                fields["url_host"], fields["url_port"], fields["url_path"], fields["username"],
+                fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
+                rc, 1 if enabled else 0, at]
+        if pw is not None:
+            sets += ", password = ?"
+            args.append(pw)
+        conn.execute(f"UPDATE cameras SET {sets} WHERE id = ?", (*args, int(existing[0])))
+        conn.commit()
+        return get_camera(conn, existing[0])
+    try:
+        cur = conn.execute(
+            "INSERT INTO cameras (source, name, kind, device_index, url_scheme, url_host, "
+            "url_port, url_path, username, password, frame_width, frame_height, "
+            "motion_min_area, record_clips, enabled, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (src, fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
+             fields["url_host"], fields["url_port"], fields["url_path"], fields["username"], pw,
+             fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
+             rc, 1 if enabled else 0, created_by, at))
+    except sqlite3.IntegrityError:
+        # The SELECT above is a check-then-act; UNIQUE(source) is the real guarantee. Two saves
+        # racing must both get the same readable "already exists" message, not one 400 and one
+        # 500 with a traceback.
+        raise ValueError(f"a camera named {src!r} already exists")
+    conn.commit()
+    return get_camera(conn, cur.lastrowid)
+
+
+def update_camera(conn: sqlite3.Connection, camera_id, *, kind, name=None, device_index=None,
+                  url_scheme=None, url_host=None, url_port=None, url_path=None,
+                  username=None, password=None, clear_password: bool = False,
+                  frame_width=None, frame_height=None, motion_min_area=None,
+                  record_clips=None, enabled=True) -> Optional[dict]:
+    """Edit one camera. Returns the stored row, or None for an unknown/deleted id.
+
+    `source` is NOT a parameter and cannot be changed -- see the schema comment. An omitted or
+    empty `password` LEAVES THE STORED ONE ALONE; that is what lets an edit form be submitted
+    without the operator re-typing a secret it is never allowed to show them. Clearing one is an
+    explicit clear_password=True, so it can never happen by accidentally submitting a blank."""
+    row = conn.execute("SELECT id FROM cameras WHERE id = ? AND deleted_at IS NULL",
+                       (int(camera_id),)).fetchone()
+    if row is None:
+        return None
+    fields = _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
+                                  username, name, frame_width, frame_height, motion_min_area)
+    stored = conn.execute("SELECT password FROM cameras WHERE id = ?",
+                          (int(camera_id),)).fetchone()
+    keeps_password = bool(stored and stored[0]) and not clear_password
+    _require_username_for_password(fields["kind"], fields["username"],
+                                   password, had_password=keeps_password)
+    rc = None if record_clips is None else (1 if record_clips else 0)
+    sets = ("name = ?, kind = ?, device_index = ?, url_scheme = ?, url_host = ?, url_port = ?, "
+            "url_path = ?, username = ?, frame_width = ?, frame_height = ?, "
+            "motion_min_area = ?, record_clips = ?, enabled = ?, updated_at = ?")
+    args = [fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
+            fields["url_host"], fields["url_port"], fields["url_path"], fields["username"],
+            fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
+            rc, 1 if enabled else 0, now_local_iso()]
+    if clear_password:
+        sets += ", password = NULL"
+    elif password is not None and password != "":
+        sets += ", password = ?"
+        args.append(str(password))
+    conn.execute(f"UPDATE cameras SET {sets} WHERE id = ?", (*args, int(camera_id)))
+    conn.commit()
+    return get_camera(conn, camera_id)
+
+
+def remove_camera(conn: sqlite3.Connection, camera_id) -> Optional[dict]:
+    """Soft-delete one camera (stamp deleted_at) and return the row it removed, or None for an
+    unknown/already-deleted id. The row STAYS: the tombstone is what stops seed_cameras putting a
+    config-listed camera back on the next start, and what makes re-adding the name an undelete.
+
+    Refusing to remove the LAST live camera is the caller's job (web.py does it) -- a rig with no
+    cameras exits as soon as the last capture thread ends."""
+    row = conn.execute(f"SELECT {_CAMERA_COLS} FROM cameras WHERE id = ? AND deleted_at IS NULL",
+                       (int(camera_id),)).fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE cameras SET deleted_at = ? WHERE id = ?",
+                 (now_local_iso(), int(camera_id)))
+    conn.commit()
+    return _camera_row(row)
+
+
+def seed_cameras(conn: sqlite3.Connection, rows) -> int:
+    """Copy the config-defined cameras into the table -- ONCE per source, ever.
+
+    Identity is `source` checked against ALL rows INCLUDING TOMBSTONES, so a camera deleted in
+    the dashboard stays deleted even though config_local.py still lists it. The consequence,
+    which cameras.py warns about at startup: once a source is seeded, EDITING IT IN config_local.py
+    STOPS HAVING ANY EFFECT. The table owns it from then on. That is the same bargain ignore_zones
+    made, and the alternative -- config silently overwriting a dashboard edit on every restart --
+    is worse. Returns how many were added."""
+    n = 0
+    for r in (rows or ()):
+        try:
+            src = clean_camera_source(r.get("source"))
+        except (ValueError, AttributeError):
+            continue                       # a malformed config camera: skip, don't crash the rig
+        if conn.execute("SELECT 1 FROM cameras WHERE source = ? LIMIT 1", (src,)).fetchone():
+            continue
+        conn.execute(
+            "INSERT INTO cameras (source, name, kind, device_index, url_scheme, url_host, "
+            "url_port, url_path, username, password, frame_width, frame_height, "
+            "motion_min_area, record_clips, enabled, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'config', ?)",
+            (src, r.get("name"), r.get("kind"), r.get("device_index"), r.get("url_scheme"),
+             r.get("url_host"), r.get("url_port"), r.get("url_path"), r.get("username"),
+             r.get("password"), r.get("frame_width"), r.get("frame_height"),
+             r.get("motion_min_area"),
+             None if r.get("record_clips") is None else (1 if r.get("record_clips") else 0),
+             now_local_iso()))
+        n += 1
     if n:
         conn.commit()
     return n

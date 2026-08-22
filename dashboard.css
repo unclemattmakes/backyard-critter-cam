@@ -750,3 +750,58 @@
   .cards .card{ content-visibility:auto; contain-intrinsic-size:auto 260px; }
   .crops .crop{ content-visibility:auto; contain-intrinsic-size:auto 155px; }
   .daygrid .daycard{ content-visibility:auto; contain-intrinsic-size:auto 90px; }
+
+  /* ---- camera management (the editable camera list) --------------------------------
+     Lives in its own modal rather than the per-camera Instrument Panel, because it is a list of
+     ALL cameras, not a control for the selected one. Reuses the panel/gear vocabulary so it
+     reads as the same instrument, not a settings screen bolted on. */
+  .modal-card.instr.cams{width:min(560px,94vw);}
+  .cams-open{margin-right:10px;}
+  /* .gear sets `display`, and a class beats the UA stylesheet's [hidden] rule -- so `hidden`
+     alone is INERT on these buttons. Without this the cameras button shows for every viewer and
+     "add a camera" never goes away while the form is open. */
+  .gear[hidden]{display:none;}
+  .cams-banner{margin:10px 0 4px; padding:9px 11px; border-radius:3px; font-size:13px;
+    line-height:1.45; color:var(--ink); background:rgba(201,162,75,.10);
+    border:1px solid var(--gilt);}
+  .cams-list{margin-top:12px;}
+  .cam-row{display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+    padding:9px 2px; border-bottom:1px solid var(--rule);}
+  .cam-row:last-child{border-bottom:0;}
+  .cam-main{flex:1; min-width:180px; display:flex; flex-direction:column; gap:2px;}
+  .cam-name{font-size:15px; color:var(--ink);}
+  .cam-src{font-family:var(--mono); font-size:11px; color:var(--gilt);}
+  .cam-addr{font-family:var(--mono); font-size:11px; color:var(--faint);
+    overflow-wrap:anywhere;}
+  .cam-flags{display:flex; gap:5px; flex-wrap:wrap;}
+  .cam-flag{font-size:10.5px; font-family:var(--mono); padding:1px 6px; border-radius:2px;
+    color:var(--dim); border:1px solid var(--rule2); white-space:nowrap;}
+  .cam-flag.off{color:var(--faint);}
+  .cam-flag.warn{color:var(--rust); border-color:var(--rust);}
+  .cam-buttons{display:flex; gap:6px; flex:none;}
+
+  .cams-actions{display:flex; gap:8px; margin-top:14px;}
+  .gear.primary{border-color:var(--gilt); color:var(--gilt);}
+  .cams-form{margin-top:16px; padding-top:14px; border-top:1px solid var(--rule);}
+  .cams-form h4{margin:0 0 10px; font-variant:small-caps; letter-spacing:.04em;
+    font-weight:500; font-size:15px;}
+  .cams-row{display:flex; align-items:center; gap:10px; margin:8px 0;}
+  .cams-row>span{flex:0 0 118px; font-size:13px; color:var(--dim);}
+  .cams-row input:not([type=checkbox]), .cams-row select{flex:1; min-width:0;
+    background:var(--panel2); color:var(--ink); border:1px solid var(--rule2);
+    border-radius:3px; padding:6px 8px; font-family:var(--serif); font-size:14px;}
+  .cams-row input:disabled{color:var(--faint); background:transparent;}
+  .cams-check>input{flex:none;}
+  .cams-note{margin:2px 0 10px 128px; font-size:12px; line-height:1.45;}
+  .cams-note.bad{color:var(--rust); font-style:normal;}
+  .cams-adv{margin-top:12px;}
+  .cams-adv summary{cursor:pointer; font-size:13px; color:var(--dim);
+    font-variant:small-caps; letter-spacing:.04em;}
+  .cams-adv[open] summary{margin-bottom:8px;}
+  .cams-msg{margin-top:10px; font-size:13px; font-style:italic; color:var(--dim);}
+  .cams-msg.bad{color:var(--rust); font-style:normal;}
+  @media (max-width:560px){
+    .cams-row{flex-wrap:wrap;}
+    .cams-row>span{flex-basis:100%;}
+    .cams-note{margin-left:0;}
+  }
