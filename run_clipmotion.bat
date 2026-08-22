@@ -36,6 +36,20 @@ REM                                2026-08-08). Rig down = curl fails = fine.
 REM Every step is RESUMABLE (only new/untouched rows are processed), so a missed
 REM night just catches up the next day.
 REM ---------------------------------------------------------------------------
+REM --- Re-arm TOMORROW's start time from the sun, before doing any work -------------------
+REM Deliberately first: if the box bugchecks mid-batch (it has, repeatedly -- 07-20, 07-22,
+REM 08-13 all landed inside this window), tomorrow's trigger is already correct. See sunsched.py
+REM for why this tracks sunset instead of a fixed clock time.
+".venv\Scripts\python.exe" sunsched.py --arm --date tomorrow
+
+REM --- Wait for a clear box ---------------------------------------------------------------
+REM Steps 1-4 are all GPU, running beside the live rig on ONE 8 GB card. What we will NOT do is
+REM run them on top of a multi-gigabyte Google Drive upload: that combination preceded both of
+REM the destructive 0x1E crashes (08-19, which corrupted the DB, and 08-21, which cost 1,032
+REM files to chkdsk). --ttl because the lock outlives the python that takes it; the release at
+REM the bottom is the normal path, the TTL only covers a run the machine kills.
+".venv\Scripts\python.exe" heavyio.py --acquire batch --wait 3600 --ttl 360 --note "nightly re-ID + motion batch"
+
 echo [%date% %time%] motion tracks for new clips...
 ".venv\Scripts\python.exe" clipmotion.py --device auto
 echo [%date% %time%] appearance embeddings for new crops...
@@ -64,4 +78,5 @@ if "%EVAL_REGRESSED%"=="1" (
 )
 echo [%date% %time%] warming the dashboard re-ID queue cache...
 curl -s -o NUL --max-time 180 "http://127.0.0.1:8000/api/reid/queue?mode=recent&offset=0&limit=30"
+".venv\Scripts\python.exe" heavyio.py --release batch
 echo [%date% %time%] done.
