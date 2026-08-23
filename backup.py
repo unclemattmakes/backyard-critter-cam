@@ -55,6 +55,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -86,10 +87,11 @@ DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # that anything ELSE appearing under a media root is still surfaced as the surprise it is.
 NOT_ARCHIVED = frozenset({"reels"})
 
-# Free space a DB snapshot needs where it is BUILT, as a multiple of the database's own size: one
-# full uncompressed copy, plus slack. A snapshot that dies half-written for want of disk looks
-# exactly like a snapshot that died of corruption, so this is checked up front and named.
-SCRATCH_HEADROOM = 1.15
+# Free space a DB snapshot needs where it is BUILT, as a multiple of the database's own size. The
+# scratch copy and its deflated zip are both there at once now -- SQLite deflates to roughly 0.7x,
+# so the peak is about 1.7x -- and a snapshot that dies half-written for want of disk looks exactly
+# like one that died of corruption, so the room is checked up front and the shortfall is named.
+SCRATCH_HEADROOM = 2.0
 
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
@@ -328,17 +330,47 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _scratch_parent(db_path: Path, out_dir: Path) -> Path:
-    """Where to BUILD the database snapshot: somewhere local with room for a full copy, and never
-    inside `out_dir`.
+def _publish(local: Path, out: Path) -> None:
+    """Put a FINISHED file at `out`, writing it into the destination exactly once.
 
-    The whole point is to keep the scratch copy away from the sync client -- see snapshot_db. The
-    system temp dir is first choice; the database's own directory is the fallback, because a
-    machine whose OS partition is too small to hold a copy of the database is demonstrably still
-    holding one where the database already lives."""
-    need = int(db_path.stat().st_size * SCRATCH_HEADROOM)
+    A rename when the two are on one filesystem: atomic, instant, free. Otherwise the bytes must
+    be copied, and a copy into a cloud folder IS the upload -- so it goes straight to the final
+    name. Staging under `<out>.tmp` there would upload the file TWICE, because the sync client
+    treats the staging file as its own upload and the rename does not cancel it: confirmed
+    2026-08-23 in DriveFS's operations table, where every artifact sat queued as a .zip/.zip.tmp
+    pair that survived ~50 minutes of draining.
+
+    The price is that an interrupted copy leaves a short file under the real name, so this is only
+    for artifacts whose readers can tell and recover. It is deliberately NOT used for the media day
+    archives: clips.py's _archive_guard licenses DELETING a clip on the mere existence of its day's
+    zip, and a truncated archive would satisfy it -- footage would go for a file holding nothing.
+    The DB and meta snapshots are the opposite case, and the two worth the most: each is a
+    whole-file rewrite every single run (~1.5 GB and ~0.6 GB), and each has a reader that tries the
+    newest, finds it will not open, and falls back to the one before."""
+    size = local.stat().st_size
+    try:
+        os.replace(local, out)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:                  # not a cross-filesystem move: a real failure
+            raise
+    shutil.copyfile(local, out)
+    landed = out.stat().st_size
+    if landed != size:
+        # Caught while we are still here to say so, rather than found at restore time.
+        out.unlink(missing_ok=True)
+        raise RuntimeError(f"{out.name} landed short ({landed} of {size} bytes) -- removed")
+
+
+def _scratch_parent(need: int, out_dir: Path, fallback: Path) -> Path:
+    """Where to BUILD something bound for `out_dir`: somewhere local with `need` bytes free, and
+    never inside `out_dir` itself.
+
+    The whole point is to keep working files away from the sync client -- see snapshot_db. The
+    system temp dir is first choice; `fallback` is tried next, because a machine whose OS
+    partition is too small to hold the work is often still holding the source of it elsewhere."""
     rejected: list[str] = []
-    for cand in (Path(tempfile.gettempdir()), db_path.resolve().parent):
+    for cand in (Path(tempfile.gettempdir()), fallback.resolve()):
         if _is_within(cand, out_dir):
             # The regression guard. This is the exact bug being fixed: a scratch file inside the
             # backup destination is a scratch file the cloud client uploads.
@@ -352,8 +384,7 @@ def _scratch_parent(db_path: Path, out_dir: Path) -> Path:
         if free >= need:
             return cand
         rejected.append(f"{cand} ({free / 2**30:.1f} GB free, needs {need / 2**30:.1f} GB)")
-    raise RuntimeError("nowhere local to build the database snapshot -- tried: "
-                       + "; ".join(rejected))
+    raise RuntimeError("nowhere local to build the snapshot -- tried: " + "; ".join(rejected))
 
 
 def _sweep_snapshot_scratch(out_dir: Path) -> None:
@@ -394,20 +425,20 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
     the TemporaryDirectory now -- which also means a throw anywhere below no longer strands a
     multi-gigabyte file in the cloud folder, as the old success-path-only unlink did.
 
-    This function is NOT yet free of that class of cost, and the same operations table says so:
-    the finished zip is still staged as `<name>.zip.tmp` INSIDE out_dir before os.replace renames
-    it, and Drive uploads that staging file as an INDEPENDENT operation -- the pair survives the
-    rename rather than being cancelled by it, so the ~1.5 GB archive still goes up twice. Staging
-    through a `.tmp` is load-bearing (a crash must never leave a truncated archive under the final
-    name), and every zip writer in this module does it, so moving the staging file out of the
-    synced folder is one deliberate change across all of them rather than a fix smuggled in here."""
+    The finished zip is built in that same local directory and published with a single write, for
+    the same reason: staging it as `<name>.zip.tmp` inside out_dir uploaded the ~1.5 GB archive
+    twice over, the sync client treating the staging file as an upload of its own and the rename
+    not cancelling it. _publish says why the media archives still stage through a .tmp and this one
+    does not -- the difference is whether a reader can tell a short file from a good one, and here
+    it can: migrate.py takes the newest DB snapshot, quick_checks it, and falls back."""
     out_zip = out_dir / f"backyard-db-{today.isoformat()}.zip"
     if dry_run:
         log.info("would snapshot %s (%.1f MB) -> %s", db_path.name, db_path.stat().st_size / 2**20, out_zip.name)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     _sweep_snapshot_scratch(out_dir)
-    scratch_parent = _scratch_parent(db_path, out_dir)
+    scratch_parent = _scratch_parent(int(db_path.stat().st_size * SCRATCH_HEADROOM),
+                                     out_dir, db_path.parent)
     log.debug("building the db snapshot in %s", scratch_parent)
     with tempfile.TemporaryDirectory(prefix="backyard-snapshot-", dir=scratch_parent) as td:
         tmp_db = Path(td) / db_path.name
@@ -431,26 +462,30 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
         if wal.exists() and wal.stat().st_size > 0:
             raise RuntimeError(f"snapshot left an un-checkpointed WAL ({wal.stat().st_size} bytes) "
                                f"-- refusing to archive an incomplete database")
-        tmp = out_zip.with_name(out_zip.name + ".tmp")
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        staged = Path(td) / out_zip.name
+        with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_db, db_path.name)
-        os.replace(tmp, out_zip)
+        _publish(staged, out_zip)
     log.info("created %s  (db %.1f MB -> %.1f MB zipped, quick_check ok)", out_zip.name,
              db_path.stat().st_size / 2**20, out_zip.stat().st_size / 2**20)
 
 
-def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
-    """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
-    it's tens of MB, and 'always current, always complete' beats clever here."""
-    out_zip = out_dir / f"meta-{today.isoformat()}.zip"
-    present = [p for p in meta_items() if p.exists()]
-    if dry_run:
-        log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp = out_zip.with_name(out_zip.name + ".tmp")
+def _tree_bytes(items: list[Path]) -> int:
+    """Total size of `items`, walking directories. Only used to size the scratch space."""
+    total = 0
+    for item in items:
+        try:
+            files = [item] if item.is_file() else [q for q in item.rglob("*") if q.is_file()]
+            total += sum(q.stat().st_size for q in files)
+        except OSError:
+            continue
+    return total
+
+
+def _write_meta_zip(staged: Path, present: list[Path]) -> int:
+    """Deflate the meta items into `staged`; returns how many files made it in."""
     n = 0
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for item in present:
             files = [item] if item.is_file() else [p for p in sorted(item.rglob("*")) if p.is_file()]
             for p in files:
@@ -466,7 +501,28 @@ def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
                     log.warning("%s lives outside the project root -- not archived; back that "
                                 "folder up by hand", item)
                     break
-    os.replace(tmp, out_zip)
+    return n
+
+
+def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
+    """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
+    it's tens of MB, and 'always current, always complete' beats clever here.
+
+    Built locally and published with one write, like the DB snapshot. "Rewritten whole every run"
+    is exactly the shape a .tmp inside the destination doubles the cost of; restore reads the
+    newest meta zip and falls back to the one before if it will not open, which is what makes
+    publishing straight to the final name safe here."""
+    out_zip = out_dir / f"meta-{today.isoformat()}.zip"
+    present = [p for p in meta_items() if p.exists()]
+    if dry_run:
+        log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scratch = _scratch_parent(int(_tree_bytes(present) * 1.1) + 2**20, out_dir, ROOT)
+    with tempfile.TemporaryDirectory(prefix="backyard-meta-", dir=scratch) as td:
+        staged = Path(td) / out_zip.name
+        n = _write_meta_zip(staged, present)
+        _publish(staged, out_zip)
     log.info("created %s  (%d files, %.1f MB)", out_zip.name, n, out_zip.stat().st_size / 2**20)
 
 

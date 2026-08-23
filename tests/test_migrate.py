@@ -205,7 +205,8 @@ def test_restore_reassembles_a_day_from_all_its_parts(env, tmp_path):
     _add_clip(old, late, f"{D1}T16:43:00")
     backup.archive_media(old / "clips", dest / "clips", date.today(), dry_run=False,
                          include_today=True)
-    assert (dest / "clips" / f"clips-glass_door_cam-{D1}.part2.zip").is_file(),         "setup failed: the top-up did not write a part"
+    part2 = dest / "clips" / f"clips-glass_door_cam-{D1}.part2.zip"
+    assert part2.is_file(), "setup failed: the top-up did not write a part"
 
     migrate.pack(dest, include_weights=False)
     use(new)
@@ -316,6 +317,28 @@ def test_restore_refuses_a_folder_that_is_not_a_backup(env, tmp_path):
     not_a_backup.mkdir()
     with pytest.raises(SystemExit, match="not a backup/pack folder"):
         migrate.restore(not_a_backup)
+
+
+def test_a_torn_newest_meta_snapshot_falls_back_to_the_one_before(env, tmp_path, caplog):
+    """The meta zip is published straight to its final name now -- staging it inside the
+    destination uploaded it twice -- so an interrupted run can leave a short one under a name that
+    reads as good. That trade is only honest because restore falls back, exactly as it already
+    did for the database. Without this it took meta_zips[-1] and raised."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    migrate.pack(dest, include_weights=False)
+    torn = dest / "snapshots" / "meta-9999-01-01.zip"
+    torn.write_bytes(bytes(128))              # a copy that stopped part way
+
+    use(new)
+    with caplog.at_level(logging.WARNING, logger="migrate"):
+        assert migrate.restore(dest) == 0
+
+    assert "will not open" in " ".join(r.getMessage() for r in caplog.records)
+    # ...and the good one before it was actually used, not merely survived.
+    assert b"private config" in (new / "config_local.py").read_bytes()
 
 
 # --- the database gate -------------------------------------------------------------------

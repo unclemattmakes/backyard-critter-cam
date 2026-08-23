@@ -26,6 +26,7 @@ diff is by NAME and the merge is append-only; both halves are pinned below.
 """
 from __future__ import annotations
 
+import errno
 import logging
 import sqlite3
 import zipfile
@@ -626,7 +627,8 @@ def test_the_scratch_is_refused_if_it_would_land_inside_the_destination(tmp_path
     src = _live_db(tmp_path / "backyard.db")
     monkeypatch.setattr(backup.tempfile, "gettempdir", lambda: str(inside))
 
-    assert not backup._is_within(backup._scratch_parent(src, dest), dest)
+    need = int(src.stat().st_size * backup.SCRATCH_HEADROOM)
+    assert not backup._is_within(backup._scratch_parent(need, dest, src.parent), dest)
     backup.snapshot_db(src, dest, date(2026, 8, 23), False)
     assert (dest / "backyard-db-2026-08-23.zip").is_file()
     assert not list(dest.rglob("*.db"))                 # nothing database-shaped under dest
@@ -680,4 +682,114 @@ def test_nowhere_to_build_says_where_it_looked(tmp_path, monkeypatch):
     monkeypatch.setattr(backup.shutil, "disk_usage",
                         lambda p: SimpleNamespace(total=0, used=0, free=0))
     with pytest.raises(RuntimeError, match="nowhere local"):
-        backup._scratch_parent(src, tmp_path / "dest")
+        backup._scratch_parent(1 << 30, tmp_path / "dest", src.parent)
+
+
+# --- publishing: a finished archive is written into the destination ONCE -------------------
+#
+# The .tmp staging file used to be created inside the destination, and a sync client uploads it
+# as an operation of its own -- the rename does not cancel it. Confirmed 2026-08-23 in DriveFS's
+# operations table: every artifact queued as a .zip/.zip.tmp pair, both surviving ~50 minutes of
+# draining. Like the scratch DB before it, this is invisible once a run ends, so these tests
+# watch where a zip is BUILT rather than what is left behind.
+
+def _zip_write_targets(monkeypatch) -> list[Path]:
+    """Every path opened as a zip for writing."""
+    targets: list[Path] = []
+    real = backup.zipfile.ZipFile
+
+    def spy(file, mode="r", *a, **k):
+        if mode in ("w", "a"):
+            targets.append(Path(file))
+        return real(file, mode, *a, **k)
+    monkeypatch.setattr(backup.zipfile, "ZipFile", spy)
+    return targets
+
+
+def test_the_db_snapshot_zip_is_built_outside_the_destination(tmp_path, monkeypatch):
+    """~1.5 GB, rewritten every single run -- the most expensive of the pairs."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+    targets = _zip_write_targets(monkeypatch)
+
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+
+    assert targets, "no zip was written -- the spy is not wired up"
+    for t in targets:
+        assert dest.resolve() not in t.resolve().parents, \
+            f"the archive was staged inside the backup destination: {t}"
+    assert [q.name for q in sorted(dest.iterdir())] == ["backyard-db-2026-08-23.zip"]
+
+
+def test_the_meta_snapshot_zip_is_built_outside_the_destination(project, dest, monkeypatch):
+    """~0.6 GB, also rewritten whole every run."""
+    _write(project / "logs", ["a.log", "b.log"])
+    monkeypatch.setattr(backup, "meta_items", lambda: (project / "logs",))
+    targets = _zip_write_targets(monkeypatch)
+
+    backup.snapshot_meta(dest, date(2026, 8, 23), False)
+
+    assert targets, "no zip was written -- the spy is not wired up"
+    for t in targets:
+        assert dest.resolve() not in t.resolve().parents, \
+            f"the archive was staged inside the backup destination: {t}"
+    assert [q.name for q in sorted(dest.iterdir())] == ["meta-2026-08-23.zip"]
+    assert _basenames(dest / "meta-2026-08-23.zip") == {"a.log", "b.log"}
+
+
+def test_media_archives_still_stage_through_a_tmp_in_the_destination(project, dest, monkeypatch):
+    """Deliberately NOT converted, and this pins the reason. clips.py's _archive_guard licenses
+    DELETING a clip on the mere existence of its day's zip, so a half-written archive under the
+    real name would authorise losing footage that exists nowhere else. Paying one extra upload
+    per day-create buys the guarantee that the file is either absent or complete."""
+    _clips(project, BATCH1)
+    targets = _zip_write_targets(monkeypatch)
+
+    _archive(project, dest)
+
+    assert [t.name for t in targets] == [f"{ZIP}.tmp"]
+    assert all(t.parent == (dest / "clips") for t in targets)
+
+
+def _exdev(*a, **k):
+    raise OSError(errno.EXDEV, "cross-device link")
+
+
+def test_publish_renames_when_both_ends_are_one_filesystem(tmp_path):
+    """A local destination costs nothing and stays atomic."""
+    local, out = tmp_path / "src.zip", tmp_path / "out.zip"
+    local.write_bytes(b"payload")
+
+    backup._publish(local, out)
+
+    assert out.read_bytes() == b"payload" and not local.exists()
+
+
+def test_publish_copies_straight_to_the_final_name_across_filesystems(tmp_path, monkeypatch):
+    """The cloud case. os.replace cannot cross a filesystem and a virtual Drive mount always is
+    one, so the bytes get copied -- and they must land under the FINAL name. A .tmp here is the
+    second upload."""
+    local, out = tmp_path / "src.zip", tmp_path / "dest" / "out.zip"
+    out.parent.mkdir()
+    local.write_bytes(b"payload" * 100)
+    monkeypatch.setattr(backup.os, "replace", _exdev)
+
+    backup._publish(local, out)
+
+    assert out.read_bytes() == b"payload" * 100
+    assert [q.name for q in sorted(out.parent.iterdir())] == ["out.zip"]
+
+
+def test_publish_removes_a_file_that_landed_short(tmp_path, monkeypatch):
+    """Publishing to the final name means an interrupted copy leaves a short file there. Anything
+    we can still catch, we catch now and delete -- a truncated archive that keeps the real name is
+    worse than no archive, because it reads as one."""
+    local, out = tmp_path / "src.zip", tmp_path / "dest" / "out.zip"
+    out.parent.mkdir()
+    local.write_bytes(b"x" * 1000)
+    monkeypatch.setattr(backup.os, "replace", _exdev)
+    monkeypatch.setattr(backup.shutil, "copyfile", lambda s, d: Path(d).write_bytes(b"x" * 400))
+
+    with pytest.raises(RuntimeError, match="landed short"):
+        backup._publish(local, out)
+    assert not out.exists()
