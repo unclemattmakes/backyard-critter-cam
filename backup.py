@@ -364,7 +364,15 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
     Note the sidecars: SQLite gives the destination the source database's WAL header, so a `-wal`
     (and `-shm`) appears beside the scratch copy and had to move with it. They live and die inside
     the TemporaryDirectory now -- which also means a throw anywhere below no longer strands a
-    multi-gigabyte file in the cloud folder, as the old success-path-only unlink did."""
+    multi-gigabyte file in the cloud folder, as the old success-path-only unlink did.
+
+    This function is NOT yet free of that class of cost, and the same operations table says so:
+    the finished zip is still staged as `<name>.zip.tmp` INSIDE out_dir before os.replace renames
+    it, and Drive uploads that staging file as an INDEPENDENT operation -- the pair survives the
+    rename rather than being cancelled by it, so the ~1.5 GB archive still goes up twice. Staging
+    through a `.tmp` is load-bearing (a crash must never leave a truncated archive under the final
+    name), and every zip writer in this module does it, so moving the staging file out of the
+    synced folder is one deliberate change across all of them rather than a fix smuggled in here."""
     out_zip = out_dir / f"backyard-db-{today.isoformat()}.zip"
     if dry_run:
         log.info("would snapshot %s (%.1f MB) -> %s", db_path.name, db_path.stat().st_size / 2**20, out_zip.name)
