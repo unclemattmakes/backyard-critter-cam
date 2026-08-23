@@ -9,10 +9,10 @@ and writes nothing but the test frames you ask for.
 Run it with the project's venv interpreter (a bare `python` on the rig is the system one, which
 has no OpenCV -- it says so rather than throwing a traceback):
 
-    .venv\\Scripts\\python.exe tools/camprobe.py 192.168.0.105 --user rig   # CAM_PASS from the env
-    python tools/camprobe.py 192.168.0.105 --user rig --password swordfish
-    python tools/camprobe.py 192.168.0.105 --user rig --path h264Preview_01_sub
-    python tools/camprobe.py --url rtsp://rig:swordfish@192.168.0.105:554/h264Preview_01_sub
+    .venv\\Scripts\\python.exe tools/camprobe.py 192.168.1.50 --user rig   # CAM_PASS from the env
+    python tools/camprobe.py 192.168.1.50 --user rig --password swordfish
+    python tools/camprobe.py 192.168.1.50 --user rig --path h264Preview_01_sub
+    python tools/camprobe.py --url rtsp://rig:swordfish@192.168.1.50:554/h264Preview_01_sub
 
 With no --path it tries a list of known vendor paths and reports which ones open, so an
 unfamiliar camera does not need its manual found first.

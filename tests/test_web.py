@@ -1021,13 +1021,13 @@ def _cam_server(cfg):
 
 
 NET_CAM = {"source": "yard_ir", "kind": "network", "name": "Yard",
-           "url_host": "192.168.0.105", "url_port": 554,
+           "url_host": "192.168.1.105", "url_port": 554,
            "url_path": "h264Preview_01_sub", "username": "rig", "motion_min_area": 200}
 
 
 @pytest.mark.parametrize("peer,expected", [
     ("127.0.0.1", True), ("::1", True), ("127.0.0.5", True),
-    ("192.168.0.50", False), ("10.0.0.1", False), ("", False), ("not-an-ip", False),
+    ("192.168.1.50", False), ("10.0.0.1", False), ("", False), ("not-an-ip", False),
 ])
 def test_loopback_rule_fails_closed(peer, expected):
     """Anything unparseable must read as NOT loopback -- this gates writing a password."""
@@ -1044,7 +1044,7 @@ def test_save_then_list_a_camera(db_path):
         assert body["pending_restart"] is True      # saved, NOT live
         status, body = _get(port, "/api/cameras")
         rows = [r for r in body["rows"] if r["source"] == "yard_ir"]
-        assert rows and rows[0]["url_host"] == "192.168.0.105"
+        assert rows and rows[0]["url_host"] == "192.168.1.105"
         assert rows[0]["has_password"] is True
     finally:
         web.shutdown(server)
@@ -1114,10 +1114,10 @@ def test_an_edit_without_a_password_keeps_the_stored_one(db_path):
     try:
         _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
         _post(port, "/api/cameras/save",
-              dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.0.199"))
+              dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.1.199"))
         _, listed = _get(port, "/api/cameras")
         row = [r for r in listed["rows"] if r["source"] == "yard_ir"][0]
-        assert row["url_host"] == "192.168.0.199" and row["has_password"] is True
+        assert row["url_host"] == "192.168.1.199" and row["has_password"] is True
     finally:
         web.shutdown(server)
 
@@ -1131,7 +1131,7 @@ def test_the_last_camera_cannot_be_deleted(db_path):
         _, only = _post(port, "/api/cameras/save", NET_CAM)
         status, body = _post(port, "/api/cameras/delete", {"id": only["camera"]["id"]})
         assert status == 400 and "only camera" in body["error"]
-        _post(port, "/api/cameras/save", dict(NET_CAM, source="cam02", url_host="192.168.0.107"))
+        _post(port, "/api/cameras/save", dict(NET_CAM, source="cam02", url_host="192.168.1.107"))
         status, _ = _post(port, "/api/cameras/delete", {"id": only["camera"]["id"]})
         assert status == 200
     finally:
@@ -1184,7 +1184,7 @@ def test_moving_a_camera_with_a_stored_password_needs_loopback(db_path, monkeypa
         # and the row did not move
         _, listed = _get(port, "/api/cameras")
         assert [r for r in listed["rows"] if r["source"] == "yard_ir"][0]["url_host"] \
-            == "192.168.0.105"
+            == "192.168.1.105"
     finally:
         web.shutdown(server)
 
@@ -1199,7 +1199,7 @@ def test_moving_a_camera_without_a_stored_password_is_ordinary(db_path, monkeypa
         _, saved = _post(port, "/api/cameras/save", NET_CAM)
         monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
         status, _ = _post(port, "/api/cameras/save",
-                          dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.0.200"))
+                          dict(NET_CAM, id=saved["camera"]["id"], url_host="192.168.1.200"))
         assert status == 200
     finally:
         web.shutdown(server)

@@ -43,22 +43,22 @@ REF = _Cfg(1800, 1920, 1080)          # this rig's glass-door camera, the refere
 
 def test_full_url_splits_into_its_five_parts():
     assert camprobe.parse_rtsp_url(
-        "rtsp://rig:swordfish@192.168.0.105:554/h264Preview_01_sub"
-    ) == ("rig", "swordfish", "192.168.0.105", 554, "h264Preview_01_sub")
+        "rtsp://rig:swordfish@192.168.1.105:554/h264Preview_01_sub"
+    ) == ("rig", "swordfish", "192.168.1.105", 554, "h264Preview_01_sub")
 
 
 def test_password_containing_an_at_sign_splits_on_the_LAST_one():
-    """The one that matters: first-'@' splitting yields ('rig', 'p', 'ss@192.168.0.105', ...) --
+    """The one that matters: first-'@' splitting yields ('rig', 'p', 'ss@192.168.1.105', ...) --
     a wrong password AND a wrong host, reported as a login failure."""
     user, pw, host, port, path = camprobe.parse_rtsp_url(
-        "rtsp://rig:p@ssw0rd@192.168.0.105:554/stream")
-    assert (user, pw, host) == ("rig", "p@ssw0rd", "192.168.0.105")
+        "rtsp://rig:p@ssw0rd@192.168.1.105:554/stream")
+    assert (user, pw, host) == ("rig", "p@ssw0rd", "192.168.1.105")
     assert (port, path) == (554, "stream")
 
 
 def test_url_without_credentials_parses_with_empty_ones():
-    assert camprobe.parse_rtsp_url("rtsp://192.168.0.105:554/stream") == (
-        "", "", "192.168.0.105", 554, "stream")
+    assert camprobe.parse_rtsp_url("rtsp://192.168.1.105:554/stream") == (
+        "", "", "192.168.1.105", 554, "stream")
 
 
 def test_missing_port_defaults_to_554():
@@ -73,7 +73,7 @@ def test_path_may_carry_a_query_string():
 
 
 @pytest.mark.parametrize("bad", [
-    "http://192.168.0.105/stream",      # not RTSP at all
+    "http://192.168.1.105/stream",      # not RTSP at all
     "rtsp://",                          # no host
     "rtsp://rig:pw@:554/stream",        # empty host
     "rtsp://cam.local:nope/stream",     # unparseable port
