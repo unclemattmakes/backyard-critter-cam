@@ -82,6 +82,16 @@ def env(tmp_path, monkeypatch):
     return use
 
 
+def _archived_names(zdir: Path, stem: str) -> set[str]:
+    """Every arcname archived for one day, across all its parts -- backup.py seals <stem>.zip and
+    writes later top-ups as <stem>.part2.zip, ... instead of rewriting it."""
+    out: set[str] = set()
+    for part in backup.archive_parts(zdir, stem):
+        with zipfile.ZipFile(part) as zf:
+            out |= set(zf.namelist())
+    return out
+
+
 def _file(root: Path, rel: str, content: bytes = b"x" * 32) -> Path:
     p = root / rel
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +185,34 @@ def test_round_trip_moves_the_whole_rig(env, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "every sampled file present" in out
     assert "every file present" in out
+
+
+def test_restore_reassembles_a_day_from_all_its_parts(env, tmp_path):
+    """End-to-end for the part layout. A trail-cam import backfills a date that was already
+    sealed, so the day exists as <stem>.zip plus <stem>.part2.zip -- and a machine rebuilt from
+    that bundle has to end up holding BOTH halves. Restore globs the media folder, which is why
+    parts cost it nothing, but nothing else in the suite proves the whole path."""
+    old, new, dest = tmp_path / "old", tmp_path / "new", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    backup.archive_media(old / "clips", dest / "clips", date.today(), dry_run=False,
+                         include_today=True)
+
+    # The afternoon batch of the same dump day, arriving after the morning was archived.
+    late = f"clips/glass_door_cam/{D1}/late.mp4"
+    _file(old, late, b"the-afternoon-batch")
+    _add_clip(old, late, f"{D1}T16:43:00")
+    backup.archive_media(old / "clips", dest / "clips", date.today(), dry_run=False,
+                         include_today=True)
+    assert (dest / "clips" / f"clips-glass_door_cam-{D1}.part2.zip").is_file(),         "setup failed: the top-up did not write a part"
+
+    migrate.pack(dest, include_weights=False)
+    use(new)
+    assert migrate.restore(dest) == 0
+
+    assert (new / LIVE_CLIP).read_bytes() == b"live-video"          # from the sealed archive
+    assert (new / late).read_bytes() == b"the-afternoon-batch"      # from part 2
 
 
 def test_pruned_clips_stay_archive_only(env, tmp_path, capsys):
@@ -458,10 +496,10 @@ def test_pack_includes_today_and_reruns_top_up(env, tmp_path):
 
     _file(old, f"clips/glass_door_cam/{D0}/later.mp4", b"later")
     assert migrate.pack(dest, include_weights=False) == 0
-    with zipfile.ZipFile(today_zip) as zf:
-        names = zf.namelist()
-        assert f"clips/glass_door_cam/{D0}/later.mp4" in names
-        assert f"clips/glass_door_cam/{D0}/today.mp4" in names
+    # The delta lands in a new part beside the sealed archive, so read the day as the SET it is.
+    names = _archived_names(dest / "clips", f"clips-glass_door_cam-{D0}")
+    assert f"clips/glass_door_cam/{D0}/later.mp4" in names
+    assert f"clips/glass_door_cam/{D0}/today.mp4" in names
 
 
 def test_pack_refuses_a_machine_with_no_rig(env, tmp_path):
@@ -497,16 +535,16 @@ def test_pack_leaves_a_file_still_being_written(env, tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "PACK_SETTLE_S", 60.0)
 
     assert migrate.pack(dest, include_weights=False) == 0
-    today_zip = dest / "clips" / f"clips-glass_door_cam-{D0}.zip"
-    with zipfile.ZipFile(today_zip) as zf:
-        assert f"clips/glass_door_cam/{D0}/done.mp4" in zf.namelist()
-        assert f"clips/glass_door_cam/{D0}/recording.mp4" not in zf.namelist()
+    names = _archived_names(dest / "clips", f"clips-glass_door_cam-{D0}")
+    assert f"clips/glass_door_cam/{D0}/done.mp4" in names
+    assert f"clips/glass_door_cam/{D0}/recording.mp4" not in names
 
-    # The rig stops, the file settles, the final pack picks it up -- the two-pass flow.
+    # The rig stops, the file settles, the final pack picks it up -- the two-pass flow. It lands
+    # in a part beside the sealed archive, which is exactly what the second pass is for.
     os.utime(recording, (hour_ago, hour_ago))
     assert migrate.pack(dest, include_weights=False) == 0
-    with zipfile.ZipFile(today_zip) as zf:
-        assert f"clips/glass_door_cam/{D0}/recording.mp4" in zf.namelist()
+    names = _archived_names(dest / "clips", f"clips-glass_door_cam-{D0}")
+    assert f"clips/glass_door_cam/{D0}/recording.mp4" in names
 
 
 # --- the backup.py meta additions --------------------------------------------------------

@@ -160,6 +160,39 @@ def test_restore_archived_clip_round_trip(tmp_path):
     assert again == out
 
 
+def test_restore_archived_clip_finds_a_member_in_a_later_part(tmp_path):
+    """A day is a set of archives: whatever a trail-cam import backfilled into an already-sealed
+    date lands in <stem>.part2.zip. Playback cannot predict which part holds a clip, so it has to
+    look in all of them -- before this, anything in a part was simply unplayable."""
+    member = "clips/glass_door_cam/2026-08-01/late.mp4"
+    payload = b"\x00\x00\x00\x18ftypmp42-from-part-two"
+    dest = tmp_path / "backupdest"
+    (dest / "clips").mkdir(parents=True)
+    with zipfile.ZipFile(dest / "clips" / "clips-glass_door_cam-2026-08-01.zip", "w",
+                         compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("clips/glass_door_cam/2026-08-01/early.mp4", b"the sealed part")
+    with zipfile.ZipFile(dest / "clips" / "clips-glass_door_cam-2026-08-01.part2.zip", "w",
+                         compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(member, payload)
+
+    out = web._restore_archived_clip(dest, member, tmp_path / "archive_cache")
+    assert out is not None and out.read_bytes() == payload
+
+
+def test_restore_archived_clip_skips_an_unreadable_part(tmp_path):
+    """One torn part must not hide a clip that a later one holds."""
+    member = "clips/glass_door_cam/2026-08-01/late.mp4"
+    dest = tmp_path / "backupdest"
+    (dest / "clips").mkdir(parents=True)
+    (dest / "clips" / "clips-glass_door_cam-2026-08-01.zip").write_bytes(b"\x00" * 64)
+    with zipfile.ZipFile(dest / "clips" / "clips-glass_door_cam-2026-08-01.part2.zip", "w",
+                         compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(member, b"still here")
+
+    out = web._restore_archived_clip(dest, member, tmp_path / "archive_cache")
+    assert out is not None and out.read_bytes() == b"still here"
+
+
 def test_restore_archived_clip_missing_is_none(tmp_path):
     assert web._restore_archived_clip(tmp_path, "clips/2026-01-01/x.mp4",
                                       tmp_path / "cache") is None

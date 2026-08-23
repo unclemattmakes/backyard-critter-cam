@@ -16,10 +16,19 @@ Design notes (why it looks the way it does):
   two separate batches, because the card goes straight back in the camera and the next dump
   brings the rest of that same day. So archives are APPEND-ONLY: an existing one is never
   rebuilt (rebuilding from a since-pruned source would shrink it, and the whole point is that
-  the archive OUTLIVES the pruning), but files the source has and the archive lacks are merged
-  in. The comparison is by NAME, not by count, because one day folder can lose files to the
-  pruner and gain files from an import between two runs -- and then it holds FEWER files than
-  its archive while still holding some that belong in it.
+  the archive OUTLIVES the pruning), and files the source has that no archive holds are written
+  as a NEW PART beside it -- <stem>.zip, then <stem>.part2.zip, part3.zip. The comparison is by
+  NAME, not by count, because one day folder can lose files to the pruner and gain files from an
+  import between two runs -- and then it holds FEWER files than its archive while still holding
+  some that belong in it. A day is therefore a SET of archives, and every reader unions them.
+* Parts exist because the destination is usually a cloud folder, and there a top-up used to cost
+  the whole day. The old merge copied the existing zip, appended to the copy and renamed it over
+  the original -- correct locally (an in-place append rewrites the central directory, so a crash
+  would leave the archive unreadable) and brutal on a synced mount, because rewriting a file
+  re-uploads all of it. Measured 2026-08-23: 21 new clips, 50.9 MB of footage, rewrote a 2.6 GB
+  archive; the 08-22 run rewrote 8199.3 MB to add 37 files. Writing a part costs the new bytes
+  and nothing else -- and it is SAFER, because a sealed archive is now never opened for writing
+  again, so no top-up can corrupt one.
 * Media zips are STORED, not compressed: mp4 and jpg are already compressed, so deflating them
   buys ~nothing and burns CPU. Zipping still pays because Drive syncs one ~75 MB file far
   faster than ~2,000 individual crop JPEGs (per-file sync overhead dominates small files).
@@ -187,6 +196,36 @@ def zip_tree(src_dir: Path, out_zip: Path, arc_root: Path, compression: int, dry
     return n, total
 
 
+# <stem>.zip is part one; later top-ups are <stem>.part2.zip, .part3.zip, ... Anchored at the
+# end so a camera or date that happens to contain "part" cannot be mistaken for one.
+PART_RE = re.compile(r"\.part(\d+)\.zip$")
+
+
+def _part_index(archive: Path) -> int:
+    """Which part of its day an archive is; the base <stem>.zip is part 1."""
+    m = PART_RE.search(archive.name)
+    return int(m.group(1)) if m else 1
+
+
+def archive_parts(out_dir: Path, stem: str) -> list[Path]:
+    """Every archive holding some of one day, base first and parts in order.
+
+    A day is a SET of archives, not a file. Nothing here rewrites a sealed one, so the second and
+    later passes over a day that gained files write <stem>.part2.zip, .part3.zip, ... beside it."""
+    parts = []
+    base = out_dir / f"{stem}.zip"
+    if base.is_file():
+        parts.append(base)
+    parts += sorted((q for q in out_dir.glob(f"{stem}.part*.zip") if PART_RE.search(q.name)),
+                    key=_part_index)
+    return parts
+
+
+def next_part(out_dir: Path, stem: str, parts: list[Path]) -> Path:
+    """Where the next top-up for this day goes."""
+    return out_dir / f"{stem}.part{max(_part_index(q) for q in parts) + 1}.zip"
+
+
 def archived_names(zip_path: Path) -> set[str] | None:
     """The arcnames of the files an existing archive holds (None = unreadable). Only the central
     directory is read, so this is cheap even on a multi-GB zip. Names rather than a count because
@@ -199,33 +238,19 @@ def archived_names(zip_path: Path) -> set[str] | None:
         return None
 
 
-def add_to_zip(new_files: list[Path], out_zip: Path, arc_root: Path, compression: int,
-               dry_run: bool) -> tuple[int, int]:
-    """Add files to an EXISTING archive, keeping every member already in it -- merge, never
-    rebuild. What the archive holds is often the only copy left (the clips pruner deletes from
-    the source; the trail cam's card is formatted every cycle), so a file that once made it in is
-    never dropped just because the source no longer has it. The new members are appended to a
-    COPY that then replaces the original, because appending in place rewrites the central
-    directory: an interrupted run would leave the archive it was extending unreadable. Returns
-    (files, bytes) added."""
-    total = sum(p.stat().st_size for p in new_files)
-    if dry_run:
-        log.info("would add %d file(s) (%.1f MB) to %s", len(new_files), total / 2**20, out_zip.name)
-        return len(new_files), total
-    tmp = out_zip.with_name(out_zip.name + ".tmp")
-    shutil.copy2(out_zip, tmp)
-    n = 0
-    with zipfile.ZipFile(tmp, "a", compression=compression) as zf:
-        for p in new_files:
-            try:
-                zf.write(p, p.relative_to(arc_root))
-                n += 1
-            except FileNotFoundError:
-                log.warning("vanished while zipping (pruned?): %s", p)
-    os.replace(tmp, out_zip)
-    log.info("added %d file(s) to %s  (now %.1f MB)", n, out_zip.name,
-             out_zip.stat().st_size / 2**20)
-    return n, total
+def archived_names_across(parts: list[Path]) -> set[str] | None:
+    """Union of the arcnames a day's parts hold, or None if ANY of them is unreadable.
+
+    All-or-nothing on purpose. A part we cannot read is a part whose contents we cannot rule out,
+    and treating it as empty would write files it already holds into yet another part -- storing
+    the same footage twice and making the duplicate look like a top-up that was needed."""
+    have: set[str] = set()
+    for part in parts:
+        names = archived_names(part)
+        if names is None:
+            return None
+        have |= names
+    return have
 
 
 def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
@@ -265,26 +290,29 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             source = settled
         if not source:
             continue  # a pruned-empty leftover folder; nothing to archive
-        out_zip = out_dir / f"{stem}.zip"
-        if out_zip.exists():
-            have = archived_names(out_zip)
+        parts = archive_parts(out_dir, stem)
+        if parts:
+            have = archived_names_across(parts)
             if have is None:
-                log.warning("%s exists but cannot be read -- leaving it alone; check it by hand "
-                            "(a good archive is never overwritten by this script)", out_zip.name)
+                log.warning("%s: one of its %d archive(s) cannot be read -- leaving the whole day "
+                            "alone; check it by hand (a good archive is never overwritten or "
+                            "duplicated by this script)", stem, len(parts))
                 stats["skipped"] += 1
                 continue
             new = [p for p in source if p.relative_to(ROOT).as_posix() not in have]
             if not new:
                 stats["skipped"] += 1
                 continue
-            log.info("%s gained %d file(s) since it was archived (%d already in it): merging",
-                     out_zip.name, len(new), len(have))
-            n, b = add_to_zip(new, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
-                              dry_run=dry_run)
+            out_zip = next_part(out_dir, stem, parts)
+            log.info("%s gained %d file(s) since it was archived (%d already across %d archive(s))"
+                     ": writing %s -- the sealed part(s) are not touched",
+                     stem, len(new), len(have), len(parts), out_zip.name)
+            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                            dry_run=dry_run, files=new)
             stats["merged"] += 1
         else:
-            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
-                            dry_run=dry_run, files=source)
+            n, b = zip_tree(day, out_dir / f"{stem}.zip", arc_root=ROOT,
+                            compression=zipfile.ZIP_STORED, dry_run=dry_run, files=source)
             stats["created"] += 1
         stats["files"] += n
         stats["bytes"] += b
@@ -665,7 +693,12 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
               before the multi-camera layout are just clips-<date>.zip). Uncompressed
               inside -- mp4 already is. The highlight reels (clips/reels/ on the machine)
               are NOT here: each is stitched from these clips and rebuilds itself on demand.
-  crops/      one zip per calendar day of detection crops (JPEGs)
+              A day whose clips arrived in more than one batch -- the trail-cam card is
+              dumped and put straight back in the camera, so its dump day always does --
+              has extra parts beside it: clips-<camera>-<date>.part2.zip, .part3.zip. They
+              are the rest of that same day, not duplicates. Unzip ALL of a day's parts;
+              no file is in two of them.
+  crops/      one zip per calendar day of detection crops (JPEGs), same .partN rule
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config,
                                         certified reference photos, the DB's import and

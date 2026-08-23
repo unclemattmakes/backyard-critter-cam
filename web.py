@@ -607,6 +607,21 @@ def _archive_zip_for(clip_path: str):
     return None
 
 
+def _archive_candidates(zdir: Path, zip_name: str):
+    """Every archive that could hold this day's clip, base first then parts.
+
+    backup.py writes a day as <stem>.zip and adds <stem>.part2.zip, .part3.zip, ... for whatever
+    a later trail-cam import backfilled into that date, rather than rewriting the sealed archive.
+    So the member is in exactly one of them and which one is not predictable from the path."""
+    base = zdir / zip_name
+    found = [base] if base.is_file() else []
+    try:
+        found += sorted(zdir.glob(zip_name[:-len(".zip")] + ".part*.zip"))
+    except OSError:
+        pass
+    return found
+
+
 def _prune_archive_cache(cache_root: Path, keep: int = _ARCHIVE_CACHE_KEEP) -> None:
     """Cap the restored-clip cache to the `keep` most-recently-used mp4s (restored originals AND
     their transcodes). Deleting is always safe: the zips still hold the originals, so a re-click
@@ -641,21 +656,25 @@ def _restore_archived_clip(backup_dest, clip_path: str, cache_root: Path):
         pass
     if not backup_dest:
         return None
-    zpath = Path(backup_dest) / "clips" / zip_name
-    if not zpath.is_file():
+    candidates = _archive_candidates(Path(backup_dest) / "clips", zip_name)
+    if not candidates:
         return None
     with _lock_for("archive:" + member):            # concurrent range requests restore once
-        try:
-            if out.is_file() and out.stat().st_size > 0:
-                return out
-            with zipfile.ZipFile(zpath) as zf, zf.open(member) as src:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                tmp = out.with_suffix(".tmp.mp4")
-                with open(tmp, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 1 << 20)
-                tmp.replace(out)                    # atomic publish, like the transcode cache
-        except (KeyError, OSError, zipfile.BadZipFile):
-            return None
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+        for zpath in candidates:
+            try:
+                with zipfile.ZipFile(zpath) as zf, zf.open(member) as src:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = out.with_suffix(".tmp.mp4")
+                    with open(tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
+                    tmp.replace(out)                # atomic publish, like the transcode cache
+                break
+            except (KeyError, OSError, zipfile.BadZipFile):
+                continue        # not in this part, or this part is unreadable -- try the next
+        else:
+            return None         # no part held it
     _prune_archive_cache(cache_root)
     return out
 
