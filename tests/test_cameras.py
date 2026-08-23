@@ -33,7 +33,7 @@ import cameras
 
 # ---- safe_src: a camera password must never reach the log ---------------------------
 
-REOLINK = "rtsp://rig:hunter2@192.168.0.105:554/h264Preview_01_sub"
+REOLINK = "rtsp://rig:hunter2@192.168.1.105:554/h264Preview_01_sub"
 
 
 def test_int_index_is_unchanged():
@@ -45,7 +45,7 @@ def test_int_index_is_unchanged():
 def test_rtsp_password_is_masked_and_everything_else_survives():
     out = cameras.safe_src(REOLINK)
     assert "hunter2" not in out
-    assert out == "'rtsp://rig:***@192.168.0.105:554/h264Preview_01_sub'"
+    assert out == "'rtsp://rig:***@192.168.1.105:554/h264Preview_01_sub'"
 
 
 def test_username_survives_because_a_rejected_login_is_the_thing_you_debug():
@@ -53,9 +53,9 @@ def test_username_survives_because_a_rejected_login_is_the_thing_you_debug():
 
 
 def test_password_containing_an_at_sign_is_still_fully_masked():
-    out = cameras.safe_src("rtsp://rig:p@ss@192.168.0.105:554/stream")
+    out = cameras.safe_src("rtsp://rig:p@ss@192.168.1.105:554/stream")
     assert "p@ss" not in out
-    assert out == "'rtsp://rig:***@192.168.0.105:554/stream'"
+    assert out == "'rtsp://rig:***@192.168.1.105:554/stream'"
 
 
 def test_url_without_credentials_is_untouched():
@@ -82,7 +82,7 @@ def test_secret_query_parameter_is_masked_by_name():
 
 def test_url_splits_into_columns():
     assert cameras.parse_stream_url(REOLINK) == {
-        "url_scheme": "rtsp", "url_host": "192.168.0.105", "url_port": 554,
+        "url_scheme": "rtsp", "url_host": "192.168.1.105", "url_port": 554,
         "url_path": "h264Preview_01_sub", "username": "rig", "password": "hunter2"}
 
 
@@ -161,7 +161,7 @@ def test_a_file_path_src_is_not_seeded():
 # ---- the table: CRUD, tombstones, and the password ------------------------------------
 
 def _net(conn, source="yard_ir", **kw):
-    kw.setdefault("url_host", "192.168.0.105")
+    kw.setdefault("url_host", "192.168.1.105")
     kw.setdefault("url_port", 554)
     kw.setdefault("url_path", "h264Preview_01_sub")
     kw.setdefault("username", "rig")
@@ -230,10 +230,10 @@ def test_update_without_a_password_leaves_the_stored_one_alone(conn):
     """The edit form can never show the operator the stored password, so submitting the form
     must not be able to wipe it."""
     cam = _net(conn, password="hunter2")
-    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.0.199",
+    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.1.199",
                      url_path="h264Preview_01_main", username="rig")
     assert db.camera_password(conn, "yard_ir") == "hunter2"
-    assert db.list_cameras(conn)[0]["url_host"] == "192.168.0.199"
+    assert db.list_cameras(conn)[0]["url_host"] == "192.168.1.199"
 
 
 def test_an_empty_password_string_also_leaves_it_alone(conn):
@@ -279,7 +279,7 @@ def test_a_host_that_is_really_a_url_is_refused(conn):
     beats assembling rtsp://rtsp://user:pass@host/path and reporting 'could not open'."""
     with pytest.raises(ValueError, match="just the address"):
         db.add_camera(conn, source="net", kind="network",
-                      url_host="rtsp://rig:pw@192.168.0.105:554/x")
+                      url_host="rtsp://rig:pw@192.168.1.105:554/x")
 
 
 def test_control_characters_are_refused(conn):
@@ -337,10 +337,10 @@ def test_the_database_wins_over_config_and_says_so(conn):
     cfg = _cfg([config.CameraSpec("yard_ir", REOLINK)])
     cameras.load_specs(cfg, conn)
     cam = db.list_cameras(conn)[0]
-    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.0.199",
+    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.1.199",
                      url_port=554, url_path="h264Preview_01_main", username="rig")
     specs, notes = cameras.load_specs(cfg, conn)
-    assert "192.168.0.199" in str(specs[0].src)
+    assert "192.168.1.199" in str(specs[0].src)
     assert any("differs from config_local.py" in n for n in notes)
 
 
@@ -348,7 +348,7 @@ def test_that_note_never_contains_the_password(conn):
     cfg = _cfg([config.CameraSpec("yard_ir", REOLINK)])
     cameras.load_specs(cfg, conn)
     cam = db.list_cameras(conn)[0]
-    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.0.199",
+    db.update_camera(conn, cam["id"], kind="network", url_host="192.168.1.199",
                      username="rig", password="hunter2")
     _, notes = cameras.load_specs(cfg, conn)
     assert notes and not any("hunter2" in n for n in notes)
@@ -358,7 +358,7 @@ def test_a_disabled_camera_is_not_run(conn):
     cfg = _cfg([config.CameraSpec("glass_door_cam", 1), config.CameraSpec("yard_ir", REOLINK)])
     cameras.load_specs(cfg, conn)
     yard = [c for c in db.list_cameras(conn) if c["source"] == "yard_ir"][0]
-    db.update_camera(conn, yard["id"], kind="network", url_host="192.168.0.105",
+    db.update_camera(conn, yard["id"], kind="network", url_host="192.168.1.105",
                      username="rig", enabled=False)
     specs, _ = cameras.load_specs(cfg, conn)
     assert [s.source for s in specs] == ["glass_door_cam"]
@@ -435,7 +435,7 @@ def test_a_password_without_a_username_is_refused(conn):
 def test_clearing_the_username_off_a_camera_that_has_a_password_is_refused(conn):
     cam = _net(conn, password="hunter2")
     with pytest.raises(ValueError, match="username"):
-        db.update_camera(conn, cam["id"], kind="network", url_host="192.168.0.105",
+        db.update_camera(conn, cam["id"], kind="network", url_host="192.168.1.105",
                          username=None)
 
 

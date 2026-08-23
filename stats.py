@@ -1699,10 +1699,28 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         "latest": not date,
         "moon": _moon(anchor - timedelta(days=1)) if label == "night" else None,
     }
+    # EFFORT: was the primary camera even watching this period? (coverage_events ledger --
+    # written by the rig at open/read-fail/reconnect/stop since 2026-08-08.) None = unknown
+    # (the ledger predates this period), and unknown stays silent: absence of evidence must
+    # never render as evidence of coverage. With a known dark stretch, the Dispatch says so
+    # beside its absence claims -- a dark camera is not an empty yard.
+    #
+    # COMPUTED BEFORE THE EMPTY-PERIOD RETURN BELOW, and that ordering is the whole point. It
+    # used to sit after it, so a period with ZERO detections carried no `coverage` key at all
+    # and newsletter.py -- which keys off d.get("coverage") in three places -- rendered a bare
+    # "a quiet night" with the "(camera was dark part of it)" qualifier structurally
+    # unreachable. An empty period is precisely when "was the camera even on?" decides whether
+    # quiet is a finding or a fault, so it is the one case the caveat must never miss.
+    dark_s = db.coverage_dark_seconds(conn, cfg.source, start, end)
+    period_s = max(1.0, (end - start).total_seconds())
+    coverage = (None if dark_s is None else
+                {"source": cfg.source, "dark_minutes": round(dark_s / 60),
+                 "frac_dark": round(dark_s / period_s, 2)})
+
     if not pr:
         conn.close()
         out.update({"empty": True, "visits": 0, "crops": 0, "species": [],
-                    "novel": [], "quiet": [], "visit_log": []})
+                    "novel": [], "quiet": [], "visit_log": [], "coverage": coverage})
         return done(out)
 
     # Clip-motion tracks over the window, for the visit log's one-line motion strips. Fetched
@@ -1715,12 +1733,6 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             ((start - timedelta(minutes=5)).isoformat(), end.isoformat())).fetchall()
     except Exception:
         period_tracks = []                       # an older DB without clip_tracks
-    # EFFORT: was the primary camera even watching this period? (coverage_events ledger --
-    # written by the rig at open/read-fail/reconnect/stop since 2026-08-08.) None = unknown
-    # (the ledger predates this period), and unknown stays silent: absence of evidence must
-    # never render as evidence of coverage. With a known dark stretch, the Dispatch says so
-    # beside its absence claims -- a dark camera is not an empty yard.
-    dark_s = db.coverage_dark_seconds(conn, cfg.source, start, end)
     conn.close()
 
     # --- visits over the period, attributed to every species they contain ---
@@ -1912,13 +1924,10 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         for x in reel:
             x.pop("_score", None)
 
-    period_s = max(1.0, (end - start).total_seconds())
     out.update({
         "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
         "n_surprising": n_surprising,
-        "coverage": (None if dark_s is None else
-                     {"source": cfg.source, "dark_minutes": round(dark_s / 60),
-                      "frac_dark": round(dark_s / period_s, 2)}),
+        "coverage": coverage,
         "novel": novel, "quiet": quiet[:4], "reel": reel, "visit_log": visit_log,
         "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
                   "conf": round(plate["species_confidence"] or plate["confidence"] or 0.0, 3),

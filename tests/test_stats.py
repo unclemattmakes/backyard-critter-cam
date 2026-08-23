@@ -44,6 +44,60 @@ def test_period_digest_empty_db(conn, db_path):
     assert isinstance(d, dict)            # returns a dict (empty:true), never raises
 
 
+def test_an_empty_period_still_reports_the_dark_camera(conn, db_path):
+    """A period with no detections must STILL say whether the camera was watching.
+
+    The regression this pins: `coverage` was computed AFTER the empty-period early return, so
+    a night with zero detections carried no `coverage` key at all -- and newsletter.py keys off
+    d.get("coverage") in three places. The Dispatch therefore rendered a bare "a quiet night"
+    with "(camera was dark part of it)" structurally unreachable, on exactly the night the
+    distinction matters most: quiet because nothing came, or quiet because nothing was looking?
+
+    test_newsletter.py's own dark-camera test could never have caught it -- that one hands a
+    coverage dict straight to compose_subject(), so it exercises the renderer while the break
+    was in the producer. This test goes through period_digest for that reason.
+    """
+    cfg = _cfg(db_path)
+    tz = datetime.now().astimezone().tzinfo
+    pinned = datetime(2026, 8, 12, 9, 0, 0, tzinfo=tz)      # a morning -> the 'night' edition
+
+    # Ask once to learn the window the digest picked, rather than reimplementing (and later
+    # drifting from) that derivation here.
+    first = stats.period_digest(cfg, now=pinned)
+    assert first["empty"] is True
+    start = datetime.fromisoformat(first["start"])
+    end = datetime.fromisoformat(first["end"])
+    assert start < end
+
+    def ev(event, at, reason=None):
+        conn.execute("INSERT INTO coverage_events (source, event, at, reason) VALUES (?,?,?,?)",
+                     (cfg.source, event, at.isoformat(), reason))
+
+    # Watching from before the window opens (so the ledger can speak for it), dark for 40
+    # minutes inside it, back up afterwards.
+    ev("up", start - timedelta(minutes=5), "opened")
+    ev("down", start + timedelta(minutes=10), "read-failed")
+    ev("up", start + timedelta(minutes=50), "reconnected")
+    conn.commit()
+
+    d = stats.period_digest(cfg, now=pinned)
+    assert d["empty"] is True                               # still nobody came
+    assert d.get("coverage") is not None, \
+        "an empty period must still carry its coverage verdict, not drop the key"
+    assert d["coverage"]["dark_minutes"] == 40
+    assert d["coverage"]["source"] == cfg.source
+
+
+def test_an_empty_period_with_no_ledger_admits_ignorance(conn, db_path):
+    """...and when the ledger cannot speak for the window, coverage is None -- NOT zero.
+    Absence of evidence must never render as evidence that the camera was watching."""
+    cfg = _cfg(db_path)
+    tz = datetime.now().astimezone().tzinfo
+    d = stats.period_digest(cfg, now=datetime(2026, 8, 12, 9, 0, 0, tzinfo=tz))
+    assert d["empty"] is True
+    assert d["coverage"] is None
+
+
 # ---- small populated database ------------------------------------------------------
 def test_compute_stats_counts_crops(conn, db_path):
     for _ in range(3):

@@ -67,7 +67,7 @@ see [Try it on footage you already have](#try-it-on-footage-you-already-have).
 ## How it works
 
 ```
-USB webcam (OpenCV / DirectShow)
+Camera feed (OpenCV: DirectShow for a USB webcam, FFMPEG for an RTSP/HTTP stream)
    -> MOG2 motion gate          cheap background subtraction; skips still frames
    -> MegaDetector v6 (CUDA)    runs only on frames with real motion, rate-limited
    -> per detection:            draw box + save crop + score shot-quality + SQLite row,
@@ -301,12 +301,22 @@ def apply(cfg):
     cfg.latitude, cfg.longitude = 40.7128, -74.0060
     cfg.cameras = [
         CameraSpec("glass_door_cam", 0, name="Glass door"),                 # USB webcam, index 0
+        # ...or the same camera over the network, once it outgrows one PC -- a Raspberry Pi
+        # running ustreamer forwards a USB webcam's own JPEG frames untouched:
+        # CameraSpec("glass_door_cam", "http://192.168.1.60:8080/stream", name="Glass door"),
         CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
                    name="Yard (night IR)"),                                  # RTSP/PoE IP camera
         CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
                    name="Feeder (ESP32)", frame_width=640, frame_height=480, motion_min_area=300),
     ]
 ```
+
+**A camera does not have to stay bolted to the rig.** Moving a USB webcam onto a cheap
+single-board computer and pointing the rig at it over HTTP is the same three-line change as any
+other network camera — and if the bridge forwards the camera's **own JPEG frames** rather than
+re-encoding them, the pixels the detector sees do not change, so `motion_min_area`, the ignore
+zones and `crop_quality` all stay comparable across the move. That is how this rig's glass-door
+camera survived being separated from the machine that watches it.
 
 `src` is anything OpenCV's `VideoCapture` accepts: an **int** webcam index, or a **URL** — `rtsp://…`
 for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Per-camera fields
@@ -342,6 +352,11 @@ python tools/camprobe.py <ip> --user <camera-user>      # CAM_PASS from the envi
 It walks port → RTSP challenge → credentials → which stream paths exist, measures what each
 stream costs to decode, suggests a `motion_min_area` for its resolution, and saves a test frame.
 Passwords are masked in everything it prints.
+
+**`camprobe` speaks RTSP only** — it refuses any other scheme rather than guessing, so it cannot
+check an HTTP MJPEG source (a Pi bridge, an ESP32-CAM, a phone app). Those have a simpler test
+anyway: **open the stream URL in a browser tab.** If it plays there, it will open for the rig,
+and you have also answered the Protocol dropdown's question.
 
 - **Networked cameras** are opened through OpenCV's FFMPEG backend with a 1-frame buffer (so the
   stream can't lag behind the detector), forced to **TCP** transport, and reconnected with
@@ -464,8 +479,11 @@ has grown from a single live feed into **nine tabs**:
   ← / → to step through the strip.
 
 There's also an **Instrument Panel** (the ⚙ modal): live camera controls — exposure, gain,
-focus, white balance — read from and pushed to the *running* camera, so you can dial in the
-glass-door shot without restarting (a live companion to `tune.py`).
+focus, white balance — read from and pushed to the *running* camera, so you can dial in the shot
+without restarting (a live companion to `tune.py`). **USB cameras only.** A networked camera
+owns its own exposure and white balance, and there is no UVC control channel over a stream, so
+the panel shows a note instead of sliders for those — which is also the quickest way to confirm
+the rig really is treating a camera as networked.
 
 - Built on Python's stdlib `http.server` — **no web framework, no new dependencies**.
 - **Localhost only** by default (it shows your camera), with LAN access an explicit opt-in and

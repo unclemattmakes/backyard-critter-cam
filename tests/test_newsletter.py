@@ -561,8 +561,8 @@ def test_dashboard_base_prefers_lan_ip_over_hostname(tmp_path, monkeypatch):
     """A bare Windows hostname does not resolve from a phone (mDNS, not NetBIOS), and the phone
     is where this is read -- so the LAN IP wins whenever one can be found."""
     cfg = mkcfg(tmp_path, email_dashboard_url=None)
-    monkeypatch.setattr(newsletter, "_lan_ip", lambda: "192.168.0.101")
-    assert newsletter.dashboard_base(cfg) == "http://192.168.0.101:8000"
+    monkeypatch.setattr(newsletter, "_lan_ip", lambda: "192.168.1.101")
+    assert newsletter.dashboard_base(cfg) == "http://192.168.1.101:8000"
     # No LAN to find -> the hostname is still better than nothing.
     monkeypatch.setattr(newsletter, "_lan_ip", lambda: None)
     assert newsletter.dashboard_base(cfg).startswith("http://")
@@ -592,21 +592,21 @@ def test_lan_ip_refuses_a_public_address(monkeypatch):
 
     monkeypatch.setattr(newsletter.socket, "socket", lambda *a: FakeSock("8.8.8.8"))
     assert newsletter._lan_ip() is None
-    monkeypatch.setattr(newsletter.socket, "socket", lambda *a: FakeSock("192.168.0.101"))
-    assert newsletter._lan_ip() == "192.168.0.101"
+    monkeypatch.setattr(newsletter.socket, "socket", lambda *a: FakeSock("192.168.1.101"))
+    assert newsletter._lan_ip() == "192.168.1.101"
 
 
 def test_dashboard_answering(monkeypatch):
     import contextlib
     monkeypatch.setattr(newsletter.socket, "create_connection",
                         lambda addr, timeout: contextlib.nullcontext())
-    assert newsletter.dashboard_answering("http://192.168.0.101:8000") is True
+    assert newsletter.dashboard_answering("http://192.168.1.101:8000") is True
 
     def refuse(addr, timeout):
         raise OSError("connection refused")
 
     monkeypatch.setattr(newsletter.socket, "create_connection", refuse)
-    assert newsletter.dashboard_answering("http://192.168.0.101:8000") is False
+    assert newsletter.dashboard_answering("http://192.168.1.101:8000") is False
     assert newsletter.dashboard_answering("not a url") is None
 
 

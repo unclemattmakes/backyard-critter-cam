@@ -37,7 +37,7 @@ python -m http.server 8011 --directory making-of
 
 ```
 making-of/
-  index.html        chapters 00–09 + the eight demo mounts
+  index.html        chapters 00–10 + the eight demo mounts
   makingof.css       the field-journal skin (lifted from ../dashboard.css)
   makingof.js        boot: loads data, fills meta, mounts demos, nav + reveal
   demos/             one file per demo, each registers against window.MakingOf
