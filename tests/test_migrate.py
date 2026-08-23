@@ -75,7 +75,8 @@ def env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(migrate.heavyio, "acquire", lambda *a, **k: 0)
     monkeypatch.setattr(migrate.heavyio, "release", lambda *a, **k: 0)
-    monkeypatch.setattr(migrate.heavyio, "wait_drive_quiet", lambda *a, **k: 0)
+    monkeypatch.setattr(migrate.heavyio, "wait_drive_quiet",
+                        lambda *a, **k: migrate.heavyio.DRIVE_DRAINED)
     monkeypatch.setattr(migrate, "HF_HUB", tmp_path / "hf-hub")
     monkeypatch.setattr(migrate, "PACK_SETTLE_S", 0.0)
     return use
@@ -731,3 +732,39 @@ def test_dry_run_on_an_existing_rig_changes_nothing_and_says_why(env, tmp_path, 
     assert (new / "backyard.db").read_bytes() == before
     assert not list(new.glob("replaced-rig-*"))
     assert "already a rig here" in capsys.readouterr().out
+
+
+# --- a bundle is not finished until it has actually gone somewhere ------------------------
+
+def test_pack_will_not_recommend_a_bundle_whose_upload_never_finished(
+        env, tmp_path, monkeypatch, capsys):
+    """pack() called wait_drive_quiet in a finally block and dropped the return value, and
+    wait_drive_quiet returned 0 whether it drained or timed out. So a pack whose upload was
+    still running printed "Packed this rig into: ..." and then told you to go and restore from
+    it on another machine -- the exact circumstance in which a file that is only in Drive's
+    local cache gets mistaken for a file that is in the cloud."""
+    old, dest = tmp_path / "old", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+    monkeypatch.setattr(migrate.heavyio, "wait_drive_quiet",
+                        lambda *a, **k: migrate.heavyio.DRIVE_TIMEOUT)
+
+    assert migrate.pack(dest, include_weights=False) == 0     # the WRITING still succeeded
+    out = capsys.readouterr().out
+    assert "DO NOT MIGRATE FROM THIS BUNDLE YET" in out
+    # Before the instructions, not after them -- nobody reads a caveat printed under a to-do list.
+    assert out.index("DO NOT MIGRATE") < out.index("Next:")
+
+
+def test_pack_gives_the_plain_instructions_once_the_upload_has_drained(env, tmp_path, capsys):
+    """The positive control for the test above: the warning must not become background noise."""
+    old, dest = tmp_path / "old", tmp_path / "bundle"
+    use = env
+    use(old)
+    build_old_rig(old)
+
+    assert migrate.pack(dest, include_weights=False) == 0
+    out = capsys.readouterr().out
+    assert "DO NOT MIGRATE" not in out
+    assert "Next:" in out

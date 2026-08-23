@@ -53,6 +53,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import zipfile
 from datetime import date, datetime
@@ -75,6 +76,11 @@ DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # second time, in a form nothing restores from. Named one by one rather than pattern-matched, so
 # that anything ELSE appearing under a media root is still surfaced as the surprise it is.
 NOT_ARCHIVED = frozenset({"reels"})
+
+# Free space a DB snapshot needs where it is BUILT, as a multiple of the database's own size: one
+# full uncompressed copy, plus slack. A snapshot that dies half-written for want of disk looks
+# exactly like a snapshot that died of corruption, so this is checked up front and named.
+SCRATCH_HEADROOM = 1.15
 
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
@@ -285,33 +291,122 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
     return stats
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    """Is `path` inside `root` once both are resolved?"""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _scratch_parent(db_path: Path, out_dir: Path) -> Path:
+    """Where to BUILD the database snapshot: somewhere local with room for a full copy, and never
+    inside `out_dir`.
+
+    The whole point is to keep the scratch copy away from the sync client -- see snapshot_db. The
+    system temp dir is first choice; the database's own directory is the fallback, because a
+    machine whose OS partition is too small to hold a copy of the database is demonstrably still
+    holding one where the database already lives."""
+    need = int(db_path.stat().st_size * SCRATCH_HEADROOM)
+    rejected: list[str] = []
+    for cand in (Path(tempfile.gettempdir()), db_path.resolve().parent):
+        if _is_within(cand, out_dir):
+            # The regression guard. This is the exact bug being fixed: a scratch file inside the
+            # backup destination is a scratch file the cloud client uploads.
+            rejected.append(f"{cand} (inside the backup destination)")
+            continue
+        try:
+            free = shutil.disk_usage(cand).free
+        except OSError as e:
+            rejected.append(f"{cand} (unreadable: {e})")
+            continue
+        if free >= need:
+            return cand
+        rejected.append(f"{cand} ({free / 2**30:.1f} GB free, needs {need / 2**30:.1f} GB)")
+    raise RuntimeError("nowhere local to build the database snapshot -- tried: "
+                       + "; ".join(rejected))
+
+
+def _sweep_snapshot_scratch(out_dir: Path) -> None:
+    """Delete scratch databases an older version of snapshot_db left in the destination.
+
+    Until 2026-08-23 the snapshot was built INSIDE out_dir and unlinked at the end, so any run
+    that threw in between -- a failed quick_check, a full disk, a killed process -- left a
+    multi-gigabyte .db (and its -wal/-shm) sitting in the cloud folder to be uploaded forever.
+    The finished archive is the .zip beside them; these are pure garbage. Matched by this
+    function's own private prefix, so nothing else can be caught by it."""
+    for stale in sorted(out_dir.glob(".snapshot-*.db*")):
+        try:
+            mb = stale.stat().st_size / 2**20
+            stale.unlink()
+            log.warning("removed a stray snapshot scratch file from an older run: %s (%.1f MB) "
+                        "-- it was never part of any archive", stale.name, mb)
+        except OSError as e:
+            log.warning("could not remove stray scratch file %s: %s", stale.name, e)
+
+
 def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> None:
     """Consistent point-in-time copy of the live WAL database via the SQLite backup API, then
     quick_check'd -- a snapshot that doesn't open cleanly is worse than none, because it looks
-    like a backup. Same-day reruns replace the day's snapshot."""
+    like a backup. Same-day reruns replace the day's snapshot.
+
+    The scratch copy is built in a LOCAL directory and only the finished zip is written to
+    `out_dir`. That distinction is the whole of this function's cost model: out_dir is normally a
+    cloud-synced folder, and a sync client uploads what it SEES, not what survives. Building the
+    2.1 GB uncompressed scratch DB there meant Drive queued it the moment it appeared, and the
+    unlink at the end came far too late to stop that -- every run spent ~2.1 GB of uplink (~11 min
+    on this rig's measured 25 Mbit/s) shipping a file that no longer existed, on top of the ~1.5 GB
+    zip that is the actual artifact. Confirmed 2026-08-23 by reading DriveFS's own `operations`
+    table during a run: `.snapshot-2026-08-23.db` and its `-wal` sidecar were queued alongside the
+    real archives. Worse, a queued operation naming a path that is now gone need not ever clear.
+
+    Note the sidecars: SQLite gives the destination the source database's WAL header, so a `-wal`
+    (and `-shm`) appears beside the scratch copy and had to move with it. They live and die inside
+    the TemporaryDirectory now -- which also means a throw anywhere below no longer strands a
+    multi-gigabyte file in the cloud folder, as the old success-path-only unlink did.
+
+    This function is NOT yet free of that class of cost, and the same operations table says so:
+    the finished zip is still staged as `<name>.zip.tmp` INSIDE out_dir before os.replace renames
+    it, and Drive uploads that staging file as an INDEPENDENT operation -- the pair survives the
+    rename rather than being cancelled by it, so the ~1.5 GB archive still goes up twice. Staging
+    through a `.tmp` is load-bearing (a crash must never leave a truncated archive under the final
+    name), and every zip writer in this module does it, so moving the staging file out of the
+    synced folder is one deliberate change across all of them rather than a fix smuggled in here."""
     out_zip = out_dir / f"backyard-db-{today.isoformat()}.zip"
     if dry_run:
         log.info("would snapshot %s (%.1f MB) -> %s", db_path.name, db_path.stat().st_size / 2**20, out_zip.name)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_db = out_dir / f".snapshot-{today.isoformat()}.db"
-    src = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=60)
-    try:
-        dst = sqlite3.connect(tmp_db)
+    _sweep_snapshot_scratch(out_dir)
+    scratch_parent = _scratch_parent(db_path, out_dir)
+    log.debug("building the db snapshot in %s", scratch_parent)
+    with tempfile.TemporaryDirectory(prefix="backyard-snapshot-", dir=scratch_parent) as td:
+        tmp_db = Path(td) / db_path.name
+        src = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=60)
         try:
-            src.backup(dst)
-            verdict = dst.execute("PRAGMA quick_check").fetchone()[0]
-            if verdict != "ok":
-                raise RuntimeError(f"snapshot failed quick_check: {verdict}")
+            dst = sqlite3.connect(tmp_db)
+            try:
+                src.backup(dst)
+                verdict = dst.execute("PRAGMA quick_check").fetchone()[0]
+                if verdict != "ok":
+                    raise RuntimeError(f"snapshot failed quick_check: {verdict}")
+            finally:
+                dst.close()
         finally:
-            dst.close()
-    finally:
-        src.close()
-    tmp = out_zip.with_name(out_zip.name + ".tmp")
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(tmp_db, db_path.name)
-    os.replace(tmp, out_zip)
-    tmp_db.unlink()
+            src.close()
+        # Closing the last connection checkpoints the WAL back into the .db and removes it. If one
+        # is still here with bytes in it, the .db alone is NOT the whole snapshot, and zipping it
+        # would archive a database quietly missing its newest pages -- the very failure this
+        # function's quick_check exists to prevent, arriving through a different door.
+        wal = tmp_db.with_name(tmp_db.name + "-wal")
+        if wal.exists() and wal.stat().st_size > 0:
+            raise RuntimeError(f"snapshot left an un-checkpointed WAL ({wal.stat().st_size} bytes) "
+                               f"-- refusing to archive an incomplete database")
+        tmp = out_zip.with_name(out_zip.name + ".tmp")
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(tmp_db, db_path.name)
+        os.replace(tmp, out_zip)
     log.info("created %s  (db %.1f MB -> %.1f MB zipped, quick_check ok)", out_zip.name,
              db_path.stat().st_size / 2**20, out_zip.stat().st_size / 2**20)
 
@@ -527,6 +622,33 @@ def write_status(dest: Path, failures: int, dry_run: bool) -> None:
     log.info("wrote STATUS.txt (%d line(s))", len(lines))
 
 
+def _note_upload_status(dest: Path, drive: str) -> None:
+    """Append the cloud-upload verdict to STATUS.txt.
+
+    STATUS.txt is written BEFORE the upload wait, so that a crash during the wait still leaves a
+    heartbeat behind; this adds afterwards the one fact that cannot be known before. It earns its
+    place because STATUS.txt is this project's only notification channel: "backup: ok" printed by
+    a run whose upload never finished is exactly the reassuring lie the file exists to prevent."""
+    text = {
+        heavyio.DRIVE_DRAINED: "cloud upload: finished",
+        heavyio.DRIVE_ABSENT: "cloud upload: no sync client running -- these archives are on the "
+                              "rig's own disk ONLY",
+        heavyio.DRIVE_TIMEOUT: "cloud upload: STILL RUNNING when the backup stopped waiting "
+                               "<-- the newest archives may not be in the cloud yet",
+        heavyio.DRIVE_UNKNOWN: "cloud upload: UNKNOWN -- the check could not run at all "
+                               "<-- treat the newest archives as NOT uploaded",
+    }.get(drive, f"cloud upload: {drive}")
+    if drive in heavyio.DRIVE_OK:
+        log.info("%s", text)
+    else:
+        log.warning("%s", text)
+    try:
+        with (dest / "STATUS.txt").open("a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError as e:
+        log.warning("could not append the upload verdict to STATUS.txt: %s", e)
+
+
 def _older_than_days(iso_ts, days: int) -> bool:
     t = db.parse_local(iso_ts) if iso_ts else None
     if t is None:
@@ -685,12 +807,18 @@ def main() -> int:
     # "finished". Holding the lock across the upload is the entire point: the next heavy job waits
     # for the network to go quiet, not just for the writing to stop. Fails open on a timeout.
     if not args.dry_run:
+        drive = heavyio.DRIVE_UNKNOWN
         try:
-            heavyio.wait_drive_quiet(timeout_s=3600)
+            drive = heavyio.wait_drive_quiet(timeout_s=3600)
         except Exception:
             log.exception("waiting for the cloud upload to settle failed")  # never sink a backup
         finally:
             heavyio.release("backup")
+        # The verdict does not change the exit code: the backup's own job -- writing the archives
+        # -- succeeded or failed on its own terms, and failing a weekly run because the uplink was
+        # slow would train the owner to ignore the one channel he has. It goes in STATUS.txt
+        # instead, where "not uploaded" is readable next to "backup: ok".
+        _note_upload_status(dest, drive)
     return 1 if failures else 0
 
 

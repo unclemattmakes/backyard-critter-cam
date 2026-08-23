@@ -29,6 +29,8 @@ USAGE
     python heavyio.py --release batch
     python heavyio.py --status
     python heavyio.py --drive-quiet --timeout 1800    # block until Drive stops uploading
+                                                     # exit 0 = drained or Drive absent,
+                                                     # exit 1 = timed out or check unavailable
 """
 from __future__ import annotations
 
@@ -58,6 +60,24 @@ MAX_LOCK_AGE_S = 8 * 3600
 DRIVE_IDLE_BYTES_PER_S = 256 * 1024
 DRIVE_SAMPLE_S = 5.0
 DRIVE_CONSECUTIVE_IDLE = 6          # ~30s of calm before we believe it
+
+# What wait_drive_quiet() actually found. Strings, not a bare 0, because "it drained", "I gave up
+# waiting" and "I could not check at all" are three different facts and the caller's next move
+# differs for each. This used to return 0 for all three: migrate.py pack() therefore reported a
+# clean bundle for an upload that never finished, which for a machine migration is the one lie
+# that costs you the data.
+DRIVE_DRAINED = "drained"       # Drive went quiet -- the upload is done
+DRIVE_ABSENT = "absent"         # Drive is not running; there is genuinely nothing to wait for
+DRIVE_TIMEOUT = "timeout"       # still moving bytes when the timeout expired
+DRIVE_UNKNOWN = "unknown"       # the check itself could not run -- NOT the same as "absent"
+
+# The two outcomes that mean "no upload is outstanding". Callers should test membership rather
+# than equality, so a future outcome is handled by the honest branch by default.
+DRIVE_OK = frozenset({DRIVE_DRAINED, DRIVE_ABSENT})
+
+
+class DriveCheckUnavailable(RuntimeError):
+    """The Drive check could not run at all, as opposed to running and finding Drive idle."""
 
 
 def _alive(pid: int) -> bool:
@@ -186,11 +206,18 @@ def _drive_io_bytes() -> int | None:
     """Total bytes read+written by every Google Drive process, or None if Drive is not running.
 
     Counting the PROCESS io counters rather than the G: volume on purpose: G: is a virtual mount
-    whose apparent traffic includes cache reads we cause ourselves just by listing it."""
+    whose apparent traffic includes cache reads we cause ourselves just by listing it.
+
+    Raises DriveCheckUnavailable when psutil cannot be imported. That used to return None -- the
+    same value as "Drive is not running" -- and every caller reads None as "nothing to wait for".
+    So on 2026-08-23, a pack run under the SYSTEM interpreter instead of .venv announced "Google
+    Drive is not running" while Drive was running and uploading, skipped the wait, and exited 0.
+    A check that cannot run must never be indistinguishable from a check that passed."""
     try:
         import psutil
-    except Exception:
-        return None
+    except Exception as e:
+        raise DriveCheckUnavailable(
+            f"psutil is not importable by {sys.executable}: {e}") from e
     total, found = 0, False
     for proc in psutil.process_iter(["name"]):
         try:
@@ -205,18 +232,35 @@ def _drive_io_bytes() -> int | None:
     return total if found else None
 
 
-def wait_drive_quiet(timeout_s: float = 1800.0) -> int:
-    """Block until Google Drive stops moving bytes, or `timeout_s` elapses.
+def wait_drive_quiet(timeout_s: float = 1800.0) -> str:
+    """Block until Google Drive stops moving bytes, or `timeout_s` elapses. Returns a DRIVE_*.
 
     This is the half of the fix that actually matters. backup.py logging "finished in 498 s" means
     THE ZIPS ARE ON DISK -- Drive then uploads them on its own schedule, for as long as it takes,
     and on 2026-08-21 that upload was still running when the batch started and the box died. So
-    the backup job holds its lock until Drive is done, not until the last zip is written."""
-    if _drive_io_bytes() is None:
+    the backup job holds its lock until Drive is done, not until the last zip is written.
+
+    The RETURN VALUE is the second half of that: this used to return 0 whether Drive drained or
+    the wait timed out, so a caller could not tell "the upload finished" from "I gave up". It
+    still fails open -- nothing here aborts a backup -- but it now says which happened, and the
+    caller decides what that is worth. For a weekly backup a timeout is a warning; for a machine
+    migration it means the bundle you are about to migrate from is not all uploaded yet."""
+    try:
+        first = _drive_io_bytes()
+    except DriveCheckUnavailable as e:
+        # The one outcome that must not be mistaken for good news. Print the interpreter, because
+        # the cause is almost always "ran with the system python instead of the project venv" and
+        # that is the fix, not something about Drive.
+        print(f"[heavyio] WARNING: cannot check Google Drive -- {e}. This is a BROKEN CHECK, not "
+              f"a clear one: if Drive is running, its upload is still going and nothing is "
+              f"waiting for it. Re-run with the project venv (.venv/Scripts/python.exe) to get a "
+              f"real answer.", flush=True)
+        return DRIVE_UNKNOWN
+    if first is None:
         print("[heavyio] Google Drive is not running -- nothing to wait for.", flush=True)
-        return 0
+        return DRIVE_ABSENT
     deadline = time.monotonic() + timeout_s
-    last, t_last, idle_streak = _drive_io_bytes(), time.monotonic(), 0
+    last, t_last, idle_streak = first, time.monotonic(), 0
     print(f"[heavyio] waiting for Google Drive to finish uploading (idle = under "
           f"{DRIVE_IDLE_BYTES_PER_S / 1024:.0f} KB/s for "
           f"{DRIVE_CONSECUTIVE_IDLE * DRIVE_SAMPLE_S:.0f}s)...", flush=True)
@@ -225,21 +269,23 @@ def wait_drive_quiet(timeout_s: float = 1800.0) -> int:
         now, t_now = _drive_io_bytes(), time.monotonic()
         if now is None:                       # Drive exited mid-wait -- nothing left to wait on
             print("[heavyio] Drive went away; treating as quiet.", flush=True)
-            return 0
+            return DRIVE_ABSENT
         rate = (now - last) / max(1e-6, t_now - t_last)
         last, t_last = now, t_now
         if rate < DRIVE_IDLE_BYTES_PER_S:
             idle_streak += 1
             if idle_streak >= DRIVE_CONSECUTIVE_IDLE:
                 print(f"[heavyio] Drive is quiet ({rate / 1024:.0f} KB/s).", flush=True)
-                return 0
+                return DRIVE_DRAINED
         else:
             if idle_streak:
                 print(f"[heavyio]   ...still going ({rate / 2 ** 20:.1f} MB/s)", flush=True)
             idle_streak = 0
-    print(f"[heavyio] WARNING: Drive still busy after {timeout_s / 60:.0f} min. Continuing anyway.",
+    print(f"[heavyio] WARNING: Drive still busy after {timeout_s / 60:.0f} min. Continuing anyway "
+          f"-- but the upload is NOT finished, and anything that depends on these files being in "
+          f"the cloud (a migration, a wipe of this machine) must not treat this as done.",
           flush=True)
-    return 0
+    return DRIVE_TIMEOUT
 
 
 def main() -> int:
@@ -269,7 +315,11 @@ def main() -> int:
         for h in holders:
             print(f"  {h['name']:8s} pid={h['pid']:<7} for {h['age_s'] / 60:5.1f} min  "
                   f"{h.get('note', '')}")
-        print(f"  google drive: {'running' if _drive_io_bytes() is not None else 'not running'}")
+        try:
+            state = "running" if _drive_io_bytes() is not None else "not running"
+        except DriveCheckUnavailable as e:
+            state = f"CANNOT TELL -- {e}"
+        print(f"  google drive: {state}")
         return 0
     if args.acquire:
         return acquire(args.acquire, wait_s=args.wait, note=args.note, owner_pid=args.owner_pid,
@@ -277,7 +327,10 @@ def main() -> int:
     if args.release:
         return release(args.release)
     if args.drive_quiet:
-        return wait_drive_quiet(args.timeout)
+        # Exit code is the honest one here: 0 only if there is genuinely no upload outstanding,
+        # so `heavyio.py --drive-quiet && <next step>` means what it looks like it means. The
+        # in-process callers fail open regardless; this is for shell callers that want to gate.
+        return 0 if wait_drive_quiet(args.timeout) in DRIVE_OK else 1
     ap.print_help()
     return 0
 
