@@ -89,6 +89,9 @@ config_local.py
 .rig_hold
 .rigwatch_state.json
 
+# backup.py's local index of what each day's archives hold; rebuilt by the next run.
+.archive_index/
+
 # ===== What setup actually resolved on THIS machine (torch build, ultralytics, ...) =====
 # Machine-specific provenance for the numbers this machine computes; backup.py archives it
 # with the weekly meta snapshot, so it doesn't belong in a shared repo.
