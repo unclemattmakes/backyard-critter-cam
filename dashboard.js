@@ -3135,6 +3135,17 @@ function camKindChanged(){
     note.classList.toggle('bad', !CAMS.canSecret);
   }
   const pw=$('#cam-password'); if(pw){ pw.disabled=!CAMS.canSecret; }
+  camSchemeChanged();
+}
+
+// Port and stream path only mean anything relative to the protocol, and borrowing them from the
+// wrong family is the failure that reads as a dead camera rather than a wrong setting: an RTSP
+// handshake against an MJPEG server never opens and never says why, it just retries forever.
+// So the hints follow the picker instead of always describing a Reolink.
+function camSchemeChanged(){
+  const el=$('#cam-scheme'); const rtsp = !el || el.value==='rtsp';
+  const p=$('#cam-port'); if(p) p.placeholder = rtsp ? '554' : '8080';
+  const s=$('#cam-path'); if(s) s.placeholder = rtsp ? 'h264Preview_01_sub' : 'stream';
 }
 
 function camForm(show){ const f=$('#cams-form'); if(f) f.hidden=!show;
@@ -3149,6 +3160,7 @@ function camNew(){
   $('#cam-source-row').hidden=false;
   $('#cam-source-note').hidden=false;
   $('#cam-kind').value='network';
+  $('#cam-scheme').value='rtsp';                  // a <select> is not cleared by the .value='' loop
   $('#cam-clips').value=''; $('#cam-enabled').checked=true;
   camKindChanged(); camsMsg(''); camForm(true);
 }
@@ -3165,6 +3177,7 @@ function camEdit(id){
   $('#cam-source-note').hidden=false;
   $('#cam-kind').value=c.kind||'network';
   $('#cam-device-index').value=(c.device_index!=null?c.device_index:'');
+  $('#cam-scheme').value=c.url_scheme||'rtsp';
   $('#cam-host').value=c.url_host||''; $('#cam-port').value=(c.url_port!=null?c.url_port:'');
   $('#cam-path').value=c.url_path||''; $('#cam-username').value=c.username||'';
   $('#cam-password').value='';                    // never prefilled: the server does not send it
@@ -3195,7 +3208,7 @@ function camSave(ev){
   else body.source=($('#cam-source').value||'').trim();
   if(body.kind==='local'){ body.device_index=num('cam-device-index'); }
   else{
-    body.url_scheme='rtsp';
+    body.url_scheme=($('#cam-scheme').value||'rtsp');
     body.url_host=($('#cam-host').value||'').trim();
     body.url_port=num('cam-port');
     body.url_path=($('#cam-path').value||'').trim() || null;
