@@ -27,9 +27,11 @@ diff is by NAME and the merge is append-only; both halves are pinned below.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import zipfile
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -411,3 +413,180 @@ def test_day_dirs_returns_oldest_day_first(project):
 
     assert [d.name for d, _ in backup.day_dirs(project / "clips")] == [
         "2026-07-22", "2026-07-23", "2026-07-24"]
+
+
+# --- the DB snapshot: only FINISHED artifacts belong in the destination -------------------
+#
+# out_dir is normally a cloud-synced folder, and a sync client uploads what it SEES, not what
+# survives. Everything below is about that one distinction.
+
+def _live_db(path: Path, rows: int = 200) -> Path:
+    """A small WAL database standing in for backyard.db."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE detections (id INTEGER PRIMARY KEY, blob TEXT)")
+        conn.executemany("INSERT INTO detections (blob) VALUES (?)",
+                         [("x" * 200,) for _ in range(rows)])
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_the_scratch_database_is_never_created_inside_the_destination(tmp_path, monkeypatch):
+    """THE regression test for the 2026-08-23 fix -- and note what it watches, because the
+    obvious test does not work here.
+
+    The bug was invisible after the fact: the old code built the scratch DB inside out_dir and
+    unlinked it at the end, so when the run finished the destination looked perfectly clean. What
+    mattered was that the file EXISTED there in between, which is all Google Drive needs to queue
+    2.1 GB of it for upload -- confirmed that day by reading DriveFS's own `operations` table
+    mid-run, which listed `.snapshot-2026-08-23.db` and its `-wal` sidecar alongside the real
+    archives, for a file that by then no longer existed. Anything asserting on the final state of
+    the folder passes against the buggy code. So this watches where the scratch is OPENED."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+    opened: list[Path] = []
+    real_connect = backup.sqlite3.connect
+
+    def spy(target, *a, **k):
+        # The source is opened through a file: URI in read-only mode; the scratch is the plain
+        # path, and it is the only one this function ever writes.
+        if not str(target).startswith("file:"):
+            opened.append(Path(target))
+        return real_connect(target, *a, **k)
+    monkeypatch.setattr(backup.sqlite3, "connect", spy)
+
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+
+    assert opened, "no scratch database was opened -- the spy is not wired up"
+    # Deliberately NOT backup._is_within here: this test has to be able to FAIL against the old
+    # code, and the old code has no such helper -- it would error out before reaching the assert.
+    for scratch in opened:
+        assert dest.resolve() not in scratch.resolve().parents, \
+            f"scratch database built inside the backup destination: {scratch}"
+
+
+def test_snapshot_db_puts_only_the_finished_zip_in_the_destination(tmp_path):
+    """Weaker than the test above -- it passes against the old code too, because the old code
+    deleted its scratch on the way out. It is kept for what it DOES catch: a leftover `.zip.tmp`
+    from the atomic rename, a `-wal`/`-shm` sidecar outliving its database, or a future edit that
+    starts writing working files here. Only finished artifacts belong in a synced folder."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+    assert [p.name for p in sorted(dest.iterdir())] == ["backyard-db-2026-08-23.zip"]
+
+
+def test_snapshot_db_archives_a_database_that_still_opens(tmp_path):
+    """A snapshot that doesn't open cleanly is worse than none, because it looks like a backup."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest, out = tmp_path / "dest", tmp_path / "out"
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+    with zipfile.ZipFile(dest / "backyard-db-2026-08-23.zip") as zf:
+        assert zf.namelist() == ["backyard.db"]
+        zf.extract("backyard.db", out)
+    conn = sqlite3.connect(out / "backyard.db")
+    try:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 200
+    finally:
+        conn.close()
+
+
+def test_a_failed_snapshot_strands_nothing_in_the_destination(tmp_path, monkeypatch):
+    """The old cleanup was a bare unlink on the SUCCESS path only, so a throw anywhere after the
+    copy left a multi-gigabyte scratch DB in the cloud folder for real -- not merely queued."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(backup.zipfile, "ZipFile", boom)
+
+    with pytest.raises(RuntimeError):
+        backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+    assert list(dest.iterdir()) == []
+
+
+def test_a_stray_scratch_db_from_an_older_run_is_swept(tmp_path, caplog):
+    """Versions before 2026-08-23 could leave one behind; it is pure garbage, but a sync client
+    uploads it anyway, forever."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / ".snapshot-2026-08-19.db").write_bytes(b"stale" * 100)
+    (dest / ".snapshot-2026-08-19.db-wal").write_bytes(b"stale")
+
+    with caplog.at_level(logging.WARNING):
+        backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+
+    assert [p.name for p in sorted(dest.iterdir())] == ["backyard-db-2026-08-23.zip"]
+    assert "stray snapshot scratch" in caplog.text      # swept loudly, not silently
+
+
+def test_the_scratch_is_refused_if_it_would_land_inside_the_destination(tmp_path, monkeypatch):
+    """The guard that keeps the fix from being undone by the environment: if the system temp dir
+    itself resolves to somewhere under out_dir, that candidate is rejected, not used."""
+    dest = tmp_path / "dest"
+    inside = dest / "tmp"
+    inside.mkdir(parents=True)
+    src = _live_db(tmp_path / "backyard.db")
+    monkeypatch.setattr(backup.tempfile, "gettempdir", lambda: str(inside))
+
+    assert not backup._is_within(backup._scratch_parent(src, dest), dest)
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+    assert (dest / "backyard-db-2026-08-23.zip").is_file()
+    assert not list(dest.rglob("*.db"))                 # nothing database-shaped under dest
+    assert not list(inside.iterdir())                   # the fallback was used, not this
+
+
+def test_a_snapshot_of_a_live_wal_database_is_self_contained(tmp_path):
+    """The rig's actual shape: WAL mode, a writer still connected, and pages that exist only in
+    the -wal (backyard.db carries a ~124 MB one). Two things have to hold at once -- the archive
+    must contain those WAL-resident rows, and it must contain no -wal of its own, because the
+    zip holds a single .db and a database whose newest pages are in a sidecar nobody archived is
+    a backup that restores short."""
+    src = tmp_path / "backyard.db"
+    dest, out = tmp_path / "dest", tmp_path / "out"
+
+    writer = sqlite3.connect(src)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE detections (id INTEGER PRIMARY KEY, blob TEXT)")
+        writer.executemany("INSERT INTO detections (blob) VALUES (?)",
+                           [("x" * 500,) for _ in range(400)])
+        writer.commit()
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")     # main file now holds those
+        writer.executemany("INSERT INTO detections (blob) VALUES (?)",
+                           [("y" * 500,) for _ in range(300)])
+        writer.commit()                                        # these stay in the -wal
+        assert src.with_name(src.name + "-wal").stat().st_size > 0, "setup: expected a live -wal"
+
+        backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+    finally:
+        writer.close()
+
+    assert [q.name for q in sorted(dest.iterdir())] == ["backyard-db-2026-08-23.zip"]
+    with zipfile.ZipFile(dest / "backyard-db-2026-08-23.zip") as zf:
+        assert zf.namelist() == ["backyard.db"]                # no -wal rode along
+        zf.extract("backyard.db", out)
+    conn = sqlite3.connect(out / "backyard.db")
+    try:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 700
+        assert conn.execute(
+            "SELECT COUNT(*) FROM detections WHERE blob LIKE 'y%'").fetchone()[0] == 300
+    finally:
+        conn.close()
+
+
+def test_nowhere_to_build_says_where_it_looked(tmp_path, monkeypatch):
+    """A snapshot that dies half-written for want of disk looks exactly like one that died of
+    corruption, so the space is checked up front and the error names every candidate tried."""
+    src = _live_db(tmp_path / "backyard.db")
+    monkeypatch.setattr(backup.shutil, "disk_usage",
+                        lambda p: SimpleNamespace(total=0, used=0, free=0))
+    with pytest.raises(RuntimeError, match="nowhere local"):
+        backup._scratch_parent(src, tmp_path / "dest")

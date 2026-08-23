@@ -4,7 +4,9 @@ are mostly about the ways a lock can be dead, because the crash this module exis
 exactly the thing that leaves half-written files behind."""
 from __future__ import annotations
 
+import itertools
 import json
+import sys
 import time
 
 import pytest
@@ -113,15 +115,75 @@ def test_held_context_manager_releases_even_on_an_exception():
     assert heavyio.read_holders() == []
 
 
-def test_drive_quiet_returns_immediately_when_drive_is_not_running(monkeypatch):
+def test_drive_quiet_reports_absent_when_drive_is_not_running(monkeypatch):
     monkeypatch.setattr(heavyio, "_drive_io_bytes", lambda: None)
-    assert heavyio.wait_drive_quiet(timeout_s=999) == 0
+    assert heavyio.wait_drive_quiet(timeout_s=999) == heavyio.DRIVE_ABSENT
+    assert heavyio.DRIVE_ABSENT in heavyio.DRIVE_OK      # genuinely nothing outstanding
 
 
-def test_drive_quiet_returns_once_the_byte_counter_stops_climbing(monkeypatch):
+def test_drive_quiet_reports_drained_once_the_byte_counter_stops_climbing(monkeypatch):
     # Busy for a few samples, then flat -- the wait must end, and only after the calm streak.
     seq = iter([0, 50 * 2**20, 100 * 2**20] + [150 * 2**20] * 40)
     monkeypatch.setattr(heavyio, "_drive_io_bytes", lambda: next(seq))
     monkeypatch.setattr(heavyio.time, "sleep", lambda s: None)
     monkeypatch.setattr(heavyio, "DRIVE_SAMPLE_S", 0.0001)
-    assert heavyio.wait_drive_quiet(timeout_s=999) == 0
+    assert heavyio.wait_drive_quiet(timeout_s=999) == heavyio.DRIVE_DRAINED
+    assert heavyio.DRIVE_DRAINED in heavyio.DRIVE_OK
+
+
+def test_giving_up_waiting_is_not_reported_as_a_finished_upload(monkeypatch):
+    """The whole reason these outcomes are not all 0. wait_drive_quiet returned 0 when Drive
+    drained AND when the wait timed out, so migrate.py pack() -- which called it in a finally
+    block and dropped the value on the floor -- announced a complete bundle for an upload that
+    was still running. For a machine migration that is the one lie that costs you the data."""
+    climbing = itertools.count(0, 50 * 2**20)               # never goes idle
+    monkeypatch.setattr(heavyio, "_drive_io_bytes", lambda: next(climbing))
+    monkeypatch.setattr(heavyio.time, "sleep", lambda s: None)
+    monkeypatch.setattr(heavyio, "DRIVE_SAMPLE_S", 0.0001)
+    assert heavyio.wait_drive_quiet(timeout_s=0.05) == heavyio.DRIVE_TIMEOUT
+    assert heavyio.DRIVE_TIMEOUT not in heavyio.DRIVE_OK
+
+
+def test_a_check_that_cannot_run_is_unknown_and_never_absent(monkeypatch, capsys):
+    """None used to mean both "Drive is not running" and "psutil would not import", and every
+    caller reads the first as "nothing to wait for". So on 2026-08-23 a pack run under the SYSTEM
+    interpreter instead of .venv printed the reassuring line, skipped the wait, and exited 0
+    while Drive was uploading."""
+    def no_psutil():
+        raise heavyio.DriveCheckUnavailable(
+            r"psutil is not importable by C:\Python314\python.exe: No module named 'psutil'")
+    monkeypatch.setattr(heavyio, "_drive_io_bytes", no_psutil)
+
+    assert heavyio.wait_drive_quiet(timeout_s=999) == heavyio.DRIVE_UNKNOWN
+    assert heavyio.DRIVE_UNKNOWN not in heavyio.DRIVE_OK
+    out = capsys.readouterr().out
+    assert "BROKEN CHECK" in out
+    assert "python.exe" in out                  # names the interpreter: that IS the diagnosis
+    assert "is not running" not in out          # must never read as the harmless case
+
+
+def test_drive_io_bytes_raises_rather_than_returning_none_when_psutil_is_missing(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)        # makes `import psutil` raise
+    with pytest.raises(heavyio.DriveCheckUnavailable):
+        heavyio._drive_io_bytes()
+
+
+def test_drive_quiet_exit_code_can_gate_a_shell_caller(monkeypatch):
+    """`heavyio.py --drive-quiet && <next step>` has to mean what it looks like it means."""
+    monkeypatch.setattr(sys, "argv", ["heavyio.py", "--drive-quiet"])
+    monkeypatch.setattr(heavyio, "wait_drive_quiet", lambda *a, **k: heavyio.DRIVE_TIMEOUT)
+    assert heavyio.main() == 1
+    monkeypatch.setattr(heavyio, "wait_drive_quiet", lambda *a, **k: heavyio.DRIVE_UNKNOWN)
+    assert heavyio.main() == 1
+    monkeypatch.setattr(heavyio, "wait_drive_quiet", lambda *a, **k: heavyio.DRIVE_DRAINED)
+    assert heavyio.main() == 0
+
+
+def test_status_says_it_cannot_tell_rather_than_not_running(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["heavyio.py", "--status"])
+    monkeypatch.setattr(heavyio, "_drive_io_bytes",
+                        lambda: (_ for _ in ()).throw(heavyio.DriveCheckUnavailable("no psutil")))
+    assert heavyio.main() == 0
+    out = capsys.readouterr().out
+    assert "CANNOT TELL" in out
+    assert "not running" not in out

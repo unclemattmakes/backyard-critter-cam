@@ -121,6 +121,7 @@ def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True,
         dest.mkdir(parents=True, exist_ok=True)
     today = date.today()
     failures = 0
+    drive: str | None = None            # the cloud-upload verdict, once there is one to have
     t0 = time.monotonic()
 
     # Same crash-avoidance as backup.py: this writes even more bytes than a weekly run, so take
@@ -164,17 +165,34 @@ def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True,
     finally:
         if not dry_run:
             try:
-                heavyio.wait_drive_quiet(timeout_s=3600)
+                drive = heavyio.wait_drive_quiet(timeout_s=3600)
             except Exception:
                 log.exception("waiting for the cloud upload to settle failed")
+                drive = heavyio.DRIVE_UNKNOWN
             finally:
                 heavyio.release("migrate")
 
     log.info("pack %s in %.1f s (%d failure(s))",
              "FAILED" if failures else "finished", time.monotonic() - t0, failures)
+    if drive is not None and drive not in heavyio.DRIVE_OK:
+        log.warning("the cloud upload did NOT confirm as finished (%s) -- this bundle is complete "
+                    "on disk but may not be complete in the cloud", drive)
     if not failures and announce:
         print(f"\nPacked this rig into: {dest}"
               + ("\n(dry run -- nothing was written)" if dry_run else ""))
+        if drive is not None and drive not in heavyio.DRIVE_OK:
+            # Before the instructions, not after them: the steps below end with "migrate from
+            # that" on another machine, and nobody reads a caveat printed under a to-do list.
+            print(f"""
+*** DO NOT MIGRATE FROM THIS BUNDLE YET ***
+The cloud upload did not confirm as finished -- it came back "{drive}".
+Every file IS written to the folder above, so a bundle you carry on a USB drive or reach over a
+network share is complete. But if you are relying on that folder syncing to the other machine,
+it is NOT known to have arrived -- a file sitting in the sync client's local cache has not been
+uploaded, and one verified that way was later found gone outright. Confirm it has drained:
+    python heavyio.py --drive-quiet --timeout 3600     (exit 0 = drained; run it from .venv)
+and do not wipe or leave this machine until it does.
+""")
         print(f"""Next:
   * If the rig was RUNNING just now, the newest minutes of media postdate the database
     snapshot. Before the actual move: STOP the rig, run this same pack once more (it only
