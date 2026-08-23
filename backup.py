@@ -218,9 +218,17 @@ def archive_parts(out_dir: Path, stem: str) -> list[Path]:
     base = out_dir / f"{stem}.zip"
     if base.is_file():
         parts.append(base)
-    parts += sorted((q for q in out_dir.glob(f"{stem}.part*.zip") if PART_RE.search(q.name)),
-                    key=_part_index)
-    return parts
+    # Matched by literal prefix rather than a glob pattern. A stem is a directory name off the
+    # disk, and clips.py sanitises camera names to alphanumerics -- but that is an invariant in
+    # another module, and if a `[` ever reached one here a glob would read it as a character class,
+    # find no parts, and write a fresh "part 2" full of the same footage on every single run.
+    prefix = f"{stem}.part"
+    try:
+        found = [q for q in out_dir.iterdir()
+                 if q.name.startswith(prefix) and PART_RE.search(q.name)]
+    except OSError:
+        found = []
+    return parts + sorted(found, key=_part_index)
 
 
 def next_part(out_dir: Path, stem: str, parts: list[Path]) -> Path:

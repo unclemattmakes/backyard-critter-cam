@@ -307,6 +307,28 @@ def test_a_file_already_in_an_earlier_part_is_never_written_again(project, dest)
     assert not (dest / "clips" / f"{STEM}.part3.zip").exists()
 
 
+def test_parts_are_found_even_when_the_camera_name_looks_like_a_glob(project, dest):
+    """A stem is a directory name off the disk. clips.py sanitises camera names to alphanumerics,
+    but that is an invariant in another module -- and if a `[` ever reached one, matching parts by
+    glob PATTERN would read it as a character class, find nothing, and write a fresh "part 2" of
+    the same footage on every run until the archive filled with copies. So the match is by literal
+    prefix, and this is what would catch a regression to a pattern."""
+    odd = "cam[01]"
+    _clips(project, ["a.mp4"], source=odd)
+    _archive(project, dest)
+    _clips(project, ["b.mp4"], source=odd)
+    _archive(project, dest)
+
+    stem = f"clips-{odd}-{DAY}"
+    assert [q.name for q in backup.archive_parts(dest / "clips", stem)] == [
+        f"{stem}.zip", f"{stem}.part2.zip"]
+
+    stats = _archive(project, dest)              # nothing new: must not write a third part
+    assert stats["merged"] == 0
+    assert not (dest / "clips" / f"{stem}.part3.zip").exists()
+    assert _basenames_across(dest / "clips", stem) == {"a.mp4", "b.mp4"}
+
+
 def test_an_unreadable_part_leaves_the_whole_day_alone(project, dest, caplog):
     """A part we cannot read is a part whose contents we cannot rule out. Treating it as empty
     would copy everything it holds into yet another part -- storing the footage twice and making

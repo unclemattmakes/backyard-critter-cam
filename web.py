@@ -615,8 +615,12 @@ def _archive_candidates(zdir: Path, zip_name: str):
     So the member is in exactly one of them and which one is not predictable from the path."""
     base = zdir / zip_name
     found = [base] if base.is_file() else []
+    # Literal prefix, not a glob: the name carries a camera label off the disk, and a `[` in one
+    # would make a glob pattern silently match nothing (backup.archive_parts says the same).
+    prefix = zip_name[:-len(".zip")] + ".part"
     try:
-        found += sorted(zdir.glob(zip_name[:-len(".zip")] + ".part*.zip"))
+        found += sorted(q for q in zdir.iterdir()
+                        if q.name.startswith(prefix) and q.name.endswith(".zip"))
     except OSError:
         pass
     return found
