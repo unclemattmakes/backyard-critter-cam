@@ -39,6 +39,7 @@ from pathlib import Path
 import cv2
 
 import config
+import backup
 import db
 
 # The day-folder shape backup.day_dirs archives. Kept here rather than imported so the pruner
@@ -235,20 +236,38 @@ def _archive_guard(cfg: config.Config, key):
     """A `path -> bool` "is it safe to delete this?" test for an IRREPLACEABLE source, or None
     when this source is replaceable and the budget alone decides.
 
-    Safe means: the day-archive zip that would hold this clip already exists on the backup
-    destination. Existence of the zip, not of the member -- reading every zip's index on every
-    prune would be minutes of work on the capture box, and a day's zip is written whole.
+    Safe means: the day-archive on the backup destination actually CONTAINS this clip, and the
+    archive holding it is still there.
 
-    FAILS CLOSED, three times over. No backup destination configured, an unreachable drive, or an
-    unrecognised path layout all return "not safe", so the file survives and the budget is
-    exceeded instead. That is the project's stated asymmetry as code: a full disk is a problem you
-    can see and fix, and footage from a card that has since been formatted is not.
+    Membership, not merely the existence of the day's zip -- which is all this asked until
+    2026-08-23, and it was not enough. A trail-cam import backfills clips into dates that were
+    archived weeks ago (the card is dumped and put straight back in the camera, so its dump day
+    always arrives in two batches), so "that day has a zip" was true for clips that had never
+    been inside one. The budget was then free to delete footage from a card that has since been
+    formatted -- the exact loss this guard exists to prevent. `import_trailcam.py --backup-first`
+    covered the usual route in, which is why it never bit; it did not make the check correct.
+
+    It answers from a LOCAL index, never by opening the archive. A zip's central directory lives
+    at the END of the file, and reading it on a Drive-hosted archive materialises the whole file
+    into Drive's cache -- a backup dry-run reading ~185 of them took content_cache from 10 to
+    86 GiB. Doing that per prune, on the capture box, while it records, would cost far more than
+    the hole it closes. backup.py writes the index as it archives, out of the central directories
+    it already has to read, so this side of it is a couple of small local file reads per prune.
+
+    FAILS CLOSED, five ways. No backup destination, an unreachable drive, an unrecognised path
+    layout, NO INDEX for that day, or an index that does not list this clip all return "not
+    safe", so the file survives and the budget is exceeded instead. That is the project's stated
+    asymmetry as code: a full disk is a problem you can see and fix, and footage from a card that
+    has since been formatted is not. The cost of the new failure mode is that a rig whose index
+    has never been written -- a fresh clone, a restored machine -- holds every irreplaceable clip
+    until backup.py runs once, and says so loudly while it does.
     """
     sources = getattr(cfg, "clips_irreplaceable_sources", ()) or ()
     if key is None or key not in {_safe_source(s) for s in sources}:
         return None
     dest = getattr(cfg, "backup_dest", None)
     archive = Path(dest) / "clips" if dest else None
+    seen: dict[str, dict | None] = {}       # one index read per DAY per prune pass, not per clip
 
     def safe(p: Path) -> bool:
         if archive is None:
@@ -259,13 +278,23 @@ def _archive_guard(cfg: config.Config, key):
             return False
         parts = rel.parts
         if len(parts) == 3 and _DAY_DIR_RE.match(parts[1]):     # <source>/<date>/<file>.mp4
-            name = f"clips-{parts[0]}-{parts[1]}.zip"
+            stem = f"clips-{parts[0]}-{parts[1]}"
         elif len(parts) == 2 and _DAY_DIR_RE.match(parts[0]):   # legacy <date>/<file>.mp4
-            name = f"clips-{parts[0]}.zip"
+            stem = f"clips-{parts[0]}"
         else:
             return False        # a layout backup.day_dirs would not archive -> assume unarchived
+        if stem not in seen:
+            seen[stem] = backup.read_archive_index(backup.ARCHIVE_INDEX_DIR, stem)
+        holds = seen[stem]
+        if not holds:
+            return False                          # nothing recorded for that day -> prove nothing
+        # backup.py's arcnames are project-relative and posix; db.rel_to_root is native-separator.
+        member = Path(_rel(p)).as_posix()
+        holder = holds.get(member)
+        if holder is None:
+            return False        # the day is archived, this clip is not: an import backfilled it
         try:
-            return (archive / name).is_file()
+            return (archive / holder).is_file()   # ...and the part holding it has not gone missing
         except OSError:
             return False                          # drive unplugged mid-prune -> keep the footage
     return safe

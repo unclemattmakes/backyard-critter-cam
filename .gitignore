@@ -88,6 +88,12 @@ config_local.py
 .rig_pause
 .rigwatch_state.json
 
+# What backup.py last saw inside each day's archives, so the prune guard can ask "is this clip
+# archived?" without opening a multi-gigabyte zip off the cloud. Derived from the archives on
+# THIS machine's destination; backup.py rebuilds it, and its absence only makes the guard
+# cautious, never wrong.
+.archive_index/
+
 # ===== What setup actually resolved on THIS machine (torch build, ultralytics, ...) =====
 # Machine-specific provenance for the numbers this machine computes; backup.py archives it
 # with the weekly meta snapshot, so it doesn't belong in a shared repo.

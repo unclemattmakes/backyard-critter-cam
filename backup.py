@@ -93,6 +93,15 @@ NOT_ARCHIVED = frozenset({"reels"})
 # like one that died of corruption, so the room is checked up front and the shortfall is named.
 SCRATCH_HEADROOM = 2.0
 
+# Where the LOCAL record of what each day's archives hold lives -- one small json per day stem,
+# arcname -> the archive holding it. It exists for clips.py's prune guard, which has to answer
+# "is this clip archived?" on the capture box, mid-recording, and must never answer it by opening
+# the archive: a zip's central directory sits at the END of the file, and reading it on a
+# Drive-hosted archive materialises the WHOLE file into Drive's cache (a backup dry-run reading
+# ~185 of them took content_cache from 10 to 86 GiB). backup.py already reads those central
+# directories to diff the day; writing down what it saw costs nothing and makes the answer local.
+ARCHIVE_INDEX_DIR = ROOT / ".archive_index"
+
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
     artifacts, tracklet thumbnails, tuning shots, logs, reports, and the machine's private
@@ -248,23 +257,60 @@ def archived_names(zip_path: Path) -> set[str] | None:
         return None
 
 
-def archived_names_across(parts: list[Path]) -> set[str] | None:
-    """Union of the arcnames a day's parts hold, or None if ANY of them is unreadable.
+def archived_index(parts: list[Path]) -> dict[str, str] | None:
+    """Every arcname a day's parts hold, mapped to the archive holding it, or None if ANY part is
+    unreadable.
 
     All-or-nothing on purpose. A part we cannot read is a part whose contents we cannot rule out,
     and treating it as empty would write files it already holds into yet another part -- storing
-    the same footage twice and making the duplicate look like a top-up that was needed."""
-    have: set[str] = set()
+    the same footage twice and making the duplicate look like a top-up that was needed.
+
+    Mapped to the part rather than collected into a set because the prune guard needs to check
+    that the archive holding a given clip is still THERE: a zip has gone missing from Drive
+    before now, and "some archive of that day exists" is not the same promise."""
+    have: dict[str, str] = {}
     for part in parts:
         names = archived_names(part)
         if names is None:
             return None
-        have |= names
+        have.update({n: part.name for n in names})
     return have
 
 
+def read_archive_index(index_dir: Path, stem: str) -> dict[str, str] | None:
+    """What the last backup saw in this day's archives: arcname -> archive filename. None when
+    there is no usable record, which every caller must read as "cannot prove anything"."""
+    try:
+        data = json.loads((index_dir / f"{stem}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_archive_index(index_dir: Path, stem: str, holds: dict[str, str]) -> None:
+    """Record what a day's archives hold. Best-effort and never fatal: this is a local convenience
+    for the prune guard, and the guard fails closed without it -- footage is kept, not lost."""
+    try:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        out = index_dir / f"{stem}.json"
+        tmp = out.with_name(out.name + ".tmp")          # local disk: a .tmp costs nothing here
+        tmp.write_text(json.dumps(holds, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, out)
+    except OSError as e:
+        log.warning("could not write the archive index for %s (%s) -- the prune guard will hold "
+                    "that day's clips until the next successful run", stem, e)
+
+
+def _record_index(index_dir: Path | None, stem: str, holds: dict[str, str],
+                  dry_run: bool) -> None:
+    """Write the day's index, unless this caller keeps none (crops/frames) or it is a dry run."""
+    if index_dir is not None and not dry_run:
+        write_archive_index(index_dir, stem, holds)
+
+
 def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
-                  include_today: bool = False, settle_s: float = 0.0) -> dict:
+                  include_today: bool = False, settle_s: float = 0.0,
+                  index_dir: Path | None = None) -> dict:
     """Per-day archives for one media root (clips/crops/frames). Today's folder is skipped -- it's
     still being written to; the next run finalizes it. `include_today` (migrate.py's pack) archives
     it anyway: a half day sealed today is merely topped up by the next run, because these archives
@@ -302,7 +348,7 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             continue  # a pruned-empty leftover folder; nothing to archive
         parts = archive_parts(out_dir, stem)
         if parts:
-            have = archived_names_across(parts)
+            have = archived_index(parts)
             if have is None:
                 log.warning("%s: one of its %d archive(s) cannot be read -- leaving the whole day "
                             "alone; check it by hand (a good archive is never overwritten or "
@@ -312,6 +358,9 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             new = [p for p in source if p.relative_to(ROOT).as_posix() not in have]
             if not new:
                 stats["skipped"] += 1
+                # Nothing to write, but the day was READ -- so record it. This is what backfills
+                # the index for every day archived before it existed, on the first run.
+                _record_index(index_dir, stem, have, dry_run)
                 continue
             out_zip = next_part(out_dir, stem, parts)
             log.info("%s gained %d file(s) since it was archived (%d already across %d archive(s))"
@@ -321,9 +370,22 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
                             dry_run=dry_run, files=new)
             stats["merged"] += 1
         else:
-            n, b = zip_tree(day, out_dir / f"{stem}.zip", arc_root=ROOT,
-                            compression=zipfile.ZIP_STORED, dry_run=dry_run, files=source)
+            have = {}
+            out_zip = out_dir / f"{stem}.zip"
+            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                            dry_run=dry_run, files=source)
             stats["created"] += 1
+        if not dry_run:
+            # Read back what actually landed rather than what we meant to write: zip_tree drops a
+            # file that the pruner deletes out from under it, and an index claiming a clip is
+            # archived when it is not would license deleting the last copy of it.
+            fresh = archived_names(out_zip)
+            if fresh is None:
+                log.warning("%s was written but will not open -- not indexing it; the prune guard "
+                            "will hold that day's clips", out_zip.name)
+            else:
+                _record_index(index_dir, stem, {**have, **{q: out_zip.name for q in fresh}},
+                              dry_run)
         stats["files"] += n
         stats["bytes"] += b
     return stats
@@ -850,7 +912,9 @@ def main() -> int:
         if not src_root.is_dir():
             continue
         try:
-            s = archive_media(src_root, dest / src_root.name, today, dry_run=args.dry_run)
+            # Only clips/ keeps a local index: it is the only root with a prune guard reading one.
+            s = archive_media(src_root, dest / src_root.name, today, dry_run=args.dry_run,
+                              index_dir=ARCHIVE_INDEX_DIR if src_root == CONFIG.clips_dir else None)
             log.info("%s: %d day(s) archived, %d topped up (%d files, %.1f MB), %d already done",
                      src_root.name, s["created"], s["merged"], s["files"], s["bytes"] / 2**20,
                      s["skipped"])
