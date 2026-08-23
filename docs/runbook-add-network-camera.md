@@ -9,6 +9,30 @@ what order, and how to tell which step you are stuck on.
 Calibrated against the first one: a Reolink RLC-810A added 2026-08-21, alongside the glass-door
 USB webcam. The numbers cited are that camera's; the sequence is not vendor-specific.
 
+## What this rig actually runs today (2026-08-23)
+
+**One live camera: `glass_door_cam` — and it is a *network* camera now.** The USB webcam it used
+to be moved onto a **Raspberry Pi serving MJPEG over HTTP**, because the rig is migrating to a
+machine with nowhere to plug a webcam in. A camera bolted to one PC cannot outlive it. The
+Reolink above and a second `cam02` were both removed on 2026-08-21 and survive only as tombstoned
+rows — the hardware is not on the network.
+
+That reframes, but does not invalidate, everything below. Read the RTSP phases as **the worked
+example they are**, not as a description of what is plugged in:
+
+| Phase | RTSP camera | HTTP (MJPEG) camera |
+|---|---|---|
+| 1 · find it on the network | yes | yes |
+| 2 · enable RTSP + reboot | **yes** | skip — nothing to enable |
+| 3 · dedicated camera user | **yes** | skip — usually no auth at all |
+| 4 · `camprobe` | yes | **cannot** — it is RTSP-only; open the URL in a browser instead |
+| 5 · write the spec | yes | yes (pick **HTTP** in the Protocol dropdown) |
+| 6 · restart and verify | yes | yes |
+| 7 · once it is in position | yes | yes, except the RTSP-camera OSD/IR items |
+
+The parts that apply to every camera — the permanence of the `source` name, the clip budget, the
+restart, and all of Phase 7 — apply unchanged whatever the protocol.
+
 ## The shape of it
 
 **The side-by-side view is not a setting.** The dashboard builds one live pane per camera from
@@ -73,8 +97,15 @@ This is the step that looks like a network fault and is not.
 
 ```
 set CAM_PASS=...
-.venv\Scripts\python.exe tools/camprobe.py 192.168.0.105 --user rig
+.venv\Scripts\python.exe tools/camprobe.py 192.168.1.50 --user rig
 ```
+
+**`camprobe` only speaks RTSP.** `parse_stream_url(url, schemes=("rtsp",))`, a default port of
+554, and a `probe_path` that builds `rtsp://` — so it cannot probe an **HTTP MJPEG** camera at
+all, and will refuse the URL rather than mislead you. For one of those (a Raspberry Pi bridge, an
+ESP32-CAM, a phone), skip to Phase 5 and check it the short way: **open the stream URL in a
+browser tab.** If it plays there, it is HTTP and it will open for the rig too. That one test also
+settles the protocol question the panel now asks you.
 
 (Use the venv's interpreter, or activate the venv first. A bare `python` on this rig is the
 system one and has no OpenCV — the tool says so rather than throwing a traceback, but it is a
@@ -134,15 +165,25 @@ Two constraints the panel enforces rather than documents: the short name is disa
 (it is stamped on everything already recorded), and a **password can only be set from the rig
 machine**, because this dashboard is plain HTTP with no login.
 
+**Pick the protocol.** The panel grew a **Protocol** dropdown on 2026-08-22 (rtsp / http / https)
+and the port and path placeholders follow it — 554 and `h264Preview_01_sub` for RTSP, 8080 and
+`stream` for HTTP. Before that it stamped `rtsp` on everything, so a Pi serving MJPEG came out the
+far side as `rtsp://host:8080/stream`: an RTSP handshake against an HTTP server, which never opens
+and never explains itself. The log just fills with reopen attempts, which reads as a dead camera
+rather than a wrong setting. If you are on an older build and the log looks like that, this is why.
+
 The config route below still works, and is what you want for the very first camera on a fresh
-install — or for reading what a running rig is configured with.
+install. It is **not** how to read what a running rig is configured with: after the first seed the
+database owns the list, and `cameras.load_specs` prints, verbatim, that editing config
+"no longer changes anything". Read the live list from the cameras panel, or off the startup
+banner's `N camera(s):` line.
 
 ```python
 from config import CameraSpec
 
 cfg.cameras = [
     CameraSpec("glass_door_cam", 1, name="Glass door"),
-    CameraSpec("yard_ir", "rtsp://rig:PASSWORD@192.168.0.105:554/h264Preview_01_sub",
+    CameraSpec("yard_ir", "rtsp://rig:PASSWORD@192.168.1.50:554/h264Preview_01_sub",
                name="Yard (night IR)", frame_width=640, frame_height=360,
                motion_min_area=200),
 ]
@@ -150,9 +191,14 @@ cfg.cameras = [
 
 - **Setting `cfg.cameras` replaces `camera_index` as the thing the rig reads**, so the existing
   camera must now be spelled out explicitly. It does not lose its tuning: every field a spec
-  does not name inherits the same-named `Config` value, so the glass door keeps its 1920×1080,
-  its `CONTRAST: 48`, its `motion_min_area` 1800 — and `backend=None` on an int `src` still
-  resolves to DirectShow on Windows.
+  does not name inherits the same-named `Config` value, so the glass door keeps its
+  `motion_min_area` 1800 — and `backend=None` on an int `src` still resolves to DirectShow on
+  Windows. **Inheriting a value is not the same as it applying**: on a URL `src` the UVC-only ones
+  (`camera_controls`, `exposure`, `gain`, the requested fourcc and fps, the DirectShow backend)
+  inherit and then do nothing, because there is no UVC control channel over a stream. That is what
+  the glass door gave up when it moved from index 1 to an HTTP stream on 2026-08-22 — its
+  `CONTRAST: 48` now lives on the Pi, asserted there, and the rig's white-balance watchdog and
+  wedge detector switch themselves off for the source entirely.
 - **Each camera needs a unique `source`, and it is effectively permanent.** It is the key
   everything downstream splits on — stamped on every detection, every visit, every clip path
   and every re-ID row — so renaming it later orphans everything already written under the old
@@ -192,11 +238,23 @@ current cameras actually use before picking the number; `clips/<source>/` is the
 
 ### Where the password lives
 
-`config_local.py`, in the URL. Three paths it could escape by, all closed:
+`config_local.py` in the URL for a camera seeded from config, and the `cameras.password` column of
+`backyard.db` for one set in the dashboard. Four paths it could escape by:
 
 - **Git** — `config_local.py` is gitignored.
-- **The dashboard** — `/api/cameras` serves only `source`, `name`, `network` and `primary`. The
-  `src` URL never leaves the process, so LAN viewers cannot read it.
+- **The dashboard** — the **password** never leaves the process: `db.list_cameras` does not select
+  the column and the API carries only a `has_password` boolean. **The address is a different
+  story, and this runbook used to claim otherwise.** `/api/cameras` also returns a `rows` block —
+  `url_scheme`, `url_host`, `url_port`, `url_path`, `username` — to any client it considers an
+  *operator*, and `_operator_decision` treats **everyone as an operator when `cfg.operator_token`
+  is unset**, which is the fresh-clone default. Verified 2026-08-23 against a running rig from a
+  non-loopback LAN address: the host came back in full. Set `operator_token` if the camera's
+  address and username should be operator-only; a LAN address is not really a secret, but a
+  document that promises it is one is worse than no promise.
+- **The backup, and the migration pack** — `backup.py` snapshots the whole database into
+  `backup_dest`, and `migrate.py pack` carries it to another machine. A dashboard-set camera
+  password rides along in both. One more reason Phase 3 says to make the rig a throwaway camera
+  user rather than reusing admin.
 - **The log** — the startup banner, the could-not-open retry and every open/reconnect notice
   print the src, and `logs/` is swept into the backup by `backup.py`. All three go through
   `backyard_cam._safe_src`, which masks the password and keeps the username (a rejected login
@@ -211,8 +269,10 @@ up, and the launcher clears it on the way in.
 
 Check, in this order:
 
-1. **The banner**: `2 cameras: Glass door (1), Yard (night IR) ('rtsp://rig:***@...')` — the
-   count, and the mask.
+1. **The banner**: `2 cameras: Glass door ('http://.../stream'), Yard (night IR)
+   ('rtsp://rig:***@...')` — the count, and the mask. A URL with **no username has nothing to
+   mask** and prints in full, so an unmasked HTTP camera is correct, not a leak; `***` appears
+   exactly where credentials exist.
 2. **Each camera opens**: one `[<source>] open (...)` line per camera.
 3. **The dashboard**: two panes in Live Observation. Click the new one — the Instrument Panel
    and "Who's visiting now?" should re-scope to it, and a networked camera shows a note instead
