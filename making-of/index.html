@@ -34,6 +34,7 @@
   <a href="#ch07">07 · Motion</a>
   <a href="#ch08">08 · Two axes</a>
   <a href="#ch09">09 · Building it</a>
+  <a href="#ch10">10 · Moving house</a>
 </div></nav>
 
 <main>
@@ -288,6 +289,61 @@
       localhost-only because it shows a live feed of someone's backyard. This is the opposite: a
       curated, public slice — person-labelled detections filtered out, a hand-written veto for the
       ones the labels got wrong, and the survivors checked by eye.</p>
+    </div>
+  </section>
+
+  <!-- 10 MOVING HOUSE -->
+  <section class="chapter" id="ch10">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 10</div>
+      <div class="ch-title">Moving house</div>
+      <div class="ch-keywords"><span>passthrough</span><span>a 2016 Raspberry Pi</span><span>same bytes, different decoder</span></div>
+    </div>
+    <div class="prose">
+      <p>A camera bolted to one computer is a camera that cannot outlive it. When the rig moved to a
+      new machine with nowhere to plug the webcam in, the camera had to stop being <span class="em">this
+      PC's camera</span> and start being <span class="em">the network's camera</span>.</p>
+      <p>The bridge is a <b>Raspberry Pi 3B from 2016</b>, and its job is deliberately unambitious. It
+      does not decode the video and it does not re-encode it. The webcam already emits JPEG frames;
+      the Pi forwards those same bytes to whoever asks. It does this at <b>0% CPU</b> — the work is
+      copying, not computing, and a nine-year-old board is wildly overqualified for copying.</p>
+      <p class="pull">Re-encoding would have been the easy choice, and it would have quietly
+      invalidated every number the rig had ever measured.</p>
+      <p>That matters more than it sounds. The motion threshold is <b>a count of pixels</b>. The
+      ignore zones are <b>pixel rectangles</b>. The shot-quality score that decides which crop of a
+      raccoon is the cutest is <b>a measure of sharpness</b>. All three are calibrated against the
+      exact pixels this particular camera produces through this particular pane of glass. Change the
+      pixels — even <em>improve</em> them — and years of tuning silently stops meaning what it meant.</p>
+    </div>
+    <div class="demo">
+      <div class="demo-head"><span class="k">Before &amp; after · the same wall</span><span class="corner">real frames</span></div>
+      <div class="demo-body">
+        <img src="media/frames/bridge_before_after.jpg" alt="Two night frames of the same patio wall,
+        side by side. On the left, taken over USB, a raccoon walks along the top of the wall. On the
+        right, taken half an hour later over the network, the identical view without the raccoon."
+        style="width:100%;height:auto;display:block;border-radius:3px">
+      </div>
+      <div class="demo-cap">Left: the last frame the camera produced over USB — with a raccoon on the
+      wall, which felt like a send-off. Right: the first frame pulled over the network, half an hour
+      later. Measured against each other, the view had moved <b>0.3 pixels</b>.</div>
+    </div>
+    <div class="prose">
+      <p>One claim in the first draft of this chapter was wrong, and the correction turned out to be
+      more interesting than the claim. <span class="em">"The pixels are bit-identical"</span> — they
+      are not. The <b>bytes</b> are identical, but the software that turns bytes into pixels changed,
+      and the same JPEG decoded two different ways disagrees about <b>96.7%</b> of them. The measured
+      effect on shot-quality was <b>0.31%</b>, against a night-to-night variation a hundred times
+      larger. Harmless — but <span class="em">"we measured it"</span> and <span class="em">"it must be
+      fine"</span> are different sentences, and only one of them is worth writing down.</p>
+      <p>The move also brought a new way to fail silently, which by now is this project's recurring
+      theme. When the camera is unplugged, the streaming software does not stop and does not
+      complain. It serves a <b>black rectangle, forever</b>, at a perfectly valid frame size. The rig
+      would read those frames, decode them successfully, find nothing moving in them, and report
+      itself in perfect health for as long as you left it running.</p>
+      <p>So a watchdog now asks, every thirty seconds, whether the camera is actually <em>there</em> —
+      and it was tested by pulling the plug rather than by reasoning about it. Which is the honest
+      summary of the whole project: <span class="em">"no errors"</span> keeps turning out to mean
+      nothing at all, and the only cure is to go and look.</p>
     </div>
   </section>
 
