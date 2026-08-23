@@ -26,6 +26,7 @@ diff is by NAME and the merge is append-only; both halves are pinned below.
 """
 from __future__ import annotations
 
+import errno
 import logging
 import sqlite3
 import zipfile
@@ -40,7 +41,8 @@ import backup
 # Every day folder in this file is in the past relative to this; today's folder is never archived.
 TODAY = date(2026, 7, 30)
 DAY = "2026-07-27"          # the real two-batch dump day
-ZIP = f"clips-trail_cam_sd-{DAY}.zip"
+STEM = f"clips-trail_cam_sd-{DAY}"
+ZIP = f"{STEM}.zip"
 
 # Two batches of the same day, as the trail cam actually delivers them: the morning clips come
 # off the card in one cycle, the afternoon clips (numbering restarted by the in-camera format)
@@ -87,6 +89,21 @@ def _members(zip_path: Path) -> set[str]:
 
 def _basenames(zip_path: Path) -> set[str]:
     return {m.rsplit("/", 1)[-1] for m in _members(zip_path)}
+
+
+def _members_across(zdir: Path, stem: str) -> set[str]:
+    """Arcnames across every archive holding part of one day. A day is a SET: the first pass
+    writes <stem>.zip and every later top-up writes <stem>.part2.zip, .part3.zip, ... rather than
+    rewriting what is already sealed. Anything asserting on one file alone is asserting on an
+    implementation detail that stopped being true."""
+    out: set[str] = set()
+    for part in backup.archive_parts(zdir, stem):
+        out |= _members(part)
+    return out
+
+
+def _basenames_across(zdir: Path, stem: str) -> set[str]:
+    return {m.rsplit("/", 1)[-1] for m in _members_across(zdir, stem)}
 
 
 def _archive(project: Path, dest: Path, today: date = TODAY, dry_run: bool = False) -> dict:
@@ -142,7 +159,7 @@ def test_second_import_into_an_archived_day_is_merged_in(project, dest):
     stats = _archive(project, dest)
 
     assert stats["merged"] == 1 and stats["created"] == 0 and stats["files"] == len(BATCH2)
-    assert _basenames(dest / "clips" / ZIP) == set(BATCH1) | set(BATCH2)
+    assert _basenames_across(dest / "clips", STEM) == set(BATCH1) | set(BATCH2)
 
 
 def test_merge_survives_a_prune_that_hides_the_growth(project, dest):
@@ -155,12 +172,12 @@ def test_merge_survives_a_prune_that_hides_the_growth(project, dest):
     for n in BATCH1[:4]:                         # clips_max_gb eats the oldest
         (day / n).unlink()
     _clips(project, BATCH2)                      # ...and the next SD dump adds the afternoon
-    assert len(list(day.iterdir())) < len(_members(dest / "clips" / ZIP))
+    assert len(list(day.iterdir())) < len(_members_across(dest / "clips", STEM))
 
     stats = _archive(project, dest)
 
     assert stats["merged"] == 1
-    assert _basenames(dest / "clips" / ZIP) == set(BATCH1) | set(BATCH2)
+    assert _basenames_across(dest / "clips", STEM) == set(BATCH1) | set(BATCH2)
 
 
 def test_merge_never_drops_what_the_source_has_lost(project, dest):
@@ -174,7 +191,7 @@ def test_merge_never_drops_what_the_source_has_lost(project, dest):
     _clips(project, BATCH2)                      # 7 files on disk vs 6 archived: "growth"
     _archive(project, dest)
 
-    assert _basenames(dest / "clips" / ZIP) == set(BATCH1) | set(BATCH2)
+    assert _basenames_across(dest / "clips", STEM) == set(BATCH1) | set(BATCH2)
 
 
 def test_pruned_day_alone_never_shrinks_the_archive(project, dest):
@@ -207,31 +224,128 @@ def test_fully_pruned_day_leaves_the_archive_alone(project, dest):
     assert _basenames(dest / "clips" / ZIP) == set(BATCH1)
 
 
-def test_merged_members_are_readable_and_intact(project, dest):
-    """Appending must produce a valid archive, not just a plausible-sized file: every member
-    extracts with its original bytes, old and new."""
+def test_topped_up_members_are_readable_and_intact(project, dest):
+    """Every part must be a valid archive, not just a plausible-sized file, and between them they
+    must hold every byte -- old members in the sealed part, new ones in the part beside it."""
     day = _clips(project, BATCH1)
     _archive(project, dest)
     _clips(project, BATCH2)
     _archive(project, dest)
 
-    out_zip = dest / "clips" / ZIP
-    with zipfile.ZipFile(out_zip) as zf:
-        assert zf.testzip() is None
-        for name in BATCH1 + BATCH2:
-            arc = f"clips/trail_cam_sd/{DAY}/{name}"
-            assert zf.read(arc) == (day / name).read_bytes()
+    payloads: dict[str, bytes] = {}
+    for part in backup.archive_parts(dest / "clips", STEM):
+        with zipfile.ZipFile(part) as zf:
+            assert zf.testzip() is None, f"{part.name} is corrupt"
+            for name in zf.namelist():
+                assert name not in payloads, f"{name} is stored in two parts"
+                payloads[name] = zf.read(name)
+    for name in BATCH1 + BATCH2:
+        arc = f"clips/trail_cam_sd/{DAY}/{name}"
+        assert payloads[arc] == (day / name).read_bytes()
 
 
-def test_merge_keeps_media_stored_uncompressed(project, dest):
-    """mp4/jpg are already compressed; appended members must stay STORED like the rest."""
+def test_top_up_keeps_media_stored_uncompressed(project, dest):
+    """mp4/jpg are already compressed; a part must stay STORED like the archive it extends."""
     _clips(project, BATCH1)
     _archive(project, dest)
     _clips(project, BATCH2)
     _archive(project, dest)
 
-    with zipfile.ZipFile(dest / "clips" / ZIP) as zf:
-        assert {i.compress_type for i in zf.infolist()} == {zipfile.ZIP_STORED}
+    for part in backup.archive_parts(dest / "clips", STEM):
+        with zipfile.ZipFile(part) as zf:
+            assert {i.compress_type for i in zf.infolist()} == {zipfile.ZIP_STORED}
+
+
+# --- parts: the whole point is that a sealed archive is never written to again -------------
+
+def test_a_top_up_writes_a_new_part_and_never_touches_the_sealed_one(project, dest):
+    """THE change. Topping a day up used to copy its archive, append to the copy and rename it
+    over the original -- correct, but on a cloud destination a rewrite re-uploads the whole file:
+    50.9 MB of new clips cost a 2.6 GB re-upload on 2026-08-23. A part costs the new bytes. It is
+    also strictly safer: the sealed archive is never opened for writing, so a top-up interrupted
+    half way cannot damage what was already stored."""
+    _clips(project, BATCH1)
+    _archive(project, dest)
+    base = dest / "clips" / ZIP
+    before = (base.stat().st_mtime_ns, base.stat().st_size, _members(base))
+
+    _clips(project, BATCH2)
+    _archive(project, dest)
+
+    assert (base.stat().st_mtime_ns, base.stat().st_size, _members(base)) == before, \
+        "the sealed archive was rewritten"
+    part2 = dest / "clips" / f"{STEM}.part2.zip"
+    assert part2.is_file(), "no part was written for the new files"
+    assert _basenames(part2) == set(BATCH2), "the part must hold ONLY the new files"
+
+
+def test_each_further_import_writes_the_next_part(project, dest):
+    """Three batches, three archives -- and the numbering keeps going rather than reusing part2."""
+    _clips(project, ["a.mp4"])
+    _archive(project, dest)
+    _clips(project, ["b.mp4"])
+    _archive(project, dest)
+    _clips(project, ["c.mp4"])
+    _archive(project, dest)
+
+    assert [q.name for q in backup.archive_parts(dest / "clips", STEM)] == [
+        ZIP, f"{STEM}.part2.zip", f"{STEM}.part3.zip"]
+    assert _basenames_across(dest / "clips", STEM) == {"a.mp4", "b.mp4", "c.mp4"}
+
+
+def test_a_file_already_in_an_earlier_part_is_never_written_again(project, dest):
+    """The diff is against the UNION of the parts. Diffing against the newest one alone would
+    re-archive the whole day every time, which is the cost this change exists to remove."""
+    _clips(project, BATCH1)
+    _archive(project, dest)
+    _clips(project, BATCH2)
+    _archive(project, dest)
+
+    stats = _archive(project, dest)              # nothing new since
+
+    assert stats["merged"] == 0 and stats["skipped"] == 1
+    assert not (dest / "clips" / f"{STEM}.part3.zip").exists()
+
+
+def test_parts_are_found_even_when_the_camera_name_looks_like_a_glob(project, dest):
+    """A stem is a directory name off the disk. clips.py sanitises camera names to alphanumerics,
+    but that is an invariant in another module -- and if a `[` ever reached one, matching parts by
+    glob PATTERN would read it as a character class, find nothing, and write a fresh "part 2" of
+    the same footage on every run until the archive filled with copies. So the match is by literal
+    prefix, and this is what would catch a regression to a pattern."""
+    odd = "cam[01]"
+    _clips(project, ["a.mp4"], source=odd)
+    _archive(project, dest)
+    _clips(project, ["b.mp4"], source=odd)
+    _archive(project, dest)
+
+    stem = f"clips-{odd}-{DAY}"
+    assert [q.name for q in backup.archive_parts(dest / "clips", stem)] == [
+        f"{stem}.zip", f"{stem}.part2.zip"]
+
+    stats = _archive(project, dest)              # nothing new: must not write a third part
+    assert stats["merged"] == 0
+    assert not (dest / "clips" / f"{stem}.part3.zip").exists()
+    assert _basenames_across(dest / "clips", stem) == {"a.mp4", "b.mp4"}
+
+
+def test_an_unreadable_part_leaves_the_whole_day_alone(project, dest, caplog):
+    """A part we cannot read is a part whose contents we cannot rule out. Treating it as empty
+    would copy everything it holds into yet another part -- storing the footage twice and making
+    the duplicate look like a top-up that was needed."""
+    _clips(project, BATCH1)
+    _archive(project, dest)
+    _clips(project, BATCH2)
+    _archive(project, dest)
+    (dest / "clips" / f"{STEM}.part2.zip").write_bytes(b"\x00" * 64)   # torn write
+    _clips(project, ["late.mp4"])
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        stats = _archive(project, dest)
+
+    assert stats["skipped"] == 1 and stats["merged"] == 0
+    assert not (dest / "clips" / f"{STEM}.part3.zip").exists()
+    assert "cannot be read" in caplog.text
 
 
 # --- the other media roots and layouts ---------------------------------------------------
@@ -246,7 +360,7 @@ def test_crops_day_backfilled_by_an_import_is_topped_up(project, dest):
     stats = backup.archive_media(project / "crops", dest / "crops", TODAY, dry_run=False)
 
     assert stats["merged"] == 1
-    assert _basenames(dest / "crops" / f"crops-{DAY}.zip") == {"a.jpg", "b.jpg", "c.jpg"}
+    assert _basenames_across(dest / "crops", f"crops-{DAY}") == {"a.jpg", "b.jpg", "c.jpg"}
 
 
 def test_each_camera_and_day_is_diffed_separately(project, dest):
@@ -259,8 +373,8 @@ def test_each_camera_and_day_is_diffed_separately(project, dest):
     stats = _archive(project, dest)
 
     assert stats["merged"] == 1 and stats["skipped"] == 1
-    assert _basenames(dest / "clips" / ZIP) == set(BATCH1) | set(BATCH2)
-    assert _basenames(dest / "clips" / f"clips-glass_door_cam-{DAY}.zip") == {"x.mp4"}
+    assert _basenames_across(dest / "clips", STEM) == set(BATCH1) | set(BATCH2)
+    assert _basenames_across(dest / "clips", f"clips-glass_door_cam-{DAY}") == {"x.mp4"}
 
 
 # --- clips/reels/: expected company, deliberately not archived ---------------------------
@@ -535,7 +649,8 @@ def test_the_scratch_is_refused_if_it_would_land_inside_the_destination(tmp_path
     src = _live_db(tmp_path / "backyard.db")
     monkeypatch.setattr(backup.tempfile, "gettempdir", lambda: str(inside))
 
-    assert not backup._is_within(backup._scratch_parent(src, dest), dest)
+    need = int(src.stat().st_size * backup.SCRATCH_HEADROOM)
+    assert not backup._is_within(backup._scratch_parent(need, dest, src.parent), dest)
     backup.snapshot_db(src, dest, date(2026, 8, 23), False)
     assert (dest / "backyard-db-2026-08-23.zip").is_file()
     assert not list(dest.rglob("*.db"))                 # nothing database-shaped under dest
@@ -589,4 +704,114 @@ def test_nowhere_to_build_says_where_it_looked(tmp_path, monkeypatch):
     monkeypatch.setattr(backup.shutil, "disk_usage",
                         lambda p: SimpleNamespace(total=0, used=0, free=0))
     with pytest.raises(RuntimeError, match="nowhere local"):
-        backup._scratch_parent(src, tmp_path / "dest")
+        backup._scratch_parent(1 << 30, tmp_path / "dest", src.parent)
+
+
+# --- publishing: a finished archive is written into the destination ONCE -------------------
+#
+# The .tmp staging file used to be created inside the destination, and a sync client uploads it
+# as an operation of its own -- the rename does not cancel it. Confirmed 2026-08-23 in DriveFS's
+# operations table: every artifact queued as a .zip/.zip.tmp pair, both surviving ~50 minutes of
+# draining. Like the scratch DB before it, this is invisible once a run ends, so these tests
+# watch where a zip is BUILT rather than what is left behind.
+
+def _zip_write_targets(monkeypatch) -> list[Path]:
+    """Every path opened as a zip for writing."""
+    targets: list[Path] = []
+    real = backup.zipfile.ZipFile
+
+    def spy(file, mode="r", *a, **k):
+        if mode in ("w", "a"):
+            targets.append(Path(file))
+        return real(file, mode, *a, **k)
+    monkeypatch.setattr(backup.zipfile, "ZipFile", spy)
+    return targets
+
+
+def test_the_db_snapshot_zip_is_built_outside_the_destination(tmp_path, monkeypatch):
+    """~1.5 GB, rewritten every single run -- the most expensive of the pairs."""
+    src = _live_db(tmp_path / "backyard.db")
+    dest = tmp_path / "dest"
+    targets = _zip_write_targets(monkeypatch)
+
+    backup.snapshot_db(src, dest, date(2026, 8, 23), False)
+
+    assert targets, "no zip was written -- the spy is not wired up"
+    for t in targets:
+        assert dest.resolve() not in t.resolve().parents, \
+            f"the archive was staged inside the backup destination: {t}"
+    assert [q.name for q in sorted(dest.iterdir())] == ["backyard-db-2026-08-23.zip"]
+
+
+def test_the_meta_snapshot_zip_is_built_outside_the_destination(project, dest, monkeypatch):
+    """~0.6 GB, also rewritten whole every run."""
+    _write(project / "logs", ["a.log", "b.log"])
+    monkeypatch.setattr(backup, "meta_items", lambda: (project / "logs",))
+    targets = _zip_write_targets(monkeypatch)
+
+    backup.snapshot_meta(dest, date(2026, 8, 23), False)
+
+    assert targets, "no zip was written -- the spy is not wired up"
+    for t in targets:
+        assert dest.resolve() not in t.resolve().parents, \
+            f"the archive was staged inside the backup destination: {t}"
+    assert [q.name for q in sorted(dest.iterdir())] == ["meta-2026-08-23.zip"]
+    assert _basenames(dest / "meta-2026-08-23.zip") == {"a.log", "b.log"}
+
+
+def test_media_archives_still_stage_through_a_tmp_in_the_destination(project, dest, monkeypatch):
+    """Deliberately NOT converted, and this pins the reason. clips.py's _archive_guard licenses
+    DELETING a clip on the mere existence of its day's zip, so a half-written archive under the
+    real name would authorise losing footage that exists nowhere else. Paying one extra upload
+    per day-create buys the guarantee that the file is either absent or complete."""
+    _clips(project, BATCH1)
+    targets = _zip_write_targets(monkeypatch)
+
+    _archive(project, dest)
+
+    assert [t.name for t in targets] == [f"{ZIP}.tmp"]
+    assert all(t.parent == (dest / "clips") for t in targets)
+
+
+def _exdev(*a, **k):
+    raise OSError(errno.EXDEV, "cross-device link")
+
+
+def test_publish_renames_when_both_ends_are_one_filesystem(tmp_path):
+    """A local destination costs nothing and stays atomic."""
+    local, out = tmp_path / "src.zip", tmp_path / "out.zip"
+    local.write_bytes(b"payload")
+
+    backup._publish(local, out)
+
+    assert out.read_bytes() == b"payload" and not local.exists()
+
+
+def test_publish_copies_straight_to_the_final_name_across_filesystems(tmp_path, monkeypatch):
+    """The cloud case. os.replace cannot cross a filesystem and a virtual Drive mount always is
+    one, so the bytes get copied -- and they must land under the FINAL name. A .tmp here is the
+    second upload."""
+    local, out = tmp_path / "src.zip", tmp_path / "dest" / "out.zip"
+    out.parent.mkdir()
+    local.write_bytes(b"payload" * 100)
+    monkeypatch.setattr(backup.os, "replace", _exdev)
+
+    backup._publish(local, out)
+
+    assert out.read_bytes() == b"payload" * 100
+    assert [q.name for q in sorted(out.parent.iterdir())] == ["out.zip"]
+
+
+def test_publish_removes_a_file_that_landed_short(tmp_path, monkeypatch):
+    """Publishing to the final name means an interrupted copy leaves a short file there. Anything
+    we can still catch, we catch now and delete -- a truncated archive that keeps the real name is
+    worse than no archive, because it reads as one."""
+    local, out = tmp_path / "src.zip", tmp_path / "dest" / "out.zip"
+    out.parent.mkdir()
+    local.write_bytes(b"x" * 1000)
+    monkeypatch.setattr(backup.os, "replace", _exdev)
+    monkeypatch.setattr(backup.shutil, "copyfile", lambda s, d: Path(d).write_bytes(b"x" * 400))
+
+    with pytest.raises(RuntimeError, match="landed short"):
+        backup._publish(local, out)
+    assert not out.exists()

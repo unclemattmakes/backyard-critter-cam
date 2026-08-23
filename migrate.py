@@ -644,17 +644,31 @@ def restore(src: Path, *, dry_run: bool = False, include_weights: bool = True,
             else:
                 report.append(f"{root_name}: nothing archived")
 
-        meta_zips = sorted((src / "snapshots").glob("meta-*.zip"))
+        # Newest first, falling back if one will not open. backup.py publishes the meta zip
+        # straight to its final name rather than staging it inside the destination (which would
+        # upload it twice), so an interrupted run can leave a short one -- and for content this
+        # small and this regenerable, the previous day's is a fine substitute. The same fallback
+        # the DB snapshot has had all along, for the same reason.
+        meta_zips = sorted((src / "snapshots").glob("meta-*.zip"), reverse=True)
         meta_plan: tuple[Path, list[str]] | None = None
-        if meta_zips:
-            take, b, st = _plan_zip(meta_zips[-1], ROOT)
+        meta_zip = None
+        for cand in meta_zips:
+            try:
+                take, b, st = _plan_zip(cand, ROOT)
+            except (OSError, zipfile.BadZipFile) as e:
+                log.warning("meta snapshot %s will not open (%s) -- trying the one before it",
+                            cand.name, e)
+                continue
+            meta_zip = cand
+            break
+        if meta_zip is not None:
             need_bytes += b
-            meta_plan = (meta_zips[-1], take)
-            line = f"meta: {len(take)} file(s) from {meta_zips[-1].name}"
+            meta_plan = (meta_zip, take)
+            line = f"meta: {len(take)} file(s) from {meta_zip.name}"
             # The two files a new machine may have already written itself. Existing files are
             # never overwritten anywhere, but for THESE two silence would read as "restored" --
             # say whose copy wins (the archived one stays in the meta zip for a hand diff).
-            with zipfile.ZipFile(meta_zips[-1]) as zf:
+            with zipfile.ZipFile(meta_zip) as zf:
                 in_zip = set(zf.namelist())
             kept = [n for n in ("config_local.py", "environment.lock.txt")
                     if n in in_zip and (ROOT / n).exists()]

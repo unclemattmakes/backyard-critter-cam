@@ -16,10 +16,19 @@ Design notes (why it looks the way it does):
   two separate batches, because the card goes straight back in the camera and the next dump
   brings the rest of that same day. So archives are APPEND-ONLY: an existing one is never
   rebuilt (rebuilding from a since-pruned source would shrink it, and the whole point is that
-  the archive OUTLIVES the pruning), but files the source has and the archive lacks are merged
-  in. The comparison is by NAME, not by count, because one day folder can lose files to the
-  pruner and gain files from an import between two runs -- and then it holds FEWER files than
-  its archive while still holding some that belong in it.
+  the archive OUTLIVES the pruning), and files the source has that no archive holds are written
+  as a NEW PART beside it -- <stem>.zip, then <stem>.part2.zip, part3.zip. The comparison is by
+  NAME, not by count, because one day folder can lose files to the pruner and gain files from an
+  import between two runs -- and then it holds FEWER files than its archive while still holding
+  some that belong in it. A day is therefore a SET of archives, and every reader unions them.
+* Parts exist because the destination is usually a cloud folder, and there a top-up used to cost
+  the whole day. The old merge copied the existing zip, appended to the copy and renamed it over
+  the original -- correct locally (an in-place append rewrites the central directory, so a crash
+  would leave the archive unreadable) and brutal on a synced mount, because rewriting a file
+  re-uploads all of it. Measured 2026-08-23: 21 new clips, 50.9 MB of footage, rewrote a 2.6 GB
+  archive; the 08-22 run rewrote 8199.3 MB to add 37 files. Writing a part costs the new bytes
+  and nothing else -- and it is SAFER, because a sealed archive is now never opened for writing
+  again, so no top-up can corrupt one.
 * Media zips are STORED, not compressed: mp4 and jpg are already compressed, so deflating them
   buys ~nothing and burns CPU. Zipping still pays because Drive syncs one ~75 MB file far
   faster than ~2,000 individual crop JPEGs (per-file sync overhead dominates small files).
@@ -46,6 +55,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -77,10 +87,11 @@ DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # that anything ELSE appearing under a media root is still surfaced as the surprise it is.
 NOT_ARCHIVED = frozenset({"reels"})
 
-# Free space a DB snapshot needs where it is BUILT, as a multiple of the database's own size: one
-# full uncompressed copy, plus slack. A snapshot that dies half-written for want of disk looks
-# exactly like a snapshot that died of corruption, so this is checked up front and named.
-SCRATCH_HEADROOM = 1.15
+# Free space a DB snapshot needs where it is BUILT, as a multiple of the database's own size. The
+# scratch copy and its deflated zip are both there at once now -- SQLite deflates to roughly 0.7x,
+# so the peak is about 1.7x -- and a snapshot that dies half-written for want of disk looks exactly
+# like one that died of corruption, so the room is checked up front and the shortfall is named.
+SCRATCH_HEADROOM = 2.0
 
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
@@ -187,6 +198,44 @@ def zip_tree(src_dir: Path, out_zip: Path, arc_root: Path, compression: int, dry
     return n, total
 
 
+# <stem>.zip is part one; later top-ups are <stem>.part2.zip, .part3.zip, ... Anchored at the
+# end so a camera or date that happens to contain "part" cannot be mistaken for one.
+PART_RE = re.compile(r"\.part(\d+)\.zip$")
+
+
+def _part_index(archive: Path) -> int:
+    """Which part of its day an archive is; the base <stem>.zip is part 1."""
+    m = PART_RE.search(archive.name)
+    return int(m.group(1)) if m else 1
+
+
+def archive_parts(out_dir: Path, stem: str) -> list[Path]:
+    """Every archive holding some of one day, base first and parts in order.
+
+    A day is a SET of archives, not a file. Nothing here rewrites a sealed one, so the second and
+    later passes over a day that gained files write <stem>.part2.zip, .part3.zip, ... beside it."""
+    parts = []
+    base = out_dir / f"{stem}.zip"
+    if base.is_file():
+        parts.append(base)
+    # Matched by literal prefix rather than a glob pattern. A stem is a directory name off the
+    # disk, and clips.py sanitises camera names to alphanumerics -- but that is an invariant in
+    # another module, and if a `[` ever reached one here a glob would read it as a character class,
+    # find no parts, and write a fresh "part 2" full of the same footage on every single run.
+    prefix = f"{stem}.part"
+    try:
+        found = [q for q in out_dir.iterdir()
+                 if q.name.startswith(prefix) and PART_RE.search(q.name)]
+    except OSError:
+        found = []
+    return parts + sorted(found, key=_part_index)
+
+
+def next_part(out_dir: Path, stem: str, parts: list[Path]) -> Path:
+    """Where the next top-up for this day goes."""
+    return out_dir / f"{stem}.part{max(_part_index(q) for q in parts) + 1}.zip"
+
+
 def archived_names(zip_path: Path) -> set[str] | None:
     """The arcnames of the files an existing archive holds (None = unreadable). Only the central
     directory is read, so this is cheap even on a multi-GB zip. Names rather than a count because
@@ -199,33 +248,19 @@ def archived_names(zip_path: Path) -> set[str] | None:
         return None
 
 
-def add_to_zip(new_files: list[Path], out_zip: Path, arc_root: Path, compression: int,
-               dry_run: bool) -> tuple[int, int]:
-    """Add files to an EXISTING archive, keeping every member already in it -- merge, never
-    rebuild. What the archive holds is often the only copy left (the clips pruner deletes from
-    the source; the trail cam's card is formatted every cycle), so a file that once made it in is
-    never dropped just because the source no longer has it. The new members are appended to a
-    COPY that then replaces the original, because appending in place rewrites the central
-    directory: an interrupted run would leave the archive it was extending unreadable. Returns
-    (files, bytes) added."""
-    total = sum(p.stat().st_size for p in new_files)
-    if dry_run:
-        log.info("would add %d file(s) (%.1f MB) to %s", len(new_files), total / 2**20, out_zip.name)
-        return len(new_files), total
-    tmp = out_zip.with_name(out_zip.name + ".tmp")
-    shutil.copy2(out_zip, tmp)
-    n = 0
-    with zipfile.ZipFile(tmp, "a", compression=compression) as zf:
-        for p in new_files:
-            try:
-                zf.write(p, p.relative_to(arc_root))
-                n += 1
-            except FileNotFoundError:
-                log.warning("vanished while zipping (pruned?): %s", p)
-    os.replace(tmp, out_zip)
-    log.info("added %d file(s) to %s  (now %.1f MB)", n, out_zip.name,
-             out_zip.stat().st_size / 2**20)
-    return n, total
+def archived_names_across(parts: list[Path]) -> set[str] | None:
+    """Union of the arcnames a day's parts hold, or None if ANY of them is unreadable.
+
+    All-or-nothing on purpose. A part we cannot read is a part whose contents we cannot rule out,
+    and treating it as empty would write files it already holds into yet another part -- storing
+    the same footage twice and making the duplicate look like a top-up that was needed."""
+    have: set[str] = set()
+    for part in parts:
+        names = archived_names(part)
+        if names is None:
+            return None
+        have |= names
+    return have
 
 
 def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
@@ -265,26 +300,29 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             source = settled
         if not source:
             continue  # a pruned-empty leftover folder; nothing to archive
-        out_zip = out_dir / f"{stem}.zip"
-        if out_zip.exists():
-            have = archived_names(out_zip)
+        parts = archive_parts(out_dir, stem)
+        if parts:
+            have = archived_names_across(parts)
             if have is None:
-                log.warning("%s exists but cannot be read -- leaving it alone; check it by hand "
-                            "(a good archive is never overwritten by this script)", out_zip.name)
+                log.warning("%s: one of its %d archive(s) cannot be read -- leaving the whole day "
+                            "alone; check it by hand (a good archive is never overwritten or "
+                            "duplicated by this script)", stem, len(parts))
                 stats["skipped"] += 1
                 continue
             new = [p for p in source if p.relative_to(ROOT).as_posix() not in have]
             if not new:
                 stats["skipped"] += 1
                 continue
-            log.info("%s gained %d file(s) since it was archived (%d already in it): merging",
-                     out_zip.name, len(new), len(have))
-            n, b = add_to_zip(new, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
-                              dry_run=dry_run)
+            out_zip = next_part(out_dir, stem, parts)
+            log.info("%s gained %d file(s) since it was archived (%d already across %d archive(s))"
+                     ": writing %s -- the sealed part(s) are not touched",
+                     stem, len(new), len(have), len(parts), out_zip.name)
+            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                            dry_run=dry_run, files=new)
             stats["merged"] += 1
         else:
-            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
-                            dry_run=dry_run, files=source)
+            n, b = zip_tree(day, out_dir / f"{stem}.zip", arc_root=ROOT,
+                            compression=zipfile.ZIP_STORED, dry_run=dry_run, files=source)
             stats["created"] += 1
         stats["files"] += n
         stats["bytes"] += b
@@ -300,17 +338,47 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _scratch_parent(db_path: Path, out_dir: Path) -> Path:
-    """Where to BUILD the database snapshot: somewhere local with room for a full copy, and never
-    inside `out_dir`.
+def _publish(local: Path, out: Path) -> None:
+    """Put a FINISHED file at `out`, writing it into the destination exactly once.
 
-    The whole point is to keep the scratch copy away from the sync client -- see snapshot_db. The
-    system temp dir is first choice; the database's own directory is the fallback, because a
-    machine whose OS partition is too small to hold a copy of the database is demonstrably still
-    holding one where the database already lives."""
-    need = int(db_path.stat().st_size * SCRATCH_HEADROOM)
+    A rename when the two are on one filesystem: atomic, instant, free. Otherwise the bytes must
+    be copied, and a copy into a cloud folder IS the upload -- so it goes straight to the final
+    name. Staging under `<out>.tmp` there would upload the file TWICE, because the sync client
+    treats the staging file as its own upload and the rename does not cancel it: confirmed
+    2026-08-23 in DriveFS's operations table, where every artifact sat queued as a .zip/.zip.tmp
+    pair that survived ~50 minutes of draining.
+
+    The price is that an interrupted copy leaves a short file under the real name, so this is only
+    for artifacts whose readers can tell and recover. It is deliberately NOT used for the media day
+    archives: clips.py's _archive_guard licenses DELETING a clip on the mere existence of its day's
+    zip, and a truncated archive would satisfy it -- footage would go for a file holding nothing.
+    The DB and meta snapshots are the opposite case, and the two worth the most: each is a
+    whole-file rewrite every single run (~1.5 GB and ~0.6 GB), and each has a reader that tries the
+    newest, finds it will not open, and falls back to the one before."""
+    size = local.stat().st_size
+    try:
+        os.replace(local, out)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:                  # not a cross-filesystem move: a real failure
+            raise
+    shutil.copyfile(local, out)
+    landed = out.stat().st_size
+    if landed != size:
+        # Caught while we are still here to say so, rather than found at restore time.
+        out.unlink(missing_ok=True)
+        raise RuntimeError(f"{out.name} landed short ({landed} of {size} bytes) -- removed")
+
+
+def _scratch_parent(need: int, out_dir: Path, fallback: Path) -> Path:
+    """Where to BUILD something bound for `out_dir`: somewhere local with `need` bytes free, and
+    never inside `out_dir` itself.
+
+    The whole point is to keep working files away from the sync client -- see snapshot_db. The
+    system temp dir is first choice; `fallback` is tried next, because a machine whose OS
+    partition is too small to hold the work is often still holding the source of it elsewhere."""
     rejected: list[str] = []
-    for cand in (Path(tempfile.gettempdir()), db_path.resolve().parent):
+    for cand in (Path(tempfile.gettempdir()), fallback.resolve()):
         if _is_within(cand, out_dir):
             # The regression guard. This is the exact bug being fixed: a scratch file inside the
             # backup destination is a scratch file the cloud client uploads.
@@ -324,8 +392,7 @@ def _scratch_parent(db_path: Path, out_dir: Path) -> Path:
         if free >= need:
             return cand
         rejected.append(f"{cand} ({free / 2**30:.1f} GB free, needs {need / 2**30:.1f} GB)")
-    raise RuntimeError("nowhere local to build the database snapshot -- tried: "
-                       + "; ".join(rejected))
+    raise RuntimeError("nowhere local to build the snapshot -- tried: " + "; ".join(rejected))
 
 
 def _sweep_snapshot_scratch(out_dir: Path) -> None:
@@ -366,20 +433,20 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
     the TemporaryDirectory now -- which also means a throw anywhere below no longer strands a
     multi-gigabyte file in the cloud folder, as the old success-path-only unlink did.
 
-    This function is NOT yet free of that class of cost, and the same operations table says so:
-    the finished zip is still staged as `<name>.zip.tmp` INSIDE out_dir before os.replace renames
-    it, and Drive uploads that staging file as an INDEPENDENT operation -- the pair survives the
-    rename rather than being cancelled by it, so the ~1.5 GB archive still goes up twice. Staging
-    through a `.tmp` is load-bearing (a crash must never leave a truncated archive under the final
-    name), and every zip writer in this module does it, so moving the staging file out of the
-    synced folder is one deliberate change across all of them rather than a fix smuggled in here."""
+    The finished zip is built in that same local directory and published with a single write, for
+    the same reason: staging it as `<name>.zip.tmp` inside out_dir uploaded the ~1.5 GB archive
+    twice over, the sync client treating the staging file as an upload of its own and the rename
+    not cancelling it. _publish says why the media archives still stage through a .tmp and this one
+    does not -- the difference is whether a reader can tell a short file from a good one, and here
+    it can: migrate.py takes the newest DB snapshot, quick_checks it, and falls back."""
     out_zip = out_dir / f"backyard-db-{today.isoformat()}.zip"
     if dry_run:
         log.info("would snapshot %s (%.1f MB) -> %s", db_path.name, db_path.stat().st_size / 2**20, out_zip.name)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     _sweep_snapshot_scratch(out_dir)
-    scratch_parent = _scratch_parent(db_path, out_dir)
+    scratch_parent = _scratch_parent(int(db_path.stat().st_size * SCRATCH_HEADROOM),
+                                     out_dir, db_path.parent)
     log.debug("building the db snapshot in %s", scratch_parent)
     with tempfile.TemporaryDirectory(prefix="backyard-snapshot-", dir=scratch_parent) as td:
         tmp_db = Path(td) / db_path.name
@@ -403,26 +470,30 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
         if wal.exists() and wal.stat().st_size > 0:
             raise RuntimeError(f"snapshot left an un-checkpointed WAL ({wal.stat().st_size} bytes) "
                                f"-- refusing to archive an incomplete database")
-        tmp = out_zip.with_name(out_zip.name + ".tmp")
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        staged = Path(td) / out_zip.name
+        with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_db, db_path.name)
-        os.replace(tmp, out_zip)
+        _publish(staged, out_zip)
     log.info("created %s  (db %.1f MB -> %.1f MB zipped, quick_check ok)", out_zip.name,
              db_path.stat().st_size / 2**20, out_zip.stat().st_size / 2**20)
 
 
-def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
-    """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
-    it's tens of MB, and 'always current, always complete' beats clever here."""
-    out_zip = out_dir / f"meta-{today.isoformat()}.zip"
-    present = [p for p in meta_items() if p.exists()]
-    if dry_run:
-        log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp = out_zip.with_name(out_zip.name + ".tmp")
+def _tree_bytes(items: list[Path]) -> int:
+    """Total size of `items`, walking directories. Only used to size the scratch space."""
+    total = 0
+    for item in items:
+        try:
+            files = [item] if item.is_file() else [q for q in item.rglob("*") if q.is_file()]
+            total += sum(q.stat().st_size for q in files)
+        except OSError:
+            continue
+    return total
+
+
+def _write_meta_zip(staged: Path, present: list[Path]) -> int:
+    """Deflate the meta items into `staged`; returns how many files made it in."""
     n = 0
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for item in present:
             files = [item] if item.is_file() else [p for p in sorted(item.rglob("*")) if p.is_file()]
             for p in files:
@@ -438,7 +509,28 @@ def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
                     log.warning("%s lives outside the project root -- not archived; back that "
                                 "folder up by hand", item)
                     break
-    os.replace(tmp, out_zip)
+    return n
+
+
+def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
+    """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
+    it's tens of MB, and 'always current, always complete' beats clever here.
+
+    Built locally and published with one write, like the DB snapshot. "Rewritten whole every run"
+    is exactly the shape a .tmp inside the destination doubles the cost of; restore reads the
+    newest meta zip and falls back to the one before if it will not open, which is what makes
+    publishing straight to the final name safe here."""
+    out_zip = out_dir / f"meta-{today.isoformat()}.zip"
+    present = [p for p in meta_items() if p.exists()]
+    if dry_run:
+        log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scratch = _scratch_parent(int(_tree_bytes(present) * 1.1) + 2**20, out_dir, ROOT)
+    with tempfile.TemporaryDirectory(prefix="backyard-meta-", dir=scratch) as td:
+        staged = Path(td) / out_zip.name
+        n = _write_meta_zip(staged, present)
+        _publish(staged, out_zip)
     log.info("created %s  (%d files, %.1f MB)", out_zip.name, n, out_zip.stat().st_size / 2**20)
 
 
@@ -665,7 +757,12 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
               before the multi-camera layout are just clips-<date>.zip). Uncompressed
               inside -- mp4 already is. The highlight reels (clips/reels/ on the machine)
               are NOT here: each is stitched from these clips and rebuilds itself on demand.
-  crops/      one zip per calendar day of detection crops (JPEGs)
+              A day whose clips arrived in more than one batch -- the trail-cam card is
+              dumped and put straight back in the camera, so its dump day always does --
+              has extra parts beside it: clips-<camera>-<date>.part2.zip, .part3.zip. They
+              are the rest of that same day, not duplicates. Unzip ALL of a day's parts;
+              no file is in two of them.
+  crops/      one zip per calendar day of detection crops (JPEGs), same .partN rule
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config,
                                         certified reference photos, the DB's import and
