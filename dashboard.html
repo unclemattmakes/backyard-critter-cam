@@ -220,7 +220,7 @@
   <div class="modal-card panel instr cams" role="dialog" aria-modal="true" aria-label="Cameras">
     <button class="modal-x" type="button" onclick="closeCameras()" aria-label="Close">&#10005;</button>
     <h3>Cameras</h3>
-    <p class="hint">The cameras this rig watches. Add a USB camera by its index, or a networked one by its address &mdash; <em>The Backyard Critter Cam</em> speaks RTSP directly, so no extra software is needed on the camera.</p>
+    <p class="hint">The cameras this rig watches. Add a USB camera by its index, or a networked one by its address &mdash; <em>The Backyard Critter Cam</em> speaks RTSP and MJPEG-over-HTTP directly, so no extra software is needed on the camera.</p>
     <div class="cams-banner" id="cams-restart" hidden></div>
     <!-- Outside the form on purpose: the form is hidden unless you are adding or editing, and a
          failed load or a refused delete has to be visible in the list view too. -->
@@ -252,6 +252,13 @@
       </div>
 
       <div id="cam-net-fields">
+        <label class="cams-row"><span>Protocol</span>
+          <select id="cam-scheme" onchange="camSchemeChanged()">
+            <option value="rtsp">RTSP</option>
+            <option value="http">HTTP (MJPEG)</option>
+            <option value="https">HTTPS (MJPEG)</option>
+          </select></label>
+        <p class="hint cams-note">Most dedicated IP cameras speak <strong>RTSP</strong>. A Raspberry&nbsp;Pi, an ESP32 or a phone running a streaming app usually serves <strong>MJPEG over HTTP</strong> instead &mdash; if the stream plays in a browser tab, it is HTTP, not RTSP.</p>
         <label class="cams-row"><span>Address</span>
           <input id="cam-host" maxlength="200" placeholder="192.168.0.105" autocomplete="off"
                  spellcheck="false"></label>
