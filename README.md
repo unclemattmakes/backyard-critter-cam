@@ -133,7 +133,7 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
   built on them. Clips are recorded by piping frames to ffmpeg (`clip_codec = "h264"`); with no
   ffmpeg the recorder falls back to OpenCV's `mp4v` writer, and no browser decodes `mp4v`, so
   those clips won't play in the dashboard — the server's on-demand transcode is *also* ffmpeg, so
-  there's nothing to fall back to. And the Dispatch's stitched highlight reel is an ffmpeg concat,
+  there's nothing to fall back to. And the Creature Report's stitched highlight reel is an ffmpeg concat,
   so without it the reel returns `ffmpeg not found on PATH` and the panel stays empty. Everything
   else — detection, crops, species, re-ID, motion tracks — works fine without it.
 
@@ -501,7 +501,7 @@ has grown from a single live feed into **nine tabs**:
   renumbered), so it survives re-clustering — star a visit while the animal is still on camera
   and the card grows to the finished span. A favourite whose crops are later purged is listed as
   gone rather than quietly disappearing.
-- **The Dispatch** — a newspaper-style **period digest** (☾ Night / ☀ Day,
+- **The Creature Report** — a newspaper-style **period digest** (☾ Night / ☀ Day,
   with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
   reel** — the period's best moments auto-cut into one short stitched video (~1 minute for a
   busy night, built by `reel.py` from motion tracks + shot quality, one beat per species /
@@ -567,7 +567,7 @@ batch importer**: point it at any folder of JPG/PNG photos — an old trail-cam 
 camera roll from the garden, doorbell-cam exports — and it runs the same detector over them and
 writes the same crops, visits and database rows the live rig would. Then serve the dashboard
 over the result. No camera, no GPU required (CPU just takes longer), and your first populated
-Dispatch/Calendar/Catalogue is on **your own animals**:
+Creature Report/Calendar/Catalogue is on **your own animals**:
 
 ```bash
 python import_trailcam.py my_folder --source my_yard
@@ -1022,8 +1022,8 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
 
 ## A morning email
 
-`newsletter.py` mails you last night's Dispatch as a small newspaper — the same
-`period_digest` the dashboard's Dispatch tab renders, laid out for an inbox: a lede of who
+`newsletter.py` mails you last night's Creature Report as a small newspaper — the same
+`period_digest` the dashboard's Creature Report tab renders, laid out for an inbox: a lede of who
 came and when, a hero photo re-judged for *cuteness* rather than raw sharpness (how much
 animal is in frame, whether the focus is on the animal or the yard behind it, night eyeshine
 as a "facing you" signal — and never an upscaled crop), the visit timeline with thumbnails,
@@ -1032,7 +1032,7 @@ are floors, "surprising" species are listed as questions, and a night the camera
 watching says so.
 
 Everything in it **deep-links back into the dashboard** — a visit opens that day, a species
-opens its catalogue sheet, a cast member opens their profile, the hero opens that Dispatch.
+opens its catalogue sheet, a cast member opens their profile, the hero opens that report.
 Those links reach the rig **over your own network only** (the dashboard has no login — see
 [Security & privacy](#security--privacy)), so they work from the sofa and not from the bus.
 The address is auto-detected per issue: your machine's **LAN IP**, not its hostname, because
@@ -1057,7 +1057,7 @@ LAN-only, and Gmail strips `data:` URIs. Set three values in `config_local.py` (
 
 ```python
 cfg.email_to = "you@example.com"     # or "you@example.com, someone@else.com" (or a list)
-cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"  # a Resend-verified domain
+cfg.email_from = "Creature Report <dispatch@your-domain.com>"  # a Resend-verified domain
 cfg.email_resend_api_key = "re_..."
 ```
 

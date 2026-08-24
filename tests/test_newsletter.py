@@ -111,6 +111,16 @@ def test_subject_leads_with_novelty():
     assert "3 visits" in s
 
 
+def test_masthead_is_one_name_for_every_edition():
+    """The paper used to retitle itself Morning/Evening by edition, which said the period twice
+    (the subject already words it) and made one publication look like two. The edition is still
+    visible in the subject -- it just isn't in the title any more."""
+    night = newsletter.compose_subject(mkbundle(mkdigest(edition="night")))
+    day = newsletter.compose_subject(mkbundle(mkdigest(edition="day")))
+    assert night.startswith(newsletter.MASTHEAD) and day.startswith(newsletter.MASTHEAD)
+    assert "Morning" not in night and "Evening" not in day
+
+
 def test_subject_crowd_beats_names():
     d = mkdigest(crowd={"n": 4, "at": "2026-08-12T02:07:11-07:00", "source": "glass_door_cam",
                         "by_species": {"raccoon": 4}})
@@ -195,7 +205,7 @@ def test_render_email_carries_the_masthead_and_hedges():
                      "typical": "6am–10am", "hours": [0] * 24, "active_hours": [2],
                      "clip": None, "surprising": True, "surprise_note": "off-hours"}])
     html = newsletter.render_email(mkbundle(d), {}, lambda cid: None)
-    assert "The Morning Dispatch" in html
+    assert newsletter.MASTHEAD in html             # one name for every edition
     assert "No. 34" in html
     assert "a floor" in html                       # crowd tally never reads as a census
     assert "verify" in html                        # surprising species listed as a question

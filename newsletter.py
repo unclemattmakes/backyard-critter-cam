@@ -1,11 +1,11 @@
 """
-The Dispatch, delivered: a morning email of last night's yard activity.
+The Creature Report, delivered: a morning email of last night's yard activity.
 
-The dashboard's Dispatch tab already writes the story of each completed sun-period --
+The dashboard's Creature Report tab already writes the story of each completed sun-period --
 stats.period_digest() knows the visits, the named individuals, the plate of the night, who was
 oddly absent and whether the camera was even watching. This module is a THIN RENDERER over that
 same payload: it asks for the most recently completed night, lays it out as a small newspaper
-(same masthead the dashboard uses -- "The Morning Dispatch"), and mails it. No new analysis
+(same masthead the dashboard uses -- see MASTHEAD), and mails it. No new analysis
 happens here; if the email and the dashboard ever disagree, the email is wrong.
 
 Delivery is Resend's REST API (https://resend.com), one stdlib urllib POST -- no SDK, no new
@@ -67,6 +67,14 @@ from pathlib import Path
 import db
 import mdns
 import stats
+
+# What the paper is called, in the subject line and over the masthead. ONE name for every
+# edition: the period is stated inside the issue (and in the subject's own words), so putting
+# Morning/Evening in the title too was saying it twice and made the paper look like two
+# publications. dashboard.js carries the same string over its Creature Report tab, so a reader
+# who taps a link lands on a page named the same as the thing they were reading -- the ROUTE
+# behind that tab stays `#dispatch`, because every issue ever sent links to it.
+MASTHEAD = "Creature Report"
 
 # ---------------------------------------------------------------------------
 # Layout knobs. The email must stay light: Gmail clips messages whose HTML part exceeds ~102 KB
@@ -305,7 +313,7 @@ def _present_names(d) -> list[tuple[str, int]]:
 def compose_subject(bundle) -> str:
     d = bundle["d"]
     ed = d.get("edition") or "night"
-    masthead = "The Morning Dispatch" if ed == "night" else "The Evening Dispatch"
+    masthead = MASTHEAD
     if d.get("empty"):
         cov = d.get("coverage")
         quiet = "a quiet night" if ed == "night" else "a quiet day"
@@ -840,7 +848,7 @@ def _flag(text, bg=_C["flag_bg"], ink=_C["soft"]) -> str:
 def render_email(bundle, images, img_src) -> str:
     d, rc = bundle["d"], bundle["rc"]
     ed = d.get("edition") or "night"
-    masthead = "The Morning Dispatch" if ed == "night" else "The Evening Dispatch"
+    masthead = MASTHEAD
     period_word = "Night" if ed == "night" else "Day"
     anchor = d.get("anchor") or ""
     try:
@@ -1106,7 +1114,7 @@ def render_email(bundle, images, img_src) -> str:
              "issue was sent, so start the rig if a link goes nowhere.")
     parts.append(f"""
     <div style="margin-top:22px;padding-top:12px;border-top:3px double {_C['ink']};text-align:center;">
-      <a href="{_esc(dash)}" style="color:{_C['gilt']};font-weight:700;font-size:14px;">Open the full Dispatch → highlight reel &amp; clips</a>
+      <a href="{_esc(dash)}" style="color:{_C['gilt']};font-weight:700;font-size:14px;">Open the full Creature Report → highlight reel &amp; clips</a>
       <p style="font-size:12px;margin:8px 0 0;">{rooms}</p>
       <p style="font-size:11px;color:{_C['faint']};margin:10px 0 0;line-height:1.6;">
         {_esc(reach)}<br>
@@ -1331,7 +1339,8 @@ def _say(msg: str, always_log: bool = False) -> None:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Email the Dispatch: last night's yard, as a morning newsletter.")
+    p = argparse.ArgumentParser(
+        description="Email the Creature Report: last night's yard, as a morning newsletter.")
     p.add_argument("--edition", choices=("night", "day", "auto"), default="night",
                    help="Which completed period to write up (default: night).")
     p.add_argument("--date", default=None, help="Anchor date YYYY-MM-DD for a back-issue.")

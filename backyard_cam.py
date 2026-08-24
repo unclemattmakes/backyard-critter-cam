@@ -2030,7 +2030,7 @@ def serve_only(cfg: config.Config) -> int:
     camera opened, no detector built (so no model download), no naming helper spawned. One
     synthetic FrameBuffer/bridge per configured camera keeps every per-camera endpoint
     answering (the Live tab shows its normal "Camera feed unavailable" overlay); every other
-    tab -- Visit Log, Dispatch, Calendar, Individuals, Catalogue -- reads the DB exactly as
+    tab -- Visit Log, Creature Report, Calendar, Individuals, Catalogue -- reads the DB exactly as
     usual. This is the "browse footage you imported" and "read an old archive on a laptop"
     mode: it starts in seconds because the heavy imports the capture path needs never run."""
     # No rig here, so there is no running camera list to hand the server: the synthetic panes come

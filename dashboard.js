@@ -1089,8 +1089,8 @@ async function renderDay(params,body){
   body.innerHTML=`
     <div class="day-summary">
       <button class="back" id="day-visits">${d.visits||0} visits this day &rarr;</button>
-      <button class="back" onclick="openDispatchAt(${jarg(date)},'day')" title="the day's dispatch — reel, timeline, roll">☀ day dispatch</button>
-      <button class="back" onclick="openDispatchAt(${jarg(nextDay)},'night')" title="the night that FOLLOWED this day (dusk to dawn)">☾ that night&rsquo;s dispatch</button>
+      <button class="back" onclick="openDispatchAt(${jarg(date)},'day')" title="the day's report — reel, timeline, roll">☀ day report</button>
+      <button class="back" onclick="openDispatchAt(${jarg(nextDay)},'night')" title="the night that FOLLOWED this day (dusk to dawn)">☾ that night&rsquo;s report</button>
       ${chips?`<div class="chips">${chips}</div>`:''}
     </div>
     <div class="crops" id="obs-grid"></div><div class="more" id="obs-more"></div>`;
@@ -1418,7 +1418,7 @@ function wireIndivMotion(root){
   root.querySelectorAll('[data-im]').forEach(b=>fillIndivMotion(b.dataset.im, b));
 }
 
-/* ---------- The Dispatch (period digest) ----------
+/* ---------- The Creature Report (period digest) ----------
    The landing page, rebuilt around the two questions people actually open it with:
    "what happened?" (the condensed highlight reel) and "who came, when?" (the visit timeline).
    Species aggregates (the Roll), the plate, and the cast roll call follow underneath.
@@ -1435,7 +1435,7 @@ function dspLatest(){ DSP={edition:'auto', date:null}; _dspHash(); loadDispatch(
 function openDispatchAt(date, edition){ dspNav(date, edition); show('dispatch'); }
 
 async function loadDispatch(){
-  const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the dispatch…</p>';
+  const body=$('#dispatch-body'); body.innerHTML='<p class="empty">Loading the report…</p>';
   clearTimeout(__reelTimer);
   const seq=++__dspSeq;
   const qs='edition='+encodeURIComponent(DSP.edition)+(DSP.date?'&date='+encodeURIComponent(DSP.date):'');
@@ -1450,7 +1450,7 @@ async function loadDispatch(){
       fetch('/api/digest?'+qs).then(r=>r.json()),
       fetch('/api/rollcall').then(r=>r.json()).catch(()=>({cast:[]})),
     ]);
-  }catch(e){ body.innerHTML='<p class="empty">Could not load the dispatch.</p>'; return; }
+  }catch(e){ body.innerHTML='<p class="empty">Could not load the report.</p>'; return; }
   if(seq!==__dspSeq) return;                    // a newer navigation superseded this load
   window.__digest=d;
   renderDispatch(d, rc, {status:'loading'});
@@ -1513,7 +1513,10 @@ function rollcallSection(rc){
 }
 function dispatchHeader(d){
   const ed=d.edition||DSP.edition;
-  const masthead = ed==='night' ? 'The Morning Dispatch' : ed==='day' ? 'The Evening Dispatch' : 'The Dispatch';
+  /* One flat name for every edition, matching newsletter.MASTHEAD -- a reader who taps a link in
+     the email lands on a page named the same as the thing they were reading. The '#dispatch'
+     route id below is deliberately NOT renamed: every issue ever sent links to it. */
+  const masthead = 'Creature Report';
   const range = d.start ? `${fmtDateTime(d.start)} – ${fmtDateTime(d.end)}` : '';
   const back = d.latest===false ? ` · <span class="dsp-latest" onclick="dspLatest()">back to the latest ↻</span>` : '';
   const nav=(dt,dir,lab)=> dt

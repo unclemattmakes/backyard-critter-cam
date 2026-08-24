@@ -107,14 +107,14 @@ def apply(cfg):
     # from pathlib import Path
     # cfg.backup_dest = Path(r"C:\cloud-synced-folder\backyard")
 
-    # The morning email (newsletter.py) -- last night's Dispatch as a small newspaper in your
+    # The morning email (newsletter.py) -- last night's Creature Report as a small newspaper in your
     # inbox. Sending needs a free https://resend.com account with a verified sender domain; all
     # three values are private, so they live here, never in config.py. Schedule
     # `python newsletter.py` daily (README "A morning email"); until these are set the script
     # just archives each issue locally under reports/mail/. Photos ride inside the email, so
     # point email_to only at people you'd show the dashboard to.
     # cfg.email_to = "you@example.com"                       # or "you@example.com, them@example.com"
-    # cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"
+    # cfg.email_from = "Creature Report <dispatch@your-domain.com>"
     # cfg.email_resend_api_key = "re_..."
     # cfg.email_dashboard_url = "http://192.168.1.20"   # override the auto-detected LAN address
     # Port 80 is the default and is omitted from every printed address. If something else on

@@ -419,9 +419,9 @@ class Config:
     # (already machine-only). Set False only if you deliberately front it with your own auth/VPN.
     lan_only: bool = True
 
-    # ---- Morning email (newsletter.py: the Dispatch, delivered) -------------------
+    # ---- Morning email (newsletter.py: the Creature Report, delivered) ------------
     # A daily email of the completed night (or day), rendered from the same period_digest the
-    # dashboard's Dispatch tab shows -- schedule `python newsletter.py` after dawn (README "A
+    # dashboard's Creature Report tab shows -- schedule `python newsletter.py` after dawn (README "A
     # morning email"). All three values below must be set for anything to send; unset (the
     # default), the script renders a local archive copy under reports/mail/ and exits politely,
     # so the scheduled task can predate the email account. Set them in config_local.py, NEVER
