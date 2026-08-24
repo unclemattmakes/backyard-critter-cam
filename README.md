@@ -240,6 +240,61 @@ your browser; species names are added automatically — there's nothing else to 
 **To stop:** click the live **video window** and press **`q`** — or just **close that window**.
 Everything (camera, dashboard, *and* species naming) shuts down together, in one step.
 
+#### Telling someone else how to connect
+
+The LAN launcher gives the rig a **name on your network**, so nobody has to be handed an IP
+address — or a port:
+
+> **`http://critter-cam.local`**
+
+That's the whole address. Nothing after it. It works from any phone, tablet or laptop on the same
+Wi-Fi, and — unlike the numeric address — it keeps working after your router hands the rig a
+different DHCP lease, so it's safe to write down. The rig also advertises itself as a web service,
+so it turns up **by name** in network browsers (macOS Finder's *Network*, Discovery on iOS,
+`avahi-browse` on Linux) without anyone typing anything.
+
+The missing `:8000` is the other half of the trick, and it's why the dashboard now defaults to
+**port 80**: that's the port a browser assumes, so serving there is what lets the address be a
+bare name. Port 80 isn't always available — it needs root on Linux/macOS, and anything web-shaped
+may already hold it — so a failed bind **falls back to `web_port_fallback`** (default 8000),
+prints why, and every address the rig prints afterwards reads the port off the actual socket.
+A rig that can't have 80 keeps its dashboard; it just has a longer address.
+
+The launcher window prints the name **and** the numeric address once the dashboard is actually up,
+and then stays open so you can go back and read it. To ask at any other time:
+
+```bash
+.venv\Scripts\python.exe mdns.py --host 0.0.0.0
+```
+
+A few things worth knowing:
+
+- **Android is the weak link.** iOS, macOS and Windows resolve `.local` reliably; some Android
+  browsers don't do mDNS at all. That's why the numeric address is always printed next to the
+  name — if the name doesn't work on a phone, use the number.
+- **Rename it per rig** with `cfg.mdns_name` in `config_local.py` (`"front-yard-cam"`) if you end
+  up with two. Spaces and punctuation are fine to type — the name is sanitised to a legal DNS
+  label. `cfg.mdns = False` turns the announcement off entirely.
+- **Windows will not prompt about the firewall again**, and that's correct — its "Allow access"
+  rules are scoped to the *program* with `LocalPort: Any`, not to one port, so the permission
+  `python.exe` already has covers 80 too. What *does* decide whether other devices can reach the
+  rig is the **network category**: those rules are per-profile, and the usual pair is *Allow* on
+  Private and *Block* on Public. Windows classifies new Wi-Fi as Public by default, and Block
+  wins over Allow — so on a Public-classified network the dashboard is unreachable from any other
+  device no matter which port it serves. Check with `Get-NetConnectionProfile`; if it says
+  `Public`, set that network to Private (Settings → Network & Internet → Wi-Fi → your network →
+  *Private network*). This is not new with port 80 — it applied equally on 8000.
+- **Only in LAN mode.** A localhost-bound rig publishes nothing — there'd be nobody to tell, and
+  a name resolving to an address that refuses every caller is worse than no name.
+- **If the name is already taken**, the rig checks who has it. Its own leftover record — what a
+  crash or a power cut leaves cached on the network, since a rig that dies never sends its goodbye
+  packets — is reclaimed, because `rigwatch.py` restarts this rig after it dies and the name must
+  survive the reboots nobody is watching. A *different* device holding the name is left alone: the
+  rig says so, names the address, and serves on numbers rather than giving two machines one name.
+
+Needs the `zeroconf` package (in `requirements.txt`). Without it the rig runs exactly as before,
+says so in one line at startup, and serves on numbers.
+
 ### From the command line
 
 ```powershell
@@ -256,7 +311,7 @@ the species-naming helper. The window is **resizable** — drag any edge.
 Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + stats + gallery):
 
 ```powershell
-.\.venv\Scripts\python.exe backyard_cam.py --serve        # then open http://127.0.0.1:8000
+.\.venv\Scripts\python.exe backyard_cam.py --serve        # then open http://127.0.0.1
 ```
 
 ### Common flags
@@ -282,7 +337,7 @@ All defaults live in `config.py`; these override them per-run:
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
 | `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
-| `--port N` / `--host H` | Dashboard port (default 8000) / bind host (default `127.0.0.1`; `0.0.0.0` = LAN). |
+| `--port N` / `--host H` | Dashboard port (default 80, falling back to 8000 if 80 is taken) / bind host (default `127.0.0.1`; `0.0.0.0` = LAN). |
 
 ### Multiple cameras (USB + networked)
 
@@ -423,7 +478,7 @@ visits. Tune the collapse window with `--visit-gap-min N` (default 5).
 ### Web dashboard (`--serve`)
 
 `python backyard_cam.py --serve` runs the same capture loop **and** a local web page (open
-`http://127.0.0.1:8000`) — a field journal for the yard you can leave open in a browser tab. It
+`http://127.0.0.1`) — a field journal for the yard you can leave open in a browser tab. It
 has grown from a single live feed into **nine tabs**:
 
 - **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
@@ -520,7 +575,7 @@ python classify.py
 python backyard_cam.py --serve-only
 ```
 
-then open `http://localhost:8000`. Three honest caveats:
+then open `http://localhost`. Three honest caveats:
 
 - **Photos are the input that matters.** Detection runs on stills; MP4s alongside them ride in
   as playable behaviour clips (paired to nearby animal photos), but a videos-only folder
@@ -923,7 +978,7 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
 - **Or pack from the dashboard.** The footer's **move this rig** link (operators) runs the
   same pack from the browser: pick a destination, watch the log live, and get the second-pass
   reminder the moment it finishes. Like a camera password, *starting* one only works from the
-  rig machine itself (`http://127.0.0.1:8000`) — it writes gigabytes to a path of your
+  rig machine itself (`http://127.0.0.1`) — it writes gigabytes to a path of your
   choosing, so to aim the rig's disk somewhere, be at the rig. Restore deliberately has no
   UI: it runs on the **new** machine, where no rig — and so no dashboard — exists yet.
 - **Packing beside a running rig is safe, but do it in two passes.** The database snapshot
@@ -984,6 +1039,14 @@ The address is auto-detected per issue: your machine's **LAN IP**, not its hostn
 phones resolve mDNS rather than NetBIOS and `http://your-pc:8000` simply fails on iOS and
 Android. Re-deriving it every morning means a DHCP change heals itself; override with
 `cfg.email_dashboard_url` for a fixed name, a different port, or a reverse proxy.
+
+The email keeps using the **number** even though the rig now publishes `critter-cam.local`
+(above), and that is deliberate: the paper carries exactly one link per item, it is read on
+phones, and some Android browsers don't resolve `.local` at all — a name would trade a link that
+always works for one that's prettier and sometimes doesn't. The startup banner can print both
+side by side and let the reader pick; an email link can't. Set
+`cfg.email_dashboard_url = "http://critter-cam.local"` if everyone in your household is on
+iOS.
 
 Sending uses [Resend](https://resend.com)'s REST API (free tier is plenty for one email a
 day) via a single stdlib HTTP call — no SDK. Photos are embedded as inline attachments
@@ -1142,21 +1205,28 @@ write is refused server-side until the token is entered once in that browser (da
 footer). Localhost is always the operator; leaving the token unset keeps the historical
 everyone-operates behaviour.
 
-- **Localhost by default.** The server binds `127.0.0.1:8000`, so nothing off the machine can
-  reach it.
+- **Localhost by default.** The server binds `127.0.0.1` (port 80, or 8000 if 80 is
+  unavailable), so nothing off the machine can reach it.
 - **LAN access is an explicit opt-in** — `start_critter_cam_lan.bat`, or `--host 0.0.0.0` — and
   even then two guards apply. The peer's IP must be loopback or private/link-local (`lan_only`,
   default `True`), which refuses *direct* connections from the wider internet; and the `Host`
-  header must be `localhost`, a private IP literal, or your configured `web_host`, which is what
-  stops **DNS rebinding** — a malicious site you happen to visit pointing its own hostname at your
-  rig's LAN IP and driving the dashboard through your own browser.
+  header must be `localhost`, a private IP literal, your configured `web_host`, or the exact
+  mDNS name this rig publishes for itself (`cfg.mdns_name`, default `critter-cam.local`) — which
+  is what stops **DNS rebinding**, a malicious site you happen to visit pointing its own hostname
+  at your rig's LAN IP and driving the dashboard through your own browser. Note *exact*: `.local`
+  is not allowed as a class. Blanket-allowing it would be nearly safe — RFC 6762 reserves `.local`
+  for multicast, so an internet resolver can't point one at your rig — but "nearly" leans on every
+  client routing `.local` to mDNS, and a network whose unicast DNS answers for `.local` would hand
+  the guard back to the attacker.
+- **The name is not a door.** mDNS publishes a nicer spelling of an address the guards above
+  already allowed; it opens nothing, and `.local` is resolvable only from your own link.
 - **Writes require a same-origin request.** Every `POST` — renaming an individual, assigning a
   visit, editing a species, deleting a clip, changing a camera control — must carry an `Origin`
   header matching the dashboard's own, and `Content-Type: application/json`. Without that, any page
   you happened to have open could quietly `fetch()` your rig and, say, blank the individual off
   months of hand-confirmed detections; the Host guard above does not stop a plain cross-origin
   POST. If you drive the API by hand, curl needs both headers:
-  `-H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json'`.
+  `-H 'Origin: http://127.0.0.1' -H 'Content-Type: application/json'`.
 - **Do not port-forward this to the internet.** The guards above close the common accidental paths;
   they are not a login and not a substitute for one. Anyone already on your Wi-Fi has full access.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only

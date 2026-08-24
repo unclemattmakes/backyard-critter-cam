@@ -15,6 +15,7 @@ tests at the end bind a real loopback socket to smoke the GET and POST endpoints
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -108,6 +109,50 @@ def test_allowed_host_missing_header_allowed():
 def test_allowed_host_ipv4_mapped_ipv6():
     assert web._is_allowed_host("[::ffff:192.168.1.23]:8000") is True
     assert web._is_allowed_host("[::ffff:8.8.8.8]:8000") is False
+
+
+def test_allowed_host_accepts_the_published_mdns_name():
+    """The rig announces itself as critter-cam.local (mdns.py) and the LAN launcher tells every
+    visitor to open exactly that -- so the guard has to let it through, or the whole feature is a
+    403. Guarded on purpose: this is the one test standing between "the name works" and "the name
+    is a permanently broken link printed in a startup banner"."""
+    assert web._is_allowed_host("critter-cam.local:8000", mdns_host="critter-cam.local") is True
+    assert web._is_allowed_host("critter-cam.local", mdns_host="critter-cam.local") is True
+    # Case is not significant in a hostname, and a phone may well send it differently.
+    assert web._is_allowed_host("Critter-Cam.LOCAL:8000", mdns_host="critter-cam.local") is True
+
+
+def test_allowed_host_does_not_blanket_allow_dot_local():
+    """Only the name THIS rig publishes, never `.local` as a class. Blanket-allowing is nearly
+    safe -- RFC 6762 reserves .local for multicast, so an internet resolver cannot point one here
+    -- but "nearly" leans on every client routing .local to mDNS, and a network whose unicast DNS
+    answers for .local hands the rebinding guard straight back to the attacker."""
+    assert web._is_allowed_host("evil.local:8000", mdns_host="critter-cam.local") is False
+    assert web._is_allowed_host("critter-cam.local:8000") is False       # nothing configured
+    assert web._is_allowed_host("critter-cam.local:8000", web_host="0.0.0.0") is False
+
+
+def test_same_origin_accepts_a_page_loaded_from_the_mdns_name():
+    """A visitor who opened http://critter-cam.local:8000 sends BOTH an Origin and a Host naming
+    it. Without the name threaded through, every POST from that page -- every species
+    confirmation, every correction -- would be refused as cross-site."""
+    assert web._is_same_origin("http://critter-cam.local:8000", "critter-cam.local:8000",
+                               web_host="0.0.0.0", web_port=8000,
+                               mdns_host="critter-cam.local") is True
+    # A cross-site page is still refused while the visitor sits on the name.
+    assert web._is_same_origin("http://evil.example", "critter-cam.local:8000",
+                               web_host="0.0.0.0", web_port=8000,
+                               mdns_host="critter-cam.local") is False
+
+
+def test_csrf_refusal_lets_a_post_from_the_mdns_name_through():
+    """The end-to-end shape of the same thing: the refusal body is None only if the request is
+    allowed to proceed."""
+    headers = {"Origin": "http://critter-cam.local:8000", "Host": "critter-cam.local:8000",
+               "Content-Type": "application/json"}
+    assert web._csrf_refusal("POST", headers, "0.0.0.0", 8000, "critter-cam.local") is None
+    # ...and without the name known, the very same request is refused.
+    assert web._csrf_refusal("POST", headers, "0.0.0.0", 8000) is not None
 
 
 # ---- the bind default: loopback unless the operator deliberately opens up -----------
@@ -648,6 +693,110 @@ def test_operator_split_reports_role_and_loopback_operates(corpus, db_path):
         assert status == 200 and role["split"] is True and role["operator"] is True
         status, body = _post(port, "/api/reid/confirm", {"visit_id": 999999, "name": "X"})
         assert "viewer" not in (body or {})   # passed the gate; outcome is the endpoint's own
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def test_bind_falls_back_when_the_wanted_port_is_taken(corpus, db_path):
+    """The dashboard asks for port 80 so the address can be a bare name. Port 80 is also a port a
+    bind can lose for ordinary reasons -- it needs root on Linux/macOS, and anything web-shaped may
+    already hold it -- and an unattended rig must not lose its dashboard over that.
+
+    The second assertion is the one that matters. _is_same_origin compares an Origin's port against
+    cfg.web_port, so a rig that fell back to another port while still believing it was on the first
+    would 403 every POST from the page it had just served itself: no label edits, no corrections,
+    from a dashboard that otherwise looks fine."""
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    taken = blocker.getsockname()[1]
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    spare = probe.getsockname()[1]
+    probe.close()
+
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=taken, web_port_fallback=spare)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        assert server.server_address[1] == spare
+        # 403 here would mean the handler still believes it is on `taken`. Any other status
+        # (including a 4xx from the endpoint itself) means the request cleared the origin guard.
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{spare}/api/individual", data=json.dumps({}).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Origin": f"http://localhost:{spare}", "Host": f"localhost:{spare}"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        assert status != 403
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+        blocker.close()
+
+
+def test_bind_raises_when_nothing_is_available(corpus, db_path):
+    """With the fallback disabled (0), a failed bind stays a failure -- backyard_cam.py catches
+    OSError and carries on without a dashboard, which is a decision for the caller, not something
+    to paper over here."""
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    taken = blocker.getsockname()[1]
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=taken, web_port_fallback=0)
+    try:
+        with pytest.raises(OSError):
+            web.make_server(cfg, {cfg.source: web.FrameBuffer()},
+                            {cfg.source: web.CameraControlBridge()})
+    finally:
+        blocker.close()
+
+
+def test_a_request_arriving_as_the_mdns_name_is_actually_served(corpus, db_path, monkeypatch):
+    """End to end, through a real socket: the LAN launcher prints critter-cam.local, so a request
+    whose Host header says critter-cam.local has to come back 200.
+
+    The unit tests above prove _is_allowed_host accepts the name; this one proves make_server
+    RESOLVES it and hands it to the guard. Those are separate failures -- a correct predicate that
+    nothing calls with the right argument still 403s every visitor -- and only this test sees the
+    second one.
+
+    mdns.enabled is forced rather than binding a wildcard address: the real trigger is
+    web_host='0.0.0.0', and a test suite should not put an open port on the operator's LAN to
+    prove a point about a string."""
+    monkeypatch.setattr(web.mdns, "enabled", lambda cfg: True)
+    monkeypatch.setattr(web.mdns, "host_name", lambda cfg: "critter-cam.local")
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    def get_as(host_header):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/evalstatus")
+        req.add_header("Host", host_header)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        assert get_as(f"critter-cam.local:{port}") == 200
+        # The guard is still a guard: a name this rig does not publish is refused, so the
+        # threading did not simply turn the rebinding check off on the way past.
+        assert get_as(f"evil.local:{port}") == 403
+        assert get_as("evil.example") == 403
     finally:
         server.shutdown()
         server.server_close()

@@ -30,8 +30,14 @@ REM closing the video window) python exits 0 and we close the window ourselves. 
 REM doesn't steal focus from the video window + browser; the full log is also in logs\.
 start "Backyard Critter Cam - log (you can ignore or minimize this)" /min cmd /k ".venv\Scripts\python.exe backyard_cam.py --serve & if errorlevel 1 (echo. & echo   *** The app exited abnormally -- the error is above and in logs\backyard_cam.log. & echo   *** This window is kept open on purpose; close it when you are done reading. & echo.) else (echo stopped from the video window > .rig_pause & exit)"
 
-REM Wait until the dashboard is actually answering (poll the port) rather than guessing a fixed
-REM delay -- the very first run downloads the detector model and can take a while, and we never
-REM want to open the browser to a "can't reach this page". Gives up after ~60s and opens anyway.
-powershell -NoProfile -Command "for($i=0;$i -lt 120;$i++){ try{ $c=New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1',8000); if($c.Connected){$c.Close();exit} }catch{} Start-Sleep -Milliseconds 500 }"
-start "" "http://127.0.0.1:8000"
+REM Wait until the dashboard is actually answering (poll it) rather than guessing a fixed delay --
+REM the very first run downloads the detector model and can take a while, and we never want to open
+REM the browser to a "can't reach this page". Gives up after ~60s and opens anyway.
+REM
+REM The poll used to be inline PowerShell against a hardcoded 8000. It can't be: the dashboard now
+REM asks for port 80 and falls back if it can't have it, so the port is not knowable until the
+REM socket exists. mdns.py --wait-local polls the real candidates and prints the URL that answered.
+set "DASHURL="
+for /f "usebackq delims=" %%u in (`.venv\Scripts\python.exe mdns.py --wait-local`) do set "DASHURL=%%u"
+if not defined DASHURL set "DASHURL=http://127.0.0.1"
+start "" "%DASHURL%"

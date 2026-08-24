@@ -367,7 +367,30 @@ class Config:
     # feed, so only expose it to the LAN deliberately (set web_host = "0.0.0.0").
     serve: bool = False
     web_host: str = "127.0.0.1"
-    web_port: int = 8000
+    # 80 is the port a browser assumes, which is the whole reason it is the default: it is what
+    # lets the address be "critter-cam.local" and nothing else -- no colon, no number, typable by
+    # a child. Everything below is what that costs and how it is paid.
+    #
+    # Windows lets any process bind 80 without elevation. Linux and macOS do NOT (ports under
+    # 1024 need root or CAP_NET_BIND_SERVICE), and 80 is also the port anything web-shaped grabs
+    # first, so a bind failure here is normal rather than exceptional -- on somebody else's
+    # machine it is the EXPECTED case. An unattended rig must not lose its dashboard over that,
+    # so a failed bind falls back to web_port_fallback and says so, loudly, with the real address.
+    web_port: int = 80
+    # Where to go when web_port is taken or forbidden. 8000 because it is where this dashboard
+    # lived until the name arrived, so a fallback lands on the address old bookmarks already know.
+    # Set 0 to disable the fallback and let a failed bind be a hard failure.
+    web_port_fallback: int = 8000
+    # A NAME on the network, so nobody has to be handed a number (mdns.py). With the LAN
+    # launcher the rig answers multicast DNS for "<mdns_name>.local", and everyone opens
+    # http://critter-cam.local:8000 instead of an IP that changes with the DHCP lease. Also
+    # advertised as an _http._tcp service, so the rig turns up by name in network browsers.
+    # Only published when web_host is a wildcard bind -- in localhost mode there is nobody to
+    # tell. Needs the `zeroconf` package; without it the rig runs exactly as before, on numbers.
+    # Rename per rig if a household ends up with two ("front-yard-cam"); the label is sanitised
+    # to a legal DNS label, so spaces and punctuation are safe to type here.
+    mdns: bool = True
+    mdns_name: str = "critter-cam"
     web_jpeg_quality: int = 80   # JPEG quality for the live stream (lighter than saved crops).
     # Cap how often the capture thread annotates + JPEG-encodes a display frame (dashboard
     # stream AND native preview share the cap). A 1080p encode is one of the loop's biggest

@@ -35,6 +35,7 @@ import clips
 import config
 import daynight
 import db
+import mdns
 import powerguard
 import quality
 import stats
@@ -1824,6 +1825,7 @@ def run(cfg: config.Config) -> None:
     server = None
     frame_buffers: dict = {}
     control_bridges: dict = {}
+    mdns_pub = None
     classify_proc = None
     classify_tag = f"{_NAMING_TAG_PREFIX}{os.getpid()}"   # unique marker for a clean, total shutdown
     # A previous rig that died without its finally (taskkill /F, crash, OOM kill) leaves its
@@ -1925,11 +1927,28 @@ def run(cfg: config.Config) -> None:
                 control_bridges[s.source] = web.CameraControlBridge()
             try:
                 server = web.start(cfg, frame_buffers, control_bridges, zone_store, specs)
-                print(f"  dashboard: http://{cfg.web_host}:{cfg.web_port}  (open in a browser)\n")
             except OSError as e:
                 print(f"  [web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
                 print("  [web] continuing without it -- try another port with --port N.\n")
                 server, frame_buffers, control_bridges = None, {}, {}
+            if server is not None:
+                # Announce a name BEFORE printing, so the block can say what was actually
+                # published rather than what was configured. The old line printed cfg.web_host
+                # verbatim, which on the LAN launcher is the wildcard "0.0.0.0" -- an address
+                # nobody can open, on the one path where someone else is meant to.
+                # OUTSIDE the try above, deliberately: web.start has already succeeded by here,
+                # and an unexpected OSError from any of this would otherwise be caught as "could
+                # not start the dashboard" and throw away a server that is up and serving.
+                # The port comes off the SOCKET, not off cfg: the default is 80 and 80 is a port a
+                # bind can lose, in which case web.py has already moved to the fallback and cfg is
+                # describing a rig that does not exist.
+                cfg = replace(cfg, web_port=server.server_address[1])
+                mdns_pub = mdns.publish(cfg)
+                print("  dashboard:")
+                for line in mdns.connect_lines(cfg, ip=mdns.lan_ip(),
+                                               name=mdns_pub.name if mdns_pub else None):
+                    print(line)
+                print()
 
         # ONE shared species-naming child (classify.py --watch): it names any crop lacking a species
         # regardless of source, so a single helper covers every camera (one launch, one stop). Runs
@@ -1985,6 +2004,7 @@ def run(cfg: config.Config) -> None:
         _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
         if server is not None:
             web.shutdown(server)
+        mdns.unpublish(mdns_pub)      # stop answering: an unanswerable name is worse than none
         cv2.destroyAllWindows()
         # Keep the visit ledger fresh: collapse this session's detections into visit events so the
         # dashboard's Behaviour tab is current without a manual `python visits.py`. Best-effort
@@ -2038,7 +2058,11 @@ def serve_only(cfg: config.Config) -> int:
         print(f"[web] could not start the dashboard on {cfg.web_host}:{cfg.web_port}: {e}")
         print("[web] is another rig already serving? Try --port N.")
         return 1
-    print(f"Dashboard (serve-only): http://{cfg.web_host}:{cfg.web_port}   (open in a browser)")
+    cfg = replace(cfg, web_port=server.server_address[1])   # the socket, not the wish -- see above
+    mdns_pub = mdns.publish(cfg)
+    print("Dashboard (serve-only):")
+    for line in mdns.connect_lines(cfg, ip=mdns.lan_ip(), name=mdns_pub.name if mdns_pub else None):
+        print(line)
     print("  No live camera in this mode -- the Live tab says so. Everything else reads the")
     print(f"  database at {cfg.db_path}. Ctrl+C to stop.")
     try:
@@ -2048,6 +2072,7 @@ def serve_only(cfg: config.Config) -> int:
         print("\nStopping.")
     finally:
         web.shutdown(server)
+        mdns.unpublish(mdns_pub)
     return 0
 
 

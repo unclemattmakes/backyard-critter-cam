@@ -423,7 +423,7 @@ This machine is not the old machine. Before first launch:
  4. On the OLD machine: retire the rig. Stop it and DISABLE its scheduled backup task -- two
     machines appending into one archive folder interleave their zips and take turns rewriting
     STATUS.txt, and whichever you read lies about the other.
- 5. Launch (python backyard_cam.py --record-clips), open http://127.0.0.1:8000, and check the
+ 5. Launch (python backyard_cam.py --record-clips), open http://127.0.0.1, and check the
     Individuals tab still knows everybody.
 """.rstrip()
 

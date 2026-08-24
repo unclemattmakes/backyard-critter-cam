@@ -39,6 +39,15 @@ def apply(cfg):
     # Wi-Fi can edit labels -- fine alone, risky with houseguests' phones on the network.
     # cfg.operator_token = "pick-a-phrase"
 
+    # The rig's NAME on your network. With the LAN launcher it answers to
+    # "http://critter-cam.local" -- no port, because the dashboard serves on 80, the port a
+    # browser assumes -- so nobody has to be handed an IP address, and the name keeps working
+    # after the router changes the rig's DHCP lease. Rename it per rig if you end up with two;
+    # spaces and punctuation are fine here (it is sanitised to a legal DNS label).
+    # cfg.mdns_name = "front-yard-cam"
+    # ...or stop announcing anything at all, and go back to numbers only:
+    # cfg.mdns = False
+
     # Power-user option (the default 'auto' already uses the GPU when it works, else CPU). Set
     # 'cuda' to REQUIRE a working NVIDIA GPU and fail loud if a wrong torch build can't use it,
     # rather than quietly running slow on the CPU -- handy on the main rig so a broken GPU shows.
@@ -107,5 +116,10 @@ def apply(cfg):
     # cfg.email_to = "you@example.com"                       # or "you@example.com, them@example.com"
     # cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"
     # cfg.email_resend_api_key = "re_..."
-    # cfg.email_dashboard_url = "http://192.168.1.20:8000"   # override the auto-detected LAN address
+    # cfg.email_dashboard_url = "http://192.168.1.20"   # override the auto-detected LAN address
+    # Port 80 is the default and is omitted from every printed address. If something else on
+    # this machine needs 80, move the dashboard rather than fighting over it:
+    # cfg.web_port = 8000
+    # ...or change where a failed bind lands (0 = no fallback, a failed bind is fatal):
+    # cfg.web_port_fallback = 8080
     # cfg.email_send_quiet = False                           # skip the email on visitor-less nights

@@ -51,7 +51,6 @@ from __future__ import annotations
 import argparse
 import base64
 import io
-import ipaddress
 import json
 import re
 import shutil
@@ -66,6 +65,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import db
+import mdns
 import stats
 
 # ---------------------------------------------------------------------------
@@ -208,22 +208,11 @@ def recipients(cfg, override=None) -> list[str]:
 def _lan_ip() -> str | None:
     """This machine's address ON THE LAN, or None.
 
-    Opens a UDP socket toward a routable address and reads back the local end. No packet is ever
-    sent (UDP connect only sets the peer), and it resolves to the interface the OS would actually
-    use -- which beats enumerating adapters and guessing, on a box that also carries WSL and
-    virtual ones. Only a PRIVATE address is accepted: a public one here would mean the rig sits
-    directly on the internet, and a link to it does not belong in an email."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.settimeout(0.5)
-        s.connect(("8.8.8.8", 9))
-        ip = s.getsockname()[0]
-        addr = ipaddress.ip_address(ip)
-        return ip if addr.is_private and not addr.is_loopback and not addr.is_link_local else None
-    except Exception:
-        return None
-    finally:
-        s.close()
+    The implementation moved to mdns.lan_ip when the rig started announcing itself by name: the
+    address the email LINKS to and the address the rig ANNOUNCES have to be the same one, and two
+    copies of a UDP-connect trick is exactly the kind of pair that drifts. Kept as a name here
+    because it is what this module's callers and tests reach for."""
+    return mdns.lan_ip()
 
 
 def dashboard_base(cfg) -> str:
@@ -234,11 +223,15 @@ def dashboard_base(cfg) -> str:
     phone: iOS and Android ask mDNS for `name.local`, they do not speak NetBIOS, so the one link
     in the paper died exactly where it was meant to be tapped. The address is re-derived for every
     issue, so a DHCP reassignment heals itself with tomorrow's edition rather than needing a
-    config edit. Falls back to the hostname when there is no LAN to find."""
+    config edit. Falls back to the hostname when there is no LAN to find.
+
+    Built through mdns.url so a link on the default port 80 comes out as "http://192.168.1.50"
+    rather than "...:80" -- the same number a browser would have assumed, and one more thing for
+    a reader to mistrust in a link they are being asked to tap."""
     base = getattr(cfg, "email_dashboard_url", None)
     if base:
         return str(base).rstrip("/")
-    return f"http://{_lan_ip() or socket.gethostname().lower()}:{getattr(cfg, 'web_port', 8000)}"
+    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower())
 
 
 def dashboard_answering(base, timeout=1.5) -> bool | None:
