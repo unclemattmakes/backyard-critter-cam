@@ -188,9 +188,10 @@ def recipients(cfg, override=None) -> list[str]:
     naturally types. Order is preserved, blanks dropped, case-insensitive duplicates collapsed
     (Resend treats a repeat as a second recipient).
 
-    Everyone on this list sees every other address in the To: header. For a household paper that
-    is the right default -- it reads like one letter to the family, not a mail-merge -- but it is
-    a disclosure, so it is said here and in config.py rather than discovered by a reader."""
+    Nobody on this list learns anyone else's address: send_issue posts ONE message per recipient,
+    each addressed only to its reader. It still reads like one letter to the family rather than a
+    mail-merge, and adding an address no longer discloses the existing readers to the new one --
+    which is what made the old shared To: header a decision rather than a detail."""
     raw = override if override is not None else getattr(cfg, "email_to", None)
     if raw is None:
         return []
@@ -1177,7 +1178,8 @@ def render_text(bundle) -> str:
 def resend_payload(cfg, subject, html, text, images, to=None) -> dict:
     """The exact JSON body POSTed to Resend -- a pure function so tests can hold it up to the
     light. Attachment content_id is what turns an attachment into an inline image (the HTML
-    references cid:<content_id>)."""
+    references cid:<content_id>). send_issue calls this once per recipient with to=<one address>,
+    so a real send never carries more than one address in the To: header."""
     return {
         "from": cfg.email_from,
         "to": recipients(cfg, to),
@@ -1192,9 +1194,10 @@ def resend_payload(cfg, subject, html, text, images, to=None) -> dict:
     }
 
 
-def send_issue(cfg, subject, html, text, images, to=None) -> str:
-    """POST to Resend; returns the email id. Raises RuntimeError with the response body on any
-    non-2xx, because a silent morning-email failure would just look like a boring yard."""
+def _post_issue(cfg, subject, html, text, images, to) -> str:
+    """One POST, for ONE recipient; returns the email id. Raises RuntimeError with the response
+    body on any non-2xx, because a silent morning-email failure would just look like a boring
+    yard. Split out of send_issue so the per-reader loop has a single place to catch."""
     payload = resend_payload(cfg, subject, html, text, images, to)
     req = urllib.request.Request(
         RESEND_URL, data=json.dumps(payload).encode(),
@@ -1219,6 +1222,53 @@ def send_issue(cfg, subject, html, text, images, to=None) -> str:
         elif e.code == 401:
             hint = " -- check email_resend_api_key, and that it has SEND permission."
         raise RuntimeError(f"Resend refused the email ({e.code}): {body}{hint}") from e
+    except urllib.error.URLError as e:
+        # AFTER the HTTPError clause on purpose: HTTPError subclasses URLError. Reaching here
+        # means the transport failed rather than the API answering -- DNS, refused connection,
+        # TLS, a dropped link. The request never got a verdict.
+        raise RuntimeError(f"Resend was unreachable: {e.reason}") from e
+    except (OSError, ValueError) as e:
+        # A socket timeout (OSError) or a 2xx whose body would not parse (JSONDecodeError is a
+        # ValueError). Both are genuinely AMBIGUOUS: Resend may have accepted the message before
+        # the read timed out, so this address is UNKNOWN rather than undelivered -- said plainly
+        # here because the person acting on it is deciding whether to re-run.
+        raise RuntimeError(f"Resend gave no usable verdict ({type(e).__name__}: {e}) -- this "
+                           "address MAY have been delivered anyway") from e
+
+
+def send_issue(cfg, subject, html, text, images, to=None) -> str:
+    """Send the issue, ONE MESSAGE PER RECIPIENT, so no reader ever sees another's address.
+
+    Returns the email id, or the ids joined by ", " when there is more than one recipient.
+
+    The cost of that privacy is one POST -- and one re-upload of the inline images -- per reader.
+    For a household list that is nothing; for a real mailing list it would be the wrong shape, and
+    the right answer there is a list provider, not a loop.
+
+    A PARTIAL failure names who did receive it. Re-running after one would send those readers a
+    second copy, so that has to be a decision the reader of the error makes knowingly rather than
+    a guess -- which is also why this raises instead of returning a tally."""
+    addrs = recipients(cfg, to)
+    if not addrs:
+        raise RuntimeError("No recipients -- set email_to in config_local.py.")
+    sent: list[tuple[str, str]] = []
+    failed: list[tuple[str, Exception]] = []
+    for addr in addrs:
+        try:
+            sent.append((addr, _post_issue(cfg, subject, html, text, images, addr)))
+        except Exception as e:
+            # Deliberately broad. _post_issue is meant to raise only RuntimeError, but if that
+            # contract ever slips, the cost is not one bad message -- it is the loop aborting, so
+            # the remaining readers are never attempted AND the record of who already received a
+            # copy is destroyed. Catching wide keeps both promises no matter what comes out.
+            failed.append((addr, e))
+    if failed:
+        delivered = ", ".join(a for a, _ in sent) or "nobody"
+        detail = "; ".join(f"{a}: {e}" for a, e in failed)
+        raise RuntimeError(
+            f"Delivered to {len(sent)} of {len(addrs)} recipient(s) ({delivered}); "
+            f"re-running would send those a second copy. Failed for {detail}")
+    return ", ".join(i for _, i in sent)
 
 
 def write_archive(cfg, bundle, images, out_path: Path | None = None) -> Path:

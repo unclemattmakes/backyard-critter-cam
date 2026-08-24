@@ -998,8 +998,9 @@ cfg.email_from = "The Backyard Dispatch <dispatch@your-domain.com>"  # a Resend-
 cfg.email_resend_api_key = "re_..."
 ```
 
-Several recipients share one email, so each sees the others' addresses in the `To:` header —
-right for a household paper, wrong for a mailing list.
+Several recipients each get their own copy, addressed only to them — nobody sees anyone
+else's address. That is one send per recipient: right for a household list, the wrong shape for a
+real mailing list.
 
 Try it, then schedule it (runs as you, no admin needed):
 

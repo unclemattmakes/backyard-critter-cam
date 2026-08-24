@@ -406,8 +406,9 @@ class Config:
     # sending mail moves yard photos off this machine (through Resend, to that inbox), which is
     # the widest the project's media ever travels automatically.
     # Recipient(s). One address, several comma-separated ("you@example.com, them@example.com"),
-    # or a list. Everyone listed sees every other address in the To: header -- right for a
-    # household paper, wrong for a mailing list, so it is stated rather than discovered.
+    # or a list. Each recipient gets their OWN message, addressed only to them, so no reader
+    # ever learns another's address. That is one send per reader -- right for a household list,
+    # the wrong shape for a real mailing list (use a list provider for that).
     email_to: str | tuple[str, ...] | list[str] | None = None
     email_from: str | None = None          # verified Resend sender ("Name <a@your-domain.com>")
     email_resend_api_key: str | None = None    # https://resend.com -> API Keys ("re_...")
