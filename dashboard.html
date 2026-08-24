@@ -30,7 +30,7 @@
   <button id="tab-live" onclick="show('live')">Live Observation</button>
   <button id="tab-visits" class="on" onclick="show('visits')">Visit Log</button>
   <button id="tab-favorites" onclick="show('favorites')">Favourites</button>
-  <button id="tab-dispatch" onclick="show('dispatch')">The Dispatch</button>
+  <button id="tab-dispatch" onclick="show('dispatch')">Creature Report</button>
   <button id="tab-behavior" onclick="show('behavior')">Behaviour</button>
   <button id="tab-indiv" onclick="show('indiv')">Individuals</button>
   <button id="tab-calendar" onclick="show('calendar')">Calendar</button>
@@ -136,9 +136,9 @@
     <div id="favorites-body"><p class="empty">Opening the album&hellip;</p></div>
   </section>
 
-  <!-- ============ THE DISPATCH (period digest) ============ -->
+  <!-- ============ CREATURE REPORT (period digest; route id stays "dispatch") ============ -->
   <section id="view-dispatch" class="view">
-    <div id="dispatch-body"><p class="empty">Loading the dispatch&hellip;</p></div>
+    <div id="dispatch-body"><p class="empty">Loading the report&hellip;</p></div>
   </section>
 
   <!-- ============ BEHAVIOUR ============ -->
@@ -313,7 +313,7 @@
     <button class="modal-x" type="button" onclick="closePack()" aria-label="Close">&#10005;</button>
     <h3>Move this rig</h3>
     <p class="hint">Pack everything this rig has recorded &mdash; database, photos, clips, reference portraits, labels, config &mdash; into one folder, ready for <code>python migrate.py restore</code> on the new machine. Same format as the weekly backup, and append-only: run it again and only what&rsquo;s new is added.</p>
-    <p class="hint" id="pack-local-note" hidden>Packing writes this rig&rsquo;s whole archive to a folder of your choosing, so like a camera password it can only be started <strong>at the rig itself</strong> &mdash; open this dashboard on the rig (<code>http://127.0.0.1:8000</code>) and start it there.</p>
+    <p class="hint" id="pack-local-note" hidden>Packing writes this rig&rsquo;s whole archive to a folder of your choosing, so like a camera password it can only be started <strong>at the rig itself</strong> &mdash; open this dashboard on the rig (<code>http://127.0.0.1</code>) and start it there.</p>
     <form id="pack-form" onsubmit="return packStart(event)">
       <label class="cams-row"><span>Pack into</span>
         <input id="pack-dest" maxlength="300" placeholder="F:\rig-move &mdash; a USB drive, share, or cloud-synced folder" autocomplete="off" spellcheck="false"></label>

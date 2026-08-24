@@ -111,6 +111,16 @@ def test_subject_leads_with_novelty():
     assert "3 visits" in s
 
 
+def test_masthead_is_one_name_for_every_edition():
+    """The paper used to retitle itself Morning/Evening by edition, which said the period twice
+    (the subject already words it) and made one publication look like two. The edition is still
+    visible in the subject -- it just isn't in the title any more."""
+    night = newsletter.compose_subject(mkbundle(mkdigest(edition="night")))
+    day = newsletter.compose_subject(mkbundle(mkdigest(edition="day")))
+    assert night.startswith(newsletter.MASTHEAD) and day.startswith(newsletter.MASTHEAD)
+    assert "Morning" not in night and "Evening" not in day
+
+
 def test_subject_crowd_beats_names():
     d = mkdigest(crowd={"n": 4, "at": "2026-08-12T02:07:11-07:00", "source": "glass_door_cam",
                         "by_species": {"raccoon": 4}})
@@ -195,7 +205,7 @@ def test_render_email_carries_the_masthead_and_hedges():
                      "typical": "6am–10am", "hours": [0] * 24, "active_hours": [2],
                      "clip": None, "surprising": True, "surprise_note": "off-hours"}])
     html = newsletter.render_email(mkbundle(d), {}, lambda cid: None)
-    assert "The Morning Dispatch" in html
+    assert newsletter.MASTHEAD in html             # one name for every edition
     assert "No. 34" in html
     assert "a floor" in html                       # crowd tally never reads as a census
     assert "verify" in html                        # surprising species listed as a question
@@ -486,6 +496,162 @@ def test_cloudflare_block_is_named_as_such(tmp_path, monkeypatch):
         newsletter.send_issue(cfg, "s", "h", "t", {})
 
 
+def test_each_recipient_gets_their_own_message_and_never_sees_the_others(tmp_path, monkeypatch):
+    """Two readers, two POSTs, each To: carrying exactly one address -- and neither reader's
+    address appearing ANYWHERE in the other's body. A shared To: header is a disclosure you
+    cannot un-send, so this asserts the whole payload, not just the To: field."""
+    cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    bodies = []
+
+    class OkResp:
+        def __init__(self, eid):
+            self.eid = eid
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"id": self.eid}).encode()
+
+    def fake_urlopen(req, timeout):
+        body = json.loads(req.data.decode())
+        bodies.append(body)
+        # Tie the id to the address, so the returned ids prove WHICH send produced them.
+        return OkResp("id_" + body["to"][0])
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", fake_urlopen)
+    out = newsletter.send_issue(cfg, "s", "<p>h</p>", "t", {})
+
+    assert len(bodies) == 2, "one message per recipient, not one message to a shared header"
+    assert [b["to"] for b in bodies] == [["a@x.com"], ["b@y.com"]]
+    for body, mine in zip(bodies, ["a@x.com", "b@y.com"]):
+        blob = json.dumps(body)
+        for other in {"a@x.com", "b@y.com"} - {mine}:
+            assert other not in blob, "%s must not appear anywhere in %s's message" % (other, mine)
+    # Both ids come back, so the log line still says what was actually sent.
+    assert out == "id_a@x.com, id_b@y.com"
+
+
+def test_a_partial_send_names_who_already_received_it(tmp_path, monkeypatch):
+    """One send per reader means a run can half-succeed. Re-running would give the delivered
+    readers a SECOND copy, so the error has to name them rather than leave it to be guessed."""
+    cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    calls = []
+
+    class OkResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"id": "email_ok"}).encode()
+
+    def first_ok_then_refuse(req, timeout):
+        calls.append(json.loads(req.data.decode())["to"])
+        if len(calls) == 1:
+            return OkResp()
+        raise urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {},
+                                     io.BytesIO(b'{"message":"mailbox unavailable"}'))
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", first_ok_then_refuse)
+    with pytest.raises(RuntimeError) as excinfo:
+        newsletter.send_issue(cfg, "s", "h", "t", {})
+    msg = str(excinfo.value)
+    assert "a@x.com" in msg and "second copy" in msg
+    assert "b@y.com" in msg and "mailbox unavailable" in msg
+    # The failure must not stop the loop early in a way that hides who was tried.
+    assert calls == [["a@x.com"], ["b@y.com"]]
+
+
+def test_a_network_drop_mid_loop_still_names_who_received_it(tmp_path, monkeypatch):
+    """The 07:00 task runs unattended over home Wi-Fi, so a DNS or socket failure -- NOT an HTTP
+    refusal -- is the likeliest way a send half-succeeds. _post_issue converts only HTTPError, so
+    this used to escape the loop: the log said just "send FAILED", and the obvious response to
+    that (re-run it) sends a second copy to whoever already had one."""
+    cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    tried = []
+
+    class OkResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"id": "email_ok"}).encode()
+
+    def drop_on_second(req, timeout):
+        tried.append(json.loads(req.data.decode())["to"][0])
+        if len(tried) == 1:
+            return OkResp()
+        raise urllib.error.URLError("[Errno 11001] getaddrinfo failed")
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", drop_on_second)
+    with pytest.raises(RuntimeError) as excinfo:
+        newsletter.send_issue(cfg, "s", "h", "t", {})
+    msg = str(excinfo.value)
+    assert "a@x.com" in msg and "second copy" in msg, "must name who already has it"
+    assert "b@y.com" in msg and "unreachable" in msg
+    assert tried == ["a@x.com", "b@y.com"]
+
+
+def test_a_failure_on_the_first_reader_still_tries_the_rest(tmp_path, monkeypatch):
+    """A transport error on reader one used to abort the whole loop, so reader two was never
+    attempted -- strictly worse than the single-POST send it replaced, which at least failed for
+    everyone equally."""
+    cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    tried = []
+
+    class OkResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"id": "email_ok"}).encode()
+
+    def fail_first(req, timeout):
+        tried.append(json.loads(req.data.decode())["to"][0])
+        if len(tried) == 1:
+            raise urllib.error.URLError("connection refused")
+        return OkResp()
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", fail_first)
+    with pytest.raises(RuntimeError) as excinfo:
+        newsletter.send_issue(cfg, "s", "h", "t", {})
+    assert tried == ["a@x.com", "b@y.com"], "reader two must still be attempted"
+    assert "b@y.com" in str(excinfo.value), "and the reader who DID receive it must be named"
+
+
+def test_a_timeout_says_maybe_delivered_rather_than_failed(tmp_path, monkeypatch):
+    """Resend can accept the message and THEN the read times out. Reporting that address as
+    simply failed invites a re-run that duplicates it, so the error has to say the delivery is
+    unknown rather than negative."""
+    cfg = mkcfg(tmp_path, email_to="a@x.com")
+
+    def time_out(req, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(newsletter.urllib.request, "urlopen", time_out)
+    with pytest.raises(RuntimeError, match="MAY have been delivered"):
+        newsletter.send_issue(cfg, "s", "h", "t", {})
+
+
+def test_send_with_no_recipients_is_an_error_not_a_silent_noop(tmp_path):
+    """email_configured() gates this upstream, but a send that quietly does nothing would log
+    'sent' to nobody -- which reads exactly like a quiet night."""
+    with pytest.raises(RuntimeError, match="No recipients"):
+        newsletter.send_issue(mkcfg(tmp_path, email_to=""), "s", "h", "t", {})
+
+
 def test_email_configured(tmp_path):
     assert newsletter.email_configured(mkcfg(tmp_path))
     assert not newsletter.email_configured(mkcfg(tmp_path, email_resend_api_key=None))
@@ -549,6 +715,10 @@ def test_recipients_accepts_every_way_a_person_types_them(tmp_path):
 
 def test_payload_and_configured_follow_the_list(tmp_path):
     cfg = mkcfg(tmp_path, email_to="a@x.com, b@y.com")
+    # resend_payload is a per-recipient body: send_issue calls it once per address. Its
+    # no-override form still mirrors the whole list, but no real send uses that shape --
+    # see test_each_recipient_gets_their_own_message_and_never_sees_the_others.
+    assert newsletter.resend_payload(cfg, "s", "h", "t", {}, to="a@x.com")["to"] == ["a@x.com"]
     assert newsletter.resend_payload(cfg, "s", "h", "t", {})["to"] == ["a@x.com", "b@y.com"]
     assert newsletter.email_configured(cfg)
     assert not newsletter.email_configured(mkcfg(tmp_path, email_to=""))

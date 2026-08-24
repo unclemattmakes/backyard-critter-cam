@@ -10,7 +10,9 @@ Serves the live MJPEG stream, stats + species JSON, crop images, AND now:
     static false-fire spots; IgnoreZoneStore hands edits to the capture threads live)
 
 The page itself lives in dashboard.html (read from disk so the design can iterate without a
-restart). Bound to localhost by default. No torch/cv2 here -- only stdlib + db/stats.
+restart). Bound to localhost by default, on port 80 so the address can be a bare name (see
+mdns.py) -- falling back to cfg.web_port_fallback when 80 is taken or forbidden, which is the
+normal case off Windows. No torch/cv2 here -- only stdlib + db/stats.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
+from dataclasses import replace
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +38,7 @@ from pathlib import Path
 import behavior
 import config
 import db
+import mdns
 import reel
 import stats
 
@@ -265,17 +269,27 @@ def _host_name(raw: str) -> str:
     return h
 
 
-def _is_allowed_host(raw: str, web_host: str = "") -> bool:
+def _is_allowed_host(raw: str, web_host: str = "", mdns_host: str = "") -> bool:
     """DNS-rebinding guard. The peer-IP check (_is_lan_client) can't stop a malicious site that
     resolves its OWN name to this rig's LAN IP: the request then comes from the victim's own (local)
     browser, so the peer IP looks fine, but the Host header still carries the ATTACKER's hostname.
-    Accept only a Host that is 'localhost', a loopback/private/link-local IP literal, or the
-    operator's configured web_host. A real browser/curl always sends Host, so a rebinding fetch
-    can't omit it; an absent Host (rare, HTTP/1.0 tooling) is allowed through."""
+    Accept only a Host that is 'localhost', a loopback/private/link-local IP literal, the
+    operator's configured web_host, or the mDNS name this rig publishes for itself (mdns.py) --
+    which is the name every LAN visitor is now told to type, so refusing it would 403 the whole
+    point. A real browser/curl always sends Host, so a rebinding fetch can't omit it; an absent
+    Host (rare, HTTP/1.0 tooling) is allowed through.
+
+    `mdns_host` is matched EXACTLY rather than blanket-allowing `*.local`. Blanket-allowing is
+    tempting and nearly safe -- RFC 6762 reserves `.local` for multicast, so an internet resolver
+    cannot point one at this rig -- but "nearly" leans on every client routing `.local` to mDNS,
+    and a network whose unicast DNS answers for `.local` (an old AD domain, say) would hand the
+    guard straight back to an attacker. One known name costs nothing and assumes nothing."""
     if not raw:
         return True
     host = _host_name(raw).lower()
     if host == "localhost" or host == str(web_host or "").lower():
+        return True
+    if mdns_host and host == str(mdns_host).lower():
         return True
     try:
         ip = ipaddress.ip_address(host)
@@ -316,7 +330,8 @@ def _host_authority(raw: str, default_port):
     return host.lower(), port or default_port
 
 
-def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=0) -> bool:
+def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=0,
+                    mdns_host: str = "") -> bool:
     """True only if `origin` names THIS dashboard. A cross-site page's Origin is its own name, so
     it never matches -- which is the whole point: the peer-IP and Host checks both PASS for a
     request the operator's own browser makes while sitting on someone else's site.
@@ -332,7 +347,7 @@ def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=
     wh = str(web_host or "").strip().lower()
     if wh and wh not in ("0.0.0.0", "::"):      # a wildcard bind isn't a name a browser can send
         allowed.add((wh, port))
-    if _is_allowed_host(host_header, web_host):
+    if _is_allowed_host(host_header, web_host, mdns_host):
         mine = _host_authority(host_header, got[1])
         if mine is not None:
             allowed.add(mine)
@@ -347,18 +362,19 @@ def _is_json_content_type(raw: str) -> bool:
     return (raw or "").split(";", 1)[0].strip().lower() == "application/json"
 
 
-def _csrf_refusal(method: str, headers, web_host: str = "", web_port=0):
+def _csrf_refusal(method: str, headers, web_host: str = "", web_port=0, mdns_host: str = ""):
     """The 403 body for a state-changing request that didn't come from this dashboard, or None if it
     may proceed. GET/HEAD change nothing and pass untouched; every POST -- present and future --
     must carry an Origin naming us and a JSON Content-Type. A MISSING Origin is refused too: fetch
     and XHR always send one, so only hand-rolled tooling lacks it, and a curl user just adds
-    -H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json'.
+    -H 'Origin: http://127.0.0.1' -H 'Content-Type: application/json'.
     Without this, any page the operator happens to be browsing could fetch
     /api/individual with {"from": "Notch", "to": ""} and blank months of hand-confirmed re-ID
     labels -- no preflight, no confirm, no undo. `headers` is anything with a .get()."""
     if method != "POST":
         return None
-    if not _is_same_origin(headers.get("Origin"), headers.get("Host"), web_host, web_port):
+    if not _is_same_origin(headers.get("Origin"), headers.get("Host"), web_host, web_port,
+                           mdns_host):
         return b"forbidden: POST needs an Origin naming this dashboard (cross-site request guard)"
     if not _is_json_content_type(headers.get("Content-Type")):
         return b"forbidden: POST needs Content-Type: application/json (cross-site request guard)"
@@ -910,6 +926,13 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                                           getattr(cfg, "reference_crops_dir", cfg.crops_dir))]
     stop_event = threading.Event()
 
+    # The name this rig publishes for itself, resolved once so every request checks a plain string.
+    # Read from CONFIG rather than from a live registration: whether the announcement actually
+    # succeeded is mdns.py's business, and a name nothing answers for is one no browser can put in
+    # a Host header anyway -- so trusting config here costs nothing and keeps the guard a pure
+    # function of settings.
+    mdns_host = mdns.host_name(cfg) if mdns.enabled(cfg) else ""
+
     # The primary camera (the Live tab's default / "Plate I"): the one matching cfg.source if it's
     # among the live cameras, else the first one. Insertion order of frame_buffers = camera order.
     primary = cfg.source if cfg.source in frame_buffers else next(iter(frame_buffers))
@@ -970,7 +993,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             # Runs before the lan_only shortcut: a rig deliberately opened past the LAN still must
             # not take POSTs from other people's pages.
             refusal = _csrf_refusal(self.command, self.headers,
-                                    getattr(cfg, "web_host", ""), getattr(cfg, "web_port", 0))
+                                    getattr(cfg, "web_host", ""), getattr(cfg, "web_port", 0),
+                                    mdns_host)
             if refusal is not None:
                 self._send(403, "text/plain", refusal)
                 return False
@@ -983,7 +1007,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 return False
             # Peer is local -- but also validate the Host header, so a malicious site can't use DNS
             # rebinding (its name -> this rig's LAN IP) to drive the dashboard from your own browser.
-            if not _is_allowed_host(self.headers.get("Host"), getattr(cfg, "web_host", "")):
+            if not _is_allowed_host(self.headers.get("Host"), getattr(cfg, "web_host", ""),
+                                    mdns_host):
                 self._send(403, "text/plain",
                            b"forbidden: unrecognized Host header (DNS-rebinding guard)")
                 return False
@@ -1256,7 +1281,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                         self._json({"error": "packing writes this rig's whole archive to a "
                                              "folder of your choosing, so it can only be "
                                              "started at the rig itself -- open this "
-                                             "dashboard on the rig (http://127.0.0.1:8000) "
+                                             "dashboard on the rig (http://127.0.0.1) "
                                              "and click it there"}, code=403)
                     else:
                         body, code = _pack_start(data.get("dest"),
@@ -1864,10 +1889,42 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 "Accept-Ranges": "bytes", "Cache-Control": "max-age=86400",
             })
 
-    server = ThreadingHTTPServer((cfg.web_host, cfg.web_port), Handler)
+    server = _bind(cfg, Handler)
+    # Rebind the closure's own `cfg` to the port actually taken. The Handler reads `cfg` from this
+    # scope at REQUEST time, so this reaches it -- and it has to, because _is_same_origin compares
+    # the Origin's port against cfg.web_port: a rig that asked for 80, fell back to 8000 and kept
+    # believing it was on 80 would refuse every POST the dashboard made, from a page it served
+    # itself. (It also makes web_port=0 honest for tests, which now get the ephemeral port back
+    # instead of a literal zero.)
+    bound = server.server_address[1]
+    if bound != cfg.web_port:
+        cfg = replace(cfg, web_port=bound)
     server.daemon_threads = True
     server.stop_event = stop_event
     return server
+
+
+def _bind(cfg, handler):
+    """Listen on cfg.web_port, falling back to cfg.web_port_fallback if that port is taken or
+    forbidden. Returns the bound server; raises the ORIGINAL OSError if nothing worked.
+
+    The fallback exists because the default port is now 80, and 80 is a port a bind can lose for
+    ordinary reasons: it needs root on Linux/macOS, and on any OS something web-shaped may already
+    hold it. Losing the whole dashboard over that would be a bad trade for a nicer address, and an
+    unattended rig cannot be asked to notice and pass --port. The failure is printed rather than
+    swallowed -- the address moved, and every printed URL downstream reads the real port from the
+    socket, so the operator is told rather than left to discover it."""
+    ports = mdns.local_candidates(cfg)
+    first_error = None
+    for port in ports:
+        try:
+            return ThreadingHTTPServer((cfg.web_host, port), handler)
+        except OSError as e:
+            first_error = first_error or e
+            if port != ports[-1]:
+                print(f"  [web] port {port} is not available ({e.strerror or e}); "
+                      f"falling back to {ports[-1]}.")
+    raise first_error
 
 
 def _naming_status() -> dict:

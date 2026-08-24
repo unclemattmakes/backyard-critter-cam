@@ -51,6 +51,12 @@ pybioclip>=2.1,<3
 # Both reuse the cu130 torch / numpy / pillow already present (timm is also a pybioclip dep).
 timm>=1.0,<2
 scipy>=1.13,<2
+# The dashboard's NAME on the network (mdns.py): the rig answers multicast DNS for
+# "critter-cam.local", so a phone opens a name instead of an IP that moves with the DHCP lease.
+# Its own responder rather than the OS's, because that is what lets the name be a config value.
+# OPTIONAL at runtime -- mdns.py catches the ImportError, says so in one line, and the rig serves
+# on numbers exactly as before. Listed here because the LAN launcher's whole story assumes it.
+zeroconf>=0.132,<1
 
 # --- Development only (not needed to run the rig) ---
 # Test suite: `python -m pytest tests/ -q`. Pure-logic tests, no GPU/camera/model needed.

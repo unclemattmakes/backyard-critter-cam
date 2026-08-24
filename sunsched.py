@@ -85,6 +85,23 @@ def target_time(when: date, tz=None) -> tuple[datetime, dict]:
     return min(max(t, lo), hi), s
 
 
+def _quiet_run(cmd: list[str], timeout: int = 60):
+    """subprocess.run with stdin CLOSED and a hard timeout, returning None if the command could
+    not be run or did not finish.
+
+    Both guards are load-bearing. A scheduled run has no console, so a child that decides to
+    PROMPT there waits forever -- which is exactly what `schtasks /Change` does (it asks for a
+    run-as password even for a task registered to run only while this user is logged on). On
+    2026-08-23 that hung the nightly batch on its first step, with a re-arm this module documents
+    as never fatal. Closing stdin turns the prompt into a fast failure; the timeout covers
+    whatever prompts next."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def arm(when: date, *, dry_run: bool = False) -> int:
     """Point the scheduled task at `when`'s computed time.
 
@@ -97,13 +114,19 @@ def arm(when: date, *, dry_run: bool = False) -> int:
           f"(sunset - {SUNSET_OFFSET_H}h)")
     if dry_run:
         return 0
-    r = subprocess.run(["schtasks", "/Change", "/TN", TASK_NAME, "/ST", hhmm],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
+    r = _quiet_run(["schtasks", "/Change", "/TN", TASK_NAME, "/ST", hhmm])
+    if r is None or r.returncode != 0:
+        # schtasks refuses this without a password it cannot be given non-interactively. The
+        # Task Scheduler PowerShell module edits the SAME daily trigger with no credentials, so
+        # try it before settling for a warning.
+        r = _quiet_run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        f"Set-ScheduledTask -TaskName '{TASK_NAME}' -Trigger "
+                        f"(New-ScheduledTaskTrigger -Daily -At '{hhmm}')"])
+    if r is None or r.returncode != 0:
         # Never fatal. If the trigger cannot be moved the batch still runs at yesterday's time,
         # which is at most a couple of minutes off -- the drift is about 1.5 min/day here.
-        print(f"[sunsched] WARNING: could not re-arm '{TASK_NAME}' (exit {r.returncode}): "
-              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+        why = "did not complete" if r is None else f"exit {r.returncode}: {(r.stderr or r.stdout).strip()}"
+        print(f"[sunsched] WARNING: could not re-arm '{TASK_NAME}' ({why})", file=sys.stderr)
         return 0
     print(f"[sunsched] '{TASK_NAME}' re-armed for {hhmm}.")
     return 0

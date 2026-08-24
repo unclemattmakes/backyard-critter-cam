@@ -35,6 +35,7 @@
   <a href="#ch08">08 · Two axes</a>
   <a href="#ch09">09 · Building it</a>
   <a href="#ch10">10 · Moving house</a>
+  <a href="#ch11">11 · The address</a>
 </div></nav>
 
 <main>
@@ -344,6 +345,81 @@
       and it was tested by pulling the plug rather than by reasoning about it. Which is the honest
       summary of the whole project: <span class="em">"no errors"</span> keeps turning out to mean
       nothing at all, and the only cure is to go and look.</p>
+    </div>
+  </section>
+
+  <!-- 11 AN ADDRESS YOU CAN SAY OUT LOUD -->
+  <section class="chapter" id="ch11">
+    <div class="ch-head">
+      <div class="ch-num">CHAPTER 11</div>
+      <div class="ch-title">An address you can say out loud</div>
+      <div class="ch-keywords"><span>mDNS</span><span>port 80</span><span>the guard that refused it</span></div>
+    </div>
+    <div class="prose">
+      <p>The rig had been reachable from every phone in the house for months, and nobody used it.
+      Not because it was hard to start &mdash; because of what you had to say to invite someone.
+      <span class="em">&ldquo;One-nine-two dot one-six-eight dot nought dot one-oh-eight, colon
+      eight thousand&rdquo;</span> is not an address. It is a dictation exercise, and it was
+      printed by a launcher window that closed a second later, so even the person who owned the
+      rig had to go looking for it.</p>
+      <p>It was not durable either. That number is a <b>DHCP lease</b>, and a lease is not a
+      promise. The morning email works around this by re-deriving the address every single issue;
+      a number written on the back of an envelope cannot.</p>
+      <p>So the rig stopped being an address and became a <b>name</b>. It answers multicast DNS
+      now &mdash; every phone on the Wi-Fi already asks the local network &ldquo;who is
+      <span class="mono">critter-cam</span>?&rdquo;, and the rig is the thing that answers. The
+      other half of the win is the <b>port</b>: the dashboard moved to <b>80</b>, the port a
+      browser assumes, because that is the only thing that turns
+      <span class="mono">critter-cam.local:8000</span> into <span class="mono">critter-cam.local</span>.</p>
+      <p class="pull">The difference between an address you dictate and one a child can type.</p>
+      <p>Three things had to be right for that to work at all, and every one of them would have
+      failed <em>quietly</em>. The rig already carried a guard against DNS rebinding that accepted
+      only <span class="mono">localhost</span> and private IP literals &mdash; it would have
+      refused the very name being advertised. A name that resolves perfectly and then returns
+      <b>403</b> is worse than no name, because it looks like the network&rsquo;s fault.</p>
+      <p>Port 80 is also a port a bind can lose, so a failed bind falls back to the old one. But
+      the dashboard checks that a form submission came from the page it served by comparing
+      <em>ports</em> &mdash; so a rig that fell back while still believing it was on 80 would have
+      served a dashboard that looked completely normal and silently refused every label edit made
+      on it.</p>
+      <p>And one that only appears <em>after a crash</em>. A responder that dies without saying
+      goodbye leaves its name cached on the network, and the library refuses to re-register a name
+      something else still answers for. The rig has a watchdog whose entire job is restarting it
+      after it dies &mdash; so the restart lands inside its own ghost&rsquo;s lifetime almost by
+      construction, and the name would have gone missing on exactly the reboots nobody is
+      watching. It now checks <em>who</em> holds the name: its own address it reclaims, a
+      different machine it leaves alone.</p>
+    </div>
+    <div class="demo">
+      <div class="demo-head"><span class="k">What the rig prints now</span><span class="corner">on startup</span></div>
+      <div class="demo-body">
+        <div class="mono" style="font-size:13px;line-height:1.9;padding:4px 2px;white-space:pre-wrap">  Others on your Wi-Fi:  http://critter-cam.local
+    ...or by number:     http://192.168.0.108   (if a device can&rsquo;t find the name)
+  On this PC:            http://127.0.0.1</div>
+      </div>
+      <div class="demo-cap">The number stays on the same screen as the name, deliberately. iOS,
+      macOS and Windows resolve <span class="mono">.local</span> reliably; <b>some Android
+      browsers do not do mDNS at all</b>, and a visitor whose phone shrugs at the name needs the
+      fallback in front of them, not in a support conversation.</div>
+    </div>
+    <div class="prose">
+      <p>Then the thing that actually stopped the first phone from connecting had nothing to do
+      with any of it. Windows classifies a new Wi-Fi network as <b>Public</b> by default, and on a
+      Public network the firewall rule matching the rig is <b>Block</b>. Every test run on the rig
+      machine had passed &mdash; traffic to your own address never touches the firewall. The name
+      resolved. The service was discoverable. The dashboard answered on port 80. It just answered
+      only to itself.</p>
+      <p>One dropdown, and the kid was in.</p>
+      <p>Which is this project&rsquo;s oldest lesson wearing a new costume: everything was
+      working, and nothing was reachable. <span class="em">&ldquo;It works on the rig&rdquo;</span>
+      is a sentence about the rig. The only cure, again, was to go and look &mdash; and to notice
+      that the place it had been looked at was the one place that could not fail.</p>
+      <p>The morning email got a name the same afternoon, for the same reason. It had been calling
+      itself <span class="em">The Morning Dispatch</span> or <span class="em">The Evening
+      Dispatch</span> depending on which half of the day it was describing, which said the period
+      twice and made one small newspaper look like two. It is the <b>Creature Report</b> now, in
+      the inbox and on the dashboard tab it links to &mdash; because the thing you hand to other
+      people is the part that has to be easy to say.</p>
     </div>
   </section>
 

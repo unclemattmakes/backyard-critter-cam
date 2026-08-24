@@ -1,11 +1,11 @@
 """
-The Dispatch, delivered: a morning email of last night's yard activity.
+The Creature Report, delivered: a morning email of last night's yard activity.
 
-The dashboard's Dispatch tab already writes the story of each completed sun-period --
+The dashboard's Creature Report tab already writes the story of each completed sun-period --
 stats.period_digest() knows the visits, the named individuals, the plate of the night, who was
 oddly absent and whether the camera was even watching. This module is a THIN RENDERER over that
 same payload: it asks for the most recently completed night, lays it out as a small newspaper
-(same masthead the dashboard uses -- "The Morning Dispatch"), and mails it. No new analysis
+(same masthead the dashboard uses -- see MASTHEAD), and mails it. No new analysis
 happens here; if the email and the dashboard ever disagree, the email is wrong.
 
 Delivery is Resend's REST API (https://resend.com), one stdlib urllib POST -- no SDK, no new
@@ -51,7 +51,6 @@ from __future__ import annotations
 import argparse
 import base64
 import io
-import ipaddress
 import json
 import re
 import shutil
@@ -66,7 +65,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import db
+import mdns
 import stats
+
+# What the paper is called, in the subject line and over the masthead. ONE name for every
+# edition: the period is stated inside the issue (and in the subject's own words), so putting
+# Morning/Evening in the title too was saying it twice and made the paper look like two
+# publications. dashboard.js carries the same string over its Creature Report tab, so a reader
+# who taps a link lands on a page named the same as the thing they were reading -- the ROUTE
+# behind that tab stays `#dispatch`, because every issue ever sent links to it.
+MASTHEAD = "Creature Report"
 
 # ---------------------------------------------------------------------------
 # Layout knobs. The email must stay light: Gmail clips messages whose HTML part exceeds ~102 KB
@@ -188,9 +196,10 @@ def recipients(cfg, override=None) -> list[str]:
     naturally types. Order is preserved, blanks dropped, case-insensitive duplicates collapsed
     (Resend treats a repeat as a second recipient).
 
-    Everyone on this list sees every other address in the To: header. For a household paper that
-    is the right default -- it reads like one letter to the family, not a mail-merge -- but it is
-    a disclosure, so it is said here and in config.py rather than discovered by a reader."""
+    Nobody on this list learns anyone else's address: send_issue posts ONE message per recipient,
+    each addressed only to its reader. It still reads like one letter to the family rather than a
+    mail-merge, and adding an address no longer discloses the existing readers to the new one --
+    which is what made the old shared To: header a decision rather than a detail."""
     raw = override if override is not None else getattr(cfg, "email_to", None)
     if raw is None:
         return []
@@ -207,22 +216,11 @@ def recipients(cfg, override=None) -> list[str]:
 def _lan_ip() -> str | None:
     """This machine's address ON THE LAN, or None.
 
-    Opens a UDP socket toward a routable address and reads back the local end. No packet is ever
-    sent (UDP connect only sets the peer), and it resolves to the interface the OS would actually
-    use -- which beats enumerating adapters and guessing, on a box that also carries WSL and
-    virtual ones. Only a PRIVATE address is accepted: a public one here would mean the rig sits
-    directly on the internet, and a link to it does not belong in an email."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.settimeout(0.5)
-        s.connect(("8.8.8.8", 9))
-        ip = s.getsockname()[0]
-        addr = ipaddress.ip_address(ip)
-        return ip if addr.is_private and not addr.is_loopback and not addr.is_link_local else None
-    except Exception:
-        return None
-    finally:
-        s.close()
+    The implementation moved to mdns.lan_ip when the rig started announcing itself by name: the
+    address the email LINKS to and the address the rig ANNOUNCES have to be the same one, and two
+    copies of a UDP-connect trick is exactly the kind of pair that drifts. Kept as a name here
+    because it is what this module's callers and tests reach for."""
+    return mdns.lan_ip()
 
 
 def dashboard_base(cfg) -> str:
@@ -233,11 +231,15 @@ def dashboard_base(cfg) -> str:
     phone: iOS and Android ask mDNS for `name.local`, they do not speak NetBIOS, so the one link
     in the paper died exactly where it was meant to be tapped. The address is re-derived for every
     issue, so a DHCP reassignment heals itself with tomorrow's edition rather than needing a
-    config edit. Falls back to the hostname when there is no LAN to find."""
+    config edit. Falls back to the hostname when there is no LAN to find.
+
+    Built through mdns.url so a link on the default port 80 comes out as "http://192.168.1.50"
+    rather than "...:80" -- the same number a browser would have assumed, and one more thing for
+    a reader to mistrust in a link they are being asked to tap."""
     base = getattr(cfg, "email_dashboard_url", None)
     if base:
         return str(base).rstrip("/")
-    return f"http://{_lan_ip() or socket.gethostname().lower()}:{getattr(cfg, 'web_port', 8000)}"
+    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower())
 
 
 def dashboard_answering(base, timeout=1.5) -> bool | None:
@@ -311,7 +313,7 @@ def _present_names(d) -> list[tuple[str, int]]:
 def compose_subject(bundle) -> str:
     d = bundle["d"]
     ed = d.get("edition") or "night"
-    masthead = "The Morning Dispatch" if ed == "night" else "The Evening Dispatch"
+    masthead = MASTHEAD
     if d.get("empty"):
         cov = d.get("coverage")
         quiet = "a quiet night" if ed == "night" else "a quiet day"
@@ -846,7 +848,7 @@ def _flag(text, bg=_C["flag_bg"], ink=_C["soft"]) -> str:
 def render_email(bundle, images, img_src) -> str:
     d, rc = bundle["d"], bundle["rc"]
     ed = d.get("edition") or "night"
-    masthead = "The Morning Dispatch" if ed == "night" else "The Evening Dispatch"
+    masthead = MASTHEAD
     period_word = "Night" if ed == "night" else "Day"
     anchor = d.get("anchor") or ""
     try:
@@ -1112,7 +1114,7 @@ def render_email(bundle, images, img_src) -> str:
              "issue was sent, so start the rig if a link goes nowhere.")
     parts.append(f"""
     <div style="margin-top:22px;padding-top:12px;border-top:3px double {_C['ink']};text-align:center;">
-      <a href="{_esc(dash)}" style="color:{_C['gilt']};font-weight:700;font-size:14px;">Open the full Dispatch → highlight reel &amp; clips</a>
+      <a href="{_esc(dash)}" style="color:{_C['gilt']};font-weight:700;font-size:14px;">Open the full Creature Report → highlight reel &amp; clips</a>
       <p style="font-size:12px;margin:8px 0 0;">{rooms}</p>
       <p style="font-size:11px;color:{_C['faint']};margin:10px 0 0;line-height:1.6;">
         {_esc(reach)}<br>
@@ -1177,7 +1179,8 @@ def render_text(bundle) -> str:
 def resend_payload(cfg, subject, html, text, images, to=None) -> dict:
     """The exact JSON body POSTed to Resend -- a pure function so tests can hold it up to the
     light. Attachment content_id is what turns an attachment into an inline image (the HTML
-    references cid:<content_id>)."""
+    references cid:<content_id>). send_issue calls this once per recipient with to=<one address>,
+    so a real send never carries more than one address in the To: header."""
     return {
         "from": cfg.email_from,
         "to": recipients(cfg, to),
@@ -1192,9 +1195,10 @@ def resend_payload(cfg, subject, html, text, images, to=None) -> dict:
     }
 
 
-def send_issue(cfg, subject, html, text, images, to=None) -> str:
-    """POST to Resend; returns the email id. Raises RuntimeError with the response body on any
-    non-2xx, because a silent morning-email failure would just look like a boring yard."""
+def _post_issue(cfg, subject, html, text, images, to) -> str:
+    """One POST, for ONE recipient; returns the email id. Raises RuntimeError with the response
+    body on any non-2xx, because a silent morning-email failure would just look like a boring
+    yard. Split out of send_issue so the per-reader loop has a single place to catch."""
     payload = resend_payload(cfg, subject, html, text, images, to)
     req = urllib.request.Request(
         RESEND_URL, data=json.dumps(payload).encode(),
@@ -1219,6 +1223,53 @@ def send_issue(cfg, subject, html, text, images, to=None) -> str:
         elif e.code == 401:
             hint = " -- check email_resend_api_key, and that it has SEND permission."
         raise RuntimeError(f"Resend refused the email ({e.code}): {body}{hint}") from e
+    except urllib.error.URLError as e:
+        # AFTER the HTTPError clause on purpose: HTTPError subclasses URLError. Reaching here
+        # means the transport failed rather than the API answering -- DNS, refused connection,
+        # TLS, a dropped link. The request never got a verdict.
+        raise RuntimeError(f"Resend was unreachable: {e.reason}") from e
+    except (OSError, ValueError) as e:
+        # A socket timeout (OSError) or a 2xx whose body would not parse (JSONDecodeError is a
+        # ValueError). Both are genuinely AMBIGUOUS: Resend may have accepted the message before
+        # the read timed out, so this address is UNKNOWN rather than undelivered -- said plainly
+        # here because the person acting on it is deciding whether to re-run.
+        raise RuntimeError(f"Resend gave no usable verdict ({type(e).__name__}: {e}) -- this "
+                           "address MAY have been delivered anyway") from e
+
+
+def send_issue(cfg, subject, html, text, images, to=None) -> str:
+    """Send the issue, ONE MESSAGE PER RECIPIENT, so no reader ever sees another's address.
+
+    Returns the email id, or the ids joined by ", " when there is more than one recipient.
+
+    The cost of that privacy is one POST -- and one re-upload of the inline images -- per reader.
+    For a household list that is nothing; for a real mailing list it would be the wrong shape, and
+    the right answer there is a list provider, not a loop.
+
+    A PARTIAL failure names who did receive it. Re-running after one would send those readers a
+    second copy, so that has to be a decision the reader of the error makes knowingly rather than
+    a guess -- which is also why this raises instead of returning a tally."""
+    addrs = recipients(cfg, to)
+    if not addrs:
+        raise RuntimeError("No recipients -- set email_to in config_local.py.")
+    sent: list[tuple[str, str]] = []
+    failed: list[tuple[str, Exception]] = []
+    for addr in addrs:
+        try:
+            sent.append((addr, _post_issue(cfg, subject, html, text, images, addr)))
+        except Exception as e:
+            # Deliberately broad. _post_issue is meant to raise only RuntimeError, but if that
+            # contract ever slips, the cost is not one bad message -- it is the loop aborting, so
+            # the remaining readers are never attempted AND the record of who already received a
+            # copy is destroyed. Catching wide keeps both promises no matter what comes out.
+            failed.append((addr, e))
+    if failed:
+        delivered = ", ".join(a for a, _ in sent) or "nobody"
+        detail = "; ".join(f"{a}: {e}" for a, e in failed)
+        raise RuntimeError(
+            f"Delivered to {len(sent)} of {len(addrs)} recipient(s) ({delivered}); "
+            f"re-running would send those a second copy. Failed for {detail}")
+    return ", ".join(i for _, i in sent)
 
 
 def write_archive(cfg, bundle, images, out_path: Path | None = None) -> Path:
@@ -1288,7 +1339,8 @@ def _say(msg: str, always_log: bool = False) -> None:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Email the Dispatch: last night's yard, as a morning newsletter.")
+    p = argparse.ArgumentParser(
+        description="Email the Creature Report: last night's yard, as a morning newsletter.")
     p.add_argument("--edition", choices=("night", "day", "auto"), default="night",
                    help="Which completed period to write up (default: night).")
     p.add_argument("--date", default=None, help="Anchor date YYYY-MM-DD for a back-issue.")

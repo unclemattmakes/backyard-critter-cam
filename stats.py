@@ -648,7 +648,7 @@ def _annotate_lapse(conn, cfg, cast) -> None:
 
 def cast_rollcall(cfg, now=None) -> dict:
     """The named cast with last-seen + an 'overdue' flag -- the daily "who's back / who hasn't
-    shown" roll for the Dispatch and Individuals tab. Placeholder clusters (raccoon_c01) are
+    shown" roll for the Creature Report and Individuals tab. Placeholder clusters (raccoon_c01) are
     excluded; this is the hand-named cast only. 'Overdue' = a REGULAR (seen on >=3 distinct days)
     now gone notably longer than its own typical gap between appearances -- a one-off visitor is
     never flagged overdue. Sorted overdue-first, then by most-recently-seen."""
@@ -1389,7 +1389,7 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Period digest -- "The Dispatch": a summary of the most-recently-COMPLETED
+# Period digest -- "The Creature Report": a summary of the most-recently-COMPLETED
 # sun-defined period. Shown in the MORNING it summarizes the NIGHT just past;
 # shown in the EVENING it summarizes the DAY just past. One artifact, two
 # editions. Pure data over the same detections table; reuses compute_visits so
