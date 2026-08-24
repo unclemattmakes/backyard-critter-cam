@@ -23,7 +23,11 @@ roadmap live in [the plan](docs/plan.md).
 **No camera handy? Start with the making-of site, live at
 [unclemattmakes.github.io/backyard-critter-cam](https://unclemattmakes.github.io/backyard-critter-cam/).**
 It's a static, camera-free walk-through of the whole system — eight interactive demos built on a
-frozen slice of this rig's real database (real crops, real embeddings, real mistakes). No GPU, no
+frozen slice of this rig's real database (real crops, real embeddings, real mistakes) — and it
+ends in **[Twenty Nights](https://unclemattmakes.github.io/backyard-critter-cam/insights.html)**,
+a one-page field report that distills that same data into the season's findings: the night-shift
+arrival clock, the very unequal cast, the similarity ladder, and how far to trust a label after
+dark. No GPU, no
 install, no clone — it's a web page. (Offline, or hacking on it? It's the [making-of/](making-of/)
 folder; serve it locally with `python -m http.server 8011 --directory making-of` and open
 `http://localhost:8011` — it fetches its data, so the GitHub file viewer can't run it.)

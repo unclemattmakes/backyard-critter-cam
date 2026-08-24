@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Twenty Nights — the yard, measured</title>
+<meta name="description" content="A field report from the backyard critter cam: 32,214 photographs, 652 visits and five named raccoons across twenty nights, distilled into the findings that matter."/>
+<meta property="og:title" content="Twenty Nights"/>
+<meta property="og:description" content="One camera at a sliding glass door. Twenty nights. Everything that moved, measured."/>
+<meta property="og:image" content="media/frames/frame_2026-06-23T00-29-35-831.jpg"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,250..800;1,400&family=Spline+Sans+Mono:wght@300..500&display=swap"/>
+<link rel="stylesheet" href="insights.css"/>
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar" id="bar" aria-hidden="true">
+  <span class="bar-mark">Twenty Nights</span>
+  <a class="bar-link" href="index.html">Behind the Glass →</a>
+</header>
+
+<!-- ═══════════════════ HERO · dusk falls ═══════════════════ -->
+<section class="hero" id="top">
+  <img class="hero-photo" src="media/frames/frame_2026-06-23T00-29-35-831.jpg"
+       alt="The patio at night through the glass door: string lights over a stone wall, a plate of food on the pavers, and a raccoon mid-stride along the top of the wall."/>
+  <div class="hero-scrim" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow"><span>Backyard Critter Cam · Field report</span><span class="eyebrow-right">Jun 7 – 26, 2026</span></p>
+    <h1 class="hero-title">Twenty<br/>Nights</h1>
+    <p class="hero-dek">One camera at a sliding glass door.<br/>Everything that moved, measured.</p>
+  </div>
+  <dl class="hero-stats" id="hero-stats">
+    <div><dt>photographs</dt><dd data-count="32214">32,214</dd></div>
+    <div><dt>visits</dt><dd data-count="652">652</dd></div>
+    <div><dt>species named</dt><dd data-count="30">30</dd></div>
+    <div><dt>raccoons known by name</dt><dd data-count="5">5</dd></div>
+  </dl>
+</section>
+
+<main id="main">
+
+<!-- ═══════════════════ 01 · THE DISTILLATION ═══════════════════ -->
+<section class="band band--dusk chapter" id="ch1">
+  <div class="col">
+    <p class="eyebrow"><span>01 · The distillation</span></p>
+    <h2>The camera counts photographs.<br/>The journal counts visits.</h2>
+    <p class="dek">A lingering raccoon can fill a memory card without telling you anything
+    new — the season's record is <b>707 photographs of a single visit</b>, Notch on the
+    first night, June&nbsp;7 at 10:15&nbsp;pm. So consecutive sightings collapse into
+    <em>visits</em>, and twenty nights of shutter become a number a person can actually read.</p>
+
+    <div class="fig fig--bare">
+      <div class="funnel" id="funnel">
+        <div class="funnel-step">
+          <div class="funnel-n" data-count="32214">32,214</div>
+          <div class="funnel-k">photographs saved</div>
+        </div>
+        <div class="funnel-join" aria-hidden="true"><span class="funnel-rule"></span><span class="funnel-note">÷ 49 · a visit is ~49 frames</span><span class="funnel-rule"></span></div>
+        <div class="funnel-step">
+          <div class="funnel-n" data-count="652">652</div>
+          <div class="funnel-k">visits, once bursts collapse</div>
+        </div>
+        <div class="funnel-join" aria-hidden="true"><span class="funnel-rule"></span><span class="funnel-note">confirmed by hand, one at a time</span><span class="funnel-rule"></span></div>
+        <div class="funnel-step">
+          <div class="funnel-n funnel-n--accent" data-count="5">5</div>
+          <div class="funnel-k">raccoons known by name</div>
+        </div>
+      </div>
+      <p class="fig-cap">Alongside: <b data-stat="clips">2,997</b> behaviour clips,
+      <b data-stat="species">30</b> species named, <b data-stat="embeddings">11,077</b> appearance
+      vectors — all from one webcam and one SQLite file. <span class="prov">data/meta.json</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 · THE NIGHT SHIFT ═══════════════════ -->
+<section class="band band--night chapter" id="ch2">
+  <div class="col">
+    <p class="eyebrow"><span>02 · The night shift</span><span class="eyebrow-right">n = 118 raccoon visits</span></p>
+    <h2>The yard clocks in at dusk.</h2>
+    <p class="dek">Of the 118 raccoon visits with an arrival time, <b>98% arrive between
+    7&nbsp;pm and 7&nbsp;am</b>. The rush peaks in the nine-o'clock hour; a typical stay runs
+    five minutes. The busy window wraps around midnight — so the chart does too.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">Arrivals, around the clock</span><span class="fig-tag">every raccoon visit</span></div>
+      <div class="dial-wrap"><div id="dial" class="dial" role="img" aria-label="Radial 24-hour chart of raccoon arrivals. Activity concentrates between 7 pm and 7 am, peaking at 22 arrivals in the 9 pm hour. Two lone daytime arrivals, at 7 am and 11 am, sit outside the pattern."></div></div>
+      <p class="fig-cap">Bar length is the count of visits that began in that hour; the shaded
+      arc marks 7&nbsp;pm&nbsp;–&nbsp;7&nbsp;am. The two daylight arrivals are ringed — the kind
+      of visit the dashboard flags as off-pattern. <span class="prov">data/twoaxis.json</span></p>
+      <details class="tbl"><summary>See the numbers</summary><div id="dial-table"></div></details>
+    </div>
+
+    <div class="asides">
+      <div class="aside"><div class="aside-n" id="peak-stat">22</div><div class="aside-k">arrivals in the peak hour — 9 to 10 pm</div></div>
+      <div class="aside"><div class="aside-n">5<span class="aside-unit">min</span></div><div class="aside-k">median stay, door to door</div></div>
+      <div class="aside"><div class="aside-n">2<span class="aside-unit">am</span></div><div class="aside-k">Notch's peak hour — the late shift is his</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 03 · THE CAST ═══════════════════ -->
+<section class="band band--night chapter" id="ch3">
+  <div class="col">
+    <p class="eyebrow"><span>03 · The cast</span><span class="eyebrow-right">5,136 named photographs</span></p>
+    <h2>Five names.<br/>One very unequal guest list.</h2>
+    <p class="dek">Human confirmations put a name on 5,136 photographs — and <b>Stan and
+    Notch account for nine in every ten</b> of them. Pepsi appears forty-nine times less often
+    than Stan. Fame in this yard is a long tail.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">Photographs per named raccoon</span><span class="fig-tag">confirmed only</span></div>
+      <div id="cast" class="cast"></div>
+      <p class="fig-cap">Portraits are real crops from the export; Miss&nbsp;B. and Pepsi were
+      photographed too rarely to make its public slice. <span class="prov">data/meta.json</span></p>
+    </div>
+
+    <aside class="callout">
+      <p class="callout-title">How Elliot got a name at all</p>
+      <p>Elliot almost never visits alone, so there was no clean solo photograph to learn him
+      from. His identity came from a <em>clip</em>: one two-raccoon visit, tracked frame by
+      frame, split into <b data-stat="tracklets">73</b> motion tracklets that clustered into
+      two animals — <b>36 frames of one, 29 of the other</b>. The raccoon who never poses got
+      a template anyway.</p>
+    </aside>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 · SAME RACCOON? ═══════════════════ -->
+<section class="band band--deep chapter" id="ch4">
+  <div class="col">
+    <p class="eyebrow"><span>04 · Appearance</span><span class="eyebrow-right">5,356 pairwise comparisons</span></p>
+    <h2>The camera remembers the night better than the animal.</h2>
+    <p class="dek">Compare every pair of the 104 raccoon photographs in this export, in the
+    re-ID model's own similarity space. Frames from the <b>same visit</b> look alike — 0.51 on
+    average, with bursts touching 0.99. The same raccoon on a <b>different night</b>? 0.23 —
+    barely ahead of two <b>different raccoons</b> at 0.15. Pose and backdrop outweigh identity,
+    and a single photograph cannot be matched across nights.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">How alike two photographs look</span><span class="fig-tag">cosine similarity, 0 → 1</span></div>
+      <div id="simstrips"></div>
+      <p class="fig-cap">Each row is the distribution of one kind of pair; darker means more
+      pairs land there. Ticks mark the mean. <span class="prov">data/appearance.json</span></p>
+      <details class="tbl"><summary>See the numbers</summary><div id="sim-table"></div></details>
+    </div>
+
+    <p class="dek dek--follow">The rescue is averaging: collapse each visit's best frames into
+    one <em>prototype</em> and identity starts to win — same-raccoon prototype pairs average
+    0.51 against 0.37 for different raccoons, and the best cross-night match hits
+    <b>0.84</b>.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">The same test, on visit prototypes</span><span class="fig-tag">16 visits, 120 pairs</span></div>
+      <div id="protostrips"></div>
+      <p class="fig-cap">Separated, but overlapping — which is why the system suggests and a
+      human confirms. <span class="prov">data/appearance.json</span></p>
+      <details class="tbl"><summary>See the numbers</summary><div id="proto-table"></div></details>
+    </div>
+
+    <aside class="callout callout--honest">
+      <p class="callout-title">The honest asterisk</p>
+      <p>With two raccoons on file this looked nearly solved: 0.83–0.93 for the same animal
+      against 0.36–0.42 for different ones. Five raccoons later, the eval reports
+      <b>ROC-AUC 0.635</b> over 113 leave-one-out probes (July&nbsp;18 run). The code didn't
+      get worse — the cast got harder. That's why every name still passes through a person.</p>
+    </aside>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 · THE GATE ═══════════════════ -->
+<section class="band band--deep chapter" id="ch5">
+  <div class="col">
+    <p class="eyebrow"><span>05 · The gate</span><span class="eyebrow-right">320 scored crops</span></p>
+    <h2>A species model can't say “nothing.”</h2>
+    <p class="dek">BioCLIP names species — show it an empty deck or a plate of kibble and it
+    must still pick one. (For a while, every false alarm was a “brown rat.”) So a general
+    CLIP goes first and answers the only question that matters: <em>is this an animal at
+    all?</em> On 320 scored crops the two populations never touch: every real animal scores
+    below&nbsp;0.43, every non-animal above&nbsp;0.60. The threshold sits in open water —
+    <b>zero crossings, in either direction</b>.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">“Probability this isn't an animal,” per crop</span><span class="fig-tag">gate model, 0 → 1</span></div>
+      <div id="gate"></div>
+      <p class="fig-cap">One dot per crop. The hairline at 0.60 is the live rig's actual
+      cut. <span class="prov">data/decoy.json</span></p>
+      <details class="tbl"><summary>See the numbers</summary><div id="gate-table"></div></details>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 · GAIT ═══════════════════ -->
+<section class="band band--deep chapter" id="ch6">
+  <div class="col">
+    <p class="eyebrow"><span>06 · Gait</span><span class="eyebrow-right">7 measured walks</span></p>
+    <h2>Every walk keeps time.</h2>
+    <p class="dek">From each behaviour clip, the tracker reads the body-bob of a walking
+    raccoon and recovers a stride — from a <b>0.8&nbsp;Hz amble to a 3.3&nbsp;Hz trot</b>.
+    Path straightness spans just as wide: 0.13 (milling about the plate) to 0.88 (a beeline
+    across the wall). A limp would read the same from any camera angle — which is what makes
+    motion the second axis of identity.</p>
+
+    <div class="fig">
+      <div class="fig-head"><span class="fig-title">Stride cadence, walk by walk</span><span class="fig-tag">hover a walk — its dot keeps its beat</span></div>
+      <div id="gait"></div>
+      <p class="fig-cap">Each dot is one tracked walk; the pulse repeats at that walk's
+      measured cadence. <span class="prov">data/gait.json</span></p>
+      <details class="tbl"><summary>See the numbers</summary><div id="gait-table"></div></details>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ sunrise ═══════════════════ -->
+<div class="sunrise" aria-hidden="true"><div class="sunrise-glow"></div></div>
+
+<!-- ═══════════════════ 07 · TRUST BY DAYLIGHT ═══════════════════ -->
+<section class="band band--dawn chapter" id="ch7">
+  <div class="col">
+    <p class="eyebrow"><span>07 · Confidence, audited</span><span class="eyebrow-right">graded against human verdicts</span></p>
+    <h2>Believe the label by day.<br/>Squint at it by night.</h2>
+    <p class="dek">Grade the model's confident species labels (≥&nbsp;0.8) against every human
+    verdict, and daylight keeps its promise — night doesn't. Through the glass, infrared is
+    monochrome and soft, and <b>a confident label in the dark is far likelier to be wrong</b>
+    than a confident label at noon. The camera didn't reveal that; the audit did.</p>
+
+    <div class="fig fig--bare">
+      <div class="trust" id="trust">
+        <div class="trust-half">
+          <div class="trust-n trust-n--day">96<span>%</span></div>
+          <div class="trust-bar"><span class="trust-fill trust-fill--day" style="--w:96%"></span></div>
+          <div class="trust-k"><span class="key key--day" aria-hidden="true"></span>labels right in daylight</div>
+        </div>
+        <div class="trust-half">
+          <div class="trust-n trust-n--night">63<span>%</span></div>
+          <div class="trust-bar"><span class="trust-fill trust-fill--night" style="--w:63%"></span></div>
+          <div class="trust-k"><span class="key key--night" aria-hidden="true"></span>labels right after dark</div>
+        </div>
+      </div>
+      <p class="fineprint">Measured July&nbsp;1 on <b>165 gradable rows</b> — 138 day, 27
+      night, 129 of them raccoon. One camera, three weeks, mostly one species: read it as the
+      shape of the problem, not a benchmark. The eval reruns in one command
+      (<span class="prov">python eval.py</span>) as the corpus grows.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ CODA ═══════════════════ -->
+<section class="band band--dawn coda chapter" id="coda">
+  <div class="col">
+    <h2>The season is still being written.</h2>
+    <p class="dek">Every number on this page is computed live from the same frozen export
+    that powers the making-of demos — regenerate the export and this page follows. Behind the
+    glass, the journal keeps going.</p>
+    <div class="coda-links">
+      <a class="btn" href="index.html">Behind the Glass — how it all works</a>
+      <a class="btn btn--ghost" href="https://github.com/unclemattmakes/backyard-critter-cam">Source on GitHub</a>
+    </div>
+
+    <div class="prov-block">
+      <p class="prov-title">Provenance</p>
+      <ul>
+        <li>Toplines &amp; cast — <span class="prov">data/meta.json</span></li>
+        <li>Arrival clock, stays — <span class="prov">data/twoaxis.json</span> (118 raccoon visits)</li>
+        <li>Similarity distributions — <span class="prov">data/appearance.json</span> (104 crops · 5,356 pairs · 16 prototypes)</li>
+        <li>Gate populations — <span class="prov">data/decoy.json</span> (320 crops scored with the live gate model)</li>
+        <li>Stride cadences — <span class="prov">data/gait.json</span> (7 tracklets from behaviour clips)</li>
+        <li>Record visit &amp; un-blend — <span class="prov">data/reid_game.json</span></li>
+        <li>Day/night accuracy (Jul&nbsp;1) and re-ID ROC-AUC (Jul&nbsp;18) — dated <span class="prov">eval.py</span> runs; <span class="prov">reports/</span> is deliberately gitignored, so reproduce them on your own corpus rather than quoting these.</li>
+      </ul>
+    </div>
+
+    <footer class="foot">
+      <p>Set in Hanken Grotesk &amp; Spline Sans Mono · charts drawn in hand-written SVG from
+      the baked JSON · no frameworks, like the rig itself.</p>
+      <p>Made with too many late nights and a patient raccoon named Stan.</p>
+    </footer>
+  </div>
+</section>
+
+</main>
+
+<div class="tip" id="tip" role="status" aria-live="polite" hidden></div>
+
+<noscript><style>.reveal{opacity:1;transform:none}</style>
+<p style="max-width:640px;margin:24px auto;padding:0 24px;font:15px/1.6 system-ui;color:#a7aeba">
+Charts on this page are drawn from <code>data/*.json</code> with JavaScript. Without it, the
+written findings above still stand — every charted number also appears in the text.</p></noscript>
+<script src="insights.js"></script>
+</body>
+</html>
