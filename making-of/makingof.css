@@ -119,3 +119,10 @@ footer.foot a:hover{ color:var(--gilt); border-color:var(--gilt); }
   .chapter{ padding:40px 0 14px; }
   body{ font-size:16px; }
 }
+
+/* ---- the field-report handoff (insights.html) ---- */
+nav.tabs a.report{color:var(--gilt);}
+.report-cta{ display:inline-block; font-family:var(--mono); font-size:13px; letter-spacing:.06em;
+  color:var(--gilt); border:1px solid var(--rule2); padding:11px 18px; border-radius:3px;
+  text-decoration:none; transition:border-color .2s; }
+.report-cta:hover{ border-color:var(--gilt); }

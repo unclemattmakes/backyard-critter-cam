@@ -40,6 +40,9 @@ making-of/
   index.html        chapters 00–11 + the eight demo mounts
   makingof.css       the field-journal skin (lifted from ../dashboard.css)
   makingof.js        boot: loads data, fills meta, mounts demos, nav + reveal
+  insights.html      "Twenty Nights" — the companion field report: the season's
+  insights.css       findings as one designed page (arrival clock, cast, similarity
+  insights.js        ladder, the gate, day/night trust), computed live from data/*.json
   demos/             one file per demo, each registers against window.MakingOf
     pipeline.js      01 · scrub a real capture through the pipeline
     glass.js         02 · what shooting through the glass door does to night crops
