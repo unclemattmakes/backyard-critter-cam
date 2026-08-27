@@ -487,7 +487,11 @@ has grown from a single live feed into **nine tabs**:
 
 - **Live Observation** — the live annotated MJPEG feed, the most-recent-visitor card (species,
   how-long-ago, confidence, a ▶ badge to play its clip, and a live *off-pattern* flag if it
-  arrived at an odd hour for its species), running tallies, and most-/least-common species. A
+  arrived at an odd hour for its species), running tallies, and most-/least-common species. Any
+  feed goes **full screen** — the expand button in its caption, or a double-click on the picture;
+  Esc, or that same button, comes back. The picture is letterboxed rather than cropped (the top
+  of the frame is where an animal walks in from), and the *other* cameras' streams detach while
+  one is full screen, so watching the yard on a phone costs one stream instead of four. A
   **Who's visiting right now?** panel lets you name the live visit as it happens: tap a known
   critter (or add a new name) and **Log who's here** — one name tags that visit's crops with the
   individual (a live solo confirm that feeds the [re-ID](#individual-re-identification-phase-3)
