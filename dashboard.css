@@ -116,7 +116,56 @@
     transition:border-color .2s; padding:2px;}
   .live-pane.sel{border-color:var(--gilt);}             /* the camera the controls + who's-here act on */
   .live-grid.single .live-pane{cursor:default; border-color:transparent; padding:0;}
-  .live-pane .cap{padding:8px 2px 0;}
+  .live-pane .cap{padding:8px 2px 0; align-items:center;}
+  .pane-acts{display:flex; align-items:center; gap:8px; flex:none;}
+  /* The expand mark is DRAWN, not typed: the glyphs for it (U+26F6 ⛶, U+2922 ⤢) are missing
+     from enough system fonts to land as a tofu box on somebody's phone, and on a touch device
+     this button is the only way into full screen. Four corner brackets — the same motif as the
+     gilt corners on the plate. The pair swaps by CSS on .full, so the icon never lies about
+     which way the button goes. */
+  .expand{display:inline-flex; align-items:center; justify-content:center; background:none;
+    border:1px solid var(--rule2); color:var(--dim); padding:5px 9px; border-radius:3px;
+    cursor:pointer; transition:border-color .2s,color .2s;}
+  .expand:hover{border-color:var(--gilt); color:var(--ink);}
+  .expand .mk path{fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round;}
+  .expand .mk-out{display:none;}
+  .live-pane.full .expand .mk-in{display:none;}
+  .live-pane.full .expand .mk-out{display:inline;}
+  .full-hint{display:none;}
+
+  /* ---- full screen: one pane blown up to the whole viewport (enterFullFeed) ----
+     These rules ARE the mechanism, not a fallback: position:fixed is what fills the screen on
+     every device, and the Fullscreen API only rides along on top of it where it exists (an
+     iPhone has no Element.requestFullscreen for an <img> at all). z-index 100 matches the
+     photo lightbox: above the page, below the modals. */
+  .live-pane.full{position:fixed; inset:0; z-index:100; display:flex; margin:0; padding:0;
+    border:0; border-radius:0; background:#000; cursor:default;}
+  .live-pane.full .frame{flex:1; min-width:0; border:0;}
+  /* Contain, never crop. A 4:3 feed on a 16:9 screen letterboxes rather than losing the top and
+     bottom of the frame — which on a yard camera is exactly where the animal walks in from. */
+  .live-pane.full .frame img{width:100%; height:100%; object-fit:contain;}
+  .live-pane.full .cap{position:absolute; left:0; right:0; bottom:0; z-index:4; padding:14px 18px;
+    background:linear-gradient(to top,rgba(10,9,6,.82),rgba(10,9,6,0));}
+  /* the caption's controls sit over live picture, so give them their own ground to read against */
+  .live-pane.full .expand,.live-pane.full .gear{background:rgba(10,9,6,.6);}
+  /* Esc is worth saying out loud, but only where an Esc key exists — on a phone the button in
+     the caption is the way out and this line would just be a lie in the corner. */
+  @media (hover:hover){
+    .live-pane.full .full-hint{display:block; position:absolute; top:14px; right:18px; z-index:4;
+      padding:5px 9px; border-radius:3px; background:rgba(10,9,6,.6); color:var(--dim);}
+  }
+  body.full-feed{overflow:hidden;}   /* the page must not scroll around behind the feed */
+  /* ...and this line is what makes position:fixed mean the VIEWPORT. .view's entrance fade
+     animates `transform`, and animation-fill-mode:both keeps that animation in effect forever
+     after it ends -- so the tab stays a containing block for fixed descendants, and the
+     full-screen pane came out the size of the tab's content box (358x1070 on a phone) rather
+     than the screen. It is the animation being in effect that does it, not the value it lands
+     on: the fill is `transform:none`, which computes to the IDENTITY MATRIX, and overriding
+     that value alone changes nothing. Dropping the forward fill for the duration is the small
+     fix -- the filled state (opacity 1, no transform) is the element's resting state anyway, so
+     nothing moves, and because animation-name is untouched the fade does not replay on the way
+     back out. */
+  body.full-feed #view-live{animation-fill-mode:backwards;}
 
   .panel.instr{padding:16px 16px 18px;}
   .instr h3{margin:0 0 4px; font-variant:small-caps; letter-spacing:.04em; font-weight:500; font-size:17px;}

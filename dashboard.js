@@ -263,6 +263,9 @@ const VIEWS=['live','visits','favorites','dispatch','behavior','indiv','calendar
 let __curView='visits';   // the tab currently on screen (explore screens remember it as "back home")
 function show(v, fromHash){
   closeSettings();
+  // Back, or a deep link, can leave the Live tab without any click of ours: the full-screen
+  // pane would otherwise stay pinned over whatever tab you landed on.
+  if(v!=='live') exitFullFeed();
   if(VIEWS.includes(v)) __curView=v;
   VIEWS.concat('explore').forEach(k=>{ const s=$('#view-'+k); if(s) s.classList.toggle('on',v===k); });
   VIEWS.forEach(k=>{ const t=$('#tab-'+k); if(t) t.classList.toggle('on',v===k); });
@@ -336,8 +339,12 @@ function syncLiveStreams(){
   const on=!!document.querySelector('#view-live.on');
   document.querySelectorAll('.live-pane').forEach(p=>{
     const img=p.querySelector('.frame img'); if(!img) return;
-    const want='/stream.mjpg?source='+encodeURIComponent(p.dataset.source||'');
-    if(on){ if(!img.getAttribute('src')) img.src=want; }
+    const src=p.dataset.source||'';
+    const want='/stream.mjpg?source='+encodeURIComponent(src);
+    // While one pane is full screen the others are behind an opaque overlay -- the same
+    // argument as the tab check above, for the same reason: a stream nobody can see is still
+    // real LAN traffic and a real decode on a phone battery.
+    if(on && (!LIVE.full || LIVE.full===src)){ if(!img.getAttribute('src')) img.src=want; }
     else if(img.getAttribute('src')){ img.removeAttribute('src'); }
   });
 }
@@ -394,7 +401,7 @@ function sendAuto(autoKey,on,slider){
 /* The live cameras. LIVE.sel is the camera the controls + "who's here" act on (click a pane to
    change it); LIVE.primary is the main feed the masthead period/coords come from. A single-camera
    rig has one pane and behaves exactly as before. */
-let LIVE={ cams:[], sel:null, primary:null };
+let LIVE={ cams:[], sel:null, primary:null, full:null };   // full = the source blown up to full screen, if any
 /* Camera MANAGEMENT state (the editable list); see the block near openCameras(). */
 let CAMS={rows:[],pending:false,manageable:false,canSecret:false,editing:null};
 async function loadCameras(){
@@ -411,13 +418,18 @@ async function loadCameras(){
   grid.classList.toggle('single', cams.length<=1);
   grid.innerHTML=cams.map(c=>`
     <figure class="live-pane${c.source===LIVE.sel?' sel':''}" data-source="${esc(c.source)}" onclick="selectCamera(${jarg(c.source)})">
-      <div class="frame"><i></i>
+      <div class="frame" ondblclick="event.preventDefault();toggleFullFeed(${jarg(c.source)})"><i></i>
         <img alt="live feed" onerror="paneFeed(${jarg(c.source)},false)">
         <div class="feed-msg"><b>Camera feed unavailable</b><span>This camera may be warming up, or isn&rsquo;t running.</span></div>
+        <span class="full-hint lbl">Esc to leave full screen</span>
       </div>
       <figcaption class="cap">
         <span class="lbl">${esc(c.name||c.source)}${c.network?' · net':''}${c.primary&&cams.length>1?' · main':''}</span>
-        <button class="gear" type="button" onclick="event.stopPropagation();openSettings(${jarg(c.source)})" title="Camera settings">&#9881;</button>
+        <span class="pane-acts">
+          <button class="expand" type="button" onclick="event.stopPropagation();toggleFullFeed(${jarg(c.source)})"
+                  title="Full screen — or double-click the picture; Esc leaves" aria-label="Full screen">${EXPAND_MARKS}</button>
+          <button class="gear" type="button" onclick="event.stopPropagation();openSettings(${jarg(c.source)})" title="Camera settings">&#9881;</button>
+        </span>
       </figcaption>
     </figure>`).join('');
   syncLiveStreams();          // streams attach only while the Live tab is on screen
@@ -443,6 +455,56 @@ function selectCamera(source){
   if(!$('#settings').hidden){ refreshControls(); loadZones(); }
 }
 function camName(source){ const c=(LIVE.cams||[]).find(x=>x.source===source); return c?(c.name||c.source):source; }
+
+/* ---------- full screen: one live pane blown up to the whole viewport ----------
+   Two mechanisms, deliberately, and the CSS one is the load-bearing half. The .full class
+   (position:fixed, inset:0 -- see dashboard.css) is what actually fills the screen; the
+   Fullscreen API rides along on top of it only where it exists, to get the browser chrome out
+   of the way too. It cannot be the whole feature: iOS Safari has no Element.requestFullscreen
+   at all -- it fullscreens a <video> and nothing else, and an MJPEG feed is an <img> -- so an
+   API-only version would do nothing on the device the family actually watches the yard on.
+   Either way one function pair owns the state, so Esc, the button, the browser's own exit and
+   a tab change all land in the same place. */
+const EXPAND_MARKS=
+  '<svg class="mk mk-in" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">'
+  +'<path d="M1 5.5V1h4.5M10.5 1H15v4.5M15 10.5V15h-4.5M5.5 15H1v-4.5"/></svg>'
+  +'<svg class="mk mk-out" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">'
+  +'<path d="M6 1.5V6H1.5M10 1.5V6h4.5M14.5 10H10v4.5M6 14.5V10H1.5"/></svg>';
+function fullBtn(source){ const p=paneFor(source); return p?p.querySelector('.expand'):null; }
+function toggleFullFeed(source){ if(LIVE.full===source) exitFullFeed(); else enterFullFeed(source); }
+function enterFullFeed(source){
+  const p=paneFor(source); if(!p) return;
+  if(LIVE.full && LIVE.full!==source) exitFullFeed();
+  selectCamera(source);              // the camera you're staring at is the one the ⚙ and who's-here act on
+  LIVE.full=source;
+  p.classList.add('full'); document.body.classList.add('full-feed');
+  const b=fullBtn(source); if(b){ b.setAttribute('aria-label','Leave full screen'); b.title='Leave full screen (Esc)'; }
+  // Best effort, and never fatal: a browser can refuse this outright (no API, no user gesture,
+  // a permissions policy). The .full class above already did the job -- so a rejection here is a
+  // feed without the browser chrome hidden, not a feed that failed to open.
+  const req=p.requestFullscreen||p.webkitRequestFullscreen;
+  if(req) try{ const r=req.call(p); if(r&&r.catch) r.catch(()=>{}); }catch(e){}
+  syncLiveStreams();                 // the other panes are behind an opaque overlay now: cut their streams
+}
+function exitFullFeed(){
+  if(!LIVE.full) return;
+  const p=paneFor(LIVE.full), b=fullBtn(LIVE.full);
+  if(p) p.classList.remove('full');
+  if(b){ b.setAttribute('aria-label','Full screen'); b.title='Full screen — or double-click the picture; Esc leaves'; }
+  LIVE.full=null; document.body.classList.remove('full-feed');
+  const ex=document.exitFullscreen||document.webkitExitFullscreen;
+  if(ex && (document.fullscreenElement||document.webkitFullscreenElement))
+    try{ const r=ex.call(document); if(r&&r.catch) r.catch(()=>{}); }catch(e){}
+  syncLiveStreams();                 // and back on for everyone
+}
+/* The browser can leave fullscreen without ever telling our click handler -- Esc, F11, the
+   swipe-down on a phone, its own exit button. Without this the .full overlay would sit there
+   after the browser had already dropped out, which reads as a page that has hung. The guard
+   also makes the reverse safe: exitFullFeed() calls document.exitFullscreen(), whose echo
+   lands right back here and finds LIVE.full already cleared. */
+['fullscreenchange','webkitfullscreenchange'].forEach(ev=>document.addEventListener(ev,()=>{
+  if(!(document.fullscreenElement||document.webkitFullscreenElement)) exitFullFeed();
+}));
 
 /* The masthead period/coords come from the PRIMARY camera (period is global -- one sun). */
 async function refreshHeader(){
@@ -3246,9 +3308,23 @@ function camDelete(id){
     .catch(()=>camsMsg('Could not reach the rig.',true));
 }
 
-function openSettings(source){ if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); loadZones(); }
+function openSettings(source){
+  // Leave full screen first. A natively-fullscreened element renders in the browser's TOP
+  // LAYER, which nothing in the page can be drawn over -- so from the ⚙ in a full-screen
+  // caption this panel opened somewhere the user could not see it, and the page just looked
+  // frozen. Dropping back to the grid is the honest answer; the feed is still right there.
+  exitFullFeed();
+  if(source) selectCamera(source); const m=$('#settings'); if(m) m.hidden=false; refreshControls(); loadZones(); }
 function closeSettings(){ const m=$('#settings'); if(m) m.hidden=true; }
-document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeSettings(); closeCameras(); } });
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape') return;
+  closeSettings(); closeCameras();
+  // Esc leaves the full-screen feed too -- and this listener is the only way out of it on a
+  // browser that refused real fullscreen (or has no API for it). Where fullscreen WAS granted
+  // the browser eats this key itself and we never see it; that path lands on fullscreenchange
+  // instead, and both call the same exit.
+  exitFullFeed();
+});
 
 /* ---------- boot ---------- */
 buildControls();
