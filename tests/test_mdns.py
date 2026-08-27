@@ -299,3 +299,116 @@ def test_lan_ip_is_none_when_there_is_no_network(monkeypatch):
         raise OSError("network is down")
     monkeypatch.setattr(mdns.socket, "socket", boom)
     assert mdns.lan_ip() is None
+
+
+# ---- the watch: keeping the name true, and keeping it ANSWERED -------------------------
+# Watching only the address was the 2026-08-25 failure. A Wi-Fi drop at 23:14 took the
+# responder's socket with it, the address came back UNCHANGED, and the watch -- which compared
+# the address, found it correct, and asked nothing else -- never fired. The dashboard went on
+# serving and the camera went on recording throughout, so nothing else in the rig reported it
+# either, and the name would have stayed dead until the next restart. A correct address is not
+# a reachable name.
+
+class FakeStop:
+    """The watch's stop flag, driven by a tick count instead of a clock, so these tests schedule
+    the loop rather than sleep through it."""
+
+    def __init__(self, ticks):
+        self.ticks, self.waited = ticks, []
+
+    def wait(self, timeout):
+        self.waited.append(timeout)
+        if self.ticks <= 0:
+            return True
+        self.ticks -= 1
+        return False
+
+
+def _watcher(monkeypatch, ticks, held, ip="192.168.1.50", now=None, register_fails=False):
+    """A Publication with no thread and no sockets, plus a record of what its watch did.
+
+    Built with __new__ because __init__'s entire job is to start the thread these tests exist to
+    drive by hand. `held` is what the link answers for the name; `now` is a moved address."""
+    events = {"registered": [], "torn_down": [], "browses": 0}
+
+    def fake_held_by(name, **kw):
+        events["browses"] += 1
+        return held
+
+    def fake_register(name, addr, port, cooperating=False):
+        events["registered"].append((name, addr, port))
+        if register_fails:
+            raise OSError("UDP 5353 is busy")
+        return f"zc@{addr}", f"info@{addr}"
+
+    monkeypatch.setattr(mdns, "lan_ip", lambda: now or ip)
+    monkeypatch.setattr(mdns, "_held_by", fake_held_by)
+    monkeypatch.setattr(mdns, "_register", fake_register)
+    monkeypatch.setattr(mdns, "_tear_down", lambda zc, info: events["torn_down"].append(zc))
+
+    pub = object.__new__(mdns.Publication)
+    pub.zc, pub.info = "original-zc", "original-info"
+    pub.name, pub.ip, pub.port = "critter-cam.local", ip, 80
+    pub._stop = FakeStop(ticks)
+    return pub, events
+
+
+def test_watch_revives_a_name_that_stopped_answering(monkeypatch, capsys):
+    """The bug this exists for: the address never moved, so nothing else in the rig will ever
+    report a problem. Silence on the link is the only symptom available, and it has to be enough
+    to act on -- the alternative is what happened, a restart at midnight mid-visit."""
+    pub, ev = _watcher(monkeypatch, ticks=5, held=None)
+    pub._watch()
+    assert ev["browses"] == 1
+    assert ev["registered"] == [("critter-cam.local", "192.168.1.50", 80)]
+    assert ev["torn_down"] == ["original-zc"], \
+        "the deaf responder is retired BEFORE its replacement probes for the name"
+    assert pub.zc == "zc@192.168.1.50", "the Publication must now hold the live responder"
+    assert "stopped answering" in capsys.readouterr().out
+
+
+def test_watch_leaves_a_name_that_still_answers_completely_alone(monkeypatch):
+    """The overwhelmingly common case. Re-registering a healthy name would churn the link every
+    five minutes and risk a conflict with the only responder that is working."""
+    pub, ev = _watcher(monkeypatch, ticks=5, held=["192.168.1.50"])
+    pub._watch()
+    assert ev["browses"] == 1
+    assert ev["registered"] == [] and ev["torn_down"] == []
+
+
+def test_watch_does_not_pay_for_a_browse_on_every_tick(monkeypatch):
+    """The address comparison is free and the browse is not, so they run on different clocks.
+    Ticks inside a single VERIFY_S must ask the network nothing at all."""
+    pub, ev = _watcher(monkeypatch, ticks=4, held=None)
+    pub._watch()
+    assert ev["browses"] == 0 and ev["registered"] == []
+
+
+def test_watch_does_not_stomp_a_name_another_device_now_answers(monkeypatch):
+    """Any answer means the name is being defended, and taking it from a second rig would make
+    which-one-you-reach a coin flip -- the exact case `publish` declines. Reviving must decline
+    on the same terms rather than forcing its way in because the address is not ours."""
+    pub, ev = _watcher(monkeypatch, ticks=5, held=["192.168.1.99"])
+    pub._watch()
+    assert ev["registered"] == [] and ev["torn_down"] == []
+
+
+def test_watch_retries_the_tick_after_a_failed_revival(monkeypatch, capsys):
+    """A revival that fails leaves the name dead, so the retry belongs one tick away, not one
+    verify interval away -- waiting out another VERIFY_S would be five more minutes of a name
+    nobody can reach, for no information gained."""
+    pub, ev = _watcher(monkeypatch, ticks=6, held=None, register_fails=True)
+    pub._watch()
+    assert ev["registered"] == [("critter-cam.local", "192.168.1.50", 80)] * 2
+    assert "could not revive" in capsys.readouterr().out
+
+
+def test_watch_still_re_announces_when_the_address_moves(monkeypatch, capsys):
+    """The watch's original job, unchanged by the liveness check bolted alongside it. A moved
+    address is already proof enough to act on, so it must not wait for a browse to agree."""
+    pub, ev = _watcher(monkeypatch, ticks=1, held=None, ip="192.168.1.50", now="192.168.1.77")
+    pub._watch()
+    assert ev["browses"] == 0, "a moved address needs no confirmation from the link"
+    assert ev["registered"] == [("critter-cam.local", "192.168.1.77", 80)]
+    assert ev["torn_down"] == ["original-zc"] and pub.ip == "192.168.1.77"
+    assert "address changed" in capsys.readouterr().out

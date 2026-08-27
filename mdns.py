@@ -74,6 +74,11 @@ SERVICE_TYPE = "_http._tcp.local."
 # IP would make the name WORSE than the number it replaces.
 REFRESH_S = 60.0
 
+# How often to stop trusting our own bookkeeping and ask the LINK whether anything still answers
+# for the name. Slower than REFRESH_S because it costs a browse rather than a local comparison,
+# and because the failure it catches is measured in hours-until-somebody-notices, not seconds.
+VERIFY_S = 300.0
+
 
 def lan_ip() -> str | None:
     """This machine's address ON THE LAN, or None.
@@ -218,28 +223,71 @@ class Publication:
         self._thread.start()
 
     def _watch(self) -> None:
-        """Re-announce whenever this machine's LAN address moves under us. A DHCP reassignment is
-        precisely the case the name exists to survive -- it is the whole reason the name beats the
-        number -- so failing to notice one would defeat the feature at exactly the moment it was
-        supposed to pay off, and quietly: the name would go on resolving, to nothing.
+        """Re-announce whenever this machine's LAN address moves under us, or whenever the name
+        stops being answered at an address that never moved.
+
+        A DHCP reassignment is precisely the case the name exists to survive -- it is the whole
+        reason the name beats the number -- so failing to notice one would defeat the feature at
+        exactly the moment it was supposed to pay off, and quietly: the name would go on
+        resolving, to nothing.
 
         The responder is torn down and rebuilt rather than merely updated. update_service alone
         would rewrite the A record but leave the socket bound to the OLD interface address, which
         by then is not an address this machine has -- so the correction would be announced from
-        somewhere nobody is listening."""
+        somewhere nobody is listening.
+
+        A correct address is not the same as a working name, and watching only the address is how
+        this went wrong in the field on 2026-08-25: a Wi-Fi drop at 23:14 took the responder's
+        socket with it (the camera reader logged the same blip and recovered on its fifth reopen;
+        the responder has no such loop), the address came back UNCHANGED, and so this watch --
+        which compared the address, found it correct, and asked nothing else -- never fired.
+        Nothing else in the rig reported it either, because nothing else was looking: the
+        dashboard went on serving, the camera went on recording, and only the name was gone. It
+        would have stayed gone until the next restart, which on that night meant restarting a rig
+        mid-visit with raccoons in frame -- the last thing anybody wants to do at midnight.
+
+        So every VERIFY_S this stops trusting its own bookkeeping and asks the link the only
+        question with an unambiguous answer: does ANYTHING answer for this name? Silence is the
+        one symptom the failure reliably has -- a responder cannot tell you its socket is deaf,
+        but the network can tell you nobody is talking. Any answer at all counts as alive,
+        including one carrying somebody else's address: a name another device is now defending is
+        exactly the case `publish` refuses to stomp on, and this must not stomp on it either."""
+        until_verify = VERIFY_S
         while not self._stop.wait(REFRESH_S):
             now = lan_ip()
-            if not now or now == self.ip:
+            if not now:
                 continue
+            moved = now != self.ip
+            if not moved:
+                until_verify -= REFRESH_S
+                if until_verify > 0:
+                    continue
+                if _held_by(self.name):
+                    until_verify = VERIFY_S
+                    continue
+                # Nothing on the link answers for us, so whatever the responder we hold believes
+                # about itself, it is not reaching anybody. Retire it BEFORE building the
+                # replacement -- that frees its socket, and it keeps a half-alive corpse from
+                # failing the name-conflict probe its own replacement is about to run.
+                _tear_down(self.zc, self.info)
+                self.zc, self.info = None, None
             try:
                 new_zc, new_info = _register(self.name, now, self.port)
             except Exception as e:
-                print(f"  [mdns] could not re-announce {self.name} at {now}: {e}")
+                # until_verify is spent, so a name still dead here retries on the NEXT tick
+                # rather than waiting out another full verify interval.
+                print(f"  [mdns] could not {'re-announce' if moved else 'revive'} "
+                      f"{self.name} at {now}: {e}")
                 continue
             old_zc, old_info = self.zc, self.info
             self.zc, self.info, self.ip = new_zc, new_info, now
-            _tear_down(old_zc, old_info)
-            print(f"  [mdns] address changed -- {self.name} now points at {now}")
+            if old_zc is not None:
+                _tear_down(old_zc, old_info)
+            until_verify = VERIFY_S
+            if moved:
+                print(f"  [mdns] address changed -- {self.name} now points at {now}")
+            else:
+                print(f"  [mdns] {self.name} had stopped answering -- re-announced at {now}")
 
     def close(self) -> None:
         self._stop.set()
