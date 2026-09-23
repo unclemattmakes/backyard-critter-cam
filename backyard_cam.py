@@ -1419,6 +1419,22 @@ NAMING_LOG_FILE = LOG_DIR / "naming.log"    # the naming child's OWN stdout/stde
 _NAMING_MAX_RESTARTS = 5                    # per rolling hour, then stop trying and say so loudly
 
 
+def _naming_env(cfg) -> dict:
+    """The environment for the naming child, with its CPU instruction set and thread count capped
+    (see Config.classify_cpu_isa). These are read once, when torch loads, so they must be set before
+    the child starts -- which is why this is the env and not a call inside classify.py."""
+    env = dict(os.environ)
+    isa = str(getattr(cfg, "classify_cpu_isa", "") or "").lower()
+    if isa:
+        env["ATEN_CPU_CAPABILITY"] = isa             # torch's own vectorised kernels
+        env["ONEDNN_MAX_CPU_ISA"] = isa.upper()      # oneDNN conv/matmul
+        env["MKL_ENABLE_INSTRUCTIONS"] = isa.upper()
+    threads = int(getattr(cfg, "classify_cpu_threads", 0) or 0)
+    if threads > 0:
+        env["OMP_NUM_THREADS"] = env["MKL_NUM_THREADS"] = str(threads)
+    return env
+
+
 def _spawn_naming(cfg, tag: str):
     """Start one `classify.py --watch` child, with its output going somewhere a human can read.
 
@@ -1444,7 +1460,7 @@ def _spawn_naming(cfg, tag: str):
             [sys.executable, str(config.ROOT / "classify.py"), "--watch",
              "--device", str(cfg.classify_device),
              "--interval", str(cfg.classify_interval_s), "--tag", tag],
-            cwd=str(config.ROOT),
+            cwd=str(config.ROOT), env=_naming_env(cfg),
             stdout=sink or subprocess.DEVNULL, stderr=subprocess.STDOUT)
         return proc, sink
     except Exception as e:      # noqa: BLE001 -- naming is optional; detection must still run
@@ -2065,7 +2081,8 @@ def run(cfg: config.Config) -> None:
                 daemon=True)
             t.start()
             threads.append(t)
-        print("Watching for critters -- press 'q' in the window (or close it) to quit.\n")
+        print("Watching for critters -- " + ("press 'q' in the window (or close it) to quit.\n"
+              if cfg.show_preview else "headless; press Ctrl+C here to quit.\n"))
 
         if cfg.show_preview:
             # The MAIN thread owns the cv2 window (GUI calls must be single-threaded).
@@ -2209,7 +2226,11 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    metavar="CLASS", choices=["animal", "person", "vehicle"],
                    help="Detector classes that trigger a clip (default: same as saved = animal). "
                         "e.g. --clip-classes animal person to also record yourself as a test.")
-    p.add_argument("--no-preview", action="store_true",
+    # Default comes from Config.show_preview (set it False in config_local.py on a box nobody looks
+    # at); either flag overrides it for one run.
+    p.add_argument("--preview", dest="show_preview", action="store_true", default=c.show_preview,
+                   help="Show the native preview window (the default unless config turns it off).")
+    p.add_argument("--no-preview", dest="show_preview", action="store_false",
                    help="Run headless (no window). Quit with Ctrl+C.")
     p.add_argument("--no-classify", dest="classify_live", action="store_false",
                    default=c.classify_live,
@@ -2253,7 +2274,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         record_clips=args.record_clips,
         clips_dir=Path(args.clips_dir),
         clip_classes=tuple(args.clip_classes) if args.clip_classes else c.clip_classes,
-        show_preview=not args.no_preview,
+        show_preview=args.show_preview,
         visit_gap_minutes=args.visit_gap_min,
         serve=args.serve,
         web_host=args.host,

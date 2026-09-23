@@ -5,13 +5,13 @@ echo.
 echo   Starting the Backyard Critter Cam...
 echo.
 echo   In a few seconds, two things open:
-echo     1. a live VIDEO window (the camera feed), and
+echo     1. a live VIDEO window (unless config_local.py sets show_preview = False), and
 echo     2. the dashboard, in your web browser.
 echo   Species names are added automatically -- there is nothing else to start.
 echo.
 echo   ===  TO STOP THE APP  ==========================================
-echo      Click the live VIDEO window, then press the  Q  key.
-echo      (Or just close that window.)  Everything stops together.
+echo      Click the live VIDEO window, then press the  Q  key -- or, with no
+echo      video window, press Ctrl+C in the minimized LOG window. Everything stops together.
 echo   ===============================================================
 echo.
 echo   You can leave this little log window alone -- it closes by itself

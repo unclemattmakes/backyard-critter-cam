@@ -350,7 +350,10 @@ class Config:
     source: str = "glass_door_cam"
 
     # ---- Live preview -----------------------------------------------------------
-    show_preview: bool = True           # Required feature; press 'q' in the window to quit.
+    # Native preview window; press 'q' in it to quit. On a headless box set this False in
+    # config_local.py: no window, no per-frame drawing unless the dashboard stream is being watched.
+    # Quit a headless rig with Ctrl+C in its log window (closing that window skips the clean stop).
+    show_preview: bool = True
     window_name: str = "Backyard Critter Cam"
     # Native preview window size relative to the capture resolution. imshow re-uploads the
     # whole image every UI tick, which at full 1080p is a real slice of the main thread; a
@@ -836,6 +839,14 @@ class Config:
     classify_live: bool = True
     classify_device: str = "cpu"        # 'cpu' (default; no GPU contention) or 'cuda'.
     classify_interval_s: float = 5.0    # Seconds between checks for new crops to name.
+    # How hard the CPU naming helper is allowed to drive the processor. Left to itself, torch runs
+    # BioCLIP with AVX-512 on every core -- the steepest power step a Skylake-X can take -- and the
+    # olVR hard hangs (docs/host-instability-2026-08.md) keep landing exactly where that coincides
+    # with the GPU detector waking: 2026-09-15 died 90 s into a start, 2026-09-21 two minutes in,
+    # both before the helper finished warming up. AVX2 on half the cores takes that step away for a
+    # few seconds more naming latency. "" / 0 restore torch's own defaults (AVX-512, all cores).
+    classify_cpu_isa: str = "avx2"      # 'avx2', 'avx512', or '' for torch's default.
+    classify_cpu_threads: int = 4       # 0 = torch's default (one per physical core).
 
     # Individual names belonging to the humans in your household. The dashboard will let you name
     # yourself as an individual (handy -- it stops the re-ID queue offering you up as a new raccoon),

@@ -35,7 +35,17 @@ after that it writes a loud line and waits the hour out.
 USAGE
     python rigwatch.py            # one check -- what the scheduled task runs, every 5 min
     python rigwatch.py --status   # say what it sees, start nothing
-    python rigwatch.py --force    # start the rig even if paused (ignores .rig_pause)
+    python rigwatch.py --force    # start the rig even if paused (ignores .rig_pause, not .rig_hold)
+    python rigwatch.py --hold     # never start the rig until --release, across reboots
+    python rigwatch.py --release  # undo --hold
+
+HOLD IS NOT PAUSE
+-----------------
+.rig_pause ages out at the next boot by design. That is exactly wrong while the HOST is the thing
+crashing: on 2026-09-15 and 2026-09-23 the box hard-hung, came back, and this watchdog started the
+rig straight back into the workload that hangs it (docs/host-instability-2026-08.md) -- so nobody
+could keep the rig off long enough to debug the machine. .rig_hold survives reboots and a running
+rig alike; only --release (or deleting the file) removes it.
 """
 from __future__ import annotations
 
@@ -51,6 +61,7 @@ import config
 
 ROOT = config.ROOT
 PAUSE_MARKER = ROOT / ".rig_pause"
+HOLD_MARKER = ROOT / ".rig_hold"
 STATE_FILE = ROOT / ".rigwatch_state.json"
 LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
@@ -130,6 +141,11 @@ def paused() -> bool:
         return PAUSE_MARKER.stat().st_mtime > boot_time()
     except OSError:
         return False
+
+
+def held() -> bool:
+    """Has a human told the watchdog to stay out of it until further notice (--hold)?"""
+    return HOLD_MARKER.exists()
 
 
 def clear_pause_marker() -> bool:
@@ -266,7 +282,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Restart the rig if it is not running.")
     ap.add_argument("--status", action="store_true", help="report and start nothing")
     ap.add_argument("--force", action="store_true", help="start even if paused by a clean stop")
+    ap.add_argument("--hold", action="store_true",
+                    help="never start the rig, across reboots, until --release")
+    ap.add_argument("--release", action="store_true", help="undo --hold")
     args = ap.parse_args()
+
+    if args.hold:
+        HOLD_MARKER.write_text(f"held {datetime.now():%Y-%m-%dT%H:%M:%S}\n", encoding="utf-8")
+        log("HOLD set -- the watchdog will not start the rig, even after a reboot, until "
+            "`python rigwatch.py --release`.")
+        print(f"held. Stop the running rig yourself if it is up; release with --release.")
+        return 0
+    if args.release:
+        if HOLD_MARKER.exists():
+            HOLD_MARKER.unlink()
+            log("HOLD released -- the rig is guarded again.")
+        print("released.")
+        return 0
 
     pids = rig_pids()
     if args.status:
@@ -274,6 +306,7 @@ def main() -> int:
                                       else f"yes  pids={pids}" if pids else "NO"))
         print(f"paused by human : {paused()}  (marker: "
               f"{'present' if PAUSE_MARKER.exists() else 'absent'})")
+        print(f"held (--hold)   : {held()}")
         print(f"starts last hour: {_recent_starts()} / {MAX_STARTS_PER_HOUR}")
         print(f"last boot       : {datetime.fromtimestamp(boot_time()):%Y-%m-%d %H:%M:%S}")
         h = naming_health()
@@ -301,6 +334,8 @@ def main() -> int:
         check_naming(health)
         _record_backlog(health.get("backlog"))
         return 0
+    if held():
+        return 0                              # --hold: a human is debugging, even across reboots
     if paused() and not args.force:
         return 0                              # stopped on purpose this session -- leave it alone
     if _recent_starts() >= MAX_STARTS_PER_HOUR and not args.force:
