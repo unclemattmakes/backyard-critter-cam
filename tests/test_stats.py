@@ -245,6 +245,71 @@ def test_current_live_visit_stops_at_the_gap(conn, db_path):
     assert v["count"] == 2 and v["active"] is True
 
 
+# ---- taggable_span: which frames a live "who's here now?" log may actually carry a name ----
+# The Live tab used to hand current_live_visit's span straight to record_live_sighting, which
+# STAMPS it for a solo name. That span has no age limit and no quality bar, so logging a raccoon
+# you can see from a window -- with the camera pointed elsewhere -- wrote that name onto whatever
+# the camera last saw. On the live rig that was a span from 2026-08-21, fifteen days stale.
+def _at_conf(conn, dt, *, conf=0.9, species="raccoon", source="glass_door_cam"):
+    db.insert_detection(conn, timestamp=dt.isoformat(), source=source,
+                        detection_class="animal", confidence=conf, bbox=(0, 0, 10, 10),
+                        frame_w=100, frame_h=100, crop_path="crops/x.jpg",
+                        species=species, crop_quality=1.0)
+
+
+def test_taggable_span_empty_db(conn, db_path):
+    v = stats.taggable_span(_cfg(db_path))
+    assert v["count"] == 0 and v["taggable"] is False and v["reason"] == "none"
+
+
+def test_taggable_span_tags_a_live_run(conn, db_path):
+    now = datetime.now().astimezone()
+    for s in (40, 25, 10, 1):
+        _at_conf(conn, now - timedelta(seconds=s))
+    conn.commit()
+    v = stats.taggable_span(_cfg(db_path))
+    assert v["taggable"] is True and v["count"] == 4 and v["reason"] is None
+
+
+def test_taggable_span_refuses_a_stale_span(conn, db_path):
+    """THE BUG. Frames older than sighting_max_age_minutes are not the animal you are looking at,
+    so they must not be stamped -- however recently they were the newest thing on the camera."""
+    cfg = _cfg(db_path)
+    now = datetime.now().astimezone()
+    for s in (30, 10):
+        _at_conf(conn, now - timedelta(minutes=cfg.sighting_max_age_minutes + 60, seconds=s))
+    conn.commit()
+    assert stats.current_live_visit(cfg)["count"] == 2      # the old span-finder still offers it
+    v = stats.taggable_span(cfg)
+    assert v["taggable"] is False and v["reason"] == "stale" and v["count"] == 0
+    assert v["latest"] and v["age_s"] > cfg.sighting_max_age_minutes * 60
+
+
+def test_taggable_span_ignores_low_confidence_and_non_critters(conn, db_path):
+    """'Not empties.' A dusk false-fire on the retaining-wall gap is a recent detection, and it
+    must never be the frame that carries a raccoon's name. Both disqualifiers are checked: below
+    the matcher's own confidence bar, and already judged a non-critter."""
+    cfg = _cfg(db_path)
+    now = datetime.now().astimezone()
+    _at_conf(conn, now - timedelta(seconds=30), conf=0.3, species=None)          # under the bar
+    _at_conf(conn, now - timedelta(seconds=20), conf=0.9, species="not an animal")
+    _at_conf(conn, now - timedelta(seconds=10), conf=0.9, species="shadow")      # human correction
+    conn.commit()
+    v = stats.taggable_span(cfg)
+    assert v["taggable"] is False and v["reason"] == "none" and v["count"] == 0
+
+
+def test_taggable_span_accepts_an_unnamed_crop(conn, db_path):
+    """A NULL species is a crop the namer has not reached yet -- which on a live camera is most of
+    the last minute, and during a naming outage is all of it. It must stay taggable, or the feature
+    is useless exactly when it is needed most."""
+    now = datetime.now().astimezone()
+    _at_conf(conn, now - timedelta(seconds=5), conf=0.9, species=None)
+    conn.commit()
+    v = stats.taggable_span(_cfg(db_path))
+    assert v["taggable"] is True and v["count"] == 1
+
+
 # ---- compute_stats.by_day: per-day tallies across distinct days (guards the single-pass refactor) --
 def test_compute_stats_by_day_across_days(conn, db_path):
     """by_day is built in one pass keyed by timestamp[:10]. Insert crops dated on three distinct days
@@ -459,19 +524,21 @@ def test_seasons_overview_weekly_grid_and_accumulation(conn, db_path):
 # ---- _sun answers in the YARD's frame, not the server's (2026-08-09) ------------------
 # astral returns "the dawn/dusk on this calendar date IN THIS TIMEZONE", so asking in the
 # machine's zone splits the pair across two local days once the machine disagrees with the
-# camera. Measured from a UTC machine at lat 47.5 / lon -122.2: dawn 12:19Z, dusk 04:10Z --
-# dusk BEFORE dawn. Every period boundary, moon bucket and sun-anchored arrival sits on this.
+# camera. Measured from a UTC machine at SEATTLE's published civic coordinates (see
+# test_behavior._Cfg for why a public reference point and never the rig's own): dawn 12:19Z,
+# dusk 04:09Z the NEXT day -- naively, dusk BEFORE dawn. Every period boundary, moon bucket
+# and sun-anchored arrival sits on this.
 
 def test_sun_returns_a_positive_day_and_ignores_the_machine_clock():
     from datetime import date, timezone as _tz
-    cfg = replace(config.CONFIG, latitude=47.5, longitude=-122.2)
+    cfg = replace(config.CONFIG, latitude=47.6062, longitude=-122.3321)
     stats._SUN_CACHE.clear()
     dawn, dusk = stats._sun(cfg, date(2026, 8, 7))
     assert dawn < dusk, "dusk before dawn means the pair came from two different local days"
     assert timedelta(hours=8) < (dusk - dawn) < timedelta(hours=20)   # a plausible August day
     # The instants are the yard's, whatever zone this test happens to run in.
     assert dawn.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M") == "2026-08-07T12:19"
-    assert dusk.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M") == "2026-08-08T04:08"
+    assert dusk.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M") == "2026-08-08T04:09"
 
 
 def test_sun_without_a_location_still_gives_a_positive_day():
@@ -610,3 +677,98 @@ def test_behaviour_profile_works_by_species_too(conn, db_path):
 
 def test_behaviour_profile_empty_without_a_subject(conn, db_path):
     assert stats.behaviour_profile(_cfg(db_path))["n_visits"] == 0
+
+
+def test_taggable_span_refuses_when_the_current_animal_is_all_sub_bar(conn, db_path):
+    """THE BUG THE REVIEW CAUGHT, and the nastiest one in this feature.
+
+    The credibility filter runs BEFORE the age test, so if the animal actually on camera produces
+    only sub-bar crops -- normal at dusk, and normal for the first seconds of any arrival -- every
+    one of its frames is discarded and the tail of an EARLIER visit becomes 'the newest frame'.
+    Under the age bound, that earlier visit then reads as taggable and gets stamped with the name
+    the human typed about the animal they can see. Same failure the feature exists to prevent,
+    scaled from days down to minutes, and silent: off_camera is False, so the dashboard reports a
+    successful tag."""
+    cfg = _cfg(db_path)
+    now = datetime.now().astimezone()
+    for m in (14, 13, 12):                      # an earlier visit, credible, inside the age bound
+        _at_conf(conn, now - timedelta(minutes=m), conf=0.9)
+    _at_conf(conn, now - timedelta(seconds=20), conf=0.3, species=None)   # who is here NOW
+    conn.commit()
+
+    v = stats.taggable_span(cfg)
+    assert v["taggable"] is False, "must not promote the earlier visit to 'now'"
+    assert v["reason"] == "no-credible-frame"
+    assert v["count"] == 0
+
+
+def test_taggable_span_still_tags_when_the_gap_is_short(conn, db_path):
+    """The guard must not over-fire: a sub-bar frame WITHIN the visit gap of the credible ones is
+    the same visit, so the span stays taggable."""
+    cfg = _cfg(db_path)
+    now = datetime.now().astimezone()
+    for s in (90, 60, 40):
+        _at_conf(conn, now - timedelta(seconds=s), conf=0.9)
+    _at_conf(conn, now - timedelta(seconds=10), conf=0.3, species=None)   # same visit, poor crop
+    conn.commit()
+
+    v = stats.taggable_span(cfg)
+    assert v["taggable"] is True and v["count"] == 3
+
+
+# ---- supported_species: what a visit's crops will actually be allowed to assert ----------
+# Regression cover for 2026-09-15. A 26-minute raccoon visit voted `raccoon` at an 0.85 margin
+# and the Creature Report still rendered it "Raccoon + Eastern Gray Squirrel + Brown Rat (+6
+# more)", because the digest printed the raw per-crop label spread. One raccoon crop read
+# `house sparrow` at 0.215 and became the email's subject line.
+
+def _label_spread(*labels):
+    """A visit dict shaped like compute_visits' output. Each arg is (species, crops, mean_conf)."""
+    from collections import Counter
+    v = {"classes": Counter(), "class_conf": Counter()}
+    for sp, n, conf in labels:
+        v["classes"][sp] = n
+        v["class_conf"][sp] = n * conf          # summed, as compute_visits accumulates it
+    return v
+
+
+def test_supported_species_keeps_only_the_animal_that_was_there():
+    """The real case: one raccoon for 26 minutes, nine junk labels of 1-8 crops scattered across
+    the tail. Every one of those is a misread raccoon crop, not another animal."""
+    v = _label_spread(("raccoon", 168, 0.985), ("eastern gray squirrel", 8, 0.597),
+               ("brown rat", 4, 0.589), ("Virginia opossum", 2, 0.755),
+               ("house sparrow", 1, 0.215), ("dark-eyed junco", 1, 0.358))
+    assert stats.supported_species(v, config.CONFIG) == ["raccoon"]
+
+
+def test_supported_species_keeps_a_genuine_mixed_flock():
+    """The filter is about EVIDENCE, not about forcing one species per visit: a dawn flock of
+    crow, jay and starling each hold a real share of the visit at credible confidence."""
+    v = _label_spread(("American crow", 111, 0.892), ("Steller's jay", 38, 0.862),
+               ("European starling", 32, 0.742), ("band-tailed pigeon", 4, 0.704),
+               ("bushtit", 2, 0.438), ("northern flicker", 1, 0.398))
+    kept = stats.supported_species(v, config.CONFIG)
+    assert kept == ["American crow", "Steller's jay", "European starling"]
+
+
+def test_supported_species_keeps_few_crops_when_the_classifier_is_certain():
+    """The emphatic bar. Two crops is below the ordinary crop floor, but at 0.99 in a daytime
+    pigeon visit a squirrel is a squirrel -- dropping it would lose a real sighting."""
+    v = _label_spread(("band-tailed pigeon", 6, 0.966), ("eastern gray squirrel", 2, 0.993))
+    assert stats.supported_species(v, config.CONFIG) == ["band-tailed pigeon",
+                                                         "eastern gray squirrel"]
+
+
+def test_supported_species_drops_a_big_but_tiny_share_tail():
+    """Crop COUNT alone must not buy a place: 8 crops clears the count floor, but at 4% of the
+    visit and 0.6 confidence it is the signature of a misread, not a second animal."""
+    v = _label_spread(("raccoon", 200, 0.98), ("eastern gray squirrel", 8, 0.62))
+    assert stats.supported_species(v, config.CONFIG) == ["raccoon"]
+
+
+def test_supported_species_always_keeps_the_leader():
+    """A thin visit still gets to name its animal -- the leader is the same crop count the visit
+    vote itself runs on, so the digest must never render a real visit as Unidentified."""
+    v = _label_spread(("Steller's jay", 2, 0.634))
+    assert stats.supported_species(v, config.CONFIG) == ["Steller's jay"]
+    assert stats.supported_species({"classes": {}, "class_conf": {}}, config.CONFIG) == []

@@ -1239,9 +1239,13 @@ everyone-operates behaviour.
   they are not a login and not a substitute for one. Anyone already on your Wi-Fi has full access.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
-- **`config_local.py` holds the sensitive bits** — your latitude/longitude, and any RTSP camera
-  credentials. It's gitignored, so it never rides along in a commit; note that `backup.py` *does*
-  copy it into the `meta-<date>.zip`, which usually lands in a cloud-synced folder.
+- **`config_local.py` holds the sensitive bits** — your latitude/longitude, any RTSP camera
+  credentials, your `email_resend_api_key` and your `operator_token`. It's gitignored, so it never
+  rides along in a commit; note that `backup.py` *does* copy it into the `meta-<date>.zip`, and
+  the database snapshot beside it carries your camera passwords. Both usually land in a
+  cloud-synced folder, unencrypted, in **every daily zip** — so whoever can read that folder can
+  send mail as you and log into your cameras. See
+  [SECURITY.md → What a backup carries off the machine](SECURITY.md#what-a-backup-carries-off-the-machine).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
   bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about

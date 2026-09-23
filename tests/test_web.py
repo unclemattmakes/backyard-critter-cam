@@ -145,6 +145,30 @@ def test_same_origin_accepts_a_page_loaded_from_the_mdns_name():
                                mdns_host="critter-cam.local") is False
 
 
+def test_same_origin_fills_a_portless_host_from_OUR_port_not_the_origins():
+    """On port 80 a browser omits the port from Host, so the expected authority has to get one
+    from somewhere -- and it must be ours, never the Origin's.
+
+    Taking the Origin's makes the comparison circular: a page served from ANOTHER port on this
+    same IP (a second service on the rig box) would have its own port copied into the expected
+    authority and match itself, and a cross-origin page would clear the cross-origin check. With
+    our port filled in it compares (ip, 9999) against (ip, 80) and is refused.
+
+    The last assertion is the one this must not break: the rig's own page, on 80, where Host
+    genuinely carries no port."""
+    assert web._is_same_origin("http://192.168.1.50:9999", "192.168.1.50",
+                               web_host="0.0.0.0", web_port=80) is False
+    assert web._csrf_refusal("POST",
+                             {"Origin": "http://192.168.1.50:9999", "Host": "192.168.1.50",
+                              "Content-Type": "application/json"},
+                             "0.0.0.0", 80) is not None
+    assert web._is_same_origin("http://192.168.1.50", "192.168.1.50",
+                               web_host="0.0.0.0", web_port=80) is True
+    assert web._is_same_origin("http://critter-cam.local", "critter-cam.local",
+                               web_host="0.0.0.0", web_port=80,
+                               mdns_host="critter-cam.local") is True
+
+
 def test_csrf_refusal_lets_a_post_from_the_mdns_name_through():
     """The end-to-end shape of the same thing: the refusal body is None only if the request is
     allowed to proceed."""

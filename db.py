@@ -1601,6 +1601,19 @@ def departed_individuals(conn: sqlite3.Connection) -> dict:
 
 _MAX_SIGHTING_NAMES = 12   # a "who's here now" log of more than a dozen named animals isn't real.
 
+# How wide a window a span-less sighting claims, for OVERLAP PURPOSES ONLY (the stored span_start /
+# span_end stay NULL, as the schema says). Matches config's default visit_gap_minutes; hardcoded
+# because db.py is the stdlib-only layer and must not import config.
+_VISIT_GAP_FALLBACK_MIN = 5.0
+
+
+def _shift_iso(ts: str, minutes: float) -> str:
+    """`ts` moved by `minutes`, as a local ISO string. Returns `ts` unchanged if it won't parse."""
+    parsed = parse_local(ts)
+    if parsed is None:
+        return ts
+    return (parsed + timedelta(minutes=minutes)).isoformat()
+
 
 def _sighting_names(names_json) -> list:
     """Decode a live_sightings.names JSON array, tolerating a corrupt/NULL value (-> [])."""
@@ -1652,7 +1665,9 @@ def _live_sighting_rows(conn: sqlite3.Connection, source: Optional[str] = None) 
 def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
                          span_start: Optional[str] = None, span_end: Optional[str] = None,
                          note: Optional[str] = None, observed_at: Optional[str] = None,
-                         stamp: bool = True, labeled_by: Optional[str] = None) -> dict:
+                         stamp: bool = True, labeled_by: Optional[str] = None,
+                         stamp_start: Optional[str] = None,
+                         stamp_end: Optional[str] = None) -> dict:
     """Log a human's real-time identification of who is visiting NOW (the dashboard Live tab).
     `names` is the list of individuals present over [span_start, span_end] on `source`.
 
@@ -1689,6 +1704,20 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
     (`labeled_by`) and reviewable, and never writes ground truth or feeds a template until the
     operator promotes it. `labeled_by` rides on the sighting row either way.
 
+    WHAT WAS SEEN vs WHAT MAY BE STAMPED (2026-09-06). These are two different spans and used to
+    be conflated. `span_start`/`span_end` are TESTIMONY -- the window the human is talking about,
+    stored on the row and read by every co-presence consumer (multi_name_sighting_spans,
+    co_present_sighting_names) and by the supersede scan below. `stamp_start`/`stamp_end` are the
+    narrower, quality-gated window that may actually receive the name; they default to the
+    testimony span, so every existing caller is unchanged.
+
+    They have to be separable because of the off-camera case: an animal you can see from a window
+    the camera does not cover is real testimony with NO frames worth labelling. Nulling both --
+    the first attempt -- silently switched off two mechanisms at once: a zero-width span overlaps
+    nothing, so corrections stopped superseding each other, and a "Stan and Notch are here" log
+    stopped marking its visit multi-animal, which would let a two-animal visit become a solo
+    template. Keep the testimony, gate only the stamp.
+
     Returns {sighting_id, stamped, multi, group, names, superseded: [ids], conflict: bool}."""
     ordered, seen = [], set()
     for n in (names or []):
@@ -1704,7 +1733,20 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
                 "names": [], "superseded": [], "conflict": False}
 
     observed = observed_at or now_local_iso()
-    s0, s1 = span_start or observed, span_end or observed
+    # The stamp window defaults to the testimony window -- callers that pass one span mean both.
+    stamp_start = stamp_start if stamp_start is not None else span_start
+    stamp_end = stamp_end if stamp_end is not None else span_end
+
+    # The overlap window for the supersede scan below. With NO span at all this used to collapse to
+    # a zero-width point at `observed`, and a point overlaps nothing -- so an off-camera correction
+    # typed seconds after the log it corrects superseded nothing and raised no conflict, silently
+    # disabling the whole 2026-08-05 correction-tracking mechanism for that path. Widen it to the
+    # visit gap around the moment instead: two logs about the same animal, typed a minute apart,
+    # are the same claim whether or not the camera happened to be looking.
+    if span_start or span_end:
+        s0, s1 = span_start or observed, span_end or observed
+    else:
+        s0, s1 = _shift_iso(observed, -_VISIT_GAP_FALLBACK_MIN), observed
 
     # Who is this re-logging? Every not-yet-superseded sighting on this source whose span overlaps.
     prior = [p for p in _live_sighting_rows(conn, source)
@@ -1719,8 +1761,8 @@ def record_live_sighting(conn: sqlite3.Connection, *, source: str, names,
     # A GROUP string is the solo path's stamp with the pair path's meaning: it stamps (the family
     # convention) AND reports multi below (several bodies -- the sighting must feed is_multi).
     # A viewer's log (stamp=False) records testimony only.
-    if stamp and not multi and span_start and span_end:
-        res = apply_visit_label(conn, source=source, start=span_start, end=span_end,
+    if stamp and not multi and stamp_start and stamp_end:
+        res = apply_visit_label(conn, source=source, start=stamp_start, end=stamp_end,
                                 name=ordered[0], labeled_by=labeled_by)
         stamped = int(res.get("detections") or 0)
 
@@ -2533,6 +2575,14 @@ def remove_camera(conn: sqlite3.Connection, camera_id) -> Optional[dict]:
     """Soft-delete one camera (stamp deleted_at) and return the row it removed, or None for an
     unknown/already-deleted id. The row STAYS: the tombstone is what stops seed_cameras putting a
     config-listed camera back on the next start, and what makes re-adding the name an undelete.
+
+    THE PASSWORD STAYS TOO, and that is worth saying out loud because "delete" does not read that
+    way. It is what makes the undelete a real recovery -- add_camera's undelete branch keeps the
+    stored password when the form omits one, so "I removed that camera by mistake" costs a name,
+    not a walk to the camera to read its login again. The cost is that a tombstoned row is still a
+    credential in `backyard.db`, and therefore in every backup of it. To actually destroy one,
+    re-add the camera, clear its password from the rig (clear_password=True), then remove it
+    again. SECURITY.md says the same where an operator will look for it.
 
     Refusing to remove the LAST live camera is the caller's job (web.py does it) -- a rig with no
     cameras exits as soon as the last capture thread ends."""

@@ -995,7 +995,12 @@ def render_email(bundle, images, img_src) -> str:
                 badges = []
                 nov = s.get("novelty") or {}
                 if s.get("surprising"):
-                    badges.append(_flag("⚠ off-hours — verify", _C["warn_bg"], _C["warn_ink"]))
+                    # Say which guard fired. A brown rat at 10 PM badged "off-hours" beside its own
+                    # printed "usually 3pm-3am" reads as a bug in the rig, not a question about the
+                    # crop -- and the digest flags for two different reasons now.
+                    why = ("⚠ unattested — verify" if s.get("surprise_kind") == "unattested"
+                           else "⚠ off-hours — verify")
+                    badges.append(_flag(why, _C["warn_bg"], _C["warn_ink"]))
                 elif nov.get("first_ever"):
                     badges.append(_flag("❋ new", _C["new_bg"], _C["new_ink"]))
                 elif (nov.get("days_since") or 0) >= 3:
@@ -1038,7 +1043,7 @@ def render_email(bundle, images, img_src) -> str:
                     line.append(f"Also on the record: {_esc(real)}.")
                 if surp:
                     line.append(f'<span style="color:{_C["warn_ink"]};">Listed to verify '
-                                f'(off-hours for their species): {_esc(surp)}.</span>')
+                                f'(the record does not support them): {_esc(surp)}.</span>')
                 rows.append(f'<tr><td colspan="3" style="padding:8px 0;font-size:12px;'
                             f'color:{_C["faint"]};">{" ".join(line)}</td></tr>')
             parts.append(f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0">'

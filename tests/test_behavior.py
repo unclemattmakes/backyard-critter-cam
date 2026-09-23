@@ -186,9 +186,15 @@ def test_co_occurrence_empty_when_no_stamped_detections(conn):
 # opossum yields a nonsense negative offset, which is the bug this test exists to prevent.
 
 class _Cfg:
-    """Minimal config stand-in: stats._sun only reads latitude/longitude."""
-    latitude = 47.5
-    longitude = -122.2
+    """Minimal config stand-in: stats._sun only reads latitude/longitude.
+
+    These are SEATTLE's published civic coordinates, not the rig's. What these tests need from a
+    location is a mid-northern latitude with a real summer/winter dusk swing and a solar offset
+    that is not UTC -- any such place does. Using the maintainer's own yard would put their home,
+    to a few kilometres, in a public repo, which is exactly what SECURITY.md tells everyone else
+    not to do with config_local.py. Please don't "correct" these to the rig's real numbers."""
+    latitude = 47.6062
+    longitude = -122.3321
 
 
 # The YARD's offset, fixed -- never the machine's. These tests are about where the sun is at
