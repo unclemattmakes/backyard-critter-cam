@@ -244,6 +244,25 @@ your browser; species names are added automatically — there's nothing else to 
 **To stop:** click the live **video window** and press **`q`** — or just **close that window**.
 Everything (camera, dashboard, *and* species naming) shuts down together, in one step.
 
+**Running it headless** (a box with no one watching the screen): set `cfg.show_preview = False`
+in `config_local.py`. No video window opens; the dashboard is the view. To stop, press **Ctrl+C**
+in the minimized *log* window. Closing that window instead kills the app without its clean
+shutdown.
+
+#### It restarts itself — and how to keep it off
+
+The **"Backyard critter-cam rigwatch"** scheduled task runs `rigwatch.py` every 5 minutes and
+starts the rig if it is down, so a crash or a reboot does not leave the yard dark. A clean stop
+(`q`, Ctrl+C) leaves a `.rig_pause` marker so it will not race you back up, but that marker only
+lasts **until the next reboot**. To keep the rig off *across* reboots (say, while debugging the
+machine), use the hold:
+
+```powershell
+.\.venv\Scripts\python.exe rigwatch.py --hold      # never start it, even after a reboot
+.\.venv\Scripts\python.exe rigwatch.py --release   # back to normal
+.\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
+```
+
 #### Telling someone else how to connect
 
 The LAN launcher gives the rig a **name on your network**, so nobody has to be handed an IP
@@ -310,7 +329,8 @@ says so in one line at startup, and serves on numbers.
 ```
 
 Press **`q`** in the preview window — or **close the window** — to quit cleanly; that also stops
-the species-naming helper. The window is **resizable** — drag any edge.
+the species-naming helper. The window is **resizable** — drag any edge. Headless (no window, via
+`--no-preview` or `cfg.show_preview = False`), quit with **Ctrl+C**.
 
 Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + stats + gallery):
 
@@ -331,12 +351,12 @@ All defaults live in `config.py`; these override them per-run:
 | `--device D` | `auto` (default; GPU if usable, else CPU) · `cuda` (require an NVIDIA GPU, fail loud) · `cpu` (force CPU, slower). |
 | `--min-confidence F` | Minimum detector confidence to draw/save (default 0.25). |
 | `--motion-min-area N` | Largest motion blob (px) needed to wake the detector (default 800). Raise to ignore small twitches; lower to catch smaller/farther critters. |
-| `--detector-interval S` | Min seconds between detector runs while motion continues (default 1.0). |
+| `--detector-interval S` | Min seconds between detector runs while motion continues (default 3.0, raised from 1.0 for the host-hang experiment in docs/host-instability-2026-08.md). |
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
 | `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` — or a per-camera budget from `clips_max_gb_by_source` — with oldest-first pruning). |
 | `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
 | `--db PATH` / `--crops-dir PATH` | Override output locations. |
-| `--no-preview` | Headless; quit with Ctrl+C. |
+| `--no-preview` / `--preview` | Headless (quit with Ctrl+C) / show the window. Default comes from `cfg.show_preview`. |
 | `--no-classify` | Detection only — don't start the live species-naming helper. The rig launches it (and stops it) automatically by default; this turns that off. You can still fill species later with `python classify.py`. |
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
 | `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
@@ -1239,9 +1259,13 @@ everyone-operates behaviour.
   they are not a login and not a substitute for one. Anyone already on your Wi-Fi has full access.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
-- **`config_local.py` holds the sensitive bits** — your latitude/longitude, and any RTSP camera
-  credentials. It's gitignored, so it never rides along in a commit; note that `backup.py` *does*
-  copy it into the `meta-<date>.zip`, which usually lands in a cloud-synced folder.
+- **`config_local.py` holds the sensitive bits** — your latitude/longitude, any RTSP camera
+  credentials, your `email_resend_api_key` and your `operator_token`. It's gitignored, so it never
+  rides along in a commit; note that `backup.py` *does* copy it into the `meta-<date>.zip`, and
+  the database snapshot beside it carries your camera passwords. Both usually land in a
+  cloud-synced folder, unencrypted, in **every daily zip** — so whoever can read that folder can
+  send mail as you and log into your cameras. See
+  [SECURITY.md → What a backup carries off the machine](SECURITY.md#what-a-backup-carries-off-the-machine).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
   bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about

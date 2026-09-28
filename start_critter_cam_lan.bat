@@ -24,8 +24,8 @@ echo   Only devices on your own network can connect (you can confirm and even co
 echo   sightings from them); it refuses direct internet connections, but has no password.
 echo.
 echo   ===  TO STOP THE APP  ==========================================
-echo      On this PC, click the live VIDEO window and press  Q.
-echo      (Or just close that window.)  Everything stops together.
+echo      On this PC, click the live VIDEO window and press  Q  -- or, with no
+echo      video window, press Ctrl+C in the minimized LOG window. Everything stops together.
 echo   ===============================================================
 echo.
 REM Starting by hand clears the "stopped on purpose" marker, so rigwatch.py will bring the rig

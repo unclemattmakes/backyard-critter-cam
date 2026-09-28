@@ -639,13 +639,27 @@ async function refreshWhoshere(){
   let d; try{ d=await fetch('/api/live/now?source='+encodeURIComponent(LIVE.sel||'')).then(r=>r.json()); connOK(); }catch(e){ connFail(); return; }
   const sec=$('#whoshere'); if(!sec) return;
   sec.hidden=false;
-  const wc=$('#wh-cam'); if(wc) wc.textContent=((LIVE.cams||[]).length>1?' · '+camName(LIVE.sel):'');
+  // Always name the camera, even with only one. This panel WRITES to that camera's rows, and the
+  // length>1 guard meant that on a single-camera rig — which is what this yard is today — it
+  // never said which. "Who's visiting right now?" reads as a question about the yard; it is
+  // actually a question about one lens.
+  const wc=$('#wh-cam'); if(wc) wc.textContent=' · '+camName(LIVE.sel);
   WH_CAST=d.cast||[];
   const v=d.visit||{};
-  $('#wh-span').textContent = v.count
-    ? (v.active ? `active now · ${v.count} frame${v.count===1?'':'s'} this visit`
-                : `quiet — last seen ${timeAgo(v.latest)}`)
-    : 'all quiet — log it anyway and it attaches to the next frames';
+  // Say what a log would DO, not just what the camera last saw. The old copy promised "it
+  // attaches to the next frames", which was never true in either direction: a solo log stamps
+  // frames that ALREADY EXIST, and it stamps none at all when nothing recent qualifies. Being
+  // wrong here is what let a name land silently on an empty deck.
+  // Driven ENTIRELY by `tg`. Mixing in v.active mixed two populations into one sentence:
+  // current_live_visit has no confidence bar and no non-critter filter, so the line could read
+  // "just now" (its false branch, a stronger freshness claim than "active now") at the exact
+  // moment the camera was showing nothing credible. State the age instead of guessing a word.
+  const tg=d.taggable||{};
+  $('#wh-span').textContent = tg.taggable
+    ? `a log tags ${tg.count} frame${tg.count===1?'':'s'}, newest ${timeAgo(tg.latest)}`
+    : (tg.latest
+        ? `nothing taggable on camera — best recent frame ${timeAgo(tg.latest)}; a log is recorded but tags no frames`
+        : 'all quiet — a log is recorded, but there are no frames to tag');
   whRenderChips();
   whRenderRecent(d.recent||[]);
 }
@@ -680,13 +694,22 @@ async function whLog(){
     if(r.error){ whMsg(r.error,true); }
     else{
       const who=names.map(cap1).join(' + ');
+      // An off-camera log is a SUCCESS, not a half-failure: the sighting is recorded in full, it
+      // just has no frames worth pinning it to. Say which, and say why, so "tagged 12 frames" and
+      // "nothing on camera" stop looking like the same outcome.
+      // Off-camera is a SUFFIX, not a branch. A pair never stamps frames by design, so leading
+      // with "no frames were tagged" for one is both uninformative and displaces the thing that
+      // matters ("co-presence noted") — the signal the un-blend step actually consumes.
+      const seen = r.visit && r.visit.latest ? timeAgo(r.visit.latest) : '';
+      const why = seen ? `best recent frame ${seen}` : 'nothing recent on camera';
+      const off = r.off_camera ? ` — off camera (${why}), nothing tagged` : '';
       whMsg(r.as_viewer
-        ? `Logged ${who} — noted for the operator to review (viewer logs never stamp).`
+        ? `Logged ${who}${off} — noted for the operator to review (viewer logs never stamp).`
         : r.group
-        ? `Logged ${who} — family stamp on ${r.stamped||0} frame${r.stamped===1?'':'s'}, counted as several animals.`
+        ? `Logged ${who} — ${r.off_camera?'counted as several animals':`family stamp on ${r.stamped||0} frame${r.stamped===1?'':'s'}, counted as several animals`}${off}.`
         : r.multi
-        ? `Logged ${who} together — co-presence noted.`
-        : `Logged ${who}${r.stamped?` · tagged ${r.stamped} frame${r.stamped===1?'':'s'}`:''}.`);
+        ? `Logged ${who} together — co-presence noted${off}.`
+        : `Logged ${who}${r.stamped?` · tagged ${r.stamped} frame${r.stamped===1?'':'s'}`:''}${off}.`);
       WH_SEL.clear();
     }
   }catch(e){ whMsg('Could not save: '+e,true); }

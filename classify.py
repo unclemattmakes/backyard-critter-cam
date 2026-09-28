@@ -31,12 +31,28 @@ import sys
 import threading
 import time
 from collections import Counter
+from datetime import datetime, timedelta
 
 import config
 import db
 import detector
 import visits
 from clipfilter import NONANIMAL_LABEL
+
+# What species_source records for a crop whose FILE will not decode. It is labelled
+# NONANIMAL_LABEL so it leaves the naming queue for good (see _decodes), but under its own source
+# so the provenance survives: these are damaged files, not crops the model judged empty, and
+# `SELECT * FROM detections WHERE species_source = 'unreadable-crop'` is the audit.
+UNREADABLE_SOURCE = "unreadable-crop"
+
+# How many pending crops one --watch poll takes on. The loop used to swallow the entire backlog in
+# a single classify_rows call, which froze the status heartbeat (and the dashboard's "ready" pill)
+# for as long as that took -- hours, on the 48k backfill.
+WATCH_CHUNK = 512
+
+# Refresh the visit ledger at least this often while unstamped detections exist, even if naming
+# wrote nothing. See the second trigger in watch_loop for why "even if" is the load-bearing word.
+LEDGER_MAX_STALE_S = 1800.0
 
 # --- Your yard's candidate species. Common names work well. Keep it to species you actually
 # get (plus a few plausibles); a tighter list gives sharper zero-shot results. This is a
@@ -108,6 +124,63 @@ def fetch_pending(conn, min_confidence: float, redo: bool, limit: int = 0):
     return rows[:limit] if limit else rows
 
 
+def count_pending(conn, min_confidence: float = 0.0) -> int:
+    """How many crops are still waiting to be named. Cheap (COUNT over the same indexed predicate
+    as fetch_pending) and reported in the naming status file, so "is the namer alive" and "is the
+    namer getting anywhere" stop being the same question -- they were, and the answer read green
+    for two weeks while the backlog grew to 48,275."""
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM detections WHERE detection_class = 'animal' "
+            "AND confidence >= ? AND COALESCE(species_verified, 0) != 1 AND species IS NULL",
+            (min_confidence,)).fetchone()[0])
+    except Exception:       # noqa: BLE001 -- a status number is never worth failing a poll over
+        return -1
+
+
+def _unstamped(conn, older_than_minutes: float) -> bool:
+    """True if a detection older than `older_than_minutes` still has no visit_id -- the test that
+    decides whether the ledger's staleness timer has anything to do.
+
+    The age bound is what makes this mean 'the ledger has fallen behind' rather than 'the camera is
+    working'. db.insert_detection never writes visit_id, so a live rig has unstamped rows within
+    seconds of any rebuild; gating on their bare existence would rebuild the whole ledger every
+    30 minutes forever. A row older than the visit gap belongs to a visit that has already CLOSED
+    and still has not been stamped, which is the real condition."""
+    try:
+        cutoff = (datetime.now().astimezone()
+                  - timedelta(minutes=float(older_than_minutes))).isoformat()
+        return conn.execute(
+            "SELECT 1 FROM detections WHERE visit_id IS NULL AND timestamp < ? LIMIT 1",
+            (cutoff,)).fetchone() is not None
+    except Exception:       # noqa: BLE001
+        return False
+
+
+def _decodes(path: str) -> bool:
+    """True if `path` actually opens as an image. Mirrors embed.py's _load_image guard, which
+    classify.py lacked -- and that asymmetry cost two weeks of naming.
+
+    A file that EXISTS is not a file that DECODES. When the host hard-hangs it loses the OS write
+    cache, and NTFS leaves the crops it was mid-write on at their full allocated length filled with
+    NUL bytes. Twenty such files survived the 2026-08-23 freeze and one more the 2026-08-24 one.
+    BioCLIP opens paths itself, deep inside predict(), and raises PIL.UnidentifiedImageError --
+    which subclasses OSError, so the GPU-OOM guard in classify_rows never caught it. Because
+    fetch_pending orders by id, those rows sat in the FIRST batch of every run, so the helper died
+    before its first commit on every single start: 48,275 crops went unnamed and every downstream
+    stage that gates on species went with them.
+
+    Image.verify() reads only enough to validate the container, so this is cheap next to the
+    inference it protects."""
+    from PIL import Image
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:       # noqa: BLE001 -- any failure to decode means "do not hand this to the model"
+        return False
+
+
 def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | None = None,
                   afilter=None):
     """Classify (id, crop_path) rows in batches, writing species back. Returns
@@ -126,7 +199,6 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
         valid = [(rid, pth) for rid, pth in valid if os.path.exists(pth)]
         if not valid:
             continue
-        n_batch = len(valid)   # crops actually processed this batch (animal + non-animal)
 
         # Run ALL the slow inference first and stash the labels in memory -- do NOT touch the DB
         # yet. Writing here would open a transaction and hold SQLite's WAL write lock across the
@@ -134,6 +206,21 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
         # thread long enough to crash it ("database is locked"). We instead commit everything in
         # one quick burst at the end, so the write lock is held for milliseconds, not minutes.
         pending: list = []                 # (id, label, score, source) -- source None = bioclip default
+
+        # Screen out files that will not decode BEFORE the model ever sees them, and LABEL them so
+        # they leave the queue rather than being retried (and re-crashing) forever -- see _decodes.
+        # Marking beats merely skipping: a skipped row stays pending, so the watcher would re-select
+        # it every poll for the life of the rig.
+        readable = []
+        for rid, pth in valid:
+            if _decodes(pth):
+                readable.append((rid, pth))
+            else:
+                pending.append((rid, NONANIMAL_LABEL, 0.0, UNREADABLE_SOURCE))
+                tally[NONANIMAL_LABEL] += 1
+                print(f"  unreadable crop, marked '{UNREADABLE_SOURCE}': {pth}")
+        n_batch = len(valid)   # crops actually processed this batch (animal + non-animal + damaged)
+        valid = readable
 
         # Stage 0: general-CLIP non-animal gate. Rejected crops are labelled NONANIMAL_LABEL and
         # dropped from the batch, so BioCLIP only ever sees things that are plausibly animals.
@@ -161,6 +248,18 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
                     preds = clf.predict([pth for _, pth in valid])
                 else:
                     raise
+            except OSError as e:
+                # _decodes screens the known failure, but the model opens each path a SECOND time
+                # inside predict(), so a race (a prune, a crop still being written) can still land
+                # here. Degrade to one-at-a-time: a bad path then costs its own row instead of the
+                # whole helper. Rows that fail stay pending and are re-screened on the next poll.
+                print(f"  batch failed to decode ({e}) -- retrying one crop at a time.")
+                preds = []
+                for _rid, pth in valid:
+                    try:
+                        preds.extend(clf.predict([pth]))
+                    except OSError as e2:      # noqa: PERF203 -- the slow path, only after a failure
+                        print(f"  unreadable crop, skipped: {pth} ({e2})")
 
             best: dict[str, tuple[str, float]] = {}
             for d in preds:
@@ -214,29 +313,59 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
     afilter = build_nonanimal_filter(device)
     print(f"[naming] BioCLIP 2 ready on {device}; naming new crops as they arrive "
           f"(checking every {interval:.0f}s).")
-    _write_naming_status("ready", device=device, named=sum(session.values()))
+    _write_naming_status("ready", device=device, named=sum(session.values()), backlog=0)
     ledger_dirty = False   # labels written that the visit ledger hasn't folded in yet
+    last_refresh = time.monotonic()
     try:
         while not stop_event.is_set():
-            rows = fetch_pending(conn, min_confidence, redo=False)
-            if rows:
-                print(f"[naming] {len(rows)} new crop(s) to name...")
-                tally, clf, device = classify_rows(conn, clf, device, rows, batch_size,
-                                                   afilter=afilter)
-                session.update(tally)
-                if tally:
-                    ledger_dirty = True
-            elif ledger_dirty:
-                # A quiet poll after a naming burst = the backlog is drained. Fold the fresh
-                # labels into the visit ledger NOW (a visit carries its crops' dominant species),
-                # so a batch import ends with LABELED visits by itself -- before this, 90 of 113
-                # trail-cam visits (2026-07-22) sat species-less until a manual `python visits.py`.
-                # Refreshing on this trailing edge -- not after every batch -- keeps the rebuild
-                # (and its short write lock) off the hot path while crops are still streaming in:
-                # during live activity it runs about once per lull, not once per poll.
-                visits.refresh(conn, config.CONFIG.visit_gap_minutes)
-                ledger_dirty = False
-            _write_naming_status("ready", device=device, named=sum(session.values()))  # heartbeat
+            try:
+                # A BITE, not the whole backlog. fetch_pending used to return every pending row and
+                # classify_rows chewed the lot before returning, so on a 48k backfill the heartbeat
+                # below did not run for hours and the dashboard showed a frozen "ready". Taking
+                # WATCH_CHUNK at a time keeps the heartbeat honest and lets a stop land promptly.
+                rows = fetch_pending(conn, min_confidence, redo=False, limit=WATCH_CHUNK)
+                if rows:
+                    print(f"[naming] {len(rows)} new crop(s) to name...")
+                    tally, clf, device = classify_rows(conn, clf, device, rows, batch_size,
+                                                       afilter=afilter)
+                    session.update(tally)
+                    if tally:
+                        ledger_dirty = True
+                stale = (time.monotonic() - last_refresh) >= LEDGER_MAX_STALE_S
+                if stale:
+                    # Advance the clock whenever the CHECK runs, not only when a rebuild follows.
+                    # Assigning it solely inside the body let `stale` latch True forever on a
+                    # ledger with nothing to do, and _unstamped is an unindexed scan of a 269k-row
+                    # table -- so a quiet rig would run one every 5 seconds for the life of the
+                    # process instead of one every 30 minutes.
+                    last_refresh = time.monotonic()
+                if (not rows and ledger_dirty) or (stale and _unstamped(conn, config.CONFIG.visit_gap_minutes)):
+                    # Two triggers, deliberately. The first is the original trailing edge: a quiet
+                    # poll after a naming burst means the backlog is drained, so fold the fresh
+                    # labels into the ledger (a visit carries its crops' dominant species) -- that
+                    # is what lets a trail-cam import end with LABELED visits by itself.
+                    #
+                    # The second exists because the first is not enough. ledger_dirty is only ever
+                    # set when naming WRITES something, so a namer that produces nothing leaves it
+                    # False forever and the ledger simply stops -- which is exactly what happened
+                    # for the nine days after 2026-08-28: 37,703 detections with no visit_id and
+                    # nothing downstream able to see them. build_visits handles species-less crops
+                    # fine (it writes species NULL), so the ledger must not depend on the namer.
+                    visits.refresh(conn, config.CONFIG.visit_gap_minutes)
+                    ledger_dirty = False
+                    last_refresh = time.monotonic()
+                # The heartbeat carries the BACKLOG, not just liveness. "ready" on its own said
+                # nothing about whether work was happening -- it read green for eight days while
+                # named stayed 0 -- so rigwatch.py can now alarm on a backlog that never falls.
+                _write_naming_status("ready", device=device, named=sum(session.values()),
+                                     backlog=count_pending(conn, min_confidence))
+            except Exception as e:   # noqa: BLE001 -- a poll must never be able to kill the helper
+                # The whole reason this loop exists is to run unattended for weeks. Anything that
+                # escapes one poll (a locked DB, a vanished crop, a model hiccup) is logged and
+                # retried on the next one; only stop_event ends this loop.
+                print(f"[naming] poll failed, continuing: {type(e).__name__}: {e}")
+                _write_naming_status("error", device=device, named=sum(session.values()),
+                                     detail=f"{type(e).__name__}: {e}")
             stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set
     finally:
         # Stopped mid-burst (standalone --watch Ctrl-C during a backlog): don't strand the labels

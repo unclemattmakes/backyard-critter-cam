@@ -1021,9 +1021,17 @@ def co_present_visit_ids(conn, *, iou_max: float = 0.45, min_frames: int = 1,
     per visit; with `include_sightings`, adds visits overlapped by a multi-name live sighting
     (the human SAW two+, whatever the stills caught)."""
     per_visit: dict = defaultdict(lambda: defaultdict(list))   # visit -> (ts, species) -> boxes
+    # NO species precondition. Co-presence is a GEOMETRIC test -- two separated boxes in one frame
+    # are two animals whether or not phase 2 ever got round to naming them -- and species was only
+    # ever a refinement of the grouping key. Requiring it made this selector depend on the namer:
+    # when naming died on 2026-08-23 every new detection had species NULL, so no post-move visit
+    # could be flagged co-present, so embed.py's --co-present pass found nothing and the sub-gate
+    # vectors it supplies (100% of them) stopped. The still-tracklet splitter -- the thing that
+    # tells two raccoons apart when they only ever arrive together -- went blind for two weeks.
+    # The (timestamp, species) key still groups same-frame boxes correctly when species is NULL.
     for r in conn.execute(
             """SELECT visit_id, timestamp, species, bbox_x1, bbox_y1, bbox_x2, bbox_y2
-               FROM detections WHERE visit_id IS NOT NULL AND species IS NOT NULL"""):
+               FROM detections WHERE visit_id IS NOT NULL"""):
         per_visit[r["visit_id"]][(r["timestamp"], r["species"])].append(
             (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]))
     out = set()

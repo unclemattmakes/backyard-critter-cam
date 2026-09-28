@@ -815,3 +815,24 @@ def test_publish_removes_a_file_that_landed_short(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="landed short"):
         backup._publish(local, out)
     assert not out.exists()
+
+
+# ---- what the meta zip hands to the cloud ------------------------------------------------
+def test_meta_zip_names_the_secrets_it_is_about_to_upload(tmp_path):
+    """config_local.py and logs/ are in the meta zip deliberately -- a restore without them is a
+    rig with no location, no camera list and no record of what it did. But the destination is
+    normally a folder a cloud client uploads, so "deliberately" has to be said out loud on every
+    run rather than discovered later by someone reading meta_items().
+
+    Pinned because the failure mode is silence: this warning going missing looks exactly like a
+    backup that carries nothing sensitive."""
+    dest = tmp_path / "drive"
+    lines = backup._secret_notice([tmp_path / "config_local.py", tmp_path / "logs"], dest)
+
+    assert len(lines) == 2
+    joined = " ".join(lines)
+    assert "config_local.py" in joined and "API key" in joined
+    assert "cleartext" in joined                      # the pre-2026-08-22 log caveat
+    assert str(dest) in joined                        # ...and WHERE it is going
+    # An item that carries no secret says nothing: a warning on every line is a warning on none.
+    assert backup._secret_notice([tmp_path / "reid", tmp_path / "tuning"], dest) == []

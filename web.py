@@ -338,7 +338,15 @@ def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=
     Accepts the configured web_host, loopback, and -- the LAN case -- whatever name or IP the
     request's own Host header carries, since a browser only sends an Origin equal to its Host when
     it loaded the page from this very server. The Host branch is gated on _is_allowed_host so a
-    DNS-rebinding name can't satisfy both headers at once."""
+    DNS-rebinding name can't satisfy both headers at once.
+
+    A Host header with NO port means "the scheme's default", and the port we fill in for it is OUR
+    OWN (web_port, rebound to the socket's real port by make_server) -- never the Origin's. Taking
+    the Origin's would make the comparison circular: on the default port 80 a browser omits the
+    port from Host, so a page served from ANOTHER port on this same IP (http://192.168.1.50:9999)
+    would have its own port copied into the expected authority and match itself. That is a
+    cross-origin page passing the cross-origin check. Filling in our port instead means such a
+    page compares (ip, 9999) against (ip, 80) and is refused, which is the whole job."""
     got = _origin_authority(origin)
     if got is None:
         return False
@@ -348,7 +356,10 @@ def _is_same_origin(origin: str, host_header: str, web_host: str = "", web_port=
     if wh and wh not in ("0.0.0.0", "::"):      # a wildcard bind isn't a name a browser can send
         allowed.add((wh, port))
     if _is_allowed_host(host_header, web_host, mdns_host):
-        mine = _host_authority(host_header, got[1])
+        # port or got[1]: web_port is 0 only when nobody told us (an unbound cfg in a unit test),
+        # and there the Origin's port is the best available guess -- it was the old behaviour for
+        # every case, and keeping it for that one keeps a portless test cfg working.
+        mine = _host_authority(host_header, port or got[1])
         if mine is not None:
             allowed.add(mine)
     return got in allowed
@@ -1630,7 +1641,15 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             only knows the names it recognises), so a stale client clock can't mislabel the span.
             One name also stamps that individual onto the span (a live solo confirm, feeding the
             re-ID templates); two+ names record co-presence only (no single contaminating stamp --
-            the documented pair gotcha). Deliberately does NOT rebuild visits."""
+            the documented pair gotcha). Deliberately does NOT rebuild visits.
+
+            OFF-CAMERA LOGS ARE FIRST-CLASS. You can watch the yard from a window the camera does
+            not cover, and "Notch is here" is worth recording whether or not the rig agrees. When
+            no recent frame is good enough to carry the name (stats.taggable_span: too old, or
+            nothing above the matcher's own confidence bar), the sighting is still written in full
+            -- names, time, attribution -- and simply tags nothing. The response says so via
+            `off_camera` and `off_camera_reason` so the dashboard can tell the human which
+            happened, instead of quietly pinning the name to an empty deck."""
             names = data.get("names")
             if isinstance(names, str):
                 names = [names]
@@ -1641,7 +1660,26 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             # watching). Falls back to the primary camera for an unknown/absent value.
             source = data.get("source")
             source = source if source in frame_buffers else primary
-            visit = stats.current_live_visit(cfg, source)
+            # WHICH FRAMES MAY CARRY THIS NAME. Not current_live_visit -- that answers "what did
+            # the camera last see", with no age limit and no quality bar, and a solo log STAMPS its
+            # span. Logging "Notch is here" from a window the camera does not cover therefore put
+            # Notch onto whatever was last on screen, however old and however junk. taggable_span
+            # applies both missing rules (see stats.taggable_span); when nothing qualifies it
+            # returns no span and the sighting is recorded WITHOUT a stamp, which is the point --
+            # "they were here" is worth logging even when the camera has nothing to pin it to.
+            visit = stats.taggable_span(cfg, source)
+            # TWO spans, not one. The STAMP window is the quality-gated one; the TESTIMONY window
+            # is what the human is talking about, and it must survive even when nothing is
+            # taggable -- it is what makes a correction supersede the log it corrects, and what
+            # tells the re-ID side that a visit the human called a pair really was a pair.
+            # Nulling both (the first cut of this) quietly switched off both mechanisms.
+            stamp_start = visit.get("start") if visit.get("taggable") else None
+            stamp_end = visit.get("end") if visit.get("taggable") else None
+            seen = stats.current_live_visit(cfg, source)
+            fresh = (seen.get("latest_age_s") if seen.get("count") else None)
+            fresh = fresh is not None and fresh <= cfg.sighting_max_age_minutes * 60.0
+            span_start = seen.get("start") if fresh else None
+            span_end = seen.get("end") if fresh else None
             # Attribution + the viewer tier. `logged_by` is whoever this browser says is typing
             # (optional, self-reported, length-capped); a VIEWER's log additionally records with
             # stamp=False -- testimony in live_sightings, nothing written onto crops.
@@ -1651,12 +1689,16 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             try:
                 res = db.record_live_sighting(
                     conn, source=source, names=names,
-                    span_start=visit.get("start"), span_end=visit.get("end"),
+                    span_start=span_start, span_end=span_end,
+                    stamp_start=stamp_start, stamp_end=stamp_end,
                     note=data.get("note"), stamp=operator, labeled_by=logged_by)
                 if res.get("error"):
                     self._json({"error": res["error"]}, code=400)
                     return
-                self._json({"ok": True, "visit": visit, "as_viewer": not operator, **res})
+                self._json({"ok": True, "visit": visit, "as_viewer": not operator,
+                            "off_camera": not visit.get("taggable"),
+                            "off_camera_reason": visit.get("reason"),
+                            "span_age_s": visit.get("age_s"), **res})
             finally:
                 conn.close()
 
@@ -2647,6 +2689,11 @@ def _live_now(cfg, source: str | None = None) -> dict:
     everywhere); only the visit span is per-source."""
     source = source or cfg.source
     visit = stats.current_live_visit(cfg, source)
+    # BEFORE you tap, not just after. "I don't realise the visitors aren't on cam" is the whole
+    # problem this panel exists to solve, so it now reports what a log would actually DO -- tag
+    # these frames, or tag nothing -- rather than only what the camera last saw. Same span the
+    # POST will use, so the preview cannot disagree with the outcome.
+    taggable = stats.taggable_span(cfg, source)
     cast, recent = [], []
     conn = db.connect_readonly(cfg.db_path)
     if conn is not None:
@@ -2658,7 +2705,7 @@ def _live_now(cfg, source: str | None = None) -> dict:
             recent = db.recent_live_sightings(conn, limit=8)
         finally:
             conn.close()
-    return {"visit": visit, "cast": cast, "recent": recent, "source": source}
+    return {"visit": visit, "taggable": taggable, "cast": cast, "recent": recent, "source": source}
 
 
 def _candidate_labels(cfg) -> list:

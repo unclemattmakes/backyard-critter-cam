@@ -276,9 +276,29 @@ class Config:
     save_classes: tuple[str, ...] = ("animal",)
     # Don't run the detector more often than this while motion is continuous. Caps GPU load
     # and stops a lingering crow from writing a near-duplicate row on every single frame.
-    detector_min_interval_s: float = 1.0
+    #
+    # RAISED 1.0 -> 3.0 on 2026-09-14, and this one is not about crows. The host hard-hangs
+    # during dense detection bursts (docs/host-instability-2026-08.md): three of the freezes with
+    # app logs died mid-visit, and in the 25 s before the 2026-09-14 07:27:38 hang the detector
+    # woke 24 times -- this cap saturating. Every wake drags the GPU P8 -> P2 (~20 W -> 52 W,
+    # 210 -> 1815 MHz, PCIe gen 1 -> gen 3) for roughly 30 ms, and those transitions are the best
+    # correlate of the fault that anyone has found.
+    #
+    # So this is a mitigation and a dose-response experiment at once: a third of the wakes should
+    # buy roughly triple the time-to-failure if the transitions really are the trigger, and if
+    # time-to-failure does not move then the transition hypothesis is wrong and the search goes
+    # elsewhere. Record the result in that doc either way.
+    #
+    # The cost is about a third as many crops per visit, which thins re-ID still density. It does
+    # NOT touch clips: those record at full camera rate, so clipmotion's gait and behaviour work
+    # is unaffected. Revert to 1.0 once the host is trustworthy -- nothing about the rig wanted
+    # this change.
+    detector_min_interval_s: float = 3.0
     # How long the last drawn boxes persist on the preview between detector runs (seconds).
-    box_display_ttl_s: float = 1.0
+    # Tracks detector_min_interval_s: any shorter and the live view spends most of each interval
+    # with no boxes drawn at all, which reads as "the rig stopped seeing it" rather than "the rig
+    # is waiting".
+    box_display_ttl_s: float = 3.0
     # How recently (seconds) a critter-class detection must have fired for the rig to publish
     # "a critter is on-cam right now" -- the masthead chip's observation/monitoring flip.
     # Much wider than detector_min_interval_s because a foraging animal keeps pausing, and
@@ -330,7 +350,10 @@ class Config:
     source: str = "glass_door_cam"
 
     # ---- Live preview -----------------------------------------------------------
-    show_preview: bool = True           # Required feature; press 'q' in the window to quit.
+    # Native preview window; press 'q' in it to quit. On a headless box set this False in
+    # config_local.py: no window, no per-frame drawing unless the dashboard stream is being watched.
+    # Quit a headless rig with Ctrl+C in its log window (closing that window skips the clean stop).
+    show_preview: bool = True
     window_name: str = "Backyard Critter Cam"
     # Native preview window size relative to the capture resolution. imshow re-uploads the
     # whole image every UI tick, which at full 1080p is a real slice of the main thread; a
@@ -360,6 +383,36 @@ class Config:
     # on; if NO crop in a visit clears it, that visit falls back to the ungated weighted vote rather
     # than losing its species.
     species_vote_min_confidence: float = 0.8
+
+    # ---- What the digest is willing to ASSERT was in the yard (2026-09-15) ------
+    # The visit vote above already gets this right -- it is the DIGEST that was printing the raw
+    # per-crop label spread beside it. A 26-minute raccoon visit on 2026-09-14 voted `raccoon` at
+    # an 0.85 margin (168 crops at 0.985) and the Creature Report still rendered it as "Raccoon +
+    # Eastern Gray Squirrel + Brown Rat (+6 more)", because nine junk labels of 1-8 crops each
+    # were listed as equals. One crop of a raccoon read `house sparrow` at 0.215 confidence, and
+    # that single crop became the email's subject line.
+    #
+    # The `surprising` guard (see stats.py) was supposed to catch this and cannot, by
+    # construction: it is purely TEMPORAL, testing a sighting against that species' own hour
+    # histogram -- and every junk night sighting widens that histogram, so each one makes the
+    # next one harder to flag. It is self-poisoning, which is why it fell silent through August
+    # and only woke up once the 8-day outage pruned the record. CONFIDENCE does not self-poison,
+    # so these gate on it instead. The two guards are complementary: keep both.
+    #
+    # A species is asserted for a visit if it LEADS that visit, or clears one of two bars:
+    #   * ordinary evidence  -- enough crops, a real share of the visit, and not a wild guess
+    #   * emphatic evidence  -- very few crops, but the classifier is sure
+    # The second bar is what keeps a genuine 2-crop squirrel at 0.99 in a daytime pigeon visit.
+    digest_species_min_crops: int = 3
+    digest_species_min_share: float = 0.10
+    digest_species_min_confidence: float = 0.6
+    digest_species_strong_crops: int = 2
+    digest_species_strong_confidence: float = 0.9
+    # Novelty ("first X in 8 days") additionally needs the species to have LED at least one visit.
+    # Every "first in N days" headline since the outage was an artifact: the badge fires at
+    # novelty_days=3, the yard went dark for 8, so on the first nights back everything unseen
+    # looked new. Leading a visit is the cheapest available proof that an animal was really there.
+    digest_novelty_requires_lead: bool = True
 
     # ---- Local web dashboard (optional, `--serve`) ------------------------------
     # A stdlib-only (no web framework) local page: live MJPEG stream + stats + crop gallery,
@@ -531,6 +584,19 @@ class Config:
     reid_proto_top_k: int = 40          # best crops (by crop_quality) averaged into a prototype
     reid_proto_min_crops: int = 3       # fewer embedded crops than this = too thin to suggest on
     reid_suggest_min_conf: float = 0.5  # embedding gate: crops below this confidence don't vote
+    # HOW FAR BACK a live "who's here right now?" log may reach for frames to tag.
+    #
+    # The Live tab's span used to be "the most recent run of detections on this camera", with no
+    # age limit at all -- so logging "Notch is here" while watching the yard THROUGH A WINDOW, with
+    # Notch out of the camera's view, stamped Notch onto whatever the camera last saw. That could
+    # be hours old and a different animal, and because a solo live log stamps its span, the wrong
+    # name went straight into the re-ID templates. Beyond this many minutes the sighting is still
+    # recorded in full -- it is real testimony about the yard -- but it tags nothing.
+    #
+    # 20 minutes is deliberately wider than visit_gap_minutes (5): the animal you can see from the
+    # kitchen may have been on-camera a quarter of an hour ago and wandered out of frame, and that
+    # IS the visit you mean. It is far short of "the last thing the camera saw today".
+    sighting_max_age_minutes: float = 20.0
     # Best-match similarity below this = "possibly someone new" (novelty flag). Set to the eval
     # optimum: eval.py's Youden-J best operating point on same-vs-different individual separation
     # (reid.separation.best_threshold in the report it writes). The old 0.55 was over-conservative
@@ -773,6 +839,14 @@ class Config:
     classify_live: bool = True
     classify_device: str = "cpu"        # 'cpu' (default; no GPU contention) or 'cuda'.
     classify_interval_s: float = 5.0    # Seconds between checks for new crops to name.
+    # How hard the CPU naming helper is allowed to drive the processor. Left to itself, torch runs
+    # BioCLIP with AVX-512 on every core -- the steepest power step a Skylake-X can take -- and the
+    # olVR hard hangs (docs/host-instability-2026-08.md) keep landing exactly where that coincides
+    # with the GPU detector waking: 2026-09-15 died 90 s into a start, 2026-09-21 two minutes in,
+    # both before the helper finished warming up. AVX2 on half the cores takes that step away for a
+    # few seconds more naming latency. "" / 0 restore torch's own defaults (AVX-512, all cores).
+    classify_cpu_isa: str = "avx2"      # 'avx2', 'avx512', or '' for torch's default.
+    classify_cpu_threads: int = 4       # 0 = torch's default (one per physical core).
 
     # Individual names belonging to the humans in your household. The dashboard will let you name
     # yourself as an individual (handy -- it stops the re-ID queue offering you up as a new raccoon),

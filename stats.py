@@ -35,6 +35,50 @@ def _ind_of(r):
         return None
 
 
+def _spconf_of(r):
+    """A row's species_confidence, or None -- same tolerance as _ind_of, because not every
+    caller's SELECT carries the column and a visit tally must not explode on the ones that don't."""
+    try:
+        return r["species_confidence"]
+    except (IndexError, KeyError):
+        return None
+
+
+def supported_species(visit, cfg) -> list[str]:
+    """The species a visit's crops actually SUPPORT, best-attested first.
+
+    `visit["classes"]` is the raw per-crop label spread, and on a long visit its tail is noise:
+    the classifier is zero-shot, so it returns its best guess for every crop including the dark,
+    blurred, half-an-animal ones, and those guesses scatter across the label set. Printing that
+    spread verbatim is what turned a 26-minute raccoon into "Raccoon + Eastern Gray Squirrel +
+    Brown Rat (+6 more)".
+
+    The visit's LEADING label is always returned -- that is the animal, and it is the same crop
+    count the visit vote itself runs on. Anything else has to earn its place by one of two bars
+    (see the digest_species_* block in config.py): ordinary evidence (crops + share + a
+    confidence that is not a coin flip) or emphatic evidence (barely any crops, but the
+    classifier is certain). Genuine multi-animal visits survive this -- a dawn flock of crow,
+    jay and starling all clear the ordinary bar on share alone -- which is the point: the filter
+    is about EVIDENCE, not about forcing one species per visit."""
+    classes = visit.get("classes") or {}
+    if not classes:
+        return []
+    ranked = sorted(classes.items(), key=lambda kv: (-kv[1], kv[0]))
+    total = sum(classes.values()) or 1
+    conf_sum = visit.get("class_conf") or {}
+    out = [ranked[0][0]]
+    for sp, n in ranked[1:]:
+        mean_conf = (conf_sum.get(sp) or 0.0) / n if n else 0.0
+        ordinary = (n >= cfg.digest_species_min_crops
+                    and (n / total) >= cfg.digest_species_min_share
+                    and mean_conf >= cfg.digest_species_min_confidence)
+        emphatic = (n >= cfg.digest_species_strong_crops
+                    and mean_conf >= cfg.digest_species_strong_confidence)
+        if ordinary or emphatic:
+            out.append(sp)
+    return out
+
+
 def compute_visits(rows, gap_minutes: float, rep_key=None):
     """Collapse time-ordered detection rows into visit events, per source.
 
@@ -64,7 +108,7 @@ def compute_visits(rows, gap_minutes: float, rep_key=None):
                     visits.append(cur)
                 cur = {"source": source, "start": dt, "end": dt, "count": 0, "max_conf": 0.0,
                        "rep_score": None, "classes": Counter(), "rep_crop": None,
-                       "individuals": Counter()}
+                       "individuals": Counter(), "class_conf": Counter()}
             conf = r["confidence"] or 0.0
             score = rep_key(r)
             cur["end"] = dt
@@ -73,7 +117,11 @@ def compute_visits(rows, gap_minutes: float, rep_key=None):
                 cur["rep_crop"] = r["crop_path"]
                 cur["rep_score"] = score
             cur["max_conf"] = max(cur["max_conf"], conf)
-            cur["classes"][r["species"] or r["detection_class"]] += 1
+            label = r["species"] or r["detection_class"]
+            cur["classes"][label] += 1
+            # Summed here, meaned on read: supported_species() needs a per-label confidence and
+            # a Counter of sums is the cheapest way to carry one through the existing loop.
+            cur["class_conf"][label] += (_spconf_of(r) or 0.0)
             iid = _ind_of(r)
             if iid:
                 cur["individuals"][iid] += 1
@@ -337,6 +385,112 @@ def current_live_visit(cfg, source: str | None = None, lookback: int = 600) -> d
             "latest_age_s": round((now - end).total_seconds(), 1),
             "active": (now - end) < gap,
             "species": dict(species.most_common()),
+        }
+    finally:
+        conn.close()
+
+
+def taggable_span(cfg, source: str | None = None, lookback: int = 600) -> dict:
+    """The most recent span of frames a live "who's here right now?" log may legitimately TAG --
+    which is not the same question as current_live_visit's "what is the camera showing".
+
+    THE PROBLEM THIS SOLVES. You can see the yard from a window the camera does not cover. You log
+    "Notch is here", because that is true and worth recording. But current_live_visit walks back
+    from the newest detection with NO age limit, and a solo live log STAMPS its span onto the
+    crops -- so the name lands on whatever the camera last happened to see. Hours old, quite
+    possibly a different raccoon, and straight into the re-ID templates as a confirmed sighting.
+    Two rules make the difference:
+
+      * AGE. Frames older than cfg.sighting_max_age_minutes are not what you are looking at. The
+        sighting is still logged in full; it simply tags nothing.
+      * CREDIBILITY. Only frames at or above cfg.reid_suggest_min_conf, and never ones already
+        judged non-animal, are eligible. Deliberately the SAME bar the matcher uses to let a crop
+        vote: we tag only frames good enough to become a template, so the low-confidence
+        false-fires this camera collects at dusk (the retaining-wall gap, moving shade) cannot be
+        labelled 'Notch'. That is the "not empties" half.
+
+    Returns current_live_visit's shape plus: `taggable` (may this be stamped), `reason` (why not,
+    when not), `age_s` (how old the span's last frame is) and `considered` (how many recent frames
+    were looked at). count 0 with reason 'none' means the camera has nothing recent worth tagging
+    -- log the sighting anyway, which is the whole point."""
+    source = source or cfg.source
+    max_age = timedelta(minutes=float(getattr(cfg, "sighting_max_age_minutes", 20.0)))
+    min_conf = float(getattr(cfg, "reid_suggest_min_conf", 0.5))
+    empty = {"source": source, "count": 0, "taggable": False, "considered": 0}
+    conn = db.connect_readonly(cfg.db_path)
+    if conn is None:
+        return {**empty, "reason": "no-db"}
+    try:
+        # Filter in SQL, not in Python: a quiet camera can have its last real animal well outside
+        # any fixed row window, and pulling `lookback` rows of dusk false-fires would hide it.
+        rows = conn.execute(
+            "SELECT timestamp, species FROM detections WHERE source = ? AND confidence >= ? "
+            "AND detection_class = 'animal' ORDER BY id DESC LIMIT ?",
+            (source, min_conf, int(lookback))).fetchall()
+        # A NULL species is NOT a non-critter -- it is a crop the namer has not reached yet, which
+        # on a live camera is most of the last minute and, during a naming outage, all of it. Only
+        # an ACTUAL non-critter label disqualifies a frame: clipfilter's "not an animal", or a
+        # human correction like "shadow" / "bricks". Getting this backwards would make the feature
+        # useless exactly when it is needed.
+        cand = sorted(((t, r["species"]) for r in rows
+                       if (t := _parse(r["timestamp"])) is not None
+                       and (r["species"] is None or r["species"].lower() not in _NON_CRITTER)),
+                      key=lambda x: x[0], reverse=True)
+        if not cand:
+            return {**empty, "reason": "none"}
+
+        now = datetime.now().astimezone()
+        gap = timedelta(minutes=cfg.visit_gap_minutes)
+
+        # THE TRAP IN THE OBVIOUS VERSION. The credibility filter runs first, so `cand[0]` is the
+        # newest SURVIVING frame -- not the newest frame. If the animal in front of you is only
+        # producing sub-bar crops (normal at dusk, and normal for the first seconds of any
+        # arrival), every one of its frames is filtered out and the tail of an EARLIER visit
+        # becomes "now". Under 20 minutes old, that earlier visit then reads as taggable, and the
+        # name you typed about the animal you can see lands on a different animal's crops --
+        # silently, because off_camera is False and the dashboard reports a successful tag. That
+        # is the same failure this function exists to prevent, scaled from days down to minutes.
+        # So compare the credible span against the newest detection of ANY quality: if the camera
+        # has been seeing something since the last credible frame, this is a different run.
+        newest = conn.execute(
+            "SELECT timestamp FROM detections WHERE source = ? ORDER BY id DESC LIMIT 1",
+            (source,)).fetchone()
+        newest_t = _parse(newest["timestamp"]) if newest else None
+        if newest_t is not None and (newest_t - cand[0][0]) >= gap:
+            return {**empty, "reason": "no-credible-frame", "considered": len(cand),
+                    "latest": cand[0][0].isoformat(),
+                    "age_s": round((now - cand[0][0]).total_seconds(), 1)}
+
+        age = now - cand[0][0]
+        if age > max_age:
+            # There ARE frames, they are just not of this moment. Say so precisely -- the dashboard
+            # tells the human "logged, but the last animal on camera was 3 hours ago", which is a
+            # far better message than silently tagging that animal with this name.
+            return {**empty, "reason": "stale", "considered": len(cand),
+                    "latest": cand[0][0].isoformat(), "age_s": round(age.total_seconds(), 1)}
+
+        span, prev = [], None      # newest-first; stop at the first gap >= visit_gap.
+        for t, sp in cand:
+            if prev is not None and (prev - t) >= gap:
+                break
+            span.append((t, sp))
+            prev = t
+        times = [t for t, _ in span]
+        start, end = min(times), max(times)
+        return {
+            "source": source,
+            "count": len(span),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "minutes": round((end - start).total_seconds() / 60.0, 1),
+            "latest": end.isoformat(),
+            "latest_age_s": round((now - end).total_seconds(), 1),
+            "age_s": round((now - end).total_seconds(), 1),
+            "active": (now - end) < gap,
+            "species": dict(Counter(s for _, s in span if s).most_common()),
+            "taggable": True,
+            "reason": None,
+            "considered": len(cand),
         }
     finally:
         conn.close()
@@ -1445,8 +1599,9 @@ def _sun(cfg, d):
     The reference frame is the YARD's, derived from longitude -- never the server's clock. That
     distinction is not pedantry: astral returns "the dawn/dusk falling on this calendar date IN
     THIS TIMEZONE", so asking in the machine's zone splits the pair across two local days as soon
-    as the machine disagrees with the camera. Measured at this yard (lat 47.5, lon -122.2) from a
-    UTC machine: dawn 2026-08-07T12:19Z but dusk 2026-08-07T04:10Z -- dusk BEFORE dawn, a negative
+    as the machine disagrees with the camera. Measured from a UTC machine at the test suite's
+    reference latitude (a published city, never this rig's own coordinates -- see
+    tests/test_behavior._Cfg): dawn 2026-08-07T12:19Z but dusk 2026-08-07T04:09Z -- dusk BEFORE dawn, a negative
     day length, and every period boundary, moon bucket and sun-anchored arrival built on top of it
     quietly wrong. It never showed here because this rig's clock happens to match its own yard.
     It stops being hypothetical the moment an archive is read somewhere else, which --serve-only
@@ -1738,10 +1893,19 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
     # --- visits over the period, attributed to every species they contain ---
     visits = compute_visits(pr, cfg.visit_gap_minutes, rep_key=_shot_score)
     visits.sort(key=lambda v: v["start"])
+    # Attributed to the species each visit's crops SUPPORT, not to every label that appeared in
+    # it -- see supported_species(). `led` is the stronger claim (this species headed a visit) and
+    # is what novelty headlines are allowed to draw on.
     per_sp_visits = Counter()
+    led_visits = Counter()
+    supported_by_visit = {}
     for v in visits:
-        for sp in v["classes"]:
+        sup = supported_species(v, cfg)
+        supported_by_visit[id(v)] = sup
+        for sp in sup:
             per_sp_visits[sp] += 1
+        if sup:
+            led_visits[sup[0]] += 1
 
     # --- the visit log: the period's visits in order -- the "who came, and when" timeline the
     # Dispatch leads with. Each entry carries its species mix, any NAMED individuals (from the
@@ -1777,7 +1941,7 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
             "start": v["start"].isoformat(), "end": v["end"].isoformat(),
             "minutes": round((v["end"] - v["start"]).total_seconds() / 60.0, 1),
             "count": v["count"], "source": v["source"],
-            "species": [sp for sp, _n in v["classes"].most_common()],
+            "species": supported_by_visit.get(id(v)) or supported_species(v, cfg),
             "individuals": individuals,
             "rep_crop": _web(v.get("rep_crop")),
             "clips": [_clip_out(c) for c in clips_overlapping(clips, v["source"], v["start"], v["end"])],
@@ -1849,6 +2013,19 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
     while _cur < end:
         period_hours.add(_cur.hour)
         _cur += timedelta(hours=1)
+    # UNATTESTED SIGHTINGS: the confidence prior, added 2026-09-15 alongside the temporal one.
+    # The temporal test above cannot catch a label whose own history is already polluted with the
+    # same mistake -- every junk 2 AM sparrow widens the sparrow histogram and makes the next junk
+    # sparrow look ordinary. That is why this guard went quiet through August and only spoke up
+    # after an 8-day outage pruned the record. Confidence has no such feedback loop: a bad crop
+    # scores badly no matter how many bad crops preceded it. So a species that no visit's crops
+    # actually attested (supported_species) is flagged here on the same footing -- NOT dropped,
+    # because an unattested label is a question for the human, and its crops are precisely the
+    # ones worth a ✎.
+    supported_anywhere = set()
+    for _sup in supported_by_visit.values():
+        supported_anywhere.update(_sup)
+
     n_surprising = 0
     for s in species_roll:
         sp = s["species"]
@@ -1857,6 +2034,15 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         srs = [r for r in pr if r["label"] == sp]
         if any(r.get("verified") == 1 for r in srs):
             continue                                   # the human has seen one this period: real
+        if sp not in supported_anywhere:
+            s["surprising"] = True
+            s["surprise_kind"] = "unattested"
+            s["surprise_note"] = (
+                f"no visit's crops attested this species -- {s['crops']} crop(s), best "
+                f"{s['rep_conf']}, never enough of any one visit to assert; likely a mislabeled "
+                f"crop of whatever else was in frame. Worth a ✎")
+            n_surprising += 1
+            continue
         ref = [r for r in sp_all[sp] if r.get("verified") == 1]
         if len(ref) < 12:
             ref = sp_all[sp]
@@ -1866,6 +2052,7 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
         frac = in_band / len(ref)
         if frac < 0.15:
             s["surprising"] = True
+            s["surprise_kind"] = "off-hours"
             s["surprise_note"] = (f"only {round(frac * 100)}% of this species' "
                                   f"{'verified ' if len(ref) != len(sp_all[sp]) else ''}record falls "
                                   f"in {label} hours -- likely a mislabeled crop; worth a ✎")
@@ -1874,8 +2061,13 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
 
     # --- headline novelty (first-ever, then rarest first) + quiet regulars ---
     alltime = {sp: len(rs) for sp, rs in sp_all.items()}
+    # A novelty headline is the strongest claim the issue makes ("first House Sparrow in 8 days"
+    # led an email off ONE crop at 0.215), and days_since is inflated by every outage -- the yard
+    # was dark for 8 days, so on the first nights back everything unseen looked new. Leading a
+    # visit is the cheapest proof that an animal was really there, so require it.
     novel_cands = [s for s in species_roll if s["species"] != "animal"
                    and not s.get("surprising")
+                   and (led_visits.get(s["species"], 0) > 0 if cfg.digest_novelty_requires_lead else True)
                    and (s["novelty"]["first_ever"] or (s["novelty"]["days_since"] or 0) >= novelty_days)]
     novel_cands.sort(key=lambda s: (not s["novelty"]["first_ever"], alltime.get(s["species"], 0)))
     novel = [s["species"] for s in novel_cands[:6]]

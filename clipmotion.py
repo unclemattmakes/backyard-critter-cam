@@ -470,7 +470,13 @@ def _species_with_named_visits(conn) -> list:
     the species worth linking tracks for (raccoon today; cats/others as the cast grows)."""
     rows = conn.execute(
         "SELECT DISTINCT species, individual_id FROM visits WHERE individual_id IS NOT NULL").fetchall()
-    return sorted({r["species"] for r in rows if not _is_placeholder(r["individual_id"])})
+    # `species is not None` is load-bearing: a human can name a visit whose species is still NULL
+    # (a live sighting logged before the namer got to those crops), and sorted() cannot order str
+    # against None. Two such rows -- visits 13759526 and 13759564, both "Pedro + Kits" -- raised
+    # TypeError here on every nightly batch from 2026-08-26 onward, and run_clipmotion.bat swallows
+    # the error and still prints BATCH COMPLETE, so step 4 silently did nothing for eleven nights.
+    return sorted({r["species"] for r in rows
+                   if r["species"] is not None and not _is_placeholder(r["individual_id"])})
 
 
 def link_tracks_to_individuals(conn, species: str = "raccoon", *,

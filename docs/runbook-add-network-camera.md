@@ -263,7 +263,8 @@ current cameras actually use before picking the number; `clips/<source>/` is the
 
 ## Phase 6: restart and verify
 
-Press **`q`** in the live video window (or close it), then run `start_critter_cam.bat`. That
+Press **`q`** in the live video window (or close it), or **Ctrl+C** in the log window if the rig
+runs headless, then run `start_critter_cam.bat`. That
 order matters: a clean stop drops a `.rig_pause` marker so `rigwatch.py` does not race you back
 up, and the launcher clears it on the way in.
 

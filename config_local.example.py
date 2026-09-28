@@ -57,6 +57,16 @@ def apply(cfg):
     #   python backyard_cam.py --list-cameras
     # cfg.camera_index = 1
 
+    # A box nobody looks at: no native preview window (and no per-frame drawing for it). Quit with
+    # Ctrl+C in the rig's log window; `backyard_cam.py --preview` brings the window back for a run.
+    # cfg.show_preview = False
+
+    # The CPU naming helper runs AVX2 on 4 threads by default, a deliberate brake on a host that
+    # hard-hung under AVX-512 (docs/host-instability-2026-08.md). On a machine that has no such
+    # problem, "" and 0 give torch its own defaults (AVX-512 where available, every core).
+    # cfg.classify_cpu_isa = ""
+    # cfg.classify_cpu_threads = 0
+
     # ---- Several cameras at once (USB + networked) ----------------------------------
     # Leave cfg.cameras unset for the single glass-door webcam above. To watch MORE of the yard,
     # add networked cameras here: each runs on its own capture thread, all share one detector, and

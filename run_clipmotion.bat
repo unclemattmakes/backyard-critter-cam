@@ -93,6 +93,15 @@ REM the bottom is the normal path, the TTL only covers a run the machine kills.
 ".venv\Scripts\python.exe" heavyio.py --acquire batch --wait 3600 --ttl 360 --note "nightly re-ID + motion batch"
 if errorlevel 1 (echo [%date% %time%]   *** heavyio --acquire FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   heavyio --acquire ok)
 
+REM --- Stamp visits BEFORE anything reads them ---------------------------------------------
+REM The ledger used to be rebuilt only by classify.py after a naming burst, or by the rig's
+REM shutdown handler. Both stopped on 2026-08-28 and 37,703 detections sat with visit_id NULL for
+REM nine days -- invisible to co_present_visit_ids, VisitMatcher, the review queue and the eval.
+REM This runs FIRST so tonight's own co-present pass and auto-assign can see tonight's visits.
+echo [%date% %time%] stamping visits for new detections...
+".venv\Scripts\python.exe" visits.py
+if errorlevel 1 (echo [%date% %time%]   *** visits FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   visits ok)
+
 echo [%date% %time%] motion tracks for new clips...
 ".venv\Scripts\python.exe" clipmotion.py --device auto
 if errorlevel 1 (echo [%date% %time%]   *** clipmotion FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   clipmotion ok)

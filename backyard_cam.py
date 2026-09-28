@@ -1383,9 +1383,14 @@ def _stop_naming(proc, tag: str | None = None) -> None:
     tree, so killing the tree alone can leave it orphaned. So we also match the helper by the
     unique --tag we put on its command line and sweep those, repeating until none remain. Silent
     and best-effort: naming is optional and may already have exited."""
-    if proc is None:
+    # proc may be None while a helper still exists: the supervisor thread nulls it when it gives
+    # up restarting, and there is a brief window each restart where the handle is being replaced.
+    # A tag still identifies our helpers, so sweep on that alone rather than returning blind.
+    if proc is None and not tag:
         return
     if sys.platform != "win32":
+        if proc is None:
+            return
         try:
             proc.terminate()
             proc.wait(timeout=5)
@@ -1397,8 +1402,9 @@ def _stop_naming(proc, tag: str | None = None) -> None:
         return
     for _ in range(4):
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if proc is not None:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
         pids = _naming_pids(tag) if tag else []
@@ -1407,6 +1413,97 @@ def _stop_naming(proc, tag: str | None = None) -> None:
         subprocess.run(["taskkill", "/F"] + [a for p in pids for a in ("/PID", p)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.4)
+
+
+NAMING_LOG_FILE = LOG_DIR / "naming.log"    # the naming child's OWN stdout/stderr; see _spawn_naming
+_NAMING_MAX_RESTARTS = 5                    # per rolling hour, then stop trying and say so loudly
+
+
+def _naming_env(cfg) -> dict:
+    """The environment for the naming child, with its CPU instruction set and thread count capped
+    (see Config.classify_cpu_isa). These are read once, when torch loads, so they must be set before
+    the child starts -- which is why this is the env and not a call inside classify.py."""
+    env = dict(os.environ)
+    isa = str(getattr(cfg, "classify_cpu_isa", "") or "").lower()
+    if isa:
+        env["ATEN_CPU_CAPABILITY"] = isa             # torch's own vectorised kernels
+        env["ONEDNN_MAX_CPU_ISA"] = isa.upper()      # oneDNN conv/matmul
+        env["MKL_ENABLE_INSTRUCTIONS"] = isa.upper()
+    threads = int(getattr(cfg, "classify_cpu_threads", 0) or 0)
+    if threads > 0:
+        env["OMP_NUM_THREADS"] = env["MKL_NUM_THREADS"] = str(threads)
+    return env
+
+
+def _spawn_naming(cfg, tag: str):
+    """Start one `classify.py --watch` child, with its output going somewhere a human can read.
+
+    WHY THE REDIRECT IS THE POINT. Until now this child inherited the rig's OS-level stdout handle
+    -- NOT sys.stdout, which by then is a Python-level _Tee wrapping the log file. So everything
+    the namer ever printed, its final traceback included, went to a console nobody was watching and
+    was never written down. On 2026-08-28 the helper died 13 seconds after reporting ready, and the
+    only evidence left anywhere on the machine was a drop in the host telemetry's process count.
+    Two weeks and 48,275 unnamed crops later, the traceback still had to be reproduced by hand.
+    A child whose death leaves no record cannot be diagnosed, so this one gets its own log."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        sink = open(NAMING_LOG_FILE, "a", encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"  [naming] could not open {NAMING_LOG_FILE} ({e}); the helper will run unlogged.")
+        sink = None
+    try:
+        if sink is not None:
+            sink.write(f"\n=== naming helper starting {datetime.now().astimezone():%Y-%m-%dT%H:%M:%S}"
+                       f" (rig pid {os.getpid()}, device {cfg.classify_device}) ===\n")
+            sink.flush()
+        proc = subprocess.Popen(
+            [sys.executable, str(config.ROOT / "classify.py"), "--watch",
+             "--device", str(cfg.classify_device),
+             "--interval", str(cfg.classify_interval_s), "--tag", tag],
+            cwd=str(config.ROOT), env=_naming_env(cfg),
+            stdout=sink or subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        return proc, sink
+    except Exception as e:      # noqa: BLE001 -- naming is optional; detection must still run
+        if sink is not None:
+            sink.close()
+        print(f"  [naming] couldn't start the species-naming helper (detection still works): {e}\n")
+        return None, None
+
+
+def _supervise_naming(state: dict, cfg, tag: str, stop_event) -> None:
+    """Restart the naming child if it dies. Runs as a daemon thread for the life of the rig.
+
+    The rig used to spawn this child with Popen and never look at it again -- the only later
+    reference was _stop_naming() in the shutdown handler. So when the helper died on its first
+    batch, the rig carried on detecting perfectly for eight days with nothing naming anything, and
+    every guardrail agreed it was healthy: rigwatch.py only counts backyard_cam.py pids, the status
+    file still read "ready", and the nightly regression gate passed because it was diffing a frozen
+    metric against itself. Supervision is what turns that silence into a line in the log.
+
+    Capped like rigwatch's own restart budget: a helper that dies instantly, forever, is a bug to
+    be fixed rather than a process to be respawned every five seconds."""
+    starts: list[float] = []
+    while not stop_event.wait(10.0):
+        proc = state.get("proc")
+        if proc is None or proc.poll() is None:
+            continue                                    # never started, or still alive -- fine
+        code = proc.returncode
+        if state.get("sink") is not None:
+            try:
+                state["sink"].close()
+            except Exception:                           # noqa: BLE001
+                pass
+            state["sink"] = None
+        starts = [t for t in starts if time.time() - t < 3600]
+        if len(starts) >= _NAMING_MAX_RESTARTS:
+            print(f"  [naming] the helper has died {_NAMING_MAX_RESTARTS}x in the last hour "
+                  f"(last exit {code}) -- it is failing on startup, not just crashing. Not "
+                  f"restarting it again; see {NAMING_LOG_FILE}. Species naming is OFF.")
+            state["proc"] = None
+            return
+        print(f"  [naming] the helper exited ({code}) -- restarting it. See {NAMING_LOG_FILE}.")
+        starts.append(time.time())
+        state["proc"], state["sink"] = _spawn_naming(cfg, tag)
 
 
 # ---- Per-camera capture worker -----------------------------------------------------
@@ -1826,7 +1923,10 @@ def run(cfg: config.Config) -> None:
     frame_buffers: dict = {}
     control_bridges: dict = {}
     mdns_pub = None
-    classify_proc = None
+    # Mutable holder, not a bare local: the supervisor thread replaces "proc" when it restarts a
+    # dead helper, and the shutdown path below must kill whichever child is current -- not the one
+    # that was spawned at startup and may have been reaped hours ago.
+    naming: dict = {"proc": None, "sink": None}
     classify_tag = f"{_NAMING_TAG_PREFIX}{os.getpid()}"   # unique marker for a clean, total shutdown
     # A previous rig that died without its finally (taskkill /F, crash, OOM kill) leaves its
     # helper running forever. Reap those leftovers now, BEFORE our own helper exists.
@@ -1958,18 +2058,18 @@ def run(cfg: config.Config) -> None:
         # is a 0-CPU shim + one worker (the rig itself appears doubled the same way). That's one
         # helper, not two -- _naming_pids, _stop_naming and the startup sweep all reap both rows.
         if cfg.classify_live:
-            try:
-                classify_proc = subprocess.Popen(
-                    [sys.executable, str(config.ROOT / "classify.py"), "--watch",
-                     "--device", str(cfg.classify_device),
-                     "--interval", str(cfg.classify_interval_s), "--tag", classify_tag],
-                    cwd=str(config.ROOT))
+            naming["proc"], naming["sink"] = _spawn_naming(cfg, classify_tag)
+            if naming["proc"] is not None:
+                # SUPERVISED, not merely spawned. See _supervise_naming: an unwatched child that
+                # dies takes species naming -- and therefore visits, re-ID templates, auto-assign
+                # and the nightly eval -- down with it, silently, for as long as nobody looks.
+                t = threading.Thread(target=_supervise_naming,
+                                     args=(naming, cfg, classify_tag, stop_event),
+                                     name="naming-supervisor", daemon=True)
+                t.start()
                 print("  species naming: ON -- a helper is warming up the model (~1-2 min), then it\n"
-                      "  names new crops automatically. The dashboard shows when it's ready.\n")
-            except Exception as e:
-                print(f"  [naming] couldn't start the species-naming helper "
-                      f"(detection still works): {e}\n")
-                classify_proc = None
+                      f"  names new crops automatically. Its log: {NAMING_LOG_FILE}\n"
+                      "  The dashboard shows when it's ready.\n")
 
         # One capture thread per camera, all sharing the single detector.
         for s in specs:
@@ -1981,7 +2081,8 @@ def run(cfg: config.Config) -> None:
                 daemon=True)
             t.start()
             threads.append(t)
-        print("Watching for critters -- press 'q' in the window (or close it) to quit.\n")
+        print("Watching for critters -- " + ("press 'q' in the window (or close it) to quit.\n"
+              if cfg.show_preview else "headless; press Ctrl+C here to quit.\n"))
 
         if cfg.show_preview:
             # The MAIN thread owns the cv2 window (GUI calls must be single-threaded).
@@ -2001,7 +2102,12 @@ def run(cfg: config.Config) -> None:
         allow_system_sleep()                        # let the box idle/sleep normally again
         for t in threads:
             t.join(timeout=10)
-        _stop_naming(classify_proc, classify_tag)   # kill the helper + any venv-launcher subproc
+        _stop_naming(naming.get("proc"), classify_tag)   # helper + any venv-launcher subproc
+        if naming.get("sink") is not None:
+            try:
+                naming["sink"].close()
+            except Exception:                       # noqa: BLE001 -- shutdown is best-effort
+                pass
         if server is not None:
             web.shutdown(server)
         mdns.unpublish(mdns_pub)      # stop answering: an unanswerable name is worse than none
@@ -2120,7 +2226,11 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
                    metavar="CLASS", choices=["animal", "person", "vehicle"],
                    help="Detector classes that trigger a clip (default: same as saved = animal). "
                         "e.g. --clip-classes animal person to also record yourself as a test.")
-    p.add_argument("--no-preview", action="store_true",
+    # Default comes from Config.show_preview (set it False in config_local.py on a box nobody looks
+    # at); either flag overrides it for one run.
+    p.add_argument("--preview", dest="show_preview", action="store_true", default=c.show_preview,
+                   help="Show the native preview window (the default unless config turns it off).")
+    p.add_argument("--no-preview", dest="show_preview", action="store_false",
                    help="Run headless (no window). Quit with Ctrl+C.")
     p.add_argument("--no-classify", dest="classify_live", action="store_false",
                    default=c.classify_live,
@@ -2164,7 +2274,7 @@ def parse_args() -> tuple[config.Config, argparse.Namespace]:
         record_clips=args.record_clips,
         clips_dir=Path(args.clips_dir),
         clip_classes=tuple(args.clip_classes) if args.clip_classes else c.clip_classes,
-        show_preview=not args.no_preview,
+        show_preview=args.show_preview,
         visit_gap_minutes=args.visit_gap_min,
         serve=args.serve,
         web_host=args.host,

@@ -512,6 +512,26 @@ def _write_meta_zip(staged: Path, present: list[Path]) -> int:
     return n
 
 
+# Meta items that carry SECRETS rather than data. Both are in the zip on purpose -- a restore
+# without config_local.py is a rig with no location, no camera list and no mail key, and logs are
+# the only record of what the rig did -- but "on purpose" is not the same as "understood", and the
+# destination is normally a folder a cloud client uploads. So each run names what it is about to
+# hand to Drive. See SECURITY.md, "What a backup carries off the machine".
+_SECRET_BEARING = {
+    "config_local.py": "your coordinates, camera list, mail API key and operator token",
+    "logs": "camera hostnames and, in logs written before 2026-08-22, camera passwords in "
+            "cleartext",
+}
+
+
+def _secret_notice(present: list[Path], out_dir: Path) -> list[str]:
+    """One line per secret-bearing item actually going into this run's meta zip. Pure, so the
+    wording is testable and so the dry run can print exactly what the real run would."""
+    return [f"meta zip carries {p.name} -- {_SECRET_BEARING[p.name]}. It is going to {out_dir}, "
+            f"unencrypted; treat that folder as holding those secrets."
+            for p in present if p.name in _SECRET_BEARING]
+
+
 def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
     """One deflated zip of all the small side content (meta_items()). Rewritten whole every run --
     it's tens of MB, and 'always current, always complete' beats clever here.
@@ -522,6 +542,8 @@ def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
     publishing straight to the final name safe here."""
     out_zip = out_dir / f"meta-{today.isoformat()}.zip"
     present = [p for p in meta_items() if p.exists()]
+    for line in _secret_notice(present, out_dir):
+        log.warning("%s", line)
     if dry_run:
         log.info("would create %s from: %s", out_zip.name, ", ".join(p.name for p in present))
         return
@@ -766,7 +788,15 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
   snapshots/  backyard-db-<date>.zip  = consistent SQLite snapshot, integrity-checked
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config,
                                         certified reference photos, the DB's import and
-                                        static-dropped ledgers
+                                        static-dropped ledgers.
+                                        THIS ONE HOLDS SECRETS: config_local.py is in it, so
+                                        every copy carries your coordinates, your camera list,
+                                        your mail API key and your operator token, unencrypted.
+                                        The database snapshot beside it carries your camera
+                                        passwords the same way. Wherever this folder syncs to
+                                        holds all of that -- share the folder accordingly, and
+                                        rotate those secrets if it ever went somewhere it
+                                        shouldn't have.
               weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging
                                         Face checkpoints); never rebuilt -- insurance for
                                         the day a hub repo disappears

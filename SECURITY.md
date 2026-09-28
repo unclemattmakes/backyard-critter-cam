@@ -3,16 +3,33 @@
 ## What this software is, threat-model-wise
 
 A single-user tool that watches a camera and serves a dashboard on **localhost**. It has
-**no authentication, no accounts, and no authorization boundary of any kind.** That is a design
-decision, not an oversight: it is the family raccoon dashboard, and a login page would advertise
-a safety it does not have.
+**no accounts and no login.** That is a design decision, not an oversight: it is the family
+raccoon dashboard, and a login page would advertise a safety it does not have.
 
-The consequence, stated plainly: **anyone who can reach the dashboard's port has full control.**
-They can rename individuals, reassign or reject identity suggestions, correct or overwrite
-species labels, change camera settings live, and delete sightings and clips. There is no
-read-only mode, no audit trail of who did what, and no undo for a delete.
+The consequence, stated plainly and as the default: **anyone who can reach the dashboard's port
+has full control.** They can rename individuals, reassign or reject identity suggestions, correct
+or overwrite species labels, change camera settings live, and delete sightings and clips. There
+is no audit trail of who did what, and no undo for a delete.
 
-So the boundary is the network, and only the network.
+So the boundary is the network, and — unless you set the one knob below — only the network.
+
+### The one knob: `operator_token`
+
+Set `cfg.operator_token = "some phrase"` in `config_local.py` and the dashboard splits in two.
+Devices that have not entered that phrase (dashboard footer, once per browser) become **viewers**:
+they read and play everything and can log a "who's here" sighting as reviewable testimony, but
+every label, name, camera and settings write is refused by the server, at the same choke point as
+the cross-site guard — so endpoints nobody has written yet are covered too. Loopback is always the
+operator; you are at the rig. A wrong token is simply a viewer, never an error.
+
+It is off by default, and off means every device on your Wi-Fi is an operator. That is fine for a
+household alone with its own devices and **wrong the moment a houseguest's phone joins the
+network**, because "delete this clip" and "rename Notch" are one tap away with nothing in between.
+If you run the LAN launcher at all, set it.
+
+What it is not: it is a phrase in cleartext over plain HTTP, so it keeps honest devices in their
+lane on a network you already trust. It is not authentication and it does not make the dashboard
+safe to expose. The network is still the real boundary.
 
 ## Camera credentials — the one exception
 
@@ -30,9 +47,23 @@ software stores, and it gets narrower rules than everything else above.
   is `has_password: true`. The edit form is blank even when a password is set, and submitting it
   blank leaves the stored one alone.
 - **It is stored in cleartext** in `backyard.db`, alongside the same secret that has always sat
-  in cleartext in `config_local.py`. If you back the database up, you are backing that up too.
-  Encrypting it would not change who can read it: anyone who can read the database file can read
-  the rig's config file next to it.
+  in cleartext in `config_local.py`. If you back the database up, you are backing that up too —
+  see "What a backup carries off the machine" below, because the default backup destination is a
+  cloud folder. Encrypting it would not change who can read it: anyone who can read the database
+  file can read the rig's config file next to it.
+- **It must not reach a log.** A camera's `src` *is* its password, and every line that prints one
+  goes to `logs/backyard_cam.log`, which `backup.py` sweeps into the meta zip and off the machine.
+  `cameras.safe_src()` masks it, and every human-facing print of a src goes through it. That was
+  not always true: **logs written before 2026-08-22 contain RTSP passwords in cleartext**, in
+  `logs/backyard_cam.log.*` and in every meta zip built from them. If you ran a networked camera
+  before that date, rotate its password and delete those log copies — the fix protects new lines,
+  not the ones already written.
+- **Deleting the camera does not delete the password.** Removing a camera from the dashboard is a
+  soft delete: the row is tombstoned so a config-listed camera can't come back on the next start,
+  and so re-adding the name is a one-click undelete — which only works because the stored password
+  is still there. The credential therefore outlives the camera, in `backyard.db` and in every
+  backup of it. To actually destroy one: re-add the camera, clear its password *at the rig*, then
+  remove it again. Or rotate it on the camera, which is the better answer anyway.
 - **Give the camera its own account.** Make a dedicated user on the camera rather than reusing
   its admin login — most cameras support this, and it means the credential on disk cannot also
   reconfigure the camera.
@@ -76,6 +107,32 @@ behind a naked reverse proxy, do not `--host 0.0.0.0` on a machine with a public
 run it on a network you share with people you would not hand the delete button to. If you want
 remote access, terminate it in something that actually does authentication — a VPN or an
 authenticating tunnel — and leave this bound to loopback behind it.
+
+## What a backup carries off the machine
+
+`backup.py` is documented as writing "into a cloud-synced folder" (Google Drive, Dropbox,
+OneDrive), and `config_local.example.py` suggests exactly that for `backup_dest`. So the
+question is not who can read your disk — it is who can read that folder, and what is in it.
+
+Every `snapshots/meta-<date>.zip` contains **`config_local.py`**, unencrypted. That is your
+latitude and longitude, your camera list, your `email_resend_api_key`, and your
+`operator_token`. Every `snapshots/backyard-db-<date>.zip` contains the database, and therefore
+your camera passwords. Both are there on purpose: a restore without them is a rig with no
+location, no cameras and no mail, which is not a restore. `backup.py` names them on every run
+rather than leaving it to be discovered.
+
+What follows from that:
+
+- **The cloud account holding that folder holds those secrets.** Whoever can read it — a shared
+  Drive, a family account, anyone you ever gave the folder to, and the provider — can send mail
+  as you and log into your cameras. If you share it, share a subfolder that is not `snapshots/`.
+- **Rotate rather than assume.** If that folder was ever shared, public, or on an account you no
+  longer control, rotate the Resend key, the operator token and the camera passwords. They are
+  in every daily zip going back to the day you started, not just the newest one.
+- **Deleting the newest copy is not enough.** These zips are per-day and they accumulate. A
+  secret leaked once is in every zip written since.
+- **`weights-archive.zip` and the media zips hold no credentials** — but the media is timestamped
+  video of your property, and possibly of people walking past it.
 
 ## Other things worth knowing
 

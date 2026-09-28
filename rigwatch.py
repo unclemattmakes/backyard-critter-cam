@@ -35,7 +35,17 @@ after that it writes a loud line and waits the hour out.
 USAGE
     python rigwatch.py            # one check -- what the scheduled task runs, every 5 min
     python rigwatch.py --status   # say what it sees, start nothing
-    python rigwatch.py --force    # start the rig even if paused (ignores .rig_pause)
+    python rigwatch.py --force    # start the rig even if paused (ignores .rig_pause, not .rig_hold)
+    python rigwatch.py --hold     # never start the rig until --release, across reboots
+    python rigwatch.py --release  # undo --hold
+
+HOLD IS NOT PAUSE
+-----------------
+.rig_pause ages out at the next boot by design. That is exactly wrong while the HOST is the thing
+crashing: on 2026-09-15 and 2026-09-23 the box hard-hung, came back, and this watchdog started the
+rig straight back into the workload that hangs it (docs/host-instability-2026-08.md) -- so nobody
+could keep the rig off long enough to debug the machine. .rig_hold survives reboots and a running
+rig alike; only --release (or deleting the file) removes it.
 """
 from __future__ import annotations
 
@@ -51,11 +61,26 @@ import config
 
 ROOT = config.ROOT
 PAUSE_MARKER = ROOT / ".rig_pause"
+HOLD_MARKER = ROOT / ".rig_hold"
 STATE_FILE = ROOT / ".rigwatch_state.json"
 LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
 
 MAX_STARTS_PER_HOUR = 3
+
+# A LIVENESS CHECK IS NOT A HEALTH CHECK.
+# This watchdog asked one question for its whole life -- "is there a backyard_cam.py pid?" -- and
+# for eight days in 2026-08 the answer was yes while the rig named nothing at all. The naming
+# helper had died on its first batch; the rig itself was perfectly alive, so nothing here fired,
+# the dashboard pill still read "ready" off a status file frozen mid-sentence, and the nightly
+# regression gate passed because it was comparing a frozen metric against itself. 48,275 crops
+# went unnamed, and with them went visits, re-ID templates, auto-assign and the eval.
+#
+# So: when the rig IS up, also ask whether it is getting anything done. We never restart the rig
+# over this -- backyard_cam.py supervises its own naming child now, and bouncing a healthy camera
+# to fix a helper is the wrong hammer -- but a stuck namer stops being invisible.
+NAMING_STALE_S = 900.0          # heartbeat is every ~5s; 15 min without one is unambiguous
+NAMING_BACKLOG_ALARM = 200      # a backlog this big that is not shrinking is stuck, not busy
 
 
 def log(msg: str) -> None:
@@ -118,6 +143,11 @@ def paused() -> bool:
         return False
 
 
+def held() -> bool:
+    """Has a human told the watchdog to stay out of it until further notice (--hold)?"""
+    return HOLD_MARKER.exists()
+
+
 def clear_pause_marker() -> bool:
     """Drop the pause marker once the rig is observed RUNNING again. True if one was removed.
 
@@ -142,6 +172,67 @@ def clear_pause_marker() -> bool:
     return True
 
 
+def naming_health() -> dict:
+    """What the species namer's status file says, plus whether that is believable.
+
+    Returns {present, state, age_s, backlog, named, stale, device}. `stale` is the important one:
+    classify.py rewrites this file every poll, so an old timestamp means the loop is not running
+    however cheerfully `state` reads. The file said "ready" for eight days after the process it
+    describes had already exited."""
+    out = {"present": False, "state": None, "age_s": None, "backlog": None,
+           "named": None, "stale": False, "device": None}
+    try:
+        raw = json.loads(config.NAMING_STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:                          # noqa: BLE001 -- no file yet, or a torn write
+        return out
+    out["present"] = True
+    out["state"] = raw.get("state")
+    out["named"] = raw.get("named")
+    out["backlog"] = raw.get("backlog")        # absent on files written before this existed
+    out["device"] = raw.get("device")
+    out["detail"] = raw.get("detail")          # set by watch_loop when a poll raised
+    try:
+        out["age_s"] = max(0.0, time.time() - float(raw.get("ts") or 0.0))
+        out["stale"] = out["age_s"] > NAMING_STALE_S
+    except (TypeError, ValueError):
+        out["stale"] = True
+    return out
+
+
+def check_naming(health: dict) -> bool:
+    """Log a line when naming is not doing its job. Returns True if something was reported.
+
+    Deliberately does NOT restart anything: the rig supervises its own naming child, and the point
+    here is that a failure of BOTH becomes visible within five minutes instead of two weeks."""
+    if not health["present"]:
+        return False                           # naming may simply be off (--no-classify)
+    if health["stale"]:
+        # age_s stays None when the timestamp itself was unreadable -- the case that FORCES stale.
+        # Formatting it unguarded raised TypeError and killed the whole check, under pythonw.exe
+        # with no stdout: the watchdog would go silent in exactly the scenario it exists to shout
+        # about. --status already guards this expression; this is the same guard.
+        age = health["age_s"]
+        when = f"{age / 60.0:.0f} min ago" if age is not None else "at an unreadable time"
+        log(f"NAMING IS STALE: the status file still says '{health['state']}' but it was last "
+            f"written {when}, so the naming loop is not running. New crops are NOT being named, "
+            f"which also stops visits, re-ID templates and the nightly eval. "
+            f"See logs/naming.log.")
+        return True
+    if health["state"] == "error":
+        log(f"NAMING IS ERRORING: {health.get('detail') or 'see logs/naming.log'}.")
+        return True
+
+    backlog, prev = health.get("backlog"), _state().get("naming_backlog")
+    if isinstance(backlog, int) and backlog >= NAMING_BACKLOG_ALARM:
+        # Busy and shrinking is fine -- a backfill legitimately sits at a big number for a while.
+        # Big and NOT shrinking between two checks five minutes apart is the stuck case.
+        if isinstance(prev, int) and backlog >= prev:
+            log(f"NAMING IS NOT KEEPING UP: {backlog} crops are waiting to be named and the "
+                f"backlog has not fallen since the last check ({prev}). See logs/naming.log.")
+            return True
+    return False
+
+
 def _state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -162,6 +253,18 @@ def _recent_starts() -> int:
     return len([t for t in _state().get("starts", []) if time.time() - t < 3600])
 
 
+def _record_backlog(backlog) -> None:
+    """Remember this check's naming backlog so the next one can tell 'busy' from 'stuck'."""
+    if not isinstance(backlog, int):
+        return
+    st = _state()
+    st["naming_backlog"] = backlog
+    try:
+        STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def start_rig() -> int:
     if not LAUNCHER.exists():
         log(f"ERROR: launcher missing: {LAUNCHER}")
@@ -179,7 +282,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Restart the rig if it is not running.")
     ap.add_argument("--status", action="store_true", help="report and start nothing")
     ap.add_argument("--force", action="store_true", help="start even if paused by a clean stop")
+    ap.add_argument("--hold", action="store_true",
+                    help="never start the rig, across reboots, until --release")
+    ap.add_argument("--release", action="store_true", help="undo --hold")
     args = ap.parse_args()
+
+    if args.hold:
+        HOLD_MARKER.write_text(f"held {datetime.now():%Y-%m-%dT%H:%M:%S}\n", encoding="utf-8")
+        log("HOLD set -- the watchdog will not start the rig, even after a reboot, until "
+            "`python rigwatch.py --release`.")
+        print(f"held. Stop the running rig yourself if it is up; release with --release.")
+        return 0
+    if args.release:
+        if HOLD_MARKER.exists():
+            HOLD_MARKER.unlink()
+            log("HOLD released -- the rig is guarded again.")
+        print("released.")
+        return 0
 
     pids = rig_pids()
     if args.status:
@@ -187,8 +306,17 @@ def main() -> int:
                                       else f"yes  pids={pids}" if pids else "NO"))
         print(f"paused by human : {paused()}  (marker: "
               f"{'present' if PAUSE_MARKER.exists() else 'absent'})")
+        print(f"held (--hold)   : {held()}")
         print(f"starts last hour: {_recent_starts()} / {MAX_STARTS_PER_HOUR}")
         print(f"last boot       : {datetime.fromtimestamp(boot_time()):%Y-%m-%d %H:%M:%S}")
+        h = naming_health()
+        if not h["present"]:
+            print("species naming  : no status file (naming may be off)")
+        else:
+            age = f"{h['age_s'] / 60.0:.0f} min ago" if h["age_s"] is not None else "unknown"
+            flag = "  <-- STALE, the loop is not running" if h["stale"] else ""
+            print(f"species naming  : {h['state']} on {h['device']}, heartbeat {age}{flag}")
+            print(f"  named this run: {h['named']}   backlog: {h['backlog']}")
         return 0
 
     if pids is None:
@@ -200,7 +328,14 @@ def main() -> int:
         return 1
     if pids:
         clear_pause_marker()                  # rig is up, so any deliberate-stop marker is spent
-        return 0                              # healthy: say nothing, every 5 minutes, forever
+        # Up is not the same as working. check_naming stays quiet when naming is fine, so this
+        # keeps the "say nothing, every 5 minutes, forever" contract for a genuinely healthy rig.
+        health = naming_health()
+        check_naming(health)
+        _record_backlog(health.get("backlog"))
+        return 0
+    if held():
+        return 0                              # --hold: a human is debugging, even across reboots
     if paused() and not args.force:
         return 0                              # stopped on purpose this session -- leave it alone
     if _recent_starts() >= MAX_STARTS_PER_HOUR and not args.force:

@@ -2,6 +2,13 @@ name: tests
 
 on: [push, pull_request]
 
+# This workflow only reads the checkout and runs pytest -- it never writes to the repo, and it
+# handles no secrets. Say so, because the default GITHUB_TOKEN permissions are repo-wide and a
+# `pull_request` build runs code from whoever opened the PR. An unpinned dependency that decided
+# to shell out would find a token that can only read.
+permissions:
+  contents: read
+
 jobs:
   pytest:
     name: pytest (ubuntu, CPU-only)

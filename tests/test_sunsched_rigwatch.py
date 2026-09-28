@@ -101,6 +101,7 @@ def test_a_failing_schtasks_is_a_warning_not_a_failure(monkeypatch, capsys):
 @pytest.fixture(autouse=True)
 def _isolated_rigwatch(tmp_path, monkeypatch):
     monkeypatch.setattr(rigwatch, "PAUSE_MARKER", tmp_path / ".rig_pause")
+    monkeypatch.setattr(rigwatch, "HOLD_MARKER", tmp_path / ".rig_hold")
     monkeypatch.setattr(rigwatch, "STATE_FILE", tmp_path / ".rigwatch_state.json")
     monkeypatch.setattr(rigwatch, "LOG_FILE", tmp_path / "logs" / "rigwatch.log")
     yield
@@ -146,6 +147,29 @@ def test_a_deliberately_stopped_rig_is_not_started(monkeypatch):
     monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("must respect a human stop"))
     monkeypatch.setattr("sys.argv", ["rigwatch.py"])
     assert rigwatch.main() == 0
+
+
+def test_a_hold_survives_a_reboot_and_keeps_the_rig_down(monkeypatch):
+    """--hold exists because the HOST was hanging under the rig: a pause aged out at every
+    crash-reboot and the watchdog started the rig straight back into the hang."""
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", "--hold"])
+    assert rigwatch.main() == 0
+    monkeypatch.setattr(rigwatch, "boot_time", lambda: time.time() + 60)   # "rebooted since"
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("must respect --hold"))
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+
+
+def test_a_hold_is_not_cleared_by_a_running_rig_and_release_undoes_it(monkeypatch):
+    rigwatch.HOLD_MARKER.write_text("held")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    rigwatch.main()
+    assert rigwatch.held() is True
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", "--release"])
+    assert rigwatch.main() == 0
+    assert rigwatch.held() is False
 
 
 def test_restart_storms_are_capped(monkeypatch):
