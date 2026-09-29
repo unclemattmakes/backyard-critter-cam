@@ -36,6 +36,7 @@ from datetime import datetime, timedelta
 import config
 import db
 import detector
+import mqttnotify
 import visits
 from clipfilter import NONANIMAL_LABEL
 
@@ -316,6 +317,11 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
     _write_naming_status("ready", device=device, named=sum(session.values()), backlog=0)
     ledger_dirty = False   # labels written that the visit ledger hasn't folded in yet
     last_refresh = time.monotonic()
+    # Live sighting alerts ride on this loop because it is the moment a crop gets its species.
+    # A no-op unless cfg.mqtt_host is set; it never raises (mqttnotify.SightingNotifier.poll).
+    notifier = mqttnotify.SightingNotifier()
+    if notifier.enabled:
+        print(f"[naming] sighting alerts ON -> MQTT {config.CONFIG.mqtt_host}.")
     try:
         while not stop_event.is_set():
             try:
@@ -331,6 +337,7 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
                     session.update(tally)
                     if tally:
                         ledger_dirty = True
+                notifier.poll(conn)   # every poll, not just busy ones: "left" fires on silence
                 stale = (time.monotonic() - last_refresh) >= LEDGER_MAX_STALE_S
                 if stale:
                     # Advance the clock whenever the CHECK runs, not only when a rebuild follows.

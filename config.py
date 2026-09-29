@@ -501,6 +501,29 @@ class Config:
     # periods are archived but not sent.
     email_send_quiet: bool = True
 
+    # ---- Live sighting alerts over MQTT (mqttnotify.py) ---------------------------
+    # "A raccoon just arrived", published to an MQTT broker the moment species naming is sure of
+    # it, for LAN devices to react to (lights, chimes, home automation). Off until mqtt_host is
+    # set in config_local.py, along with this rig's broker login. The naming loop drives it, so it
+    # runs wherever live naming runs. Topics and payloads are documented in mqttnotify.py.
+    mqtt_host: str | None = None
+    mqtt_port: int = 1883
+    mqtt_username: str | None = None
+    mqtt_password: str | None = None
+    mqtt_topic_prefix: str = "critter-cam"
+    # Which species announce themselves: "*" = every animal label, or a list of labels exactly as
+    # classify.py names them (["raccoon", "Virginia opossum"]). Case-insensitive.
+    mqtt_alert_species: str | tuple[str, ...] | list[str] = "*"
+    # An arrival needs mqtt_min_crops crops of one species, each at species_confidence >= this, on
+    # one camera within the last mqtt_window_s seconds. Sept 2026 glass-door data: 2 crops >= 0.8
+    # catches ~88% of raccoon visits and never fires on the low-confidence misreads.
+    mqtt_min_confidence: float = 0.8
+    mqtt_min_crops: int = 2
+    mqtt_window_s: float = 120.0
+    # Only these sources alert (None = all). Imports never alert either way: their crops are old,
+    # and only crops inside mqtt_window_s count. A visit "leaves" after visit_gap_minutes of quiet.
+    mqtt_sources: tuple[str, ...] | list[str] | None = None
+
     # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
     # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
     # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust
