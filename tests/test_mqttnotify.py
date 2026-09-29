@@ -237,6 +237,44 @@ def test_broker_down_never_raises_and_backs_off(conn):
     assert len(calls) == 2, "after the backoff, the retained present list is retried"
 
 
+def test_routing_keys_lead_the_payload(conn):
+    """Contract with the lantern LED controller: it parses only the first 2048 bytes of a payload,
+    so "event", "slug" and "visit_id" must appear there -- as the first three keys, so no other
+    field's length can push them out. Worst case on purpose: a long species label and source."""
+    raw = []
+    n = mqttnotify.SightingNotifier(_cfg(), sender=lambda msgs: raw.extend(msgs))
+    long_species = "extraordinarily long-named " * 20 + "raccoon"
+    long_source = "a_rather_long_network_camera_source_name_" * 3
+    for s in (10, 5):
+        _crop(conn, seconds_ago=s, species=long_species, source=long_source)
+    n.poll(conn, now=NOW)
+    n.poll(conn, now=NOW + timedelta(minutes=6))
+
+    events = [p for t, p, r in raw if "/sighting/" in t]
+    assert len(events) == 2                                            # arrived, then left
+    for payload in events:
+        assert list(json.loads(payload))[:3] == ["event", "slug", "visit_id"]
+        head = payload[:2048]
+        for key in (b'"event"', b'"slug"', b'"visit_id"'):
+            assert key in head
+
+
+def test_cli_test_event_carries_the_routing_keys(monkeypatch, capsys):
+    """`mqttnotify.py --test` is how a lantern is checked end to end, so its event must satisfy
+    the same contract, visit_id included (the lantern de-duplicates on it)."""
+    import sys
+    import config
+    sent = []
+    for k, v in vars(_cfg()).items():
+        monkeypatch.setattr(config.CONFIG, k, v, raising=False)
+    monkeypatch.setattr(mqttnotify, "publish", lambda host, port, msgs, **kw: sent.extend(msgs))
+    monkeypatch.setattr(sys, "argv", ["mqttnotify.py", "--test"])
+    assert mqttnotify.main() == 0
+    (topic, payload, retain), = sent
+    assert topic == "critter-cam/sighting/test" and retain is False
+    assert list(json.loads(payload))[:3] == ["event", "slug", "visit_id"]
+
+
 def test_slug():
     assert mqttnotify.slug("Steller's jay") == "stellers-jay"
     assert mqttnotify.slug("American crow") == "american-crow"

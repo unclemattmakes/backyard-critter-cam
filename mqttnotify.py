@@ -281,7 +281,10 @@ class SightingNotifier:
         # can de-duplicate on it). Not the DB's visits.id -- that table is rebuilt from scratch and
         # its ids are not stable.
         vid = f"{src}/{slug(sp)}/{s['first_seen'].strftime('%Y%m%dT%H%M%S')}"
-        ev = {"event": kind, "visit_id": vid, "species": sp, "slug": slug(sp), "source": src,
+        # KEY ORDER IS A CONTRACT: "event", "slug" and "visit_id" lead, in that order. The lantern
+        # LED controller parses only the first 2048 bytes of a payload, so those three must land
+        # inside it however long the other fields get. test_routing_keys_lead_the_payload holds this.
+        ev = {"event": kind, "slug": slug(sp), "visit_id": vid, "species": sp, "source": src,
               "first_seen": s["first_seen"].isoformat(), "last_seen": s["last_seen"].isoformat(),
               "crops": s["crops"], "confidence": round(s["confidence"], 3),
               "detection_id": s["detection_id"], "sent_at": now.isoformat()}
@@ -350,7 +353,9 @@ def main() -> int:
         p.print_help()
         return 0
     now = datetime.now().astimezone().isoformat()
-    ev = {"event": "arrived", "species": "test", "slug": "test", "source": "mqttnotify --test",
+    ev = {"event": "arrived", "slug": "test",
+          "visit_id": f"mqttnotify-test/test/{datetime.now().strftime('%Y%m%dT%H%M%S')}",
+          "species": "test", "source": "mqttnotify --test",
           "first_seen": now, "last_seen": now, "crops": 0, "confidence": 1.0,
           "detection_id": None, "sent_at": now, "test": True}
     topic = f"{getattr(cfg, 'mqtt_topic_prefix', 'critter-cam')}/sighting/test"
