@@ -1144,13 +1144,14 @@ line, and naming carries on.
 
 | Topic | Retained | Payload |
 |---|---|---|
-| `critter-cam/sighting/<slug>` | no | `{"event": "arrived" \| "left", "visit_id", "species", "slug", "source", "confidence", "crops", "first_seen", "last_seen", "sent_at", "detection_id"}`; `left` adds `duration_s` |
+| `critter-cam/sighting/<slug>` | no | `{"event": "arrived" \| "left", "slug", "visit_id", "species", "source", "confidence", "crops", "first_seen", "last_seen", "sent_at", "detection_id"}`; `left` adds `duration_s` |
 | `critter-cam/present` | yes | `{"present": [{"species", "slug", "source", "since"}], "updated"}`: what's in view now, reset at rig start |
 | `critter-cam/last-sighting` | yes | the latest `arrived` event |
 
 `slug` is the species label lowercased with hyphens (`Steller's jay` → `stellers-jay`). The
-`visit_id` is the same on a visit's `arrived` and `left`. The prefix is `cfg.mqtt_topic_prefix`,
-and the thresholds are the `mqtt_*` settings in `config.py`. Give the rig its own broker login,
+`visit_id` is the same on a visit's `arrived` and `left`. `event`, `slug` and `visit_id` always
+lead the payload, in that order, so a subscriber with a small parse buffer can rely on them. The
+prefix is `cfg.mqtt_topic_prefix`, and the thresholds are the `mqtt_*` settings in `config.py`. Give the rig its own broker login,
 and refuse anonymous clients on the broker. Otherwise anyone on your Wi-Fi can publish fake
 sightings to your lights.
 
