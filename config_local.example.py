@@ -133,3 +133,11 @@ def apply(cfg):
     # ...or change where a failed bind lands (0 = no fallback, a failed bind is fatal):
     # cfg.web_port_fallback = 8080
     # cfg.email_send_quiet = False                           # skip the email on visitor-less nights
+
+    # Live sighting alerts over MQTT (mqttnotify.py): "raccoon arrived" / "raccoon left" events
+    # for LAN devices (LED controllers, Home Assistant, ...). Needs an MQTT broker such as
+    # Mosquitto somewhere on the network. Test the settings with `python mqttnotify.py --test`.
+    # cfg.mqtt_host = "192.168.1.20"
+    # cfg.mqtt_username = "critter-cam"
+    # cfg.mqtt_password = "..."
+    # cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*" = every animal

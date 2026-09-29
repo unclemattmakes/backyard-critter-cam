@@ -58,6 +58,7 @@ see [Try it on footage you already have](#try-it-on-footage-you-already-have).
 - [Output](#output) · [Backups](#backups) ·
   [Moving the rig to a new machine](#moving-the-rig-to-a-new-machine) ·
   [A morning email](#a-morning-email) ·
+  [Live sighting alerts (MQTT)](#live-sighting-alerts-mqtt) ·
   [Database schema](#database-schema) · [Configuration](#configuration)
 - [Security & privacy](#security--privacy) — there is no login; read this before the dashboard
   leaves your machine
@@ -1114,6 +1115,47 @@ and until all three values are set the scheduled run is a polite no-op. A back-i
 
 ---
 
+## Live sighting alerts (MQTT)
+
+The rig can announce "a raccoon just arrived" the moment it's sure, as a message any device on
+your network can react to: an LED lantern, a chime, Home Assistant. It publishes to an
+[MQTT](https://mqtt.org/) broker (Mosquitto is the usual one, and runs happily on the rig's own
+machine). Nothing new to install on the rig side: `mqttnotify.py` speaks MQTT with the standard
+library. Set the broker in `config_local.py`, then check it without waiting for an animal:
+
+```python
+cfg.mqtt_host = "192.168.1.20"      # or "127.0.0.1" if the broker is on this machine
+cfg.mqtt_username = "critter-cam"
+cfg.mqtt_password = "..."
+cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*": every animal
+```
+
+```bash
+python mqttnotify.py --test         # publishes to critter-cam/sighting/test
+```
+
+Live naming drives it, so it runs wherever naming runs and starts with the rig. It fires once
+per **visit**, not per crop: an arrival needs 2 crops of one species at ≥ 0.8 species confidence
+on one camera within 2 minutes. On September 2026's glass-door data, that caught 70 of 80 raccoon
+visits, and it never fired on the low-confidence labels that are usually misreads. A visit
+**leaves** after `visit_gap_minutes` with no confident crop. Only crops from the last two minutes
+count, so trail-cam imports and naming backlogs never alert. A broker that is down costs one log
+line, and naming carries on.
+
+| Topic | Retained | Payload |
+|---|---|---|
+| `critter-cam/sighting/<slug>` | no | `{"event": "arrived" \| "left", "visit_id", "species", "slug", "source", "confidence", "crops", "first_seen", "last_seen", "sent_at", "detection_id"}`; `left` adds `duration_s` |
+| `critter-cam/present` | yes | `{"present": [{"species", "slug", "source", "since"}], "updated"}`: what's in view now, reset at rig start |
+| `critter-cam/last-sighting` | yes | the latest `arrived` event |
+
+`slug` is the species label lowercased with hyphens (`Steller's jay` → `stellers-jay`). The
+`visit_id` is the same on a visit's `arrived` and `left`. The prefix is `cfg.mqtt_topic_prefix`,
+and the thresholds are the `mqtt_*` settings in `config.py`. Give the rig its own broker login,
+and refuse anonymous clients on the broker. Otherwise anyone on your Wi-Fi can publish fake
+sightings to your lights.
+
+---
+
 ## Database schema
 
 One row per detection in the **`detections`** table. Timestamps are **local time with UTC
@@ -1260,7 +1302,7 @@ everyone-operates behaviour.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
 - **`config_local.py` holds the sensitive bits** — your latitude/longitude, any RTSP camera
-  credentials, your `email_resend_api_key` and your `operator_token`. It's gitignored, so it never
+  credentials, your `email_resend_api_key`, your `mqtt_password` and your `operator_token`. It's gitignored, so it never
   rides along in a commit; note that `backup.py` *does* copy it into the `meta-<date>.zip`, and
   the database snapshot beside it carries your camera passwords. Both usually land in a
   cloud-synced folder, unencrypted, in **every daily zip** — so whoever can read that folder can
