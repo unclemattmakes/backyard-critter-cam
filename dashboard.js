@@ -1037,7 +1037,7 @@ function vlabelOpen(btn,i){
     const sp=(v.title&&v.title!=='animal')?v.title:'';
     tools.innerHTML=`
         <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:6px">
-          <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+          ${sp?`<button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>`:''}
           ${speciesSelect('vsp-'+i,sp)}
           <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
         <div style="display:flex;gap:5px;align-items:center;margin-top:6px">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>

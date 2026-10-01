@@ -1590,3 +1590,55 @@ def test_pack_endpoint_validation_reaches_the_form(db_path, monkeypatch):
         assert web._pack_job is None
     finally:
         web.shutdown(server)
+
+
+# ---- ✓ sp never confirms a species guess the dashboard is hiding as Unidentified ------------
+def test_visit_verify_skips_guesses_hidden_by_the_display_threshold(conn, db_path):
+    def crop(ts, species, sp_conf):
+        did = db.insert_detection(conn, timestamp=ts, source="glass_door_cam",
+                                  detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                                  frame_w=100, frame_h=100, crop_path="crops/x.jpg",
+                                  species=species, crop_quality=1.0)
+        conn.execute("UPDATE detections SET species_confidence = ?, species_source = 'bioclip' "
+                     "WHERE id = ?", (sp_conf, did))
+        return did
+
+    hidden = [crop("2026-06-10T21:00:00-07:00", "song sparrow", 0.31),
+              crop("2026-06-10T21:01:00-07:00", "song sparrow", 0.28)]
+    shown = crop("2026-06-11T21:00:00-07:00", "raccoon", 0.95)
+    mixed_hidden = crop("2026-06-11T21:01:00-07:00", "bushtit", 0.2)
+    conn.commit()
+
+    def verified(i):
+        return conn.execute("SELECT species_verified FROM detections WHERE id = ?",
+                            (i,)).fetchone()[0]
+
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0, species_display_min_confidence=0.5)
+    server = web.make_server(cfg, {cfg.source: web.FrameBuffer()},
+                             {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        # Every crop hidden (the card reads Unidentified): refused, nothing written.
+        code, body = _post(port, "/api/visit/label",
+                           {"source": "glass_door_cam", "start": "2026-06-10T21:00:00-07:00",
+                            "end": "2026-06-10T21:01:00-07:00", "verify": True})
+        assert code == 409 and "Unidentified" in body["error"]
+        assert [verified(i) for i in hidden] == [None, None]
+
+        # A mixed visit: the shown label is confirmed, the hidden guess is skipped.
+        code, body = _post(port, "/api/visit/label",
+                           {"source": "glass_door_cam", "start": "2026-06-11T21:00:00-07:00",
+                            "end": "2026-06-11T21:01:00-07:00", "verify": True})
+        assert code == 200 and body["verified"] == 1 and body["verify_skipped"] == 1
+        assert verified(shown) == 1 and verified(mixed_hidden) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+    # Threshold 0: nothing is hidden, so ✓ confirms every crop as before.
+    res = db.apply_visit_label(conn, source="glass_door_cam", start="2026-06-10T21:00:00-07:00",
+                               end="2026-06-10T21:01:00-07:00", verify=True)
+    assert res["verified"] == 2 and [verified(i) for i in hidden] == [1, 1]
