@@ -827,15 +827,59 @@ def test_meta_zip_names_the_secrets_it_is_about_to_upload(tmp_path):
     Pinned because the failure mode is silence: this warning going missing looks exactly like a
     backup that carries nothing sensitive."""
     dest = tmp_path / "drive"
-    lines = backup._secret_notice([tmp_path / "config_local.py", tmp_path / "logs"], dest)
+    local = tmp_path / "config_local.py"
+    local.write_text(_CONFIG_LOCAL_WITH_KEY, encoding="utf-8")
+    lines = backup._secret_notice([local, tmp_path / "logs"], dest)
 
     assert len(lines) == 2
     joined = " ".join(lines)
     assert "config_local.py" in joined and "API key" in joined
+    assert "re_placeholder" not in joined             # names the secret, never its value
+    assert "secrets file" in joined                   # ...and where it should live instead
     assert "cleartext" in joined                      # the pre-2026-08-22 log caveat
     assert str(dest) in joined                        # ...and WHERE it is going
     # An item that carries no secret says nothing: a warning on every line is a warning on none.
     assert backup._secret_notice([tmp_path / "reid", tmp_path / "tuning"], dest) == []
+
+
+_CONFIG_LOCAL_WITH_KEY = """\
+def apply(cfg):
+    cfg.email_resend_api_key = "re_placeholder"
+"""
+
+_CONFIG_LOCAL_CLEAN = """\
+from config import CameraSpec, secret
+def apply(cfg):
+    # cfg.email_resend_api_key = "re_..."
+    # CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/sub")
+    cfg.operator_token = secret("operator_token")
+    cfg.mqtt_password = _pw_from_somewhere
+    cfg.cameras = [CameraSpec("yard_ir", secret("yard_ir_url")),
+                   CameraSpec("feeder", "http://192.168.1.51:81/stream")]
+"""
+
+_CONFIG_LOCAL_LEAKY = """\
+def apply(cfg):
+    cfg.operator_token = 'tok_placeholder'
+    cfg.mqtt_password = r"mqtt_placeholder"
+    cfg.cameras = [CameraSpec("yard_ir", "rtsp://rig:pw_placeholder@10.0.0.9/s")]
+"""
+
+
+def test_config_local_is_only_named_for_secrets_it_still_spells_out(tmp_path):
+    """Once the keys live in the secrets file, config_local.py is coordinates and a camera list;
+    warning about it every run would teach the operator to ignore the warning. Commented-out
+    example lines, values read from elsewhere and password-free URLs are not secrets in the file."""
+    local = tmp_path / "config_local.py"
+    local.write_text(_CONFIG_LOCAL_CLEAN, encoding="utf-8")
+    assert backup._config_local_secrets(local) == []
+    assert backup._secret_notice([local], tmp_path / "drive") == []
+
+    local.write_text(_CONFIG_LOCAL_LEAKY, encoding="utf-8")
+    found = backup._config_local_secrets(local)
+    assert found == ["the operator token", "the MQTT password",
+                     "camera passwords inside stream URLs"]
+    assert not any("placeholder" in f for f in found)
 
 
 # --- the local archive index: what lets the prune guard check membership cheaply ------------

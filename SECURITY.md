@@ -15,7 +15,8 @@ So the boundary is the network, and — unless you set the one knob below — on
 
 ### The one knob: `operator_token`
 
-Set `cfg.operator_token = "some phrase"` in `config_local.py` and the dashboard splits in two.
+Set `"operator_token": "some phrase"` in the secrets file (below), or `cfg.operator_token` in
+`config_local.py`, and the dashboard splits in two.
 Devices that have not entered that phrase (dashboard footer, once per browser) become **viewers**:
 they read and play everything and can log a "who's here" sighting as reviewable testimony, but
 every label, name, camera and settings write is refused by the server, at the same choke point as
@@ -25,7 +26,9 @@ operator; you are at the rig. A wrong token is simply a viewer, never an error.
 It is off by default, and off means every device on your Wi-Fi is an operator. That is fine for a
 household alone with its own devices and **wrong the moment a houseguest's phone joins the
 network**, because "delete this clip" and "rename Notch" are one tap away with nothing in between.
-If you run the LAN launcher at all, set it.
+If you run the LAN launcher at all, set it — and especially if `config_local.py` sets
+`web_host = "0.0.0.0"`, which puts the rig on the LAN on *every* start, unattended reboots
+included.
 
 What it is not: it is a phrase in cleartext over plain HTTP, so it keeps honest devices in their
 lane on a network you already trust. It is not authentication and it does not make the dashboard
@@ -46,11 +49,11 @@ software stores, and it gets narrower rules than everything else above.
   cameras, so no API response, log line, or error message can carry it. What the dashboard shows
   is `has_password: true`. The edit form is blank even when a password is set, and submitting it
   blank leaves the stored one alone.
-- **It is stored in cleartext** in `backyard.db`, alongside the same secret that has always sat
-  in cleartext in `config_local.py`. If you back the database up, you are backing that up too —
-  see "What a backup carries off the machine" below, because the default backup destination is a
-  cloud folder. Encrypting it would not change who can read it: anyone who can read the database
-  file can read the rig's config file next to it.
+- **It is stored in cleartext** in `backyard.db` (and in `config_local.py` too, if a camera URL
+  there still spells it out — keep those in the secrets file). If you back the database up, you
+  are backing that up too — see "What a backup carries off the machine" below, because the
+  default backup destination is a cloud folder. Encrypting it would not change who can read it:
+  anyone who can read the database file can read the rig's config file next to it.
 - **It must not reach a log.** A camera's `src` *is* its password, and every line that prints one
   goes to `logs/backyard_cam.log`, which `backup.py` sweeps into the meta zip and off the machine.
   `cameras.safe_src()` masks it, and every human-facing print of a src goes through it. That was
@@ -58,12 +61,12 @@ software stores, and it gets narrower rules than everything else above.
   `logs/backyard_cam.log.*` and in every meta zip built from them. If you ran a networked camera
   before that date, rotate its password and delete those log copies — the fix protects new lines,
   not the ones already written.
-- **Deleting the camera does not delete the password.** Removing a camera from the dashboard is a
-  soft delete: the row is tombstoned so a config-listed camera can't come back on the next start,
-  and so re-adding the name is a one-click undelete — which only works because the stored password
-  is still there. The credential therefore outlives the camera, in `backyard.db` and in every
-  backup of it. To actually destroy one: re-add the camera, clear its password *at the rig*, then
-  remove it again. Or rotate it on the camera, which is the better answer anyway.
+- **Deleting the camera deletes the password.** Removing a camera from the dashboard is a soft
+  delete — the row is tombstoned so a config-listed camera can't come back on the next start — but
+  its stored password is erased, so a tombstone is not a credential. Re-adding the name undeletes
+  the row without one; set it again at the rig. Rows removed before 2026-09-30 are cleaned on the
+  rig's next start. Older database snapshots in your backups still hold them: rotate those
+  passwords on the camera if that matters.
 - **Give the camera its own account.** Make a dedicated user on the camera rather than reusing
   its admin login — most cameras support this, and it means the credential on disk cannot also
   reconfigure the camera.
@@ -74,8 +77,11 @@ By default `web_host` is `127.0.0.1` — the dashboard is reachable only from th
 the rig, and nothing else on your LAN can see it.
 
 LAN mode is a deliberate, separate opt-in: `start_critter_cam_lan.bat` (or `--host 0.0.0.0`),
-which exists so you can confirm a raccoon from the sofa. Every request — GET and POST alike —
-goes through `_lan_guard` in `web.py` before it is routed, and that runs three checks:
+which exists so you can confirm a raccoon from the sofa. A deployment can also make it permanent
+with `cfg.web_host = "0.0.0.0"` in `config_local.py`; then every start is a LAN start, and
+`operator_token` is what stands between a guest's phone and the delete button. Every request —
+GET and POST alike — goes through `_lan_guard` in `web.py` before it is routed, and that runs
+three checks:
 
 1. **Origin and Content-Type, on state-changing requests** (`_csrf_refusal`, new in this
    release): a `POST` must carry an `Origin` naming this dashboard *and* declare
@@ -89,18 +95,27 @@ goes through `_lan_guard` in `web.py` before it is routed, and that runs three c
    link-local, or an IPv4-mapped IPv6 form of those. A public address gets a 403. This is what
    stops a forwarded port from serving the internet.
 3. **Host header** (`_is_allowed_host`): the `Host` must be `localhost`, a
-   loopback/private/link-local IP literal, or your configured `web_host`. Without this, a
-   malicious website could point *its own* hostname at your rig's LAN IP and drive the dashboard
-   from your own browser — the peer IP would look local because it *is* local (DNS rebinding).
+   loopback/private/link-local IP literal, your configured `web_host`, or the exact mDNS name the
+   rig publishes for itself (`<mdns_name>.local`, default `critter-cam.local` — that one name, not
+   `.local` as a class). Without this, a malicious website could point *its own* hostname at your
+   rig's LAN IP and drive the dashboard from your own browser — the peer IP would look local
+   because it *is* local (DNS rebinding).
 
 The practical cost of check 1: a script that POSTs to the API needs
 `-H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json'`. That is the intended
 trade — the dashboard's own JS sends both for free.
 
 POST bodies are capped (`_MAX_POST_BYTES`) so a huge body can't be used to exhaust memory, and
-every file the dashboard serves out of `crops/`, `clips/`, and `clips_web/` is confined to those
-directories by an explicit containment check, so a crafted `?path=` cannot walk up into the rest
-of your disk.
+every file the dashboard serves is confined to its directory by an explicit containment check, so
+a crafted path cannot walk up into the rest of your disk. Those directories are `crops/`,
+`frames/`, `clips/`, `clip_crops/`, `reference_crops/` (detector crops of your hand-held reference
+photos; the originals in `reference/` are not served), `making-of/`, the `clips_web/` transcode
+cache, and `archive_cache/` (pruned clips restored from your backup zips for playback).
+
+Every response also carries `X-Frame-Options: DENY` and `Content-Security-Policy:
+frame-ancestors 'none'`, so no other site can load the dashboard in a hidden frame and steer a
+real tap onto delete or rename (clickjacking) — the Origin check above stops forged requests, not
+genuine clicks inside a frame.
 
 **None of this makes it safe to expose to the internet.** Do not port-forward it, do not put it
 behind a naked reverse proxy, do not `--host 0.0.0.0` on a machine with a public IP, and do not
@@ -108,18 +123,38 @@ run it on a network you share with people you would not hand the delete button t
 remote access, terminate it in something that actually does authentication — a VPN or an
 authenticating tunnel — and leave this bound to loopback behind it.
 
+## Where secrets live: the secrets file
+
+Keys and passwords belong in a small JSON file **outside the project**, which no backup, bundle
+or commit ever touches: `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
+`~/.critter-cam/secrets.json` elsewhere, or wherever the `CRITTER_CAM_SECRETS` environment
+variable points.
+
+```json
+{"email_resend_api_key": "re_...", "operator_token": "...", "mqtt_password": "...",
+ "yard_ir_url": "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub"}
+```
+
+`email_resend_api_key`, `operator_token` and `mqtt_password` fill the config automatically; any
+other key is read in `config_local.py` with `config.secret("name")` (that is how a camera URL with
+a password stays out of it — see `config_local.example.py`). A value still set in
+`config_local.py` wins, so an old config keeps working; it just keeps riding into the backups.
+Readable only by your user is the right permission for the file. Moving to a new machine, carry
+it across by hand.
+
 ## What a backup carries off the machine
 
 `backup.py` is documented as writing "into a cloud-synced folder" (Google Drive, Dropbox,
 OneDrive), and `config_local.example.py` suggests exactly that for `backup_dest`. So the
 question is not who can read your disk — it is who can read that folder, and what is in it.
 
-Every `snapshots/meta-<date>.zip` contains **`config_local.py`**, unencrypted. That is your
-latitude and longitude, your camera list, your `email_resend_api_key`, and your
-`operator_token`. Every `snapshots/backyard-db-<date>.zip` contains the database, and therefore
-your camera passwords. Both are there on purpose: a restore without them is a rig with no
-location, no cameras and no mail, which is not a restore. `backup.py` names them on every run
-rather than leaving it to be discovered.
+Every `snapshots/meta-<date>.zip` contains **`config_local.py`**, unencrypted: your latitude and
+longitude, your camera list, and any key or password still written in it rather than in the
+secrets file. Every `snapshots/backyard-db-<date>.zip` contains the database, and therefore your
+live cameras' passwords. Both are there on purpose: a restore without them is a rig with no
+location and no cameras, which is not a restore. `backup.py` names, on every run, each secret
+`config_local.py` still spells out (by kind, never by value), so moving them to the secrets file
+is what makes that warning go quiet. Zips written before you moved them still hold them.
 
 What follows from that:
 
@@ -128,8 +163,8 @@ What follows from that:
   as you and log into your cameras. If you share it, share a subfolder that is not `snapshots/`.
 - **Rotate rather than assume.** If that folder was ever shared, public, or on an account you no
   longer control, rotate the Resend key, the operator token and the camera passwords. They are
-  in every daily zip going back to the day you started, not just the newest one.
-- **Deleting the newest copy is not enough.** These zips are per-day and they accumulate. A
+  in every snapshot going back to the day you started, not just the newest one.
+- **Deleting the newest copy is not enough.** These snapshots accumulate. A
   secret leaked once is in every zip written since.
 - **`weights-archive.zip` and the media zips hold no credentials** — but the media is timestamped
   video of your property, and possibly of people walking past it.

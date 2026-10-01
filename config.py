@@ -12,6 +12,8 @@ pipeline later via the `source` column. See PLAN.md for the full four-phase road
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +35,61 @@ ROOT = Path(__file__).resolve().parent
 # Where the live species-naming helper (classify.py --watch) writes its status, so the dashboard
 # can show "warming up" vs "naming" vs "stopped". A hidden file in the project root.
 NAMING_STATUS_FILE = ROOT / ".naming_status.json"
+
+
+# ---- Secrets file -----------------------------------------------------------------
+# Credentials live in a small JSON file OUTSIDE the project, so backup.py's meta zip (which
+# carries config_local.py) never carries them. Path: $CRITTER_CAM_SECRETS, else
+# ~/.critter-cam/secrets.json (on Windows C:\Users\<you>\.critter-cam\secrets.json). Format:
+#     {"email_resend_api_key": "re_...", "operator_token": "...", "mqtt_password": "..."}
+# Keys named in SECRET_FIELDS fill the same-named Config field before config_local.py runs, so
+# a value still set there wins. Any other key is readable with secret("name"), e.g. a camera URL
+# in config_local.py: CameraSpec("yard_ir", secret("yard_ir_url")).
+SECRETS_ENV = "CRITTER_CAM_SECRETS"
+SECRET_FIELDS = ("email_resend_api_key", "operator_token", "mqtt_password", "heartbeat_url")
+_secrets_cache: dict | None = None
+
+
+def secrets_path() -> Path:
+    env = os.environ.get(SECRETS_ENV, "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".critter-cam" / "secrets.json"
+
+
+def load_secrets(path: Path | str | None = None) -> dict:
+    """The secrets file as a dict of non-empty strings. A missing file is no secrets, not an
+    error; an unreadable or malformed one is reported (never its contents) and also yields {}."""
+    p = Path(path) if path is not None else secrets_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        print(f"[config] secrets file {p} not loaded ({type(exc).__name__}); "
+              "continuing without it", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[config] secrets file {p} is not a JSON object; continuing without it",
+              file=sys.stderr)
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, str) and v}
+
+
+def secret(name: str) -> str | None:
+    """One value from the secrets file (read once per process), or None."""
+    global _secrets_cache
+    if _secrets_cache is None:
+        _secrets_cache = load_secrets()
+    return _secrets_cache.get(name)
+
+
+def apply_secrets(cfg, secrets: dict) -> list[str]:
+    """Fill each SECRET_FIELDS field present in `secrets`. Returns the field NAMES filled."""
+    filled = []
+    for name in SECRET_FIELDS:
+        if secrets.get(name) and hasattr(cfg, name):
+            setattr(cfg, name, secrets[name])
+            filled.append(name)
+    return filled
 
 
 @dataclass
@@ -474,7 +531,7 @@ class Config:
     # (kept in that browser's localStorage; localhost is always operator). This closes the
     # documented "anyone on your Wi-Fi has full access, INCLUDING label edits" caveat for
     # households that want it closed, without adding accounts or passwords for anyone else.
-    operator_token: str | None = None
+    operator_token: str | None = None      # best kept in the secrets file (see secrets_path)
     # When the dashboard is bound to the network (web_host = "0.0.0.0", the LAN launcher), accept
     # connections ONLY from your local network -- loopback + private ranges (192.168.x, 10.x,
     # 172.16-31.x, link-local). A DIRECT request from a public internet address is refused (HTTP
@@ -501,7 +558,7 @@ class Config:
     # the wrong shape for a real mailing list (use a list provider for that).
     email_to: str | tuple[str, ...] | list[str] | None = None
     email_from: str | None = None          # verified Resend sender ("Name <a@your-domain.com>")
-    email_resend_api_key: str | None = None    # https://resend.com -> API Keys ("re_...")
+    email_resend_api_key: str | None = None    # https://resend.com -> API Keys ("re_..."); secrets file
     # Where the issue's links point (every headline, species, animal and visit in it deep-links
     # into the dashboard). Default (None) uses this machine's LAN IP and web_port, re-derived per
     # issue so a DHCP change heals itself overnight. It is the IP and not the hostname because
@@ -523,7 +580,7 @@ class Config:
     mqtt_host: str | None = None
     mqtt_port: int = 1883
     mqtt_username: str | None = None
-    mqtt_password: str | None = None
+    mqtt_password: str | None = None       # best kept in the secrets file (see secrets_path)
     mqtt_topic_prefix: str = "critter-cam"
     # Which species announce themselves: "*" = every animal label, or a list of labels exactly as
     # classify.py names them (["raccoon", "Virginia opossum"]). Case-insensitive.
@@ -1111,6 +1168,9 @@ class Config:
 
 # The single shared default instance. backyard_cam.py copies this and applies CLI overrides.
 CONFIG = Config()
+
+# Secrets first (see secrets_path above), so config_local.py below can still override them.
+apply_secrets(CONFIG, {k: secret(k) for k in SECRET_FIELDS})
 
 # Local, untracked overrides for private / machine-specific values (e.g. your camera's real
 # latitude/longitude). Copy config_local.example.py to config_local.py (gitignored) and set

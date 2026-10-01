@@ -967,6 +967,13 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
         def log_message(self, *args):
             pass
 
+        def end_headers(self):
+            # Every response, whichever path sent it: no other site may frame the dashboard
+            # (clickjacking a delete or rename under a decoy page).
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            super().end_headers()
+
         def _send(self, code, content_type, body: bytes, extra=None):
             self.send_response(code)
             self.send_header("Content-Type", content_type)

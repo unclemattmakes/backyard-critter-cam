@@ -77,7 +77,7 @@ from pathlib import Path
 
 import db
 import heavyio
-from config import CONFIG, ROOT
+from config import CONFIG, ROOT, SECRET_FIELDS, secrets_path
 
 log = logging.getLogger("backup")
 
@@ -837,24 +837,61 @@ def _write_meta_zip(staged: Path, present: list[Path]) -> int:
     return n
 
 
-# Meta items that carry SECRETS rather than data. Both are in the zip on purpose -- a restore
-# without config_local.py is a rig with no location, no camera list and no mail key, and logs are
-# the only record of what the rig did -- but "on purpose" is not the same as "understood", and the
+# Meta items that can carry SECRETS rather than data. Both are in the zip on purpose -- a restore
+# without config_local.py is a rig with no location and no camera list, and logs are the only
+# record of what the rig did -- but "on purpose" is not the same as "understood", and the
 # destination is normally a folder a cloud client uploads. So each run names what it is about to
 # hand to Drive. See SECURITY.md, "What a backup carries off the machine".
 _SECRET_BEARING = {
-    "config_local.py": "your coordinates, camera list, mail API key and operator token",
     "logs": "camera hostnames and, in logs written before 2026-08-22, camera passwords in "
             "cleartext",
 }
+# What config_local.py may still hold that belongs in the secrets file (config.secrets_path).
+_SECRET_FIELD_NAMES = {"email_resend_api_key": "the mail API key",
+                       "operator_token": "the operator token",
+                       "mqtt_password": "the MQTT password"}
+_LITERAL_ASSIGN = re.compile(
+    r"^\s*cfg\.(%s)\s*=\s*[rRuUfFbB]{0,2}['\"]" % "|".join(map(re.escape, SECRET_FIELDS)))
+_URL_LOGIN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@'\"]+:[^\s'\"]+@")
+
+
+def _config_local_secrets(path: Path) -> list[str]:
+    """Which secrets config_local.py still spells out: a string literal assigned to a
+    SECRET_FIELDS field, or a stream URL with a password in it. Comment lines don't count.
+    Names only -- a value never leaves this function."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ["whatever secrets it holds (it could not be read to check)"]
+    found = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        m = _LITERAL_ASSIGN.match(line)
+        if m:
+            found.append(_SECRET_FIELD_NAMES.get(m.group(1), m.group(1)))
+        if _URL_LOGIN.search(line):
+            found.append("camera passwords inside stream URLs")
+    return list(dict.fromkeys(found))
 
 
 def _secret_notice(present: list[Path], out_dir: Path) -> list[str]:
-    """One line per secret-bearing item actually going into this run's meta zip. Pure, so the
-    wording is testable and so the dry run can print exactly what the real run would."""
-    return [f"meta zip carries {p.name} -- {_SECRET_BEARING[p.name]}. It is going to {out_dir}, "
-            f"unencrypted; treat that folder as holding those secrets."
-            for p in present if p.name in _SECRET_BEARING]
+    """One line per secret-bearing item actually going into this run's meta zip, so the dry run
+    can print exactly what the real run would. config_local.py is named only while it still
+    spells a secret out; secrets kept in the secrets file never enter the zip at all."""
+    lines = []
+    for p in present:
+        if p.name == "config_local.py":
+            found = _config_local_secrets(p)
+            if found:
+                lines.append(
+                    f"meta zip carries config_local.py, which still holds {', '.join(found)}. "
+                    f"It is going to {out_dir}, unencrypted; move those into the secrets file "
+                    f"({secrets_path()}), which is never backed up -- see SECURITY.md.")
+        elif p.name in _SECRET_BEARING:
+            lines.append(f"meta zip carries {p.name} -- {_SECRET_BEARING[p.name]}. It is going "
+                         f"to {out_dir}, unencrypted; treat that folder as holding those secrets.")
+    return lines
 
 
 def snapshot_meta(out_dir: Path, today: date, dry_run: bool) -> None:
@@ -1116,10 +1153,12 @@ archived every run; everything in snapshots/ is written weekly.
               meta-<date>.zip         = re-ID data, tracklet thumbs, tuning, logs, config,
                                         certified reference photos, the DB's import and
                                         static-dropped ledgers.
-                                        THIS ONE HOLDS SECRETS: config_local.py is in it, so
-                                        every copy carries your coordinates, your camera list,
-                                        your mail API key and your operator token, unencrypted.
-                                        The database snapshot beside it carries your camera
+                                        THIS ONE CAN HOLD SECRETS: config_local.py is in it, so
+                                        every copy carries your coordinates, your camera list
+                                        and any key or password still written in that file,
+                                        unencrypted (the secrets file outside the project is
+                                        never copied here -- that is where they belong). The
+                                        database snapshot beside it carries your live cameras'
                                         passwords the same way. Wherever this folder syncs to
                                         holds all of that -- share the folder accordingly, and
                                         rotate those secrets if it ever went somewhere it

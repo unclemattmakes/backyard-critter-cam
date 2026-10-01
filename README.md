@@ -432,8 +432,8 @@ motion area. Two things it deliberately does not pretend:
   thread when the rig starts, so unlike ignore zones a camera cannot be attached to a running rig.
   The panel says so.
 - **A camera's short name is permanent.** It is stamped on every detection, visit and clip folder
-  recorded under it, so renaming would orphan all of it. Removing a camera keeps those rows, and
-  re-adding the same short name reattaches to them.
+  recorded under it, so renaming would orphan all of it. Removing a camera keeps those rows (its
+  stored password is erased), and re-adding the same short name reattaches to them.
 
 A camera **password** can only be set from the rig machine itself, never over the network — see
 [SECURITY.md](SECURITY.md#camera-credentials--the-one-exception). Everything else is editable from
@@ -1108,14 +1108,13 @@ iOS.
 Sending uses [Resend](https://resend.com)'s REST API (free tier is plenty for one email a
 day) via a single stdlib HTTP call — no SDK. Photos are embedded as inline attachments
 because the alternatives genuinely fail in mail clients: your dashboard's image URLs are
-LAN-only, and Gmail strips `data:` URIs. Set three values in `config_local.py` (never
-`config.py` — the key is a secret and this repo is public; see
-`config_local.example.py`):
+LAN-only, and Gmail strips `data:` URIs. Set two values in `config_local.py` (never
+`config.py` — this repo is public; see `config_local.example.py`), and the API key as
+`"email_resend_api_key": "re_..."` in the secrets file (see Security & privacy):
 
 ```python
 cfg.email_to = "you@example.com"     # or "you@example.com, someone@else.com" (or a list)
 cfg.email_from = "Creature Report <dispatch@your-domain.com>"  # a Resend-verified domain
-cfg.email_resend_api_key = "re_..."
 ```
 
 Several recipients each get their own copy, addressed only to them — nobody sees anyone
@@ -1153,8 +1152,7 @@ library. Set the broker in `config_local.py`, then check it without waiting for 
 
 ```python
 cfg.mqtt_host = "192.168.1.20"      # or "127.0.0.1" if the broker is on this machine
-cfg.mqtt_username = "critter-cam"
-cfg.mqtt_password = "..."
+cfg.mqtt_username = "critter-cam"   # password: "mqtt_password" in the secrets file
 cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*": every animal
 ```
 
@@ -1298,7 +1296,7 @@ The camera's best settings differ with the light, so two pieces handle it:
 dashboard's port sees the live feed, browses every crop and clip, and can edit species labels
 and individual names — a deliberate trade for a single-household tool, and the one thing to
 keep in mind before the page leaves the machine it runs on. The one optional split:
-**`operator_token`** in `config_local.py` turns un-tokened devices into **viewers** — they read
+**`operator_token`** (secrets file, below) turns un-tokened devices into **viewers** — they read
 and play everything and can log "who's here" as reviewable testimony, but every label/settings
 write is refused server-side until the token is entered once in that browser (dashboard
 footer). Localhost is always the operator; leaving the token unset keeps the historical
@@ -1330,13 +1328,16 @@ everyone-operates behaviour.
   they are not a login and not a substitute for one. Anyone already on your Wi-Fi has full access.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
-- **`config_local.py` holds the sensitive bits** — your latitude/longitude, any RTSP camera
-  credentials, your `email_resend_api_key`, your `mqtt_password`, your `heartbeat_url` and your `operator_token`. It's gitignored, so it never
-  rides along in a commit; note that `backup.py` *does* copy it into the `meta-<date>.zip`, and
-  the database snapshot beside it carries your camera passwords. Both usually land in a
-  cloud-synced folder, unencrypted, in **every daily zip** — so whoever can read that folder can
-  send mail as you and log into your cameras. See
-  [SECURITY.md → What a backup carries off the machine](SECURITY.md#what-a-backup-carries-off-the-machine).
+- **Keys and passwords go in the secrets file, not `config_local.py`.** `config_local.py` is
+  gitignored, but `backup.py` copies it into the weekly `meta-<date>.zip`, which usually lands in
+  a cloud-synced folder, unencrypted. So `email_resend_api_key`, `operator_token`, `mqtt_password`,
+  `heartbeat_url` and any camera URL carrying a password live in a JSON file outside the project
+  that no backup touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
+  `~/.critter-cam/secrets.json` elsewhere, or `$CRITTER_CAM_SECRETS` (format and `config.secret()`
+  in `config_local.example.py`). A key still set in `config_local.py` keeps working and still
+  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`, and
+  the database snapshot still carries your live cameras' passwords. See
+  [SECURITY.md → Where secrets live](SECURITY.md#where-secrets-live-the-secrets-file).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
   bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about

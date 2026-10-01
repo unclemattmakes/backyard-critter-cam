@@ -454,7 +454,7 @@ CREATE TABLE IF NOT EXISTS cameras (
     url_port      INTEGER,                  -- NULL = the scheme's default (554 / 80).
     url_path      TEXT,                     -- everything after the host, no leading slash.
     username      TEXT,                     -- camera account, NOT a vendor/cloud login.
-    password      TEXT,                     -- write-only: never returned by any API. See cameras.py.
+    password      TEXT,                     -- write-only, never returned; erased on removal.
     frame_width   INTEGER,                  -- NULL on every override below = inherit Config,
     frame_height  INTEGER,                  -- exactly as a CameraSpec field left at None does.
     motion_min_area INTEGER,                -- FULL-FRAME pixels, so it is resolution-dependent.
@@ -915,6 +915,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("suppress_ref_id", "INTEGER"), ("suppress_detail", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE detections ADD COLUMN {col} {decl}")
+    # 2026-09-30: a removed camera keeps no password (see remove_camera). Rows tombstoned before
+    # that still hold one; erase it. Checked with a read first, because this runs on every
+    # connect and an UPDATE would take the write lock even when it matched nothing.
+    if conn.execute("SELECT 1 FROM cameras WHERE deleted_at IS NOT NULL "
+                    "AND password IS NOT NULL LIMIT 1").fetchone():
+        conn.execute("UPDATE cameras SET password = NULL "
+                     "WHERE deleted_at IS NOT NULL AND password IS NOT NULL")
 
 
 def set_species(conn: sqlite3.Connection, detection_id: int, species: str,
@@ -2591,8 +2598,8 @@ def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_inde
     if existing is not None and existing[1] is None:
         raise ValueError(f"a camera named {src!r} already exists")
     if existing is not None:
-        # Undelete. Everything the form supplied wins; an omitted password keeps the old one,
-        # which is what makes "I deleted that camera by mistake" a one-click recovery.
+        # Undelete. Everything the form supplied wins. remove_camera erased the password, so an
+        # omitted one stays NULL -- it has to be set again, at the rig.
         # EVERY column the caller can supply, or the undeleted row keeps a stale value from
         # whatever it was before it was removed -- a camera that comes back at the old
         # resolution and the old motion trigger, with nothing on screen to say so. The SET list
@@ -2675,13 +2682,10 @@ def remove_camera(conn: sqlite3.Connection, camera_id) -> Optional[dict]:
     unknown/already-deleted id. The row STAYS: the tombstone is what stops seed_cameras putting a
     config-listed camera back on the next start, and what makes re-adding the name an undelete.
 
-    THE PASSWORD STAYS TOO, and that is worth saying out loud because "delete" does not read that
-    way. It is what makes the undelete a real recovery -- add_camera's undelete branch keeps the
-    stored password when the form omits one, so "I removed that camera by mistake" costs a name,
-    not a walk to the camera to read its login again. The cost is that a tombstoned row is still a
-    credential in `backyard.db`, and therefore in every backup of it. To actually destroy one,
-    re-add the camera, clear its password from the rig (clear_password=True), then remove it
-    again. SECURITY.md says the same where an operator will look for it.
+    THE PASSWORD DOES NOT STAY. A tombstoned row is otherwise a live credential for a camera
+    nobody is using, in `backyard.db` and every backup of it, so removal erases it; re-adding the
+    name undeletes the row without one, to be set again at the rig. (_migrate clears the ones
+    tombstoned before this rule.)
 
     Refusing to remove the LAST live camera is the caller's job (web.py does it) -- a rig with no
     cameras exits as soon as the last capture thread ends."""
@@ -2689,7 +2693,7 @@ def remove_camera(conn: sqlite3.Connection, camera_id) -> Optional[dict]:
                        (int(camera_id),)).fetchone()
     if row is None:
         return None
-    conn.execute("UPDATE cameras SET deleted_at = ? WHERE id = ?",
+    conn.execute("UPDATE cameras SET deleted_at = ?, password = NULL WHERE id = ?",
                  (now_local_iso(), int(camera_id)))
     conn.commit()
     return _camera_row(row)

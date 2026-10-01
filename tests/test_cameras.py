@@ -223,7 +223,40 @@ def test_re_adding_a_removed_source_undeletes_the_same_row(conn):
     again = _net(conn, name="Yard again")
     assert again["id"] == cam["id"]
     assert again["name"] == "Yard again"
-    assert db.camera_password(conn, "yard_ir") == "hunter2"   # not re-typed, not lost
+    assert again["has_password"] is False          # erased at removal; set again at the rig
+
+
+def _stored_password(conn, cam_id):
+    return conn.execute("SELECT password FROM cameras WHERE id = ?", (cam_id,)).fetchone()[0]
+
+
+def test_removing_a_camera_erases_its_password(conn):
+    """A tombstone is not a camera anyone uses, so it must not stay a credential in backyard.db
+    and every backup of it."""
+    cam = _net(conn, password="hunter2")
+    keep = _net(conn, source="feeder", password="other")
+    db.remove_camera(conn, cam["id"])
+    assert _stored_password(conn, cam["id"]) is None
+    assert db.camera_password(conn, "feeder") == "other"      # live cameras untouched
+    assert _stored_password(conn, keep["id"]) == "other"
+
+
+def test_connect_erases_passwords_left_on_older_tombstones(db_path):
+    """Rows tombstoned before removal erased passwords: the next connect cleans them, touches
+    nothing live, and is a no-op on every connect after."""
+    c = db.connect(db_path)
+    old = _net(c, password="hunter2")
+    live = _net(c, source="feeder", password="other")
+    # The pre-fix tombstone: deleted_at set, password still there.
+    c.execute("UPDATE cameras SET deleted_at = '2026-09-01T00:00:00-07:00' WHERE id = ?",
+              (old["id"],))
+    c.commit()
+    c.close()
+    for _ in range(2):                                         # idempotent
+        c = db.connect(db_path)
+        assert _stored_password(c, old["id"]) is None
+        assert _stored_password(c, live["id"]) == "other"
+        c.close()
 
 
 def test_update_without_a_password_leaves_the_stored_one_alone(conn):
