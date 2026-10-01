@@ -9,7 +9,7 @@ Keep it honest the way the rest of this project stays honest: when an item ships
 let the code speak; when an item is **measured dead**, do not delete it — move it to
 [Killed, with reasons](#killed-with-reasons) so nobody spends a week re-discovering the same
 negative. Numbers here come from the evaluation, from
-[the identity eval](identity-eval-2026-08-05.md), and from measurements run against the live
+[the identity eval](../identity-eval-2026-08-05.md), and from measurements run against the live
 database on 2026-08-08 and 08-09 while writing this — those say so where they appear, and two of
 them killed a design that was on this list a day earlier.
 
@@ -63,7 +63,7 @@ machinery is `eval.py --reid` + `evalmetrics.py`; the nightly batch now writes a
 every night, so a current baseline already exists.
 
 ### 1.4 The refimg shadow review — **done 2026-08-09**, and it needs one human decision
-Full write-up with every number: [the shadow review](refimg-review-2026-08-09.md). The short
+Full write-up with every number: [the shadow review](../refimg-review-2026-08-09.md). The short
 version, because two things this entry said the same morning turned out to be wrong:
 
 - **The veto is not inert. It has flagged 18 rows and all 18 are furniture** — the tipped watering
@@ -114,7 +114,7 @@ most of the signal.** Session-blocked leave-one-visit-out over the same 139 conf
 visits, same protocol, same corpus — the only difference is which pixels the embedder sees:
 
 Full write-up, with the harness validation and the paired statistics:
-[the background-identity diagnostic](background-identity-2026-08-09.md).
+[the background-identity diagnostic](../background-identity-2026-08-09.md).
 
 | arm | what the embedder sees | blocked | 7-day embargo | 21 days |
 |---|---|---|---|---|
@@ -488,7 +488,7 @@ cycle* gave a much gloomier 0.799, because Matt evidently repositions the trail 
 cycle too (07-30 and 07-31 are visibly different framings) — so the epoch count will exceed the
 cycle count, and "same cycle" is not a control. Second, do not carry the glass door's result over:
 there the same fingerprint runs 0.075–0.68 across one provably stationary day
-([refimg review](refimg-review-2026-08-09.md) §4), because that camera shoots through glass and
+([refimg review](../refimg-review-2026-08-09.md) §4), because that camera shoots through glass and
 its floodlit evening frames classify as `day`. **This signal is camera-specific.** It is sound on
 the trail cam, which is the camera §5.3 is about.
 
@@ -701,7 +701,7 @@ and looked at, are the same tipped watering can.** So the bar is not what is hol
 — it is not dangerous to lower on this corpus, it is simply *pointless*, and it spends the one gate
 that answers the design's photographed failure mode (a properly certified reference with an
 undetected raccoon walking the wall in it). Thirty-eight hours without that failure recurring is not
-evidence about a rare unrecoverable event. Full numbers: [the shadow review](refimg-review-2026-08-09.md) §3.
+evidence about a rare unrecoverable event. Full numbers: [the shadow review](../refimg-review-2026-08-09.md) §3.
 
 ### "The bounding-box amplification is why coverage never reaches the bar" — killed at 1.37×
 The suspicion was that `_blobs` remembering `cv2.boundingRect()` instead of the blob itself was

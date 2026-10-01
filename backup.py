@@ -1172,7 +1172,7 @@ archived every run; everything in snapshots/ is written weekly.
                                         diffed weekly (a mass label change logs LOUDLY)
               export-<date>.zip       = the observation record as plain CSV + DATA.md --
                                         readable on any stack, forever, no venv required
-  STATUS.txt  the weekly heartbeat: rig freshness, newest labels, shadow-review flags,
+  STATUS.txt  the daily heartbeat: rig freshness, newest labels, shadow-review flags,
               disk headroom. If this file goes stale on your phone's Drive app, the
               backup task itself has stopped -- that staleness IS the alarm.
   backup.log  what happened on every run

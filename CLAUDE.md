@@ -14,7 +14,8 @@ behaviour, a stdlib web dashboard. One maintainer. **Public repo, AGPL-3.0.** St
   sunset; `sunsched.py --show` prints the exact time).
 - **Never write the live `backyard.db`** (several GB, irreplaceable). Don't open it for writing,
   don't run migrations against it by hand. Read-only queries only, and only when asked. Tests use
-  `tmp_path` via the `conn`/`db_path` fixtures. Schema changes go through `db._migrate`,
+  `tmp_path` via the `conn`/`db_path` fixtures. Schema changes go through `db._migrate` and bump
+  `db.SCHEMA_VERSION`,
   additive only (new columns/tables, never rewrites).
 - **The host hard-hangs under sustained heavy CPU/GPU load** (see
   [docs/host-instability-2026-08.md](docs/host-instability-2026-08.md)). Don't run `embed.py`,

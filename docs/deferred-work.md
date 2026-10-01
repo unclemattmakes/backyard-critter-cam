@@ -72,11 +72,8 @@ numbers in that file.
     surface, behind the existing tests, one file per PR. *L, low urgency.*
 15. **Exercise the never-fired safety paths on purpose.** The auto-assign reject tombstone and
     the USB-wedge self-heal have never run outside tests; trigger each once deliberately. *S.*
-16. **Small doc/code drift found on 2026-10-01.** The `README.txt` that `backup.py` drops in the
-    destination still calls `STATUS.txt` "the weekly heartbeat"; `config.py`'s `heartbeat_url`
-    comment says to set it in `config_local.py` though it is a secrets-file field; the morning
-    email's link uses the configured `web_port`, so it is wrong when the rig fell back to 8000.
-    *S.*
+16. **The morning email's dashboard link uses the configured `web_port`**, so it is wrong when the
+    rig fell back to 8000 at startup. *S.*
 17. **Trail-cam view epochs.** `view_epochs` is empty for the trail cam (and holds one wrong row
     for the glass door), which blocks both an occupancy map and the trail-cam half of the
     furniture veto. The segmenter method is measured and works; build the read-only reporter
