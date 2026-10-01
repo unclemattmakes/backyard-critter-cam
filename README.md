@@ -3,15 +3,17 @@
 [![tests](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml/badge.svg)](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml)
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-A live backyard-critter detection rig. A USB webcam points through a sliding glass door at
-the yard; the program watches the feed, wakes a real animal detector only when something
-moves, draws live bounding boxes, and saves a cropped image + a database row for every
-critter it sees — crows, raccoons, opossums.
+A live backyard-critter detection rig. A camera points through a sliding glass door at the
+yard; the program watches the feed, wakes a real animal detector only when something moves,
+draws live bounding boxes, and saves a cropped image + a database row for every critter it
+sees — crows, raccoons, opossums. The glass-door camera started as a USB webcam on the rig PC
+and is now a webcam on a Raspberry Pi serving MJPEG over HTTP, so the rig reads it as a network
+camera; a plain USB webcam works just as well.
 
 This glass-door cam is the **primary rig for all three species, day and night** (the
 "glass = mirror after dark" worry didn't pan out — lit animals at the pane read clearly; a
-raccoon already turned up at dusk). A second source — a wider-yard weatherproof trail cam,
-imported in batches off its SD card — plugs into the same pipeline later.
+raccoon already turned up at dusk). A second source, a wider-yard weatherproof trail cam
+imported in batches off its SD card, runs through the same pipeline.
 
 What began as a live-capture skeleton is now the **full four-phase system** the plan called
 for. It captures, **names the species** on every crop (BioCLIP 2), **re-identifies individual
@@ -35,10 +37,30 @@ folder; serve it locally with `python -m http.server 8011 --directory making-of`
 **Have a folder of photos from any camera?** You don't need the live rig to try the pipeline —
 see [Try it on footage you already have](#try-it-on-footage-you-already-have).
 
+## Quickstart
+
+```bash
+git clone https://github.com/unclemattmakes/backyard-critter-cam.git
+cd backyard-critter-cam
+setup.bat                      # Windows (or double-click it); Linux/macOS: bash setup.sh
+.venv\Scripts\python.exe backyard_cam.py --list-cameras    # Linux/macOS: .venv/bin/python
+.venv\Scripts\python.exe backyard_cam.py --serve           # then open http://127.0.0.1
+```
+
+`--list-cameras` prints the webcam indices that open; if yours isn't 0, add `--camera-index N`
+on the first run (that first run writes the camera into the database, and after that the
+dashboard's **cameras** button is where you change it). `--serve` prints the dashboard address;
+it is port 80 unless that is taken, then 8000. The first start downloads the detector (tens of
+MB) and, once the naming helper starts, about 2.6 GB of species models; `--no-classify` skips
+those for now. A network camera instead of a webcam? See
+[Multiple cameras](#multiple-cameras-usb--networked). No camera at all? `--serve-only` serves the
+dashboard over an existing database. Details: [Setup](#setup) and [Running](#running).
+
 ---
 
 ## Contents
 
+- [Quickstart](#quickstart) — clone to a running dashboard in five commands
 - [How it works](#how-it-works) — the pipeline, one box at a time
 - [The making-of site](https://unclemattmakes.github.io/backyard-critter-cam/) — the system
   explained through eight interactive demos; **no hardware needed** (its source and export
@@ -264,10 +286,16 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
-It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
-`NAMING IS STALE` when species naming stops, and `NIGHTLY BATCH IS STALE` when the newest
-`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
-has not finished a run since.
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`
+(at most hourly per alarm): `NAMING IS STALE` when species naming stops, `NIGHTLY BATCH IS
+STALE` when the newest `reports/eval_*.json` is older than `batch_stale_hours` (default 36),
+meaning the nightly batch has not finished a run since, and `rig is down and HELD` while a
+`--hold` is keeping a down rig down, so a forgotten hold still leaves a trace.
+
+One limit: the scheduled tasks in this README are registered without a stored password, so they
+run only while you are logged on. After a reboot that stops at the lock screen nothing runs (no
+rigwatch, no rig, no nightly batch, no backup) until someone logs in; on this rig that once cost
+24.5 hours. The off-host heartbeat below is how you hear about it.
 
 #### Hearing about it when the whole machine is down
 
@@ -275,9 +303,14 @@ Every alarm above is written on the rig's own machine, so a hung or powered-off 
 For that, point rigwatch at any free "dead man's switch" service ([healthchecks.io](https://healthchecks.io),
 or anything that takes a ping URL) and give the check a 5-minute period with some grace:
 
-```python
-cfg.heartbeat_url = "https://hc-ping.com/your-check-uuid"    # config_local.py: the URL is a secret
+```json
+{"heartbeat_url": "https://hc-ping.com/your-check-uuid"}
 ```
+
+That line goes in the secrets file (`~/.critter-cam/secrets.json`; see
+[Security & privacy](#security--privacy)), because the URL is the secret: anyone holding it can
+report your rig healthy. `cfg.heartbeat_url` in `config_local.py` also works, but that file rides
+into every backup.
 
 Each rigwatch run then pings that URL when everything is fine (rig up, or held/paused by you; naming
 and the nightly batch OK), and `<url>/fail` when it is not, which healthchecks.io treats as an
@@ -361,13 +394,17 @@ Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + 
 
 ### Common flags
 
-All defaults live in `config.py`; these override them per-run:
+All defaults live in `config.py`; these override them per-run. One exception to "per run": the
+camera list lives in the database's `cameras` table, which config (and the first three flags
+below) only **seed**, once per source. After that first run, change a camera from the
+dashboard's **cameras** button; the startup banner says so when config and the table disagree.
 
 | Flag | Meaning |
 |------|---------|
-| `--camera-index N` | Which webcam (default 0). Single-camera mode; for several at once see [Multiple cameras](#multiple-cameras-usb--networked). |
+| `--camera-index N` | Which webcam (default 0). Single-camera mode, and only until that camera has been seeded into the `cameras` table (see above); for several at once see [Multiple cameras](#multiple-cameras-usb--networked). |
 | `--source NAME` | DB `source` label for this camera's rows (single-camera mode; default `glass_door_cam`). |
-| `--width W --height H` | Requested capture resolution. |
+| `--width W --height H` | Requested capture resolution (seeded like `--camera-index`). |
+| `--exposure F` / `--gain F` | Lock manual exposure / gain on a USB webcam (find values with `tune.py`). Omit for auto. A network camera sets these itself. |
 | `--model-version V` | `MDV6-yolov10-c` (default, fast) · `MDV6-yolov9-c` · `MDV6-rtdetr-c` · `MDV6-yolov10-e` / `MDV6-yolov9-e` (heavier, more accurate). |
 | `--device D` | `auto` (default; GPU if usable, else CPU) · `cuda` (require an NVIDIA GPU, fail loud) · `cpu` (force CPU, slower). |
 | `--min-confidence F` | Minimum detector confidence to draw/save (default 0.25). |
@@ -376,34 +413,41 @@ All defaults live in `config.py`; these override them per-run:
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
 | `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` — or a per-camera budget from `clips_max_gb_by_source` — with oldest-first pruning). |
 | `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
-| `--db PATH` / `--crops-dir PATH` | Override output locations. |
+| `--db PATH` / `--crops-dir PATH` / `--frames-dir PATH` / `--clips-dir PATH` | Override output locations. |
 | `--no-preview` / `--preview` | Headless (quit with Ctrl+C) / show the window. Default comes from `cfg.show_preview`. |
 | `--no-classify` | Detection only — don't start the live species-naming helper. The rig launches it (and stops it) automatically by default; this turns that off. You can still fill species later with `python classify.py`. |
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
-| `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
+| `--visit-gap-min N` | Minutes of quiet that split two visits in `--stats` (default 5). |
+| `--list-cameras` | Probe webcam indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
+| `--serve-only` | Serve only the dashboard over the existing database: no camera, no detector, no model downloads. For imported footage or a restored archive. |
 | `--port N` / `--host H` | Dashboard port (default 80, falling back to 8000 if 80 is taken) / bind host (default `127.0.0.1`; `0.0.0.0` = LAN). |
 
 ### Multiple cameras (USB + networked)
 
-The glass-door webcam is the primary rig, but you can watch **several cameras at once** — a USB
-webcam *plus* networked cameras around the yard. They run on one process (one capture thread per
+The glass-door camera is the primary rig, but you can watch **several cameras at once** — USB
+webcams and networked cameras around the yard, in any mix. They run on one process (one capture thread per
 camera, all sharing the single MegaDetector and the one naming helper), and the dashboard's **Live
 Observation** tab shows a **grid of feeds**. Each camera writes its own `source`, so the whole
 downstream — species ID, re-ID, behaviour, visits, the calendar — keeps the cameras separate
 automatically (the schema was multi-source from day one).
 
-List the cameras in `config_local.py` (copy `config_local.example.py`):
+**The `cameras` table in the database is the authority on which cameras run.** A camera list in
+`config_local.py` (copy `config_local.example.py`) only **seeds** that table, once per source,
+the first time the rig starts with it; from then on `cameras.load_specs` reads the table, and
+editing the config entry changes nothing (the startup banner says so when the two disagree). The
+seed looks like this:
 
 ```python
 from config import CameraSpec
 def apply(cfg):
     cfg.latitude, cfg.longitude = 40.7128, -74.0060
     cfg.cameras = [
-        CameraSpec("glass_door_cam", 0, name="Glass door"),                 # USB webcam, index 0
-        # ...or the same camera over the network, once it outgrows one PC -- a Raspberry Pi
-        # running ustreamer forwards a USB webcam's own JPEG frames untouched:
-        # CameraSpec("glass_door_cam", "http://192.168.1.60:8080/stream", name="Glass door"),
+        # This rig's glass-door camera: a webcam on a Raspberry Pi running ustreamer, which
+        # forwards the webcam's own JPEG frames untouched over HTTP.
+        CameraSpec("glass_door_cam", "http://192.168.1.60:8080/stream", name="Glass door"),
+        # ...or a USB webcam plugged into the rig PC itself, by index:
+        # CameraSpec("glass_door_cam", 0, name="Glass door"),
         CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
                    name="Yard (night IR)"),                                  # RTSP/PoE IP camera
         CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
@@ -423,9 +467,9 @@ for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Pe
 (resolution, `motion_min_area`, day/night profile, `record_clips`) default to the global config;
 only override what differs. Each camera needs a **unique `source`**.
 
-**Or add one without editing Python.** Since 2026-08-22 the camera list lives in the database and
-the block above only **seeds** it the first time. The dashboard's **cameras** button (top right of
-Live Observation) adds, edits and removes cameras — name, address, stream path, login, resolution,
+**Or add one without editing Python.** The camera list has lived in the database since
+2026-08-22, so the dashboard's **cameras** button (top right of Live Observation) adds, edits and
+removes cameras — name, address, stream path, login, resolution,
 motion area. Two things it deliberately does not pretend:
 
 - **A change applies at the next restart, not immediately.** Each camera gets its own capture
@@ -689,6 +733,15 @@ species tracks the new labels with no manual `visits.py` step.
   list or a threshold — to see your numbers. (The grading only works because `model_species`
   snapshots the model's original call, so your corrections *teach* the eval instead of erasing the
   thing it scores.)
+  **By September the corpus was big enough to grade by confidence band.** The nightly eval of
+  late September 2026 graded **0.906** right at `species_confidence` ≥ 0.8 (n=2,446), **0.225** at
+  0.5–0.8 (n=662) and **0.026** below 0.5 (n=1,163).
+- **Low-confidence guesses read as "Unidentified".** Because a sub-0.5 label is almost always
+  wrong, the dashboard and the Creature Report show the namer's own calls below
+  `species_display_min_confidence` (default 0.5; 0 turns it off) as *Unidentified*, still counted
+  as an animal. Nothing stored changes, human labels always show, and the review queue and the
+  species sheet still show the raw guess with its score. The visit card's "✓ species" is not
+  offered on an Unidentified visit, so you can't confirm a label you can't see.
 
 ---
 
@@ -757,6 +810,15 @@ misnamed visit poisons its own template), which is another reason to re-measure 
 believe. `reports/` is gitignored, so these aren't numbers you can read out of a checkout — run
 `python eval.py --reid` and get your own.
 
+**And it holds for about a week.** The 2026-09-28 nightly eval scored pair ROC-AUC **0.61** and
+session-blocked leave-one-out top-1 **0.70**; hold back every template from within 7 days of the
+probe and top-1 falls to **0.46**, and at 21 days to about **0.16**, below the 0.34 you would get
+by always guessing the commonest raccoon. Most of what survives a week is the scene rather than
+the animal ([docs/background-identity-2026-08-09.md](docs/background-identity-2026-08-09.md)).
+So appearance names an animal reliably only from recent templates; telling raccoons apart over
+months needs a cue that doesn't depend on the yard behind them (the ear notch, body mass), which
+the rig doesn't have yet.
+
 The **dashboard's Individuals tab** is the intended surface: a "Who is this?" review queue
 with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
 anything is confirmed. Once you've named a few, it adds:
@@ -799,15 +861,34 @@ The same calls work from the CLI:
 ### Keeping it automatic (the nightly batch + auto-assign)
 
 Suggestions are only as fresh as the vectors behind them, so the nightly batch
-(`run_clipmotion.bat`) keeps the whole loop fed without you thinking about it: motion tracks for
-new clips → still embeddings (all species, down to the 0.5 suggestion gate) → clip-tracklet
-embeddings → solo-track linking → **auto-assign**. Every step is resumable, so schedule it daily
-in an activity trough (like the backup task, no admin needed):
+(`run_clipmotion.bat`) keeps the whole loop fed without you thinking about it: visit stamping →
+motion tracks for new clips → still embeddings (all species, down to the 0.5 suggestion gate) →
+clip-tracklet embeddings → solo-track linking → **the eval gate** → **auto-assign**. Every step is
+resumable, so schedule it daily (like the backup task, no admin needed):
 
 ```powershell
 schtasks /Create /TN "BackyardCritterCam-MotionTracks" /SC DAILY /ST 14:00 `
          /TR "\"$PWD\run_clipmotion.bat\"" /F
+.\.venv\Scripts\python.exe sunsched.py --arm --date today   # aim it at the glare window
 ```
+
+The 14:00 is only a first start time. Each run re-arms the next day's trigger with `sunsched.py`
+at about sunset − 2.5 h, the late-afternoon window when the sun shines into this rig's
+west-facing glass-door camera and the rig is blind anyway, so the GPU steps cost no detections (`sunsched.py --show` prints the
+next fortnight). The batch copies itself to `%TEMP%` and runs from the copy, because cmd.exe
+re-reads a running `.bat` by byte offset and a `git checkout` in the rig folder mid-run once left
+it hung for two days. Output goes to `logs/clipmotion_batch.log`; a run ends with `BATCH COMPLETE`
+then `BATCH EXIT <code>`.
+
+**The eval gate.** Before auto-assign, the batch runs `eval.py` against a **pinned baseline**
+(`python eval.py --pin-baseline latest` copies the newest artifact to
+`reports/pinned_baseline.json`; without one it diffs last night's). It exits **1** when a
+headline metric falls more than the tolerance below the baseline or below an absolute floor in
+`eval_floors` (set your own from your own artifact; the shipped floors are this yard's), and
+then auto-assign is **skipped** that night. It exits **3** when the scored corpus and every metric
+have not changed for `eval_stale_nights` (default 7) nights, which is what a dead naming helper
+looks like; that is logged and auto-assign still runs. **0** is a pass. The dashboard's eval chip
+shows the same verdict.
 
 **Auto-assign** is the *review by exception* tier: a solo visit whose best match clears **both**
 an eval-measured similarity bar *and* a lead-over-the-runner-up margin gets named automatically,
@@ -816,6 +897,16 @@ but deliberately **never feed the suggestion templates** and never ground behavi
 wrong auto name can't teach the matcher anything. In the queue each one shows as **auto: Stan**
 with **✓ keep** (promotes it to a real, template-feeding confirmation) and **✗ not them** (clears
 it *and* pins the visit so the nightly pass won't re-name it).
+
+**A name lands on the matched species' crops only.** A visit's `species` is a crop-count vote,
+and detector noise can outvote a raccoon (one real visit: 43 `not an animal` boxes against 30
+raccoon crops). Auto-assign writes the name onto the crops of the species it matched, and skips a
+visit that has none. A human confirm or clear does the same, using the species the review queue
+showed (or `--species` on the CLI), else the individual's own species; a confirm that would
+write nothing is refused instead of silently landing on the wrong rows. Labels written before
+this (2026-09-30) are not repaired; `python individuals.py --audit-species-mismatch` lists, read
+only, every labelled crop whose species differs from its individual's, as a review list (many
+are misclassified crops of the right animal, so not a delete list).
 
 It ships **disabled** — `reid_auto_threshold = 0.0` — and that is deliberate: an operating point is
 a property of one corpus, one camera and one cast, so the default must not write machine-made names
@@ -965,13 +1056,29 @@ then:
   tuning shots, logs, your `config_local.py`, the certified reference photos and their crops,
   and the database's import/static-dropped ledgers — the import ledger is what stops a
   restored rig from double-importing the trail cam's card).
+- **Media daily, snapshots weekly.** Every run archives new media. The `snapshots/` family (the
+  ~2.5 GB database snapshot, the meta zip, the label ledger and the CSV export) is written only
+  when the newest DB snapshot is at least `backup_snapshot_every_days` old (default 7; 0 = every
+  run; `--snapshots-now` forces it). Otherwise the run logs one "snapshots skipped" line. So a
+  daily schedule costs only the new media.
 - **The backup outlives the clip pruner.** `clips/` is a rolling window (`clips_max_gb`), so
-  run the backup at least **weekly**: each day folder is archived the morning after it
+  run the backup **daily**: each day folder is archived the morning after it
   completes, well inside the ~two-week prune horizon, and an existing archive is never rebuilt
   from a (possibly since-pruned) source. It *is* topped up, though: files a past day has gained
   since it was archived get merged in — a trail-cam import backfills old dates, and the day you
   dump the card arrives in two batches, because the card goes straight back in the camera and
   the rest of that day comes off it next time. Archives only ever grow.
+- **Irreplaceable clips are deleted only once they are provably archived.** For sources in
+  `clips_irreplaceable_sources` (default the trail cam, whose card gets formatted), the pruner
+  deletes a clip only if the backup's local index (`.archive_index/`, written by `backup.py`)
+  lists that clip in an archive part that is still on the destination. Whether that day has a zip
+  is not enough, because an import backfills old days. On a fresh clone or a restored machine
+  there is no index yet, so those clips are kept, over budget and loudly, until `backup.py` has
+  run once.
+- **Clips pruned before they were archived are reported.** After the media pass, `STATUS.txt`
+  gets a line per camera ("oldest day on disk, newest archived"), and a past day folder that is
+  empty with no archive at all is logged as `clips for <camera>/<day> were pruned before they
+  were archived` and marked `LOST` in `STATUS.txt`.
 - **Idempotent** — run it as often as you like; finished days are skipped in seconds. Restore
   instructions land in a `README.txt` beside the archives — and restoring is automated:
   `python migrate.py restore <backup folder>` from a fresh clone reassembles the whole rig
@@ -998,15 +1105,15 @@ then:
   - `export-<date>.zip` — the observation record as **plain CSV plus a `DATA.md` dictionary**
     (`export.py`). Data longevity shouldn't equal codebase longevity: this opens in a
     spreadsheet in ten years with no Python at all.
-  - `STATUS.txt` — a weekly heartbeat: rig freshness, newest human label against the decay
-    horizon, shadow-review flag count, trail-card import age, disk headroom. Its **absence or
-    staleness** in your cloud app is itself the alarm, which is the only notification channel
-    this project has.
+  - `STATUS.txt` — a heartbeat rewritten on every run: rig freshness, newest human label against
+    the decay horizon, shadow-review flag count, trail-card import age, disk headroom, and the
+    clip-coverage lines above. Its **absence or staleness** in your cloud app is itself an
+    alarm, alongside rigwatch's off-host heartbeat ([above](#hearing-about-it-when-the-whole-machine-is-down)).
 
-Schedule it weekly with Windows Task Scheduler (runs as you, no admin needed):
+Schedule it daily with Windows Task Scheduler (runs as you, no admin needed):
 
 ```powershell
-schtasks /Create /TN "Backyard critter-cam backup" /SC WEEKLY /D MON /ST 03:30 `
+schtasks /Create /TN "Backyard critter-cam backup" /SC DAILY /ST 03:30 `
     /TR "C:\path\to\backyard\.venv\Scripts\pythonw.exe C:\path\to\backyard\backup.py"
 ```
 
@@ -1026,10 +1133,10 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
 .\.venv\Scripts\python.exe migrate.py restore F:\rig-move
 ```
 
-- **`pack` writes the exact same layout as the weekly backup** (per-day media zips, an
+- **`pack` writes the exact same layout as the backup** (per-day media zips, an
   integrity-checked database snapshot, the meta zip, the one-time weights mirror) — plus
-  *today's* folders, which the weekly run leaves for tomorrow. One format, so `restore` also
-  works pointed straight at your **weekly cloud backup folder**: recovering from a dead
+  *today's* folders, which the daily run leaves for tomorrow. One format, so `restore` also
+  works pointed straight at your **cloud backup folder**: recovering from a dead
   machine is the same command, you just lose whatever the last backup missed. And because
   these archives are append-only, re-running `pack` only adds the delta.
 - **Or pack from the dashboard.** The footer's **move this rig** link (operators) runs the
@@ -1062,15 +1169,16 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
   keep their DB rows and stay playable straight out of the backup zips (the dashboard's
   archive path), exactly as before the move.
 - **What never migrates, on purpose:** the `.venv` and CUDA build (per-machine — run setup),
-  scheduled tasks (they live in the OS; re-register the weekly backup on the new machine and
+  scheduled tasks (they live in the OS; re-register the backup on the new machine and
   **disable it on the old one**, or the two rigs will interleave writes into one archive),
   and caches that rebuild themselves (`clips_web/`, `archive_cache/`, `refimg_store/`).
   `--dry-run` on either half says exactly what it would do first; `--no-weights` skips the
   ~1.3 GB weights mirror if you'd rather re-download.
 - **The new machine doesn't need the old machine's camera.** A configured camera that isn't
   there is retried forever, never fatal — and a rig with no camera at all still serves the
-  entire migrated archive via `--serve-only`. Drop the departed camera from
-  `config_local.py`, and your history is untouched either way: everything keys off the
+  entire migrated archive via `--serve-only`. Remove the departed camera with the dashboard's
+  **cameras** button (the restored database carries the camera list; `config_local.py` only
+  seeded it), and your history is untouched either way: everything keys off the
   `source` column, so a retired camera simply stops adding rows. A replacement camera on the
   **same view** should reuse the old source name (continuous timeline); a new angle gets a
   new name.
@@ -1092,9 +1200,11 @@ Everything in it **deep-links back into the dashboard** — a visit opens that d
 opens its catalogue sheet, a cast member opens their profile, the hero opens that report.
 Those links reach the rig **over your own network only** (the dashboard has no login — see
 [Security & privacy](#security--privacy)), so they work from the sofa and not from the bus.
-The address is auto-detected per issue: your machine's **LAN IP**, not its hostname, because
-phones resolve mDNS rather than NetBIOS and `http://your-pc:8000` simply fails on iOS and
-Android. Re-deriving it every morning means a DHCP change heals itself; override with
+The address is auto-detected per issue: your machine's **LAN IP** (e.g. `http://192.168.1.50`,
+with the port added only when `web_port` isn't 80; a rig that fell back to 8000 at startup isn't
+detected, so set the URL below if yours does), not its Windows hostname, because
+phones resolve mDNS rather than NetBIOS and a bare PC name simply fails on iOS and Android.
+Re-deriving it every morning means a DHCP change heals itself; override with
 `cfg.email_dashboard_url` for a fixed name, a different port, or a reverse proxy.
 
 The email keeps using the **number** even though the rig now publishes `critter-cam.local`
@@ -1240,6 +1350,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 
 | Table | What it records |
 |-------|-----------------|
+| `cameras` | **The cameras the rig runs** — the authority, not `config_local.py`, which only seeds it once per source. One row per `source`: kind (`local` index or `network` URL split into scheme/host/port/path), login, resolution and motion overrides, `enabled`, and a `deleted_at` tombstone. `source` is write-once because every detection and clip is stamped with it. The password is never returned by the API and is erased when the camera is removed. Edited from the dashboard's **cameras** button. |
 | `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
 | `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
 | `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
@@ -1247,7 +1358,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 | `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
 | `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
 | `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |
-| `identity_references` | Hand-certified photographs of a known individual (`refcam.py`) — identity evidence that does not decay, and that never becomes a matcher template. |
+| `identity_references`, `identity_reference_crops` | Hand-certified photographs of a known individual and the detector crops cut from them (`refcam.py`) — identity evidence that does not decay, and that never becomes a matcher template. |
 
 Example queries:
 
@@ -1329,7 +1440,7 @@ everyone-operates behaviour.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
 - **Keys and passwords go in the secrets file, not `config_local.py`.** `config_local.py` is
-  gitignored, but `backup.py` copies it into the weekly `meta-<date>.zip`, which usually lands in
+  gitignored, but `backup.py` copies it into each `meta-<date>.zip`, which usually lands in
   a cloud-synced folder, unencrypted. So `email_resend_api_key`, `operator_token`, `mqtt_password`,
   `heartbeat_url` and any camera URL carrying a password live in a JSON file outside the project
   that no backup touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
@@ -1341,7 +1452,8 @@ everyone-operates behaviour.
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
   bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about
-  seven weeks: `backyard.db` ~810 MB, `crops/` ~4.7 GB. Deleting old material is a decision the rig
+  seven weeks: `backyard.db` ~810 MB, `crops/` ~4.7 GB; by 2026-10-01, with the trail cam added,
+  the database alone was ~3.8 GB. Deleting old material is a decision the rig
   deliberately leaves to you, so make it consciously rather than discovering it as a full disk.
 - **Reporting a problem:** see [SECURITY.md](SECURITY.md).
 
@@ -1388,7 +1500,8 @@ It's a camera pointed at the outdoors, which makes a few things worth saying pla
 
 A pure-logic test suite covers the data-shaping code — visit collapsing, behaviour profiles,
 the two-axis readout, the non-animal gate's scoring, clip motion + embeddings, shot-quality, and
-the DB layer — with **no GPU, camera, or model download needed**:
+the DB layer — with **no GPU, camera, network, or model download needed** (CI runs it on
+Python 3.12; the rig runs 3.14):
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\ -q
@@ -1423,6 +1536,21 @@ Full plan and design philosophy: **[docs/plan.md](docs/plan.md)**. The short ver
   visit ledger refreshes itself again when the labels land. Running a card whose contents get
   **formatted away each cycle**? Read **[the import runbook](docs/runbook-trailcam-import.md)**
   first — it is the budget-and-backup sequence that keeps a prune from eating the only copy.
+- **Since then, all built:** the [Creature Report](#web-dashboard---serve) digest and its
+  [morning email](#a-morning-email); [MQTT sighting alerts](#live-sighting-alerts-mqtt);
+  `critter-cam.local` over [mDNS](#telling-someone-else-how-to-connect); cameras in the database
+  and network cameras ([runbook](docs/runbook-add-network-camera.md)); the
+  [machine move](#moving-the-rig-to-a-new-machine) (`migrate.py pack`/`restore`, done for real on
+  2026-08-23); and the [making-of site](https://unclemattmakes.github.io/backyard-critter-cam/).
+- **Ops hardening (September 2026),** after a run of host hangs: rigwatch `--hold` and its
+  stale-naming, stale-batch and off-host heartbeat alarms; the nightly batch running from a copy;
+  an eval gate with a pinned baseline, floors and a staleness check; daily media backups with
+  weekly snapshots, opt-in snapshot retention, and a prune guard that checks archive membership;
+  secrets moved out of `config_local.py`; species-scoped naming; low-confidence labels shown as
+  Unidentified.
+- **Open:** a durable identity cue that doesn't decay in a week (appearance does — see
+  [phase 3](#individual-re-identification-phase-3)). The ranked backlog is
+  [docs/deferred-work.md](docs/deferred-work.md).
 
 Guiding principle: keep **appearance and behaviour on separate axes** and surface both —
 augment the critter-knower, don't replace them. And: boring and robust over clever; most of

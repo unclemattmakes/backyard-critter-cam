@@ -1,6 +1,6 @@
 # The refimg shadow review, run 2026-08-09 — and it was not inert
 
-`docs/deferred-work.md` §1.4 recorded, on the morning of 2026-08-09, that the reference-image veto
+`docs/archive/deferred-work-2026-08.md` §1.4 recorded, on the morning of 2026-08-09, that the reference-image veto
 had flagged **nothing** after a full night live, and reframed the review question from "are these
 flags furniture?" to "why does motion-mask coverage never reach the bar?".
 
@@ -195,7 +195,7 @@ contact sheets.
    the cover quantiles. `db.record_suppression` writes a row only for SUPPRESS, which is precisely
    why an inert veto and a perfectly precise one are indistinguishable in the database, and why
    answering §1.4 took a full clip replay. One line an hour would have answered it in a `grep`.
-   (This is the concrete case for `docs/deferred-work.md` §6's missing `shadow_reviews` record.)
+   (This is the concrete case for `docs/archive/deferred-work-2026-08.md` §6's missing `shadow_reviews` record.)
 
 ## 6. Still unmeasured, and it is the one that decides coverage's future
 

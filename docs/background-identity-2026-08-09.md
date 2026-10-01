@@ -1,6 +1,6 @@
 # Does the background identify the animal? Yes — and past a week, it is all there is
 
-`docs/deferred-work.md` §2.1 called this the evaluation's most consequential unrun test. It is run.
+`docs/archive/deferred-work-2026-08.md` §2.1 called this the evaluation's most consequential unrun test. It is run.
 
 **The question.** Every re-ID number this project reports is a top-1 against a 0.345 majority
 baseline ("always say Stan"). But a crop is not just an animal: it is an animal *somewhere*, and a
@@ -96,7 +96,7 @@ left of the number is the yard.*
    days. Measured that way the shipped 0.741 is a +0.144 achievement, not a +0.396 one, and the
    7-day 0.482 is not an achievement at all.
 2. **The next move is capture geometry, not a better backbone** — which is exactly the branch
-   `deferred-work` §2.1 wrote in advance. More pixels on the body and fewer on the wall behind it;
+   `archive/deferred-work-2026-08` §2.1 wrote in advance. More pixels on the body and fewer on the wall behind it;
    a tighter, more consistent framing at the dish. A backbone swap cannot separate two channels
    that are carrying the same information.
 3. **It raises the value of era-invariant signals** already on the backlog — the ear notch (§3.4),

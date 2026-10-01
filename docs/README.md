@@ -5,10 +5,16 @@ system works and how to run it, read the [README](../README.md) at the repo root
 
 ## Current — keep these true
 
-- [deferred-work.md](deferred-work.md) — the live backlog: what the 2026-08-08 evaluation
-  surfaced and the same-day implementation pass did *not* build, each with the plan as
-  adversarial review left it and the first step that would move it. Ends with **Killed, with
-  reasons** — the ideas that were measured dead, kept so nobody rediscovers them.
+- [deferred-work.md](deferred-work.md) — the ranked backlog, rewritten 2026-10-01: what's worth
+  doing next, why, and roughly how big. Links to the measured-dead ideas in the archived August
+  version.
+- [host-instability-2026-08.md](host-instability-2026-08.md) — **an open investigation, updated
+  in place with dated entries**: the rig's host hard-hangs under load, what has been ruled out
+  (the PSU), what is being tried (the GPU power cap, the AVX2 cap on the naming helper), and what
+  to try next. Read its status line first.
+- [runbook-add-network-camera.md](runbook-add-network-camera.md) — the operational sequence for
+  adding a network camera (RTSP or HTTP/MJPEG), including the two steps that look like faults and
+  aren't, and what this rig actually runs.
 - [runbook-trailcam-import.md](runbook-trailcam-import.md) — the operational sequence for
   importing an SD card whose contents get formatted away each cycle: orient, check the clip
   budget, archive first, verify before you format. The checks exist because the card is the only
@@ -19,8 +25,9 @@ system works and how to run it, read the [README](../README.md) at the repo root
 
 ## Dated snapshots — do not read as current documentation
 
-Each was written on the day in its banner and is kept because it explains *why* the code looks
-the way it does. Findings in them have largely been addressed since.
+Each was written on the date in its name or banner and is kept because it explains *why* the
+code looks the way it does. Findings in them have largely been addressed since, and their numbers
+are frozen at that date.
 
 - [plan.md](plan.md) — the original project plan (2026-06-07), written before a line of it existed:
   the two-axis "looks like X but isn't acting like X" idea, the four phases, and the per-species
@@ -38,6 +45,15 @@ the way it does. Findings in them have largely been addressed since.
 - [refimg-design-2026-08-07.md](refimg-design-2026-08-07.md) — the empty-scene reference veto,
   designed and then raced against real footage before shipping: why the bare-pixel metric erases
   raccoons, why rolling background models are forbidden here, and why it went out in shadow mode.
+- [background-identity-2026-08-09.md](background-identity-2026-08-09.md) — does the background
+  identify the animal? Yes: with the animal blanked out the matcher is still right 60% of the
+  time, and at a 7-day embargo the animal adds nothing over the scene.
+- [refimg-review-2026-08-09.md](refimg-review-2026-08-09.md) — the first review of the veto's
+  shadow-mode flags (18, all furniture), why coverage keeps it from firing by day, and the dawn
+  "camera moved" false alarm it uncovered.
+- [archive/deferred-work-2026-08.md](archive/deferred-work-2026-08.md) — the August backlog in
+  full, kept verbatim: every plan as adversarial review left it, and **Killed, with reasons**,
+  the ideas that were measured dead.
 
 Developer utilities live in [../tools/](../tools/). `check_endpoints.py` cross-checks the
 dashboard's `/api/` calls against the routes `web.py` actually defines. `eval_rigidity.py`
@@ -45,3 +61,4 @@ re-sweeps `staticfilter.DEFAULT_RIGID_MAXPAIR` — the threshold below which a r
 is judged furniture on its pixels rather than its persistence — against this yard's own
 furniture and animal populations. **Run it before changing that constant**: it deletes rows,
 and the number it defends is the distance to the lowest-scoring real animal on record.
+`camprobe.py` probes an RTSP camera before you add it (see the network-camera runbook).
