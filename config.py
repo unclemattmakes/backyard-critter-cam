@@ -37,6 +37,11 @@ ROOT = Path(__file__).resolve().parent
 # can show "warming up" vs "naming" vs "stopped". A hidden file in the project root.
 NAMING_STATUS_FILE = ROOT / ".naming_status.json"
 
+# The rig's health record (health.py reads both): rigwatch's state, which carries its active
+# alarms, and backup.py's last-run verdict plus the lost clip days it has already reported.
+RIGWATCH_STATE_FILE = ROOT / ".rigwatch_state.json"
+BACKUP_STATE_FILE = ROOT / ".backup_state.json"
+
 
 # ---- Secrets file -----------------------------------------------------------------
 # Credentials live in a small JSON file OUTSIDE the project, so backup.py's meta zip (which

@@ -6,6 +6,7 @@ allowed to do nothing, and neither may ever do something surprising -- restartin
 just stopped, or parking the batch on top of the raccoon peak."""
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -450,3 +451,90 @@ def test_status_never_pings_and_shows_only_the_host(monkeypatch, pings, capsys):
     out = capsys.readouterr().out
     assert pings == []
     assert "hc-ping.example" in out and "secret-token" not in out
+
+
+# --------------------------------------------------------------------------- the health record
+# The log above is for post-mortems; nothing reads it live. The state file's "alarms" is what the
+# morning email and the dashboard read (health.py), so it must hold exactly what is true now.
+
+def _alarms() -> dict:
+    return rigwatch._state().get("alarms")
+
+
+def test_a_standing_alarm_keeps_its_first_seen_and_clears_when_the_condition_does(monkeypatch):
+    _eval_artifact(50)
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {"present": False, "stale": False})
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    first = _alarms()["batch_stale"]
+    assert first["severity"] == "warn" and "50 h" in first["message"]
+    assert first["first_seen"] == first["last_seen"]
+    assert rigwatch.main() == 0                          # five minutes later: still standing
+    again = _alarms()["batch_stale"]
+    assert again["first_seen"] == first["first_seen"] and again["last_seen"] >= first["last_seen"]
+    _eval_artifact(1)                                    # the batch finished a night
+    assert rigwatch.main() == 0
+    assert _alarms() == {}
+    assert "cleared: batch_stale" in _log_text()
+    assert time.time() - rigwatch._state()["checked_at"] < 60
+
+
+def test_every_alarm_kind_lands_in_the_record(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: None)
+    rigwatch.main()
+    assert set(_alarms()) == {"psutil_missing"}
+
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    rigwatch.HOLD_MARKER.write_text("held")
+    rigwatch.main()
+    assert set(_alarms()) == {"rig_held"}                # psutil_missing cleared itself
+    rigwatch.main()                                      # the LOG line is hourly; the record is not
+    assert set(_alarms()) == {"rig_held"}
+    rigwatch.HOLD_MARKER.unlink()
+
+    for _ in range(rigwatch.MAX_STARTS_PER_HOUR):
+        rigwatch._record_start()
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("should back off"))
+    rigwatch.main()
+    assert set(_alarms()) == {"restart_storm"}
+    assert _alarms()["restart_storm"]["severity"] == "alarm"
+
+
+def test_naming_alarms_land_in_the_record(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {
+        "present": True, "state": "ready", "age_s": 3600.0, "stale": True, "backlog": None})
+    rigwatch.main()
+    assert "60 min ago" in _alarms()["naming_stale"]["message"]
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {
+        "present": True, "state": "error", "age_s": 5.0, "stale": False, "backlog": 3,
+        "detail": "CUDA out of memory"})
+    rigwatch.main()
+    assert set(_alarms()) == {"naming_error"}
+    assert "CUDA out of memory" in _alarms()["naming_error"]["message"]
+
+
+def test_a_corrupt_state_file_is_survived_and_replaced(monkeypatch):
+    rigwatch.STATE_FILE.write_text("{torn mid-wri")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {"present": False, "stale": False})
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    st = json.loads(rigwatch.STATE_FILE.read_text())
+    assert st["alarms"] == {} and "checked_at" in st
+    assert [p.name for p in rigwatch.STATE_FILE.parent.glob("*.tmp")] == []
+
+
+def test_status_lists_the_active_alarms_and_writes_nothing(monkeypatch, capsys):
+    rigwatch._write_state({"starts": [], "checked_at": 1.0, "alarms": {
+        "rig_held": {"severity": "warn", "message": "The rig is down and held.",
+                     "first_seen": 1.0, "last_seen": 1.0}}})
+    before = rigwatch.STATE_FILE.read_text()
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", "--status"])
+    assert rigwatch.main() == 0
+    assert "[warn] rig_held: The rig is down and held." in capsys.readouterr().out
+    assert rigwatch.STATE_FILE.read_text() == before
