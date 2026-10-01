@@ -20,11 +20,14 @@ import dataclasses
 import os
 import shutil
 import subprocess
+from datetime import date
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
+import backup
 import clips
 import config
 import db
@@ -661,16 +664,158 @@ def test_prune_refuses_to_delete_the_only_copy(clip_cfg, clip_conn, tmp_path):
     assert (clip_cfg.clips_dir / "trail_cam_sd" / "2026-08-01" / "a.mp4").exists()
 
 
-def test_prune_proceeds_once_the_day_archive_exists(clip_cfg, clip_conn, tmp_path):
-    _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4", mtime=1_000, mib=2)
+def _member(p: Path) -> str:
+    """The arcname backup.py stores a file under -- project-relative, posix separators."""
+    return Path(db.rel_to_root(p)).as_posix()
+
+
+@pytest.fixture
+def archive_index(tmp_path, monkeypatch):
+    """Point the prune guard's LOCAL archive index somewhere disposable, and hand back a writer.
+    Without this a test would read the real rig's index out of the project root."""
+    idx = tmp_path / "archive-index"
+    monkeypatch.setattr(backup, "ARCHIVE_INDEX_DIR", idx)
+
+    def write(stem: str, holds: dict) -> None:
+        backup.write_archive_index(idx, stem, holds)
+    return write
+
+
+def _guarded_cfg(clip_cfg, dest):
+    return dataclasses.replace(clip_cfg, backup_dest=dest,
+                               clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(1)},
+                               clips_irreplaceable_sources=("trail_cam_sd",))
+
+
+def test_prune_proceeds_once_the_archive_actually_holds_the_clip(
+        clip_cfg, clip_conn, tmp_path, archive_index):
+    _, p = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4",
+                       mtime=1_000, mib=2)
     dest = tmp_path / "drive"
     (dest / "clips").mkdir(parents=True)
-    (dest / "clips" / "clips-trail_cam_sd-2026-08-01.zip").write_bytes(b"PK" + bytes([5, 6]) + bytes(18))
-    cfg = dataclasses.replace(clip_cfg, backup_dest=dest,
-                              clips_max_gb_by_source={db.SOURCE_TRAIL_CAM_SD: _mib_budget(1)},
-                              clips_irreplaceable_sources=("trail_cam_sd",))
-    assert clips.prune_clips(cfg, clip_conn) == 1
-    assert not (clip_cfg.clips_dir / "trail_cam_sd" / "2026-08-01" / "a.mp4").exists()
+    zip_name = "clips-trail_cam_sd-2026-08-01.zip"
+    (dest / "clips" / zip_name).write_bytes(b"PK" + bytes([5, 6]) + bytes(18))
+    archive_index("clips-trail_cam_sd-2026-08-01", {_member(p): zip_name})
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 1
+    assert not p.exists()
+
+
+def test_a_clip_backfilled_into_an_already_archived_day_is_held(
+        clip_cfg, clip_conn, tmp_path, archive_index):
+    """THE hole this closes. The trail-cam card is dumped and goes straight back in the camera, so
+    its dump day arrives in two batches -- the second lands in a date that was archived days ago.
+    The guard used to ask only whether that day had a zip, which was true, and the budget was free
+    to delete footage that had never been inside one. The card has since been formatted."""
+    _, archived = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4",
+                              mtime=1_000, mib=2)
+    _, backfilled = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "b.mp4",
+                                mtime=2_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    zip_name = "clips-trail_cam_sd-2026-08-01.zip"
+    (dest / "clips" / zip_name).write_bytes(b"PK" + bytes([5, 6]) + bytes(18))
+    archive_index("clips-trail_cam_sd-2026-08-01", {_member(archived): zip_name})
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 1
+    assert not archived.exists(), "the archived clip should still be prunable"
+    assert backfilled.exists(), "a clip no archive holds must survive the budget"
+
+
+def test_prune_holds_a_day_with_no_index_at_all(clip_cfg, clip_conn, tmp_path, archive_index):
+    """A fresh clone or a restored machine has archives but no local index yet. "I cannot prove
+    it" keeps the footage and says so; one backup.py run rebuilds the index."""
+    _, p = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4",
+                       mtime=1_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    (dest / "clips" / "clips-trail_cam_sd-2026-08-01.zip").write_bytes(
+        b"PK" + bytes([5, 6]) + bytes(18))
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 0
+    assert p.exists()
+
+
+def test_prune_holds_when_the_archive_the_index_names_has_gone_missing(
+        clip_cfg, clip_conn, tmp_path, archive_index):
+    """A zip written on 08-21 was simply GONE from Drive the next day. The index says which
+    archive holds a clip; that archive still has to be there."""
+    _, p = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4",
+                       mtime=1_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    archive_index("clips-trail_cam_sd-2026-08-01",
+                  {_member(p): "clips-trail_cam_sd-2026-08-01.zip"})   # ...but no such file
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 0
+    assert p.exists()
+
+
+def test_prune_proceeds_for_a_clip_archived_in_a_later_part(
+        clip_cfg, clip_conn, tmp_path, archive_index):
+    """A day is a set of archives; the guard must accept whichever part holds the clip."""
+    _, p = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "b.mp4",
+                       mtime=2_000, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    part2 = "clips-trail_cam_sd-2026-08-01.part2.zip"
+    (dest / "clips" / part2).write_bytes(b"PK" + bytes([5, 6]) + bytes(18))
+    archive_index("clips-trail_cam_sd-2026-08-01", {_member(p): part2})
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 1
+    assert not p.exists()
+
+
+def test_the_day_index_is_read_once_per_day_not_once_per_clip(
+        clip_cfg, clip_conn, tmp_path, archive_index, monkeypatch):
+    """The reason this is answered from a local index at all is cost, so the cost is pinned. Even
+    a local read per CLIP would be wasteful; against the cloud archives themselves it would be
+    catastrophic -- opening a zip's central directory on Drive materialises the whole file, and a
+    backup dry-run reading ~185 of them grew Drive's cache from 10 to 86 GiB."""
+    for i in range(3):
+        _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", f"c{i}.mp4",
+                    mtime=1_000 + i, mib=2)
+    dest = tmp_path / "drive"
+    (dest / "clips").mkdir(parents=True)
+    reads: list[str] = []
+    real = backup.read_archive_index
+    monkeypatch.setattr(backup, "read_archive_index",
+                        lambda d, stem: (reads.append(stem), real(d, stem))[1])
+
+    clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn)      # all three examined, all held
+
+    assert reads == ["clips-trail_cam_sd-2026-08-01"]
+
+
+def test_backup_and_the_prune_guard_agree_end_to_end(
+        clip_cfg, clip_conn, tmp_path, monkeypatch):
+    """The index is a contract BETWEEN two modules, so this drives both real functions rather than
+    hand-writing one side: backup.archive_media records what its archives hold, and the guard
+    answers out of that record. A hand-written index would pin the contract to itself."""
+    monkeypatch.setattr(backup, "ROOT", tmp_path)
+    monkeypatch.setattr(db, "_ROOT", tmp_path)
+    idx = tmp_path / "archive-index"
+    monkeypatch.setattr(backup, "ARCHIVE_INDEX_DIR", idx)
+
+    stamp = 1_785_000_000                       # a real 2026 mtime: zipfile refuses pre-1980
+    _, archived = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "a.mp4",
+                              mtime=stamp, mib=2)
+    dest = tmp_path / "drive"
+    backup.archive_media(clip_cfg.clips_dir, dest / "clips", date(2026, 8, 2),
+                               dry_run=False, index_dir=idx)
+    # Imported after that archive was sealed -- the two-batch dump day, for real this time.
+    _, backfilled = _dated_clip(clip_cfg, clip_conn, "trail_cam_sd", "2026-08-01", "b.mp4",
+                                mtime=stamp + 60, mib=2)
+
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 1
+    assert not archived.exists()
+    assert backfilled.exists()
+
+    # ...and once backup.py has caught up, it becomes prunable like anything else.
+    backup.archive_media(clip_cfg.clips_dir, dest / "clips", date(2026, 8, 2),
+                               dry_run=False, index_dir=idx)
+    assert clips.prune_clips(_guarded_cfg(clip_cfg, dest), clip_conn) == 1
+    assert not backfilled.exists()
 
 
 def test_prune_gate_fails_closed_without_a_backup_destination(clip_cfg, clip_conn):

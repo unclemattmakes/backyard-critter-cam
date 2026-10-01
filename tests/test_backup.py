@@ -836,3 +836,95 @@ def test_meta_zip_names_the_secrets_it_is_about_to_upload(tmp_path):
     assert str(dest) in joined                        # ...and WHERE it is going
     # An item that carries no secret says nothing: a warning on every line is a warning on none.
     assert backup._secret_notice([tmp_path / "reid", tmp_path / "tuning"], dest) == []
+
+
+# --- the local archive index: what lets the prune guard check membership cheaply ------------
+
+def _index(index_dir: Path, stem: str):
+    return backup.read_archive_index(index_dir, stem)
+
+
+def test_archiving_a_day_records_which_archive_holds_each_file(project, dest, tmp_path):
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert holds is not None
+    assert set(holds) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1}
+    assert set(holds.values()) == {ZIP}
+
+
+def test_a_top_up_extends_the_index_with_the_new_part(project, dest, tmp_path):
+    """The guard checks that the archive NAMED for a clip is still present, so the index has to
+    say which part holds what -- not merely that the day is covered."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+    _clips(project, BATCH2)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert {holds[f"clips/trail_cam_sd/{DAY}/{n}"] for n in BATCH1} == {ZIP}
+    assert {holds[f"clips/trail_cam_sd/{DAY}/{n}"] for n in BATCH2} == {f"{STEM}.part2.zip"}
+
+
+def test_a_day_needing_no_new_archive_still_gets_indexed(project, dest, tmp_path):
+    """How every day archived before the index existed gets one: the day is skipped for WRITING,
+    but its central directories were read to decide that, so recording them is free. Without this
+    the guard would hold the whole back catalogue until each day happened to gain a file."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False)   # no index yet
+    assert _index(idx, STEM) is None
+
+    stats = backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False,
+                                 index_dir=idx)
+
+    assert stats["skipped"] == 1 and stats["created"] == 0
+    assert set(_index(idx, STEM)) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1}
+
+
+def test_a_dry_run_writes_no_index(project, dest, tmp_path):
+    """--dry-run writes nothing anywhere, and an index claiming an archive that was never written
+    would license deleting the footage it claims to cover."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=True, index_dir=idx)
+
+    assert _index(idx, STEM) is None
+
+
+def test_no_index_is_written_for_roots_that_have_no_guard(project, dest, tmp_path):
+    """Only clips/ has a prune guard reading one. crops/ and frames/ would be thousands of
+    entries a day that nothing ever reads."""
+    idx = tmp_path / "archive-index"
+    _write(project / "crops" / DAY, ["a.jpg", "b.jpg"])
+
+    backup.archive_media(project / "crops", dest / "crops", TODAY, dry_run=False)
+
+    assert not idx.exists()
+
+
+def test_the_index_records_what_landed_not_what_was_intended(project, dest, tmp_path, monkeypatch):
+    """zip_tree drops a file the pruner deletes out from under it, and an index claiming a clip is
+    archived when it is not would license deleting the last copy. So the archive is read back."""
+    idx = tmp_path / "archive-index"
+    day = _clips(project, BATCH1)
+    real_write = backup.zipfile.ZipFile.write
+
+    def drop_one(self, filename, arcname=None, *a, **k):
+        if str(filename).endswith(BATCH1[0]):
+            raise FileNotFoundError(filename)       # vanished mid-zip, exactly as the pruner does
+        return real_write(self, filename, arcname, *a, **k)
+    monkeypatch.setattr(backup.zipfile.ZipFile, "write", drop_one)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert f"clips/trail_cam_sd/{DAY}/{BATCH1[0]}" not in holds, \
+        "the index claimed a file the archive does not hold"
+    assert set(holds) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1[1:]}
+    assert (day / BATCH1[0]).exists()
