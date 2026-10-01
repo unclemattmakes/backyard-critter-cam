@@ -3319,7 +3319,7 @@ function camSave(ev){
 
 function camDelete(id){
   const c=CAMS.rows.find(r=>r.id===id); if(!c) return;
-  if(!confirm(`Remove ${c.name||c.source}?\n\nThe photos, visits and clips it already recorded are kept — they stay filed under "${c.source}". Adding a camera with that same short name later reattaches to them.`)) return;
+  if(!confirm(`Remove ${c.name||c.source}?\n\nThe photos, visits and clips it already recorded are kept — they stay filed under "${c.source}". Adding a camera with that same short name later reattaches to them. Its stored password is erased.`)) return;
   fetch('/api/cameras/delete',{method:'POST',headers:{'Content-Type':'application/json'},
                                body:JSON.stringify({id})})
     .then(r=>r.json().then(d=>({ok:r.ok,d})))

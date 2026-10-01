@@ -58,12 +58,12 @@ software stores, and it gets narrower rules than everything else above.
   `logs/backyard_cam.log.*` and in every meta zip built from them. If you ran a networked camera
   before that date, rotate its password and delete those log copies — the fix protects new lines,
   not the ones already written.
-- **Deleting the camera does not delete the password.** Removing a camera from the dashboard is a
-  soft delete: the row is tombstoned so a config-listed camera can't come back on the next start,
-  and so re-adding the name is a one-click undelete — which only works because the stored password
-  is still there. The credential therefore outlives the camera, in `backyard.db` and in every
-  backup of it. To actually destroy one: re-add the camera, clear its password *at the rig*, then
-  remove it again. Or rotate it on the camera, which is the better answer anyway.
+- **Deleting the camera deletes the password.** Removing a camera from the dashboard is a soft
+  delete — the row is tombstoned so a config-listed camera can't come back on the next start — but
+  its stored password is erased, so a tombstone is not a credential. Re-adding the name undeletes
+  the row without one; set it again at the rig. Rows removed before 2026-09-30 are cleaned on the
+  rig's next start. Older database snapshots in your backups still hold them: rotate those
+  passwords on the camera if that matters.
 - **Give the camera its own account.** Make a dedicated user on the camera rather than reusing
   its admin login — most cameras support this, and it means the credential on disk cannot also
   reconfigure the camera.

@@ -412,8 +412,8 @@ motion area. Two things it deliberately does not pretend:
   thread when the rig starts, so unlike ignore zones a camera cannot be attached to a running rig.
   The panel says so.
 - **A camera's short name is permanent.** It is stamped on every detection, visit and clip folder
-  recorded under it, so renaming would orphan all of it. Removing a camera keeps those rows, and
-  re-adding the same short name reattaches to them.
+  recorded under it, so renaming would orphan all of it. Removing a camera keeps those rows (its
+  stored password is erased), and re-adding the same short name reattaches to them.
 
 A camera **password** can only be set from the rig machine itself, never over the network — see
 [SECURITY.md](SECURITY.md#camera-credentials--the-one-exception). Everything else is editable from
