@@ -853,6 +853,75 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
     assert db.visit_labels_by_source(conn, "auto", "raccoon") == {}
 
 
+def _outvoted_raccoon_visit(conn, vec, *, start_min, n_noise=4):
+    """A raccoon visit whose crop-count vote went to 'not an animal' -- the 2026-06-26 visit:
+    30 raccoon crops, 43 low-confidence 'not an animal' boxes, visits.species 'not an animal'."""
+    ids, raccoon = [], []
+    for k in range(3):
+        d = _det(conn, minutes=start_min + k * 0.2)
+        _embed(conn, d, _unit(*vec))
+        raccoon.append(d)
+    noise = [_det(conn, minutes=start_min + 0.1 + k * 0.2, species="not an animal",
+                  confidence=0.28, bbox=(60, 60, 70, 70)) for k in range(n_noise)]
+    vid = _visit(conn, raccoon + noise, species="not an animal",
+                 start_min=start_min, end_min=start_min + 1)
+    return vid, raccoon, noise
+
+
+def _names(conn, ids):
+    return {r["id"]: (r["individual_id"], r["individual_source"]) for r in conn.execute(
+        f"SELECT id, individual_id, individual_source FROM detections "
+        f"WHERE id IN ({','.join('?' * len(ids))})", ids)}
+
+
+def test_auto_assign_names_the_raccoon_crops_of_a_visit_outvoted_by_noise(conn, cfg):
+    """Regression (2026-09-28): the nightly pass matched a visit on its raccoon crops, then
+    label_visit scoped the write to visits.species -- 'not an animal' -- so 43 noise boxes got
+    'Notch' (auto) and the 30 raccoon crops stayed unnamed."""
+    _named_visits(conn, "Notch", [[0, 1, 0]], first_min=0)
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100)
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    r = m.auto_assign(conn, threshold=0.75, margin=0.1, min_templates=1)
+    assert [(a["visit_id"], a["name"]) for a in r["assigned"]] == [(vid, "Notch")]
+    named = _names(conn, raccoon + noise)
+    assert all(named[d] == ("Notch", "auto") for d in raccoon)
+    assert all(named[d] == (None, None) for d in noise)
+    assert db.visit_labels_by_source(conn, "auto") == {vid: "Notch"}
+
+    # And the next night sees it as already named, so it is not re-stamped.
+    r2 = VisitMatcher(conn, "raccoon", cfg).auto_assign(conn, threshold=0.75, margin=0.1,
+                                                        min_templates=1)
+    assert r2["assigned"] == [] and r2["skipped"]["already_auto"] == 1
+
+
+def test_auto_assign_skips_a_visit_with_no_matching_species_rows_left(conn, cfg):
+    """If the raccoon crops are gone by write time (a human re-labelled them), nothing is written
+    -- not onto the remaining rows, not onto the visits row -- and the visit is reported."""
+    _named_visits(conn, "Notch", [[0, 1, 0]], first_min=0)
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100)
+    m = VisitMatcher(conn, "raccoon", cfg)
+    conn.execute(f"UPDATE detections SET species = 'Virginia opossum' "
+                 f"WHERE id IN ({','.join('?' * len(raccoon))})", raccoon)
+    conn.commit()
+
+    r = m.auto_assign(conn, threshold=0.75, margin=0.1, min_templates=1)
+    assert r["assigned"] == []
+    assert r["skipped"]["no_matching_species"] == 1 and r["no_matching_species"] == [vid]
+    assert all(v == (None, None) for v in _names(conn, raccoon + noise).values())
+    assert conn.execute("SELECT individual_id FROM visits WHERE id=?", (vid,)).fetchone()[0] is None
+
+
+def test_label_visit_species_overrides_the_visits_dominant_species(conn):
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [1, 0, 0], start_min=0)
+    assert db.label_visit(conn, vid, "Stan", species="raccoon") == len(raccoon)
+    named = _names(conn, raccoon + noise)
+    assert all(named[d][0] == "Stan" for d in raccoon)
+    assert all(named[d][0] is None for d in noise)
+    # Without it, the dominant-species scope is unchanged (the human path).
+    assert db.label_visit(conn, vid, "Stan") == len(noise)
+
+
 # ---------------------------------------------------------------------------
 # Auto-assign guardrails: the per-individual TEMPLATE FLOOR and the SOURCE GUARD.
 # Both are refusals that protect the human label set (docs/identity-eval-2026-08-05.md,
