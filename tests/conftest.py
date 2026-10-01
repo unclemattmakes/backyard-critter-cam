@@ -17,11 +17,17 @@ lean environment loses one test file instead of collapsing at collection.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+
+# Never let the operator's real secrets file (config.secrets_path) reach a test: point it at a
+# path that cannot exist BEFORE anything imports config, so a mail key or operator token on this
+# machine can't switch on sending or the viewer split mid-suite.
+os.environ["CRITTER_CAM_SECRETS"] = str(Path(__file__).resolve().parent / "no-such-secrets.json")
 
 # The project root is the parent of this tests/ directory. Putting it first on sys.path lets
 # `import db`, `import visits`, ... resolve to the live modules without an install step.

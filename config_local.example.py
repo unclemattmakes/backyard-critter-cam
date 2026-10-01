@@ -1,8 +1,27 @@
-"""Local, untracked config overrides.
+r"""Local, untracked config overrides.
 
 Copy this file to `config_local.py` (which is gitignored) and set any private or
 machine-specific values there. config.py imports it automatically after building CONFIG,
 so whatever you set here overrides the defaults in config.py -- and never enters git.
+
+PASSWORDS AND KEYS DO NOT GO IN THIS FILE. backup.py copies config_local.py into every meta zip
+it writes to your (usually cloud-synced) backup folder. Put them in the secrets file instead --
+a JSON file outside the project that no backup touches:
+
+    %USERPROFILE%\.critter-cam\secrets.json      (Windows)
+    ~/.critter-cam/secrets.json                   (Linux, macOS)
+    ...or wherever the CRITTER_CAM_SECRETS environment variable points.
+
+    {
+      "email_resend_api_key": "re_...",
+      "operator_token": "pick-a-phrase",
+      "mqtt_password": "...",
+      "yard_ir_url": "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub"
+    }
+
+email_resend_api_key, operator_token and mqtt_password are applied to the config automatically
+(a value set in this file still wins). Any other key is yours to read here with
+config.secret("name") -- see the camera list below. A missing secrets file just means no secrets.
 """
 
 
@@ -35,9 +54,9 @@ def apply(cfg):
     # Household viewing vs curating (OFF unless set). With a token, devices that haven't entered
     # it (dashboard footer, once per browser) become VIEWERS: they read and play everything and
     # can log "who's here" as reviewable testimony, but every label/settings write is refused by
-    # the server. Localhost is always the operator. Without this line, every device on your
+    # the server. Localhost is always the operator. Without a token, every device on your
     # Wi-Fi can edit labels -- fine alone, risky with houseguests' phones on the network.
-    # cfg.operator_token = "pick-a-phrase"
+    # Set it as "operator_token" in the secrets file (see the top of this file), not here.
 
     # The rig's NAME on your network. With the LAN launcher it answers to
     # "http://critter-cam.local" -- no port, because the dashboard serves on 80, the port a
@@ -74,14 +93,14 @@ def apply(cfg):
     # re-ID / behaviour keep the cameras separate automatically. (Tip for a nocturnal yard: a PoE
     # IR camera is the night workhorse; an ESP32-CAM is a fun, cheap DAYTIME angle -- weak in the dark.)
     #
-    # from config import CameraSpec
+    # from config import CameraSpec, secret
     # cfg.cameras = [
     #     # The existing glass-door USB webcam (keep it as the primary).
     #     CameraSpec("glass_door_cam", 0, name="Glass door"),
     #     # A Reolink (or any RTSP/ONVIF) PoE camera -- use the lower-res SUB-stream for the motion
-    #     # gate so decoding stays cheap. Put your camera's user/pass and LAN IP in the URL.
-    #     CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
-    #                name="Yard (night IR)"),
+    #     # gate so decoding stays cheap. The URL carries the camera's password, so it lives in the
+    #     # secrets file (key "yard_ir_url") rather than here.
+    #     CameraSpec("yard_ir", secret("yard_ir_url"), name="Yard (night IR)"),
     #     # An ESP32-CAM streaming MJPEG over HTTP (Arduino CameraWebServer). Lower-res, so give it a
     #     # smaller motion_min_area than the 1280x720 default (the trigger is in pixels).
     #     CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
@@ -118,14 +137,13 @@ def apply(cfg):
     # cfg.backup_dest = Path(r"C:\cloud-synced-folder\backyard")
 
     # The morning email (newsletter.py) -- last night's Creature Report as a small newspaper in your
-    # inbox. Sending needs a free https://resend.com account with a verified sender domain; all
-    # three values are private, so they live here, never in config.py. Schedule
+    # inbox. Sending needs a free https://resend.com account with a verified sender domain; the
+    # API key goes in the secrets file as "email_resend_api_key", the addresses here. Schedule
     # `python newsletter.py` daily (README "A morning email"); until these are set the script
     # just archives each issue locally under reports/mail/. Photos ride inside the email, so
     # point email_to only at people you'd show the dashboard to.
     # cfg.email_to = "you@example.com"                       # or "you@example.com, them@example.com"
     # cfg.email_from = "Creature Report <dispatch@your-domain.com>"
-    # cfg.email_resend_api_key = "re_..."
     # cfg.email_dashboard_url = "http://192.168.1.20"   # override the auto-detected LAN address
     # Port 80 is the default and is omitted from every printed address. If something else on
     # this machine needs 80, move the dashboard rather than fighting over it:
@@ -139,5 +157,5 @@ def apply(cfg):
     # Mosquitto somewhere on the network. Test the settings with `python mqttnotify.py --test`.
     # cfg.mqtt_host = "192.168.1.20"
     # cfg.mqtt_username = "critter-cam"
-    # cfg.mqtt_password = "..."
+    # ...and "mqtt_password" in the secrets file.
     # cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*" = every animal
