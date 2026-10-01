@@ -1,0 +1,25 @@
+# Weekly dependency PRs, kept few. CI runs the full suite on each one before anything merges,
+# and nothing reaches the rig until its checkout is pulled and setup is re-run.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      # One PR for the week's minor/patch bumps instead of one per package.
+      pip-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # torch/torchvision are pinned by hand in several places (setup.bat, setup.sh, README and
+      # the CI lock) and each bump needs a check of the cu130/cu126 indexes -- not a bot's job.
+      - dependency-name: torch
+      - dependency-name: torchvision
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
