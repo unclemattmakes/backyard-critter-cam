@@ -1812,3 +1812,31 @@ def test_visit_verify_skips_guesses_hidden_by_the_display_threshold(conn, db_pat
     res = db.apply_visit_label(conn, source="glass_door_cam", start="2026-06-10T21:00:00-07:00",
                                end="2026-06-10T21:01:00-07:00", verify=True)
     assert res["verified"] == 2 and [verified(i) for i in hidden] == [1, 1]
+
+
+def test_health_endpoint_serves_the_rig_health_list(corpus, db_path, monkeypatch):
+    """/api/health is the dashboard banner's feed: the same list the morning email boxes, readable
+    by any client (it is a GET), and an empty list -- never a 500 -- when the reader breaks."""
+    item = {"severity": "alarm", "kind": "rigwatch_silent",
+            "message": "The watchdog (rigwatch.py) has not run for 3 h.",
+            "since": "2026-10-01T07:00:00-07:00"}
+    monkeypatch.setattr(web.health, "rig_health", lambda: [item])
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, body = _get(port, "/api/health")
+        assert status == 200 and body == {"items": [item]}
+
+        def boom():
+            raise ValueError("torn record")
+        monkeypatch.setattr(web.health, "rig_health", boom)
+        status, body = _get(port, "/api/health")
+        assert status == 200 and body == {"items": []}
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)

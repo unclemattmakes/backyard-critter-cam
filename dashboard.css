@@ -709,6 +709,8 @@
   .rig-warn.wedge{ color:#fff; background:var(--rust); border-color:var(--rust); font-weight:600;
     animation:pulse 2s infinite; }
   .rig-warn[hidden]{ display:none; }
+  /* Health lines are sentences, several at once: left-aligned, normal case. */
+  .rig-warn.health{ text-align:left; text-transform:none; letter-spacing:.02em; line-height:1.5; }
 
   /* ---------- the cast strip + individual profiles ----------
      Cast chips: a face, a name, how long since they showed. One tap opens the animal's full

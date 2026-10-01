@@ -880,6 +880,55 @@ def test_species_count_falls_back_without_n_species():
     assert "1 species" in lede
 
 
+# ---- the rig's own health -----------------------------------------------------------------
+# The one channel the owner reads every day. A box above the lede when health.rig_health has
+# anything; nothing at all when it does not.
+
+TWO_ALARMS = [
+    {"severity": "alarm", "kind": "naming_stale",
+     "message": "Species naming has stopped: its heartbeat was last written 95 min ago, so new "
+                "crops are not being named (and visits, re-ID and the nightly eval stall). "
+                "See logs/naming.log.",
+     "since": "2026-08-12T04:55:00-07:00"},
+    {"severity": "warn", "kind": "clips_lost",
+     "message": "1 day of clips was pruned before the backup archived it "
+                "(glass_door_cam/2026-08-10); that footage is gone. 11 such days in all.",
+     "since": "2026-08-12T03:34:00-07:00"},
+]
+
+
+def test_no_health_box_when_all_is_well():
+    for h in (None, []):
+        b = mkbundle()
+        b["health"] = h
+        html = newsletter.render_email(b, {}, lambda cid: None)
+        assert "Rig health" not in html
+        assert "RIG HEALTH" not in newsletter.render_text(b)
+
+
+def test_health_box_sits_above_the_lede_in_both_parts():
+    b = mkbundle()
+    b["health"] = TWO_ALARMS
+    html = newsletter.render_email(b, {}, lambda cid: None)
+    vis = text_of(html)
+    assert "Rig health · 2 things to look at" in vis
+    assert vis.index("Rig health") < vis.index("Between ")       # above the lede
+    assert "⚠ Species naming has stopped" in vis
+    assert "since Aug 12, 4:55 AM" in vis
+    txt = newsletter.render_text(b)
+    assert "RIG HEALTH · 2 THINGS TO LOOK AT" in txt
+    assert txt.index("RIG HEALTH") < txt.index("Between ")
+    assert "  ⚠ 1 day of clips was pruned" in txt and "(since Aug 12, 3:34 AM)" in txt
+
+
+def test_health_messages_are_escaped():
+    b = mkbundle()
+    b["health"] = [{"severity": "alarm", "kind": "naming_error",
+                    "message": "Species naming is erroring: <script>x</script>", "since": None}]
+    html = newsletter.render_email(b, {}, lambda cid: None)
+    assert "<script>x" not in html and "&lt;script&gt;" in html
+
+
 def test_dashboard_link_uses_the_port_the_rig_actually_bound(tmp_path, monkeypatch):
     """Port 80 was taken and the rig fell back to 8000: the links must follow the socket."""
     import mdns

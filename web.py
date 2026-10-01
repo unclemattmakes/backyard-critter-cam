@@ -38,6 +38,7 @@ from pathlib import Path
 import behavior
 import config
 import db
+import health
 import mdns
 import reel
 import stats
@@ -1110,6 +1111,14 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._json(_naming_status())
                 elif path == "/api/evalstatus":
                     self._json(_eval_status())
+                elif path == "/api/health":
+                    # What needs a human (health.rig_health): the same list the morning email
+                    # boxes. Read-only, so viewers see it too.
+                    try:
+                        items = health.rig_health()
+                    except Exception:          # noqa: BLE001 -- a banner is never worth a 500
+                        items = []
+                    self._json({"items": items})
                 elif path == "/api/role":
                     # Which tier THIS client is. The client uses it for comfort (hiding the
                     # curation chrome); the server refuses viewer writes regardless, in do_POST.
