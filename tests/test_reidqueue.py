@@ -150,6 +150,66 @@ def test_queue_is_newest_first_and_mode_filters_page_within_the_window(conn, db_
     assert out["funnel"]["confirmed"] == 2 and out["funnel"]["auto_named"] == 1
 
 
+def _crop_by_hand(conn, det):
+    if det is None:
+        return None
+    r = conn.execute("SELECT crop_path FROM detections WHERE id = ?", (det,)).fetchone()
+    return r["crop_path"].replace("\\", "/") if r and r["crop_path"] else None
+
+
+def _rep_by_hand(conn, visit_id):
+    """The per-visit lookup the batched one replaced: visit -> representative -> crop path."""
+    row = conn.execute("SELECT representative_detection_id FROM visits WHERE id = ?",
+                       (visit_id,)).fetchone()
+    return _crop_by_hand(conn, row[0] if row else None)
+
+
+def _group_by_hand(conn, visit_ids):
+    """A group's crop strip the per-visit way, in the order the group's own query returns."""
+    rows = conn.execute(
+        f"""SELECT representative_detection_id FROM visits
+            WHERE id IN ({','.join('?' * len(visit_ids))})""", visit_ids).fetchall()
+    return [c for c in (_crop_by_hand(conn, r[0]) for r in rows) if c]
+
+
+def test_representative_crops_are_fetched_once_per_page_with_the_same_answers(conn, db_path):
+    ids = _small_corpus(conn)
+    for i in range(6):                              # unconfirmed lookalikes, so refit has fits
+        _visit(conn, vec=_unit(1, 0.02 * i, 0), days_ago=2 + i, backslash=bool(i % 2))
+    seen = []
+    conn.set_trace_callback(seen.append)
+    try:
+        out = reidqueue.queue(conn, _cfg(db_path), since_h=0, limit=100)
+    finally:
+        conn.set_trace_callback(None)
+    # One batched lookup each for the page, the refit fits and each novel group -- never one per
+    # visit (there are 11 visits here).
+    by_id = [q for q in seen if "SELECT id, crop_path FROM detections WHERE id IN" in q]
+    assert 1 <= len(by_id) <= 2 + len(out["refit"]["novel_groups"])
+    assert not [q for q in seen if "SELECT crop_path FROM detections WHERE id =" in q]
+
+    for card in out["queue"]:
+        assert card["rep_crop"] == _rep_by_hand(conn, card["visit_id"])
+    assert next(c for c in out["queue"] if c["visit_id"] == ids["norep"])["rep_crop"] is None
+    assert "\\" not in next(c for c in out["queue"] if c["visit_id"] == ids["auto"])["rep_crop"]
+    fits = [x for f in out["refit"]["fits"].values() for x in f["visits"]]
+    assert fits
+    for x in fits:
+        assert x["rep_crop"] == _rep_by_hand(conn, x["visit_id"])
+    for g in out["refit"]["novel_groups"]:
+        assert g["crops"] == _group_by_hand(conn, g["visits"])
+
+
+def test_bootstrap_group_crops_match_the_per_visit_lookup(conn, db_path):
+    for i in range(6):
+        _visit(conn, vec=_unit(1, 0.02 * i, 0) if i % 2 else _unit(0, 1, 0.02 * i),
+               days_ago=0.1 * i + 0.05, minutes=i, rep=(i != 3), backslash=(i == 5))
+    out = reidqueue.queue(conn, _cfg(db_path), since_h=0)
+    assert out["bootstrap"] and out["refit"] is None
+    for g in out["bootstrap"]:
+        assert g["crops"] == _group_by_hand(conn, g["visits"])
+
+
 # ---- web.py only wraps: each endpoint serves the pure function's JSON, byte for byte ------
 def test_the_queue_endpoint_serves_reidqueue_output_byte_for_byte(conn, db_path):
     ids = _small_corpus(conn)

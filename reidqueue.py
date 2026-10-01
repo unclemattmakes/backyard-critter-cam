@@ -36,6 +36,27 @@ DOSSIER_MAX_CROPS = 60
 
 ADJACENT_CONTEXT_S = 3600.0   # the measured window; display only, never a ranking input
 
+_IN_CHUNK = 500   # ids per IN (...) query: under SQLite's pre-3.32 cap of 999 bound parameters
+
+
+def _rows_in(conn, sql: str, ids) -> list:
+    """`sql` (one `{}` where the IN list goes) run over the distinct non-None `ids`, chunked."""
+    ids = list(dict.fromkeys(i for i in ids if i is not None))
+    out = []
+    for k in range(0, len(ids), _IN_CHUNK):
+        part = ids[k:k + _IN_CHUNK]
+        out += conn.execute(sql.format(",".join("?" * len(part))), part).fetchall()
+    return out
+
+
+def _rep_crops(conn, det_ids) -> dict:
+    """{detection id: crop path, forward slashes} for each id that has a crop. One query per 500
+    ids instead of one per visit; an id with no row or an empty path is simply absent."""
+    return {r["id"]: r["crop_path"].replace("\\", "/")
+            for r in _rows_in(conn, "SELECT id, crop_path FROM detections WHERE id IN ({})",
+                              det_ids)
+            if r["crop_path"]}
+
 
 def appearance_rank(matcher, vid):
     """(name, similarity, lead) for one visit from the APPEARANCE templates only -- the same two
@@ -325,12 +346,6 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
 
     matcher = individuals.VisitMatcher(conn, species, cfg)
 
-    def _rep_crop(det_id):
-        if det_id is None:
-            return None
-        r = conn.execute("SELECT crop_path FROM detections WHERE id = ?", (det_id,)).fetchone()
-        return r["crop_path"].replace("\\", "/") if r and r["crop_path"] else None
-
     cards = []
     all_clips = stats.load_clips(conn)   # once; overlap-match each visit's footage in memory
     # The WHOLE species pool, newest first. The mode filters it and offset/limit page it --
@@ -368,6 +383,7 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     # name in code, so it stays true when a camera is added, moved or retired.
     template_sources = {source_of.get(tvid) for _n, tvid, _p in matcher.templates()}
     template_sources.discard(None)
+    reps = _rep_crops(conn, [v["representative_detection_id"] for v in rows])
     for v in rows:
         s = matcher.suggest(v["id"])
         # Evidence for the human doing the naming: the clips that rolled during this visit
@@ -375,7 +391,8 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
         vclips = [stats._clip_out(c) for c in stats.clips_overlapping(
             all_clips, v["source"],
             db.parse_local(v["started_at"]), db.parse_local(v["ended_at"]))]
-        rep = _rep_crop(v["representative_detection_id"])
+        rep = reps.get(v["representative_detection_id"])
+        # Still one query per card: each strip is its own time range, and a page is <= 100.
         vcrops = [r["crop_path"] for r in conn.execute(
             "SELECT crop_path FROM detections WHERE source = ? AND species = ? "
             "AND timestamp >= ? AND timestamp <= ? AND crop_path IS NOT NULL "
@@ -455,7 +472,8 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
         reps = conn.execute(
             f"""SELECT representative_detection_id FROM visits
                 WHERE id IN ({','.join('?' * len(visit_ids))})""", visit_ids).fetchall()
-        return [c for c in (_rep_crop(r["representative_detection_id"]) for r in reps) if c]
+        crops = _rep_crops(conn, [r["representative_detection_id"] for r in reps])
+        return [c for c in (crops.get(r["representative_detection_id"]) for r in reps) if c]
 
     has_templates = bool(matcher.templates())
 
@@ -471,14 +489,14 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     refit = None
     if has_templates:
         r = matcher.refit()
-
-        def _rep_for_visit(vid):
-            # The visit may have been renumbered/removed by a rebuild since refit() listed it,
-            # so guard the row (fetchone() can be None) rather than index None[0] -> 500.
-            row = conn.execute(
-                "SELECT representative_detection_id FROM visits WHERE id=?", (vid,)).fetchone()
-            return _rep_crop(row[0] if row else None)
-        fits = {name: {"visits": [{**x, "rep_crop": _rep_for_visit(x["visit_id"])} for x in lst]}
+        # The visit may have been renumbered/removed by a rebuild since refit() listed it, so a
+        # missing row is a None crop, not an error.
+        rep_of = {row["id"]: row["representative_detection_id"] for row in _rows_in(
+            conn, "SELECT id, representative_detection_id FROM visits WHERE id IN ({})",
+            [x["visit_id"] for lst in r["fits"].values() for x in lst])}
+        fit_crops = _rep_crops(conn, rep_of.values())
+        fits = {name: {"visits": [{**x, "rep_crop": fit_crops.get(rep_of.get(x["visit_id"]))}
+                                  for x in lst]}
                 for name, lst in r["fits"].items()}
         refit = {
             "fits": fits,
