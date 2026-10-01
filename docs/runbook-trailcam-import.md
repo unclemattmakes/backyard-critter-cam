@@ -58,9 +58,10 @@ rather than letting the prune choose. A 15 GB budget was nearly fatal once: one 
 Run with **`--backup-first`**. It archives to the backup destination before a single clip can
 be pruned, and if the archive fails it disables the prune for that run rather than proceeding.
 
-Not ceremony: `backup.py` skips today's folder and runs weekly, so the newest trail-cam days
-routinely sit unarchived. On 2026-08-02 the newest archive was three days behind a 2.9 GB day
-that had no second copy anywhere; `--backup-first` swept it up seconds before the import.
+Not ceremony: `backup.py` skips today's folder and archives media daily (snapshots weekly), so
+the newest trail-cam days routinely sit unarchived. On 2026-08-02 the newest archive was three
+days behind a 2.9 GB day that had no second copy anywhere; `--backup-first` swept it up seconds
+before the import.
 
 ## Phase 4: run it
 
