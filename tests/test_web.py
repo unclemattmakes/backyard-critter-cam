@@ -686,6 +686,41 @@ def test_makingof_route_serves_the_explainer_and_stays_contained(corpus, db_path
         t.join(timeout=5)
 
 
+def test_every_response_refuses_to_be_framed(corpus, db_path):
+    """Clickjacking: another site must not be able to load the dashboard in a frame and trick a
+    tap onto delete or rename. So every path -- the HTML page, JSON, a served file (the making-of
+    site), an error, and the MJPEG stream -- carries both anti-framing headers, and the stream
+    still works."""
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buffers = {cfg.source: web.FrameBuffer()}
+    buffers[cfg.source].update(b"\xff\xd8frame")
+    server = web.make_server(cfg, buffers, {cfg.source: web.CameraControlBridge()})
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    def headers_of(path):
+        try:
+            r = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10)
+        except urllib.error.HTTPError as e:
+            r = e
+        with r:
+            return r.status, r.headers
+
+    try:
+        for path in ("/", "/api/reid/queue", "/making-of/", "/no-such-page", "/stream.mjpg"):
+            status, h = headers_of(path)
+            assert h.get("X-Frame-Options") == "DENY", path
+            assert h.get("Content-Security-Policy") == "frame-ancestors 'none'", path
+        status, h = headers_of("/stream.mjpg")
+        assert status == 200 and h.get("Content-Type").startswith("multipart/x-mixed-replace")
+    finally:
+        server.stop_event.set()
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
 def test_operator_decision_covers_all_four_cases():
     """The operator/viewer rule, pure. No token = everyone operates (fresh-clone default);
     with a token: loopback always operates (you are at the rig), a matching header operates,
