@@ -35,6 +35,11 @@ python -m pytest tests/ -q
 camera, no model download, no network. A test that needs any of those four is a test that will
 be skipped forever, which is worse than no test.
 
+CI runs the suite on ubuntu + Python 3.12 and on Windows + Python 3.14 (the rig's platform),
+installing the exact versions in `requirements-lock.txt`, then runs `ruff check .` (lint only,
+config in `pyproject.toml`; there is no formatter). If you change `requirements.txt`, regenerate
+the lock with the command in its header.
+
 Two rules that are load-bearing rather than stylistic:
 
 - **Every test that touches a database uses `tmp_path`.** The `conn` / `db_path` fixtures in
