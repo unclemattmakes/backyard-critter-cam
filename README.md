@@ -3,15 +3,17 @@
 [![tests](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml/badge.svg)](https://github.com/unclemattmakes/backyard-critter-cam/actions/workflows/tests.yml)
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-A live backyard-critter detection rig. A USB webcam points through a sliding glass door at
-the yard; the program watches the feed, wakes a real animal detector only when something
-moves, draws live bounding boxes, and saves a cropped image + a database row for every
-critter it sees — crows, raccoons, opossums.
+A live backyard-critter detection rig. A camera points through a sliding glass door at the
+yard; the program watches the feed, wakes a real animal detector only when something moves,
+draws live bounding boxes, and saves a cropped image + a database row for every critter it
+sees — crows, raccoons, opossums. The glass-door camera started as a USB webcam on the rig PC
+and is now a webcam on a Raspberry Pi serving MJPEG over HTTP, so the rig reads it as a network
+camera; a plain USB webcam works just as well.
 
 This glass-door cam is the **primary rig for all three species, day and night** (the
 "glass = mirror after dark" worry didn't pan out — lit animals at the pane read clearly; a
-raccoon already turned up at dusk). A second source — a wider-yard weatherproof trail cam,
-imported in batches off its SD card — plugs into the same pipeline later.
+raccoon already turned up at dusk). A second source, a wider-yard weatherproof trail cam
+imported in batches off its SD card, runs through the same pipeline.
 
 What began as a live-capture skeleton is now the **full four-phase system** the plan called
 for. It captures, **names the species** on every crop (BioCLIP 2), **re-identifies individual
@@ -35,10 +37,30 @@ folder; serve it locally with `python -m http.server 8011 --directory making-of`
 **Have a folder of photos from any camera?** You don't need the live rig to try the pipeline —
 see [Try it on footage you already have](#try-it-on-footage-you-already-have).
 
+## Quickstart
+
+```bash
+git clone https://github.com/unclemattmakes/backyard-critter-cam.git
+cd backyard-critter-cam
+setup.bat                      # Windows (or double-click it); Linux/macOS: bash setup.sh
+.venv\Scripts\python.exe backyard_cam.py --list-cameras    # Linux/macOS: .venv/bin/python
+.venv\Scripts\python.exe backyard_cam.py --serve           # then open http://127.0.0.1
+```
+
+`--list-cameras` prints the webcam indices that open; if yours isn't 0, add `--camera-index N`
+on the first run (that first run writes the camera into the database, and after that the
+dashboard's **cameras** button is where you change it). `--serve` prints the dashboard address;
+it is port 80 unless that is taken, then 8000. The first start downloads the detector (tens of
+MB) and, once the naming helper starts, about 2.6 GB of species models; `--no-classify` skips
+those for now. A network camera instead of a webcam? See
+[Multiple cameras](#multiple-cameras-usb--networked). No camera at all? `--serve-only` serves the
+dashboard over an existing database. Details: [Setup](#setup) and [Running](#running).
+
 ---
 
 ## Contents
 
+- [Quickstart](#quickstart) — clone to a running dashboard in five commands
 - [How it works](#how-it-works) — the pipeline, one box at a time
 - [The making-of site](https://unclemattmakes.github.io/backyard-critter-cam/) — the system
   explained through eight interactive demos; **no hardware needed** (its source and export
@@ -361,13 +383,17 @@ Prefer a browser? Add **`--serve`** for a one-stop local dashboard (live feed + 
 
 ### Common flags
 
-All defaults live in `config.py`; these override them per-run:
+All defaults live in `config.py`; these override them per-run. One exception to "per run": the
+camera list lives in the database's `cameras` table, which config (and the first three flags
+below) only **seed**, once per source. After that first run, change a camera from the
+dashboard's **cameras** button; the startup banner says so when config and the table disagree.
 
 | Flag | Meaning |
 |------|---------|
-| `--camera-index N` | Which webcam (default 0). Single-camera mode; for several at once see [Multiple cameras](#multiple-cameras-usb--networked). |
+| `--camera-index N` | Which webcam (default 0). Single-camera mode, and only until that camera has been seeded into the `cameras` table (see above); for several at once see [Multiple cameras](#multiple-cameras-usb--networked). |
 | `--source NAME` | DB `source` label for this camera's rows (single-camera mode; default `glass_door_cam`). |
-| `--width W --height H` | Requested capture resolution. |
+| `--width W --height H` | Requested capture resolution (seeded like `--camera-index`). |
+| `--exposure F` / `--gain F` | Lock manual exposure / gain on a USB webcam (find values with `tune.py`). Omit for auto. A network camera sets these itself. |
 | `--model-version V` | `MDV6-yolov10-c` (default, fast) · `MDV6-yolov9-c` · `MDV6-rtdetr-c` · `MDV6-yolov10-e` / `MDV6-yolov9-e` (heavier, more accurate). |
 | `--device D` | `auto` (default; GPU if usable, else CPU) · `cuda` (require an NVIDIA GPU, fail loud) · `cpu` (force CPU, slower). |
 | `--min-confidence F` | Minimum detector confidence to draw/save (default 0.25). |
@@ -376,34 +402,41 @@ All defaults live in `config.py`; these override them per-run:
 | `--save-full-frame` | Also save the whole frame per detection event (default off; crops always saved). |
 | `--record-clips` / `--no-record-clips` | Record a short video clip around each visit (default ON, disk-capped to `clips_max_gb` — or a per-camera budget from `clips_max_gb_by_source` — with oldest-first pruning). |
 | `--clip-classes C…` | Detector classes that trigger a clip (default = saved = `animal`); e.g. `--clip-classes animal person` to record yourself as a test. |
-| `--db PATH` / `--crops-dir PATH` | Override output locations. |
+| `--db PATH` / `--crops-dir PATH` / `--frames-dir PATH` / `--clips-dir PATH` | Override output locations. |
 | `--no-preview` / `--preview` | Headless (quit with Ctrl+C) / show the window. Default comes from `cfg.show_preview`. |
 | `--no-classify` | Detection only — don't start the live species-naming helper. The rig launches it (and stops it) automatically by default; this turns that off. You can still fill species later with `python classify.py`. |
 | `--stats` | Print a DB summary (crops vs. visits, per-hour activity, latest catches) and exit. Read-only. |
-| `--list-cameras` | Probe camera indices and exit (find the right `--camera-index`). |
+| `--visit-gap-min N` | Minutes of quiet that split two visits in `--stats` (default 5). |
+| `--list-cameras` | Probe webcam indices and exit (find the right `--camera-index`). |
 | `--serve` | Also serve the local web dashboard (live stream + stats) at `http://host:port`. |
+| `--serve-only` | Serve only the dashboard over the existing database: no camera, no detector, no model downloads. For imported footage or a restored archive. |
 | `--port N` / `--host H` | Dashboard port (default 80, falling back to 8000 if 80 is taken) / bind host (default `127.0.0.1`; `0.0.0.0` = LAN). |
 
 ### Multiple cameras (USB + networked)
 
-The glass-door webcam is the primary rig, but you can watch **several cameras at once** — a USB
-webcam *plus* networked cameras around the yard. They run on one process (one capture thread per
+The glass-door camera is the primary rig, but you can watch **several cameras at once** — USB
+webcams and networked cameras around the yard, in any mix. They run on one process (one capture thread per
 camera, all sharing the single MegaDetector and the one naming helper), and the dashboard's **Live
 Observation** tab shows a **grid of feeds**. Each camera writes its own `source`, so the whole
 downstream — species ID, re-ID, behaviour, visits, the calendar — keeps the cameras separate
 automatically (the schema was multi-source from day one).
 
-List the cameras in `config_local.py` (copy `config_local.example.py`):
+**The `cameras` table in the database is the authority on which cameras run.** A camera list in
+`config_local.py` (copy `config_local.example.py`) only **seeds** that table, once per source,
+the first time the rig starts with it; from then on `cameras.load_specs` reads the table, and
+editing the config entry changes nothing (the startup banner says so when the two disagree). The
+seed looks like this:
 
 ```python
 from config import CameraSpec
 def apply(cfg):
     cfg.latitude, cfg.longitude = 40.7128, -74.0060
     cfg.cameras = [
-        CameraSpec("glass_door_cam", 0, name="Glass door"),                 # USB webcam, index 0
-        # ...or the same camera over the network, once it outgrows one PC -- a Raspberry Pi
-        # running ustreamer forwards a USB webcam's own JPEG frames untouched:
-        # CameraSpec("glass_door_cam", "http://192.168.1.60:8080/stream", name="Glass door"),
+        # This rig's glass-door camera: a webcam on a Raspberry Pi running ustreamer, which
+        # forwards the webcam's own JPEG frames untouched over HTTP.
+        CameraSpec("glass_door_cam", "http://192.168.1.60:8080/stream", name="Glass door"),
+        # ...or a USB webcam plugged into the rig PC itself, by index:
+        # CameraSpec("glass_door_cam", 0, name="Glass door"),
         CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
                    name="Yard (night IR)"),                                  # RTSP/PoE IP camera
         CameraSpec("feeder_esp32", "http://192.168.1.51:81/stream",
@@ -423,9 +456,9 @@ for an IP/PoE camera, or `http://…/stream` for an ESP32-CAM's MJPEG server. Pe
 (resolution, `motion_min_area`, day/night profile, `record_clips`) default to the global config;
 only override what differs. Each camera needs a **unique `source`**.
 
-**Or add one without editing Python.** Since 2026-08-22 the camera list lives in the database and
-the block above only **seeds** it the first time. The dashboard's **cameras** button (top right of
-Live Observation) adds, edits and removes cameras — name, address, stream path, login, resolution,
+**Or add one without editing Python.** The camera list has lived in the database since
+2026-08-22, so the dashboard's **cameras** button (top right of Live Observation) adds, edits and
+removes cameras — name, address, stream path, login, resolution,
 motion area. Two things it deliberately does not pretend:
 
 - **A change applies at the next restart, not immediately.** Each camera gets its own capture
@@ -1069,8 +1102,9 @@ carry all of it to a new PC. `migrate.py` is that move, as two halves of one ope
   ~1.3 GB weights mirror if you'd rather re-download.
 - **The new machine doesn't need the old machine's camera.** A configured camera that isn't
   there is retried forever, never fatal — and a rig with no camera at all still serves the
-  entire migrated archive via `--serve-only`. Drop the departed camera from
-  `config_local.py`, and your history is untouched either way: everything keys off the
+  entire migrated archive via `--serve-only`. Remove the departed camera with the dashboard's
+  **cameras** button (the restored database carries the camera list; `config_local.py` only
+  seeded it), and your history is untouched either way: everything keys off the
   `source` column, so a retired camera simply stops adding rows. A replacement camera on the
   **same view** should reuse the old source name (continuous timeline); a new angle gets a
   new name.
@@ -1240,6 +1274,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 
 | Table | What it records |
 |-------|-----------------|
+| `cameras` | **The cameras the rig runs** — the authority, not `config_local.py`, which only seeds it once per source. One row per `source`: kind (`local` index or `network` URL split into scheme/host/port/path), login, resolution and motion overrides, `enabled`, and a `deleted_at` tombstone. `source` is write-once because every detection and clip is stamped with it. The password is never returned by the API and is erased when the camera is removed. Edited from the dashboard's **cameras** button. |
 | `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
 | `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
 | `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
@@ -1247,7 +1282,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 | `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
 | `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
 | `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |
-| `identity_references` | Hand-certified photographs of a known individual (`refcam.py`) — identity evidence that does not decay, and that never becomes a matcher template. |
+| `identity_references`, `identity_reference_crops` | Hand-certified photographs of a known individual and the detector crops cut from them (`refcam.py`) — identity evidence that does not decay, and that never becomes a matcher template. |
 
 Example queries:
 

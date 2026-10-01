@@ -4,9 +4,10 @@ Central configuration for the backyard-critter detection rig.
 This is the ONE place to tune the rig. Every knob the app reads lives here; the CLI
 (backyard_cam.py) exposes the common ones as --flags that override these defaults.
 
-V1 scope: the live glass-door USB webcam ("glass_door_cam") -- the PRIMARY rig for all three
-species, day AND night (crows by day; a raccoon at dusk; lit mammals at the glass after
-dark -- the "glass = mirror at night" worry did not materialize). A second source, the
+V1 scope: the live glass-door camera ("glass_door_cam", now a Raspberry Pi serving MJPEG over
+HTTP; it began as a USB webcam on the rig PC) -- the PRIMARY rig for all three species, day AND
+night (crows by day; a raccoon at dusk; lit mammals at the glass after dark -- the "glass =
+mirror at night" worry did not materialize). A second source, the
 wider-yard weatherproof trail cam (batch SD-card import, IR at night), plugs into the same
 pipeline later via the `source` column. See PLAN.md for the full four-phase roadmap.
 """
@@ -96,11 +97,12 @@ def apply_secrets(cfg, secrets: dict) -> list[str]:
 class CameraSpec:
     """One camera in a multi-camera rig.
 
-    The live rig can watch several cameras at once -- a USB webcam at the glass door PLUS
-    networked cameras around the yard -- each writing its own `source` into the DB so all the
-    downstream phases (species ID, re-ID, behaviour, the dashboard) keep them separate. List them
-    in `Config.cameras` (typically in config_local.py); leave it None to stay single-camera (the
-    flat `camera_index`/`source` fields below are then used, unchanged).
+    The live rig can watch several cameras at once -- USB webcams and networked cameras around
+    the yard -- each writing its own `source` into the DB so all the downstream phases (species
+    ID, re-ID, behaviour, the dashboard) keep them separate. List them in `Config.cameras`
+    (typically in config_local.py); leave it None to stay single-camera (the flat
+    `camera_index`/`source` fields below are then used). Either way this only SEEDS the `cameras`
+    table once per source; after that the table is authoritative (cameras.load_specs).
 
     Only `source` and `src` are required; every other field defaults to None and INHERITS the
     matching Config value at runtime, so a spec stays terse:
@@ -246,8 +248,9 @@ class Config:
     # ---- Multiple cameras (optional) --------------------------------------------
     # None = single-camera mode: the flat camera_index/source fields above are the one camera.
     # Set a list of CameraSpec to run SEVERAL cameras at once (USB + networked), each on its own
-    # capture thread, all sharing one detector and one dashboard (a grid of live feeds). Define it
-    # in config_local.py, e.g.:
+    # capture thread, all sharing one detector and one dashboard (a grid of live feeds). This list
+    # only seeds the DB `cameras` table (once per source); the dashboard edits the table after
+    # that. Define it in config_local.py, e.g.:
     #   from config import CameraSpec
     #   cfg.cameras = [CameraSpec("glass_door_cam", 0, name="Glass door"),
     #                  CameraSpec("yard_ir", "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub",
