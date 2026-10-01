@@ -67,7 +67,7 @@ numbers in that file.
     archive, §1.1 and §1.2. *M, human.*
 13. **Re-sweep the auto-assign operating point** on the current corpus before trusting the bars
     in `config_local.py`; group labels and new animals have moved it since August. *S.*
-14. **Refactor the three biggest files.** `dashboard.js` (~3,600 lines), `web.py` (~2,800) and
+14. **Refactor the three biggest files.** `dashboard.js` (~3,600 lines), `web.py` (~2,300) and
     `stats.py` (~2,200) each hold several unrelated surfaces. Split by tab / route family /
     surface, behind the existing tests, one file per PR. *L, low urgency.*
 15. **Exercise the never-fired safety paths on purpose.** The auto-assign reject tombstone and
