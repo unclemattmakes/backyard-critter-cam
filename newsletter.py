@@ -142,6 +142,13 @@ def _name_of(sp) -> str:
     return "Unidentified" if (sp or "animal") == "animal" else _cap1(sp)
 
 
+def _n_species(d) -> int:
+    """How many species the period asserts -- Unidentified is not one, nor is a surprising row."""
+    if d.get("n_species") is not None:
+        return d["n_species"]
+    return len(d.get("species") or []) - (d.get("n_surprising") or 0)
+
+
 def _latin_of(sp) -> str:
     return _LATIN.get((sp or "").lower().replace("'", "’"), "")
 
@@ -352,7 +359,7 @@ def compose_lede(bundle) -> list[str]:
     if d.get("empty"):
         out.append("No visitors recorded. The yard kept its own counsel.")
     else:
-        n_sp = len(d.get("species") or []) - (d.get("n_surprising") or 0)
+        n_sp = _n_species(d)
         out.append(f"Between {_clock(d.get('start'))} and {_clock(d.get('end'))}, the yard "
                    f"logged {d.get('visits')} visit{'' if d.get('visits') == 1 else 's'} from "
                    f"{n_sp} species.")
@@ -506,7 +513,8 @@ def pick_plate(cfg, d) -> dict | None:
         return None
     try:
         rows = conn.execute(
-            "SELECT id, timestamp, source, detection_class, species, confidence, "
+            "SELECT id, timestamp, source, detection_class, "
+            f"{stats.display_species_sql(cfg)} AS species, confidence, "
             "species_confidence, species_verified, crop_path, crop_quality, individual_id, "
             "frame_path, bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
             "FROM detections WHERE timestamp >= ? AND timestamp < ? AND crop_path IS NOT NULL",
@@ -925,7 +933,7 @@ def render_email(bundle, images, img_src) -> str:
       </div>""")
 
         # -- the night in numbers ----------------------------------------------------
-        n_sp = len(d.get("species") or []) - (d.get("n_surprising") or 0)
+        n_sp = _n_species(d)
         tallies = [(str(d.get("visits") or 0), "visits"), (str(n_sp), "species")]
         if d.get("busiest_hour"):
             tallies.append((_fmt_hour(d["busiest_hour"]["hour"]), "busiest hour"))
@@ -988,7 +996,7 @@ def render_email(bundle, images, img_src) -> str:
         roll = d.get("species") or []
         if roll:
             n_surp = d.get("n_surprising") or 0
-            sub = (f"{len(roll) - n_surp} species" + (f" + {n_surp} to verify" if n_surp else ""))
+            sub = (f"{_n_species(d)} species" + (f" + {n_surp} to verify" if n_surp else ""))
             parts.append(_section("The Roll", sub))
             rows = []
             for i, s in enumerate(roll[:MAX_ROLL_ROWS]):

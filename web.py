@@ -1585,12 +1585,24 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 kw["species"] = str(data["species"]).strip()
             if data.get("verify"):
                 kw["verify"] = True
+                # ✓ confirms what the dashboard SHOWS: a guess hidden as Unidentified by the
+                # display threshold is skipped, never confirmed unseen (a stale page, a direct POST).
+                sp = stats.display_species_sql(cfg)
+                if sp != "species":
+                    kw["verify_filter"] = f"species IS NULL OR {sp} IS NOT NULL"
             kw["labeled_by"] = _labeler(data)
             conn = db.connect(cfg.db_path)
             try:
-                self._json({"ok": True, **db.apply_visit_label(conn, **kw)})
+                res = db.apply_visit_label(conn, **kw)
             finally:
                 conn.close()
+            if (kw.get("verify") and "species" not in kw and "name" not in kw
+                    and res.get("detections") and not res.get("verified")):
+                self._json({"error": "nothing to confirm: this visit's species reads Unidentified "
+                                     "(the model's guess is below the display threshold) -- "
+                                     "correct it to a species instead", **res}, code=409)
+                return
+            self._json({"ok": True, **res})
 
         def _favorite(self, data):
             """Star / un-star one crop or one visit -- "keep this".

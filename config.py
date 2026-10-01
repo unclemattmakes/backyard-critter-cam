@@ -417,6 +417,11 @@ class Config:
     digest_species_min_confidence: float = 0.6
     digest_species_strong_crops: int = 2
     digest_species_strong_confidence: float = 0.9
+    # Below this species_confidence a model-assigned species is SHOWN (dashboard, Creature Report)
+    # as Unidentified; stored labels are untouched and human labels always show. Graded against
+    # human labels (2026-09 nightly eval): 0.906 right at >= 0.8 (n=2446), 0.225 at 0.5-0.8
+    # (n=662), 0.026 below 0.5 (n=1163). 0 disables. See stats.display_species_sql.
+    species_display_min_confidence: float = 0.5
     # Novelty ("first X in 8 days") additionally needs the species to have LED at least one visit.
     # Every "first in N days" headline since the outage was an artifact: the badge fires at
     # novelty_days=3, the yard went dark for 8, so on the first nights back everything unseen

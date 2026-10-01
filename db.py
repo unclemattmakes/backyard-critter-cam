@@ -1225,7 +1225,8 @@ _UNSET = object()   # sentinel: "argument not provided" (distinct from None = "c
 def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = None,
                       source: Optional[str] = None, start: Optional[str] = None,
                       end: Optional[str] = None, name=_UNSET, species: Optional[str] = None,
-                      verify: bool = False, labeled_by: Optional[str] = None) -> dict:
+                      verify: bool = False, labeled_by: Optional[str] = None,
+                      verify_filter: Optional[str] = None) -> dict:
     """Confirm/correct a whole visit's SPECIES and/or assign its INDIVIDUAL, in one shot. The
     visit is identified EITHER by `visit_id` (the Individuals queue, which has it) OR by a
     (`source`, `start`, `end`) time span (the Explorer computes visits on the fly and has no
@@ -1234,7 +1235,10 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
 
       species='raccoon'  -> correct every crop in the set to that species (confidence 1,
                             verified, source='human').
-      verify=True        -> (no species) just confirm the existing species on every crop.
+      verify=True        -> (no species) just confirm the existing species on every crop --
+                            or only those matching `verify_filter` (a SQL condition; the
+                            dashboard passes "the label is shown", so a hidden guess is
+                            never confirmed unseen). Returns `verified` / `verify_skipped`.
       name='Stan'        -> set individual_id on the crops matching the visit's DOMINANT species
                             (a stray crow crop in a raccoon visit keeps its own identity) -- or
                             Stan's own species (individual_species) when the span has any;
@@ -1273,6 +1277,7 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
     n = conn.execute(f"SELECT COUNT(*) FROM detections WHERE {where}", params).fetchone()[0]
     if not n:
         return {"detections": 0}
+    verified = None
 
     if species:
         # Preserve each crop's model prediction before overwriting (COALESCE keeps an existing
@@ -1287,7 +1292,9 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
             f"species = ?, species_confidence = 1.0, species_verified = 1, "
             f"species_source = 'human' WHERE {where}", [species] + params)
     elif verify:
-        conn.execute(f"UPDATE detections SET species_verified = 1 WHERE {where}", params)
+        vwhere = f"{where} AND ({verify_filter})" if verify_filter else where
+        verified = conn.execute(f"UPDATE detections SET species_verified = 1 WHERE {vwhere}",
+                                params).rowcount
 
     dominant = scope = None
     if name is not _UNSET:
@@ -1322,8 +1329,11 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
     if name is not _UNSET:
         conn.execute(f"UPDATE visits SET individual_id = ? WHERE {vsub}", [name] + params)
     conn.commit()
-    return {"detections": int(n), "dominant_species": dominant, "named_species": scope,
-            "species_set": species or None, "named": None if name is _UNSET else name}
+    out = {"detections": int(n), "dominant_species": dominant, "named_species": scope,
+           "species_set": species or None, "named": None if name is _UNSET else name}
+    if verified is not None:
+        out.update(verified=int(verified), verify_skipped=int(n) - int(verified))
+    return out
 
 
 def visit_labels_by_source(conn: sqlite3.Connection, source: str,

@@ -772,3 +772,69 @@ def test_supported_species_always_keeps_the_leader():
     v = _label_spread(("Steller's jay", 2, 0.634))
     assert stats.supported_species(v, config.CONFIG) == ["Steller's jay"]
     assert stats.supported_species({"classes": {}, "class_conf": {}}, config.CONFIG) == []
+
+
+# ---- display threshold: a sub-threshold MODEL species is shown as Unidentified --------------
+# The stored label is never touched; only what the dashboard and the Creature Report SAY. Below
+# species_display_min_confidence BioCLIP is right ~3% of the time (2026-09 nightly eval).
+def _guess(conn, species, sp_conf, *, source="bioclip", verified=None, individual=None,
+           individual_source=None, labeled_by=None):
+    did = db.insert_detection(conn, timestamp="2026-06-10T21:00:00-07:00", source="glass_door_cam",
+                              detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                              frame_w=100, frame_h=100, crop_path="crops/x.jpg", species=species,
+                              individual_id=individual, crop_quality=1.0)
+    conn.execute("UPDATE detections SET species_confidence = ?, species_source = ?, "
+                 "species_verified = ?, individual_source = ?, labeled_by = ? WHERE id = ?",
+                 (sp_conf, source, verified, individual_source, labeled_by, did))
+    conn.commit()
+    return did
+
+
+def _thr(db_path, t=0.5):
+    return replace(_cfg(db_path), species_display_min_confidence=t)
+
+
+def test_a_low_confidence_model_species_is_shown_as_unidentified(conn, db_path):
+    _guess(conn, "raccoon", 0.95)
+    _guess(conn, "song sparrow", 0.31)
+    cfg = _thr(db_path)
+    s = stats.compute_stats(cfg)
+    # Counted under the coarse 'animal' label every surface already renders "Unidentified".
+    assert {c["name"]: c["crops"] for c in s["by_class"]} == {"raccoon": 1, "animal": 1}
+    assert s["by_day"][0]["classes"] == {"raccoon": 1, "animal": 1}
+    assert sorted(x["species"] or "" for x in s["latest"]) == ["", "raccoon"]
+    assert [x["species"] for x in stats.species_overview(cfg)["species"]] == ["raccoon"]
+    assert [c["species"] for c in stats.crops_page(cfg)["crops"]] == [None, "raccoon"]
+    assert stats.crops_page(cfg, species="song sparrow")["total"] == 0
+    assert stats.visits_page(cfg)["visits"][0]["classes"] == {"raccoon": 1, "animal": 1}
+    # ...and the DB still holds exactly what the model said.
+    assert conn.execute("SELECT species FROM detections WHERE species_confidence < 0.5"
+                        ).fetchone()[0] == "song sparrow"
+
+
+def test_human_labels_show_whatever_the_confidence(conn, db_path):
+    _guess(conn, "song sparrow", 0.2, verified=1)                               # confirmed as-is
+    _guess(conn, "Steller's jay", 0.2, source="human")                          # a correction
+    _guess(conn, "raccoon", 0.3, individual="Stan", individual_source="human")  # named by a human
+    _guess(conn, "opossum", 0.3, labeled_by="kim")                              # attributed label
+    _guess(conn, "not an animal", 0.0, source="unreadable-crop")                # not the namer's call
+    _guess(conn, "bushtit", 0.3, individual="raccoon_c07", individual_source="auto")
+    _guess(conn, "brown rat", 0.3, verified=0)                                  # rejected: still a guess
+    s = stats.compute_stats(_thr(db_path))
+    assert {c["name"]: c["crops"] for c in s["by_class"]} == {
+        "song sparrow": 1, "Steller's jay": 1, "raccoon": 1, "opossum": 1, "not an animal": 1,
+        "animal": 2}
+
+
+def test_threshold_zero_shows_every_model_label(conn, db_path):
+    _guess(conn, "song sparrow", 0.05)
+    cfg = _thr(db_path, 0)
+    assert stats.display_species_sql(cfg) == "species"
+    assert {c["name"] for c in stats.compute_stats(cfg)["by_class"]} == {"song sparrow"}
+    assert [x["species"] for x in stats.species_overview(cfg)["species"]] == ["song sparrow"]
+
+
+def test_an_unscored_label_is_shown(conn, db_path):
+    """NULL species_confidence is a legacy or hand-set label, not a low score."""
+    _guess(conn, "raccoon", None)
+    assert {c["name"] for c in stats.compute_stats(_thr(db_path))["by_class"]} == {"raccoon"}

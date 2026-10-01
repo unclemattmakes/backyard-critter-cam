@@ -1056,7 +1056,7 @@ function vlabelOpen(btn,i){
     const sp=(v.title&&v.title!=='animal')?v.title:'';
     tools.innerHTML=`
         <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:6px">
-          <button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>
+          ${sp?`<button class="gear" onclick="postVisitLabel(_visitTarget(${i}),{verify:true},()=>visitSaved(${i},'✓ species confirmed'))" title="confirm this species for the whole visit">✓ sp</button>`:''}
           ${speciesSelect('vsp-'+i,sp)}
           <button class="gear" onclick="explorerSpecies(${i})" title="correct the species for the whole visit">correct</button></div>
         <div style="display:flex;gap:5px;align-items:center;margin-top:6px">${reidInput('vn-'+i,'name the individual…')}<button class="gear" onclick="explorerName(${i})">Name</button></div>
@@ -1758,7 +1758,7 @@ function renderDispatch(d, rc, rl){
   html+=visitLogSection(d);
   html+=roll;
   const t=[['visits',(d.visits||0).toLocaleString()],
-    [(d.n_surprising?'species (+'+d.n_surprising+' to verify)':'species'),(d.species||[]).length-(d.n_surprising||0)],
+    [(d.n_surprising?'species (+'+d.n_surprising+' to verify)':'species'),(d.n_species!=null?d.n_species:(d.species||[]).length-(d.n_surprising||0))],
     ['busiest hour',d.busiest_hour?fmtHourJS(d.busiest_hour.hour):'—']];
   /* AT LEAST N AT ONCE. A floor three times over -- the detector's recall on a huddle is ~0.39,
      the counting is greedy, and the stills only see instants something was saved. So it says
@@ -1783,8 +1783,8 @@ function renderDispatch(d, rc, rl){
       </div></div>`;
   }
   window.__rollClips=(d.species||[]).map(s=> s.clip?{...s.clip, species:s.species}:null);
-  const nSurp=d.n_surprising||0, nSp=(d.species||[]).length;
-  html+=`<h2 class="sec">The Roll <span class="n">${nSp-nSurp} species${nSurp?` + ${nSurp} surprising`:''}</span>${nSurp?infoDot('A "surprising" species is one whose own record says it is almost never active at this hour — a goldfinch at 2 AM is nearly always a mislabeled crop of something else (kit-melee crops get forced onto the nearest species). They are listed at the bottom as questions, not counted as fauna; their crops are exactly the ones worth correcting in the Catalogue.'):''}</h2>`;
+  const nSurp=d.n_surprising||0, nSp=(d.n_species!=null?d.n_species:(d.species||[]).length-nSurp);
+  html+=`<h2 class="sec">The Roll <span class="n">${nSp} species${nSurp?` + ${nSurp} surprising`:''}</span>${nSurp?infoDot('A "surprising" species is one whose own record says it is almost never active at this hour — a goldfinch at 2 AM is nearly always a mislabeled crop of something else (kit-melee crops get forced onto the nearest species). They are listed at the bottom as questions, not counted as fauna; their crops are exactly the ones worth correcting in the Catalogue.'):''}</h2>`;
   html+=`<div class="roll">${(d.species||[]).map(entryRow).join('')||'<p class="empty" style="padding:18px">—</p>'}</div>`;
   body.innerHTML=html;
   body.querySelectorAll('.entry[data-sp]').forEach(el=>el.onclick=()=>{ show('cat'); openSheet(el.dataset.sp); });
