@@ -29,6 +29,7 @@ import pytest
 import config
 import db
 import individuals
+import reidqueue
 import web
 
 
@@ -381,7 +382,7 @@ def test_recent_defaults_to_the_last_48h_and_says_what_it_is_hiding(corpus, db_p
     # The corpus' Stan template is 30 days old; everything else is inside two days of the newest.
     assert corpus["stan_t"] not in _ids(out)
     assert len(out["queue"]) == len(corpus) - 1 == out["n_matched"]
-    assert out["since_h"] == web.DEFAULT_QUEUE_WINDOW_H
+    assert out["since_h"] == reidqueue.DEFAULT_QUEUE_WINDOW_H
     assert out["n_in_window"] == len(corpus) - 1 and out["n_all"] == len(corpus)
     assert out["window_from"]
 
@@ -650,7 +651,7 @@ def test_reid_queue_endpoint_returns_200_and_valid_json(corpus, db_path):
             status, body = _get(port, path)
             assert status == 200, path
             assert set(body) >= {"queue", "cast", "mode", "offset", "limit", "n_matched", "funnel"}
-            assert body["mode"] in web.QUEUE_MODES
+            assert body["mode"] in reidqueue.QUEUE_MODES
             assert isinstance(body["queue"], list)
         assert _get(port, "/api/reid/queue?mode=bogus&limit=abc&offset=-3")[1]["mode"] == "recent"
     finally:
@@ -1330,7 +1331,7 @@ def test_dossier_pairs_the_same_minutes_on_another_camera(conn, db_path):
     n = out["neighbours"][0]
     assert n["source"] == db.SOURCE_TRAIL_CAM_SD
     assert n["crops"]                       # the neighbour ships its own evidence, not just a count
-    assert 0 < n["offset_s"] <= web.CROSS_CAMERA_PAD_S
+    assert 0 < n["offset_s"] <= reidqueue.CROSS_CAMERA_PAD_S
 
 
 def test_dossier_caps_the_crop_strip_sharpest_first(conn, db_path):
@@ -1338,10 +1339,10 @@ def test_dossier_caps_the_crop_strip_sharpest_first(conn, db_path):
     crops least worth looking at, and the payload says how many it is showing of how many."""
     cfg = _rq_cfg(db_path)
     big = _visit_with(conn, vec=_unit(1, 0, 0), days_ago=3,
-                      n=web.DOSSIER_MAX_CROPS + 12)
+                      n=reidqueue.DOSSIER_MAX_CROPS + 12)
     out = web._reid_dossier(cfg, big)
-    assert len(out["crops"]) == web.DOSSIER_MAX_CROPS
-    assert out["n_crops"] == web.DOSSIER_MAX_CROPS + 12
+    assert len(out["crops"]) == reidqueue.DOSSIER_MAX_CROPS
+    assert out["n_crops"] == reidqueue.DOSSIER_MAX_CROPS + 12
 
 
 # ---- camera management: the list the dashboard edits ---------------------------------
