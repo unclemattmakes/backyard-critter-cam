@@ -1119,6 +1119,99 @@ def test_confirming_a_visit_records_who_did_it(corpus, db_path):
         t.join(timeout=5)
 
 
+@pytest.fixture
+def api_port(corpus, db_path):
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    server = web.make_server(cfg, {cfg.source: web.FrameBuffer()},
+                             {cfg.source: web.CameraControlBridge()})
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def _mixed_visit(conn, parts, *, visit_species, days_ago=0.1):
+    """One visit holding `parts` = [(species, n), ...]; visits.species is the given vote."""
+    ids, k = {}, 0
+    for sp, n in parts:
+        for _ in range(n):
+            ids.setdefault(sp, []).append(db.insert_detection(
+                conn, timestamp=_at(days_ago, k), source=db.SOURCE_GLASS_DOOR_CAM,
+                detection_class="animal", confidence=0.5, bbox=(0, 0, 10, 10), frame_w=100,
+                frame_h=100, crop_path=f"crops/mixed-{days_ago}-{k}.jpg", species=sp))
+            k += 1
+    every = [d for v in ids.values() for d in v]
+    vid = db.insert_visit(conn, source=db.SOURCE_GLASS_DOOR_CAM, species=visit_species,
+                          individual_id=None, started_at=_at(days_ago, 0),
+                          ended_at=_at(days_ago, k), detection_count=k, max_confidence=0.9,
+                          representative_detection_id=every[0])
+    db.assign_visit(conn, every, vid)
+    conn.commit()
+    return vid, ids
+
+
+def _labels(db_path, ids):
+    conn = db.connect_readonly(db_path)
+    try:
+        return {r[0]: (r[1], r[2]) for r in conn.execute(
+            f"SELECT id, individual_id, individual_source FROM detections "
+            f"WHERE id IN ({','.join('?' * len(ids))})", list(ids))}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("send_species", [True, False])
+def test_confirming_an_outvoted_visit_names_the_raccoon_not_the_noise(
+        corpus, conn, db_path, api_port, send_species):
+    """43 'not an animal' boxes vs 30 raccoon crops: the vote says noise, the human means the
+    raccoon. With the queue's species, or derived from Notch's own labels when absent."""
+    vid, ids = _mixed_visit(conn, [("raccoon", 3), ("not an animal", 4)],
+                            visit_species="not an animal")
+    body = {"visit_id": vid, "name": "Notch"}
+    if send_species:
+        body["species"] = "raccoon"
+    status, out = _post(api_port, "/api/reid/confirm", body)
+    assert status == 200 and out["stamped"] == 3 and out["species"] == "raccoon"
+    got = _labels(db_path, ids["raccoon"] + ids["not an animal"])
+    assert all(got[d] == ("Notch", "human") for d in ids["raccoon"])
+    assert all(got[d] == (None, None) for d in ids["not an animal"])
+    assert db.confirmed_visit_labels(conn, "raccoon")[vid] == "Notch"
+
+
+def test_rejecting_from_the_raccoon_queue_leaves_another_species_label_alone(
+        corpus, conn, db_path, api_port):
+    vid, ids = _mixed_visit(conn, [("raccoon", 2), ("domestic cat", 3)],
+                            visit_species="domestic cat")
+    db.set_individual_bulk(conn, ids["domestic cat"], "Tom")
+    db.label_visit(conn, vid, "Stan", source="auto", species="raccoon")
+    status, out = _post(api_port, "/api/reid/confirm",
+                        {"visit_id": vid, "name": None, "reject": True, "species": "raccoon"})
+    assert status == 200 and out["rejected"] and out["stamped"] == 2
+    got = _labels(db_path, ids["raccoon"] + ids["domestic cat"])
+    assert all(got[d] == (None, "human") for d in ids["raccoon"])     # the tombstone
+    assert all(got[d] == ("Tom", "human") for d in ids["domestic cat"])
+    assert vid in db.rejected_visit_ids(conn, "raccoon")
+
+
+def test_confirm_refuses_a_species_the_visit_has_no_crops_of(corpus, conn, db_path, api_port):
+    vid, ids = _mixed_visit(conn, [("not an animal", 2)], visit_species="not an animal")
+    status, out = _post(api_port, "/api/reid/confirm",
+                        {"visit_id": vid, "name": "Notch", "species": "raccoon"})
+    assert status == 409 and "no raccoon crops" in out["error"]
+    assert all(v == (None, None) for v in _labels(db_path, ids["not an animal"]).values())
+    assert conn.execute("SELECT individual_id FROM visits WHERE id=?", (vid,)).fetchone()[0]         is None
+
+
+def test_every_dashboard_confirm_sends_the_queue_species():
+    src = (Path(__file__).resolve().parent.parent / "dashboard.js").read_text(encoding="utf-8")
+    calls = src.split("'/api/reid/confirm'")[1:]
+    assert calls and all("body:reidBody(" in c[:200] for c in calls)
+
+
 def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_path):
     """No logged_by -> labeled_by stays NULL, which reads as 'the operator, before attribution'.
     It must never be filled with a placeholder."""

@@ -135,8 +135,10 @@ def pack(dest: Path, *, dry_run: bool = False, include_weights: bool = True,
             if not src_root.is_dir():
                 continue
             try:
-                s = backup.archive_media(src_root, dest / src_root.name, today, dry_run=dry_run,
-                                         include_today=True, settle_s=PACK_SETTLE_S)
+                s = backup.archive_media(
+                    src_root, dest / src_root.name, today, dry_run=dry_run, include_today=True,
+                    settle_s=PACK_SETTLE_S,
+                    index_dir=backup.ARCHIVE_INDEX_DIR if src_root == CONFIG.clips_dir else None)
                 log.info("%s: %d day(s) archived, %d topped up (%d files, %.1f MB), %d already done",
                          src_root.name, s["created"], s["merged"], s["files"], s["bytes"] / 2**20,
                          s["skipped"])

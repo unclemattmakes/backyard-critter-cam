@@ -1424,9 +1424,12 @@ class VisitMatcher:
             0.119 -> 0.137 for LESS coverage). It is a fact the human supplies and the machine
             cannot infer, and it is a DATE test: visits from before the departure are still
             auto-nameable, and the departed individual is still ranked, suggested and templated
-            everywhere else. See is_departed().
+            everywhere else. See is_departed();
+          - SPECIES SCOPE: the name is written only onto this matcher's species' crops, never onto
+            the visit's dominant species (`no_matching_species` when there are none).
 
-        Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped}."""
+        Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped,
+        no_matching_species: [visit_id, ...]}."""
         cfg = self.cfg
         threshold = cfg.reid_auto_threshold if threshold is None else threshold
         margin = cfg.reid_auto_margin if margin is None else margin
@@ -1436,7 +1439,7 @@ class VisitMatcher:
                     "note": "disabled -- set reid_auto_threshold from eval.py --reid's sweep"}
         out = {"enabled": True, "threshold": threshold, "margin": margin,
                "min_templates": min_templates,
-               "assigned": [], "skipped": defaultdict(int)}
+               "assigned": [], "skipped": defaultdict(int), "no_matching_species": []}
         if not self.templates():
             out["skipped"]["no_templates"] = len(self.protos)
             out["skipped"] = dict(out["skipped"])
@@ -1484,8 +1487,13 @@ class VisitMatcher:
             if self.is_departed(name, self.visit_started.get(vid)):
                 out["skipped"]["departed"] += 1
                 continue
-            if not dry_run:
-                db.label_visit(conn, vid, name, source="auto")
+            # The name goes on THIS species' crops only, never the visit's dominant species: a
+            # raccoon visit outvoted by 'not an animal' boxes would hand them the name instead.
+            if not self._co_rows.get(vid) or (not dry_run and not db.label_visit(
+                    conn, vid, name, source="auto", species=self.species)):
+                out["skipped"]["no_matching_species"] += 1
+                out["no_matching_species"].append(vid)
+                continue
             out["assigned"].append({"visit_id": vid, "name": name,
                                     "similarity": round(sim, 3), "margin": round(lead, 3),
                                     "started": self.visit_started.get(vid)})
@@ -1521,9 +1529,30 @@ def _print_suggestion(s, matcher):
         print(f"      note: {s['note']}")
 
 
+def _audit_species_mismatch(db_path) -> int:
+    """Print db.species_mismatched_labels over a READ-ONLY connection (mode=ro)."""
+    conn = db.connect_readonly(db_path)
+    if conn is None:
+        print(f"No database at {db_path}.")
+        return 1
+    try:
+        r = db.species_mismatched_labels(conn)
+    finally:
+        conn.close()
+    print(f"{r['total']} labelled crop(s) whose species differs from their individual's.")
+    for g in r["groups"]:
+        print(f"  {g['name']} ({g['individual_species']}): {g['n']} '{g['species']}' crop(s), "
+              f"source {g['individual_source']}")
+        for e in g["examples"]:
+            print(f"      det #{e['id']}  visit #{e['visit_id']}  {e['timestamp']}  {e['source']}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 3: suggest-confirm loop for individual ID.")
-    p.add_argument("--species", default="raccoon", help="Species to suggest for (default raccoon).")
+    p.add_argument("--species", default=None,
+                   help="Species to suggest for (default raccoon). With --confirm: the species "
+                        "whose crops take the name (default: the individual's own, from its labels).")
     p.add_argument("--queue", action="store_true", help="Recent unconfirmed visits + suggestions.")
     p.add_argument("--visit", type=int, default=None, help="Suggestion read-out for one visit id.")
     p.add_argument("--bootstrap", action="store_true",
@@ -1538,17 +1567,31 @@ def main() -> int:
                    help="With --auto-assign: report what would be named, write nothing.")
     p.add_argument("--confirm", nargs=2, metavar=("VISIT_ID", "NAME"), default=None,
                    help="Confirm a visit's individual, e.g. --confirm 1014 Stan.")
+    p.add_argument("--audit-species-mismatch", action="store_true",
+                   help="READ-ONLY: list labelled crops whose species differs from their "
+                        "individual's. Writes nothing.")
+    p.add_argument("--db", default=None, help="Database path (default: config db_path).")
     p.add_argument("--limit", type=int, default=25, help="Queue length (default 25).")
     args = p.parse_args()
+    db_path = args.db or config.CONFIG.db_path
 
-    conn = db.connect(config.CONFIG.db_path)
+    if args.audit_species_mismatch:
+        return _audit_species_mismatch(db_path)
+
+    confirm_species = args.species
+    args.species = args.species or "raccoon"
+    conn = db.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if args.confirm is not None:
-            vid, name = int(args.confirm[0]), args.confirm[1].strip()
-            n = db.label_visit(conn, vid, name or None)
-            print(f"Visit #{vid}: stamped individual_id='{name}' on {n} crop(s). "
-                  f"It is now a suggestion template.")
+            vid, name = int(args.confirm[0]), args.confirm[1].strip() or None
+            sp = db.confirm_species(conn, vid, name, confirm_species)
+            n = db.label_visit(conn, vid, name, species=sp)
+            if sp and not n:
+                print(f"Visit #{vid}: no {sp} crops to name -- nothing written.")
+                return 1
+            print(f"Visit #{vid}: stamped individual_id='{name or ''}' on {n} "
+                  f"{sp or 'dominant-species'} crop(s). It is now a suggestion template.")
             return 0
 
         matcher = VisitMatcher(conn, args.species)
@@ -1568,6 +1611,9 @@ def main() -> int:
             for a in r["assigned"]:
                 print(f"  visit #{a['visit_id']:<6} {_fmt_started(a['started'])}  "
                       f"{a['name']}  sim {a['similarity']:.2f}  lead {a['margin']:.2f}")
+            for vid in r.get("no_matching_species", ()):
+                print(f"  visit #{vid:<6} {_fmt_started(matcher.visit_started.get(vid))}  "
+                      f"skipped: no {args.species} crops to name")
             if r["skipped"]:
                 parts = ", ".join(f"{k} {v}" for k, v in sorted(r["skipped"].items()))
                 print(f"  (skipped: {parts})")

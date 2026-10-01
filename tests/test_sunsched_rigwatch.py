@@ -104,6 +104,11 @@ def _isolated_rigwatch(tmp_path, monkeypatch):
     monkeypatch.setattr(rigwatch, "HOLD_MARKER", tmp_path / ".rig_hold")
     monkeypatch.setattr(rigwatch, "STATE_FILE", tmp_path / ".rigwatch_state.json")
     monkeypatch.setattr(rigwatch, "LOG_FILE", tmp_path / "logs" / "rigwatch.log")
+    monkeypatch.setattr(rigwatch, "REPORTS_DIR", tmp_path / "reports")
+    # A config_local.py heartbeat_url must never be pinged from a test, and nothing may reach the net.
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", None)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("network call from a test"))
     yield
 
 
@@ -170,6 +175,33 @@ def test_a_hold_is_not_cleared_by_a_running_rig_and_release_undoes_it(monkeypatc
     monkeypatch.setattr("sys.argv", ["rigwatch.py", "--release"])
     assert rigwatch.main() == 0
     assert rigwatch.held() is False
+
+
+def _log_text() -> str:
+    return rigwatch.LOG_FILE.read_text(encoding="utf-8") if rigwatch.LOG_FILE.exists() else ""
+
+
+def test_a_hold_that_keeps_a_down_rig_down_says_so_once_an_hour(monkeypatch):
+    rigwatch.HOLD_MARKER.write_text("held")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("must respect --hold"))
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    assert rigwatch.main() == 0                         # five minutes later: no second line
+    assert _log_text().count("HELD") == 1
+    st = rigwatch._state()
+    st["hold_logged_at"] = time.time() - rigwatch.REPEAT_ALARM_S - 1
+    rigwatch._write_state(st)
+    assert rigwatch.main() == 0
+    assert _log_text().count("HELD") == 2
+
+
+def test_a_hold_on_a_running_rig_logs_nothing(monkeypatch):
+    rigwatch.HOLD_MARKER.write_text("held")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    assert "HELD" not in _log_text()
 
 
 def test_restart_storms_are_capped(monkeypatch):
@@ -241,3 +273,180 @@ def test_it_refuses_to_act_when_it_cannot_tell_whether_the_rig_is_running(monkey
                         lambda: pytest.fail("must not start a rig it cannot see"))
     monkeypatch.setattr("sys.argv", ["rigwatch.py"])
     assert rigwatch.main() == 1
+
+
+# --------------------------------------------------------------------------- nightly batch
+# The batch hung for two days and nothing noticed. Every successful night writes an eval artifact,
+# so an old newest artifact is the signal.
+
+def _eval_artifact(hours_ago: float) -> None:
+    rigwatch.REPORTS_DIR.mkdir(exist_ok=True)
+    when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    (rigwatch.REPORTS_DIR / f"eval_{when:%Y%m%dT%H%M%SZ}.json").write_text("{}")
+
+
+def test_a_recent_eval_artifact_means_the_batch_is_fine():
+    _eval_artifact(48)
+    _eval_artifact(20)
+    h = rigwatch.batch_health()
+    assert h["present"] and not h["stale"]
+    assert 19 * 3600 < h["age_s"] < 21 * 3600            # the NEWEST one counts
+    assert rigwatch.check_batch(h) is False
+
+
+def test_no_artifacts_at_all_is_not_an_alarm():
+    """A machine that has never run the batch has nothing to be late for."""
+    h = rigwatch.batch_health()
+    assert h["present"] is False and h["stale"] is False
+
+
+def test_a_stale_batch_is_logged_on_every_path_once_an_hour(monkeypatch):
+    _eval_artifact(50)
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0                          # alarms do not change the exit code
+    assert rigwatch.main() == 0
+    assert _log_text().count("NIGHTLY BATCH IS STALE") == 1
+    rigwatch.HOLD_MARKER.write_text("held")              # a held, down rig still checks the batch
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    st = rigwatch._state()
+    st["batch_logged_at"] = 0
+    rigwatch._write_state(st)
+    assert rigwatch.main() == 0
+    assert _log_text().count("NIGHTLY BATCH IS STALE") == 2
+
+
+def test_the_stale_threshold_is_configurable(monkeypatch):
+    _eval_artifact(30)
+    assert rigwatch.batch_health()["stale"] is False     # default 36 h
+    monkeypatch.setattr(config.CONFIG, "batch_stale_hours", 24.0)
+    assert rigwatch.batch_health()["stale"] is True
+
+
+def test_an_unstamped_artifact_falls_back_to_its_mtime():
+    import os
+    rigwatch.REPORTS_DIR.mkdir()
+    p = rigwatch.REPORTS_DIR / "eval_handmade.json"
+    p.write_text("{}")
+    old = time.time() - 72 * 3600
+    os.utime(p, (old, old))
+    h = rigwatch.batch_health()
+    assert h["newest"] == "eval_handmade.json" and h["stale"] is True
+
+
+def test_status_shows_the_batch_and_changes_nothing(monkeypatch, capsys):
+    _eval_artifact(50)
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", "--status"])
+    assert rigwatch.main() == 0
+    out = capsys.readouterr().out
+    assert "nightly batch" in out and "STALE" in out
+    assert "NIGHTLY BATCH" not in _log_text()
+
+
+# --------------------------------------------------------------------------- off-host heartbeat
+# Every alarm above lives on the same box; when the box is down, only an outside service that
+# notices the pings stopping can tell anyone.
+URL = "https://hc-ping.example/0b1c-secret-token"
+
+
+class _Resp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        return b"OK"
+
+
+@pytest.fixture
+def pings(monkeypatch):
+    sent = []
+
+    def fake_urlopen(req, timeout=None):
+        assert timeout is not None and timeout <= 10
+        assert req.get_method() == "GET"
+        sent.append(req.full_url)
+        return _Resp()
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen", fake_urlopen)
+    # Pinned so a real .naming_status.json on the machine cannot decide healthy vs /fail.
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {"present": False, "stale": False})
+    return sent
+
+
+def _run(monkeypatch, pids, *argv):
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: pids)
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", *argv])
+    return rigwatch.main()
+
+
+def test_a_healthy_run_pings_the_heartbeat(monkeypatch, pings):
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL]
+
+
+def test_a_held_or_paused_down_rig_still_counts_as_healthy(monkeypatch, pings):
+    rigwatch.HOLD_MARKER.write_text("held")
+    assert _run(monkeypatch, []) == 0
+    rigwatch.HOLD_MARKER.unlink()
+    monkeypatch.setattr(rigwatch, "paused", lambda: True)
+    assert _run(monkeypatch, []) == 0
+    assert pings == [URL, URL]
+
+
+def test_stale_naming_pings_fail(monkeypatch, pings):
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {
+        "present": True, "state": "ready", "age_s": 3600.0, "stale": True, "backlog": None})
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL + "/fail"]
+
+
+def test_a_stale_batch_pings_fail(monkeypatch, pings):
+    _eval_artifact(50)
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL + "/fail"]
+
+
+def test_a_restart_storm_or_blind_watchdog_pings_fail(monkeypatch, pings):
+    assert _run(monkeypatch, None) == 1
+    for _ in range(rigwatch.MAX_STARTS_PER_HOUR):
+        rigwatch._record_start()
+    assert _run(monkeypatch, []) == 1
+    assert pings == [URL + "/fail"] * 2
+
+
+def test_fail_keeps_a_query_string_intact(monkeypatch, pings):
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL + "/?rid=abc")
+    rigwatch.ping_heartbeat(False)
+    assert pings == [URL + "/fail?rid=abc"]
+
+
+def test_the_restart_happens_before_the_ping_and_survives_a_dead_network(monkeypatch):
+    order = []
+
+    def boom(req, timeout=None):
+        order.append("ping")
+        raise OSError("connect to https://hc-ping.example/0b1c-secret-token timed out")
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: order.append("start") or 0)
+    assert _run(monkeypatch, []) == 0
+    assert order == ["start", "ping"]
+    text = _log_text()
+    assert "heartbeat to hc-ping.example failed" in text
+    assert "secret-token" not in text                    # the URL is the secret: host only
+
+
+def test_no_url_means_no_network_at_all(monkeypatch):
+    # The autouse fixture fails the test on any urlopen; heartbeat_url is None there.
+    assert _run(monkeypatch, [123]) == 0
+
+
+def test_status_never_pings_and_shows_only_the_host(monkeypatch, pings, capsys):
+    assert _run(monkeypatch, [123], "--status") == 0
+    out = capsys.readouterr().out
+    assert pings == []
+    assert "hc-ping.example" in out and "secret-token" not in out

@@ -264,6 +264,26 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
+`NAMING IS STALE` when species naming stops, and `NIGHTLY BATCH IS STALE` when the newest
+`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
+has not finished a run since.
+
+#### Hearing about it when the whole machine is down
+
+Every alarm above is written on the rig's own machine, so a hung or powered-off box says nothing.
+For that, point rigwatch at any free "dead man's switch" service ([healthchecks.io](https://healthchecks.io),
+or anything that takes a ping URL) and give the check a 5-minute period with some grace:
+
+```python
+cfg.heartbeat_url = "https://hc-ping.com/your-check-uuid"    # config_local.py: the URL is a secret
+```
+
+Each rigwatch run then pings that URL when everything is fine (rig up, or held/paused by you; naming
+and the nightly batch OK), and `<url>/fail` when it is not, which healthchecks.io treats as an
+immediate alarm. The point is the opposite case: when the pings **stop**, the service emails or
+texts you, from off the box. A network error never stops rigwatch, and only the host is logged.
+
 #### Telling someone else how to connect
 
 The LAN launcher gives the rig a **name on your network**, so nobody has to be handed an IP
@@ -956,6 +976,14 @@ then:
   instructions land in a `README.txt` beside the archives — and restoring is automated:
   `python migrate.py restore <backup folder>` from a fresh clone reassembles the whole rig
   (see [Moving the rig to a new machine](#moving-the-rig-to-a-new-machine)).
+- **Old snapshots are kept forever unless you opt in.** Each `backyard-db-<date>.zip` is a
+  full copy (~2.5 GB and growing), so the folder only grows. To thin it, set
+  `cfg.backup_snapshot_retention = {"weekly": 8, "monthly": 12}` in `config_local.py`: keep
+  the newest 8 DB snapshots, plus the newest one from each of the 12 most recent months, and
+  the same for `meta-<date>.zip`. The newest 3 are always kept, because `restore` falls back
+  to older ones when the newest is bad. Nothing is deleted on a run whose own DB or meta
+  snapshot failed. Preview it first with `backup.py --dry-run --snapshots-now`, which lists
+  each file it would delete and the space it would free.
 - **Four things beyond the media**, because "the weights re-download themselves" is only true
   for some of them and a database is not the same thing as a readable record:
   - `weights-archive.zip` — a **one-time** mirror of the model weights (MegaDetector plus the
@@ -1301,14 +1329,15 @@ everyone-operates behaviour.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
 - **Keys and passwords go in the secrets file, not `config_local.py`.** `config_local.py` is
-  gitignored, but `backup.py` copies it into every `meta-<date>.zip`, which usually lands in a
-  cloud-synced folder, unencrypted. So `email_resend_api_key`, `operator_token`, `mqtt_password`
-  and any camera URL carrying a password live in a JSON file outside the project that no backup
-  touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows, `~/.critter-cam/secrets.json`
-  elsewhere, or `$CRITTER_CAM_SECRETS` (format and `config.secret()` in
-  `config_local.example.py`). A key still set in `config_local.py` keeps working and still wins;
-  each backup run names any it finds. The database snapshot still carries your live cameras'
-  passwords. See [SECURITY.md → Where secrets live](SECURITY.md#where-secrets-live-the-secrets-file).
+  gitignored, but `backup.py` copies it into the weekly `meta-<date>.zip`, which usually lands in
+  a cloud-synced folder, unencrypted. So `email_resend_api_key`, `operator_token`, `mqtt_password`,
+  `heartbeat_url` and any camera URL carrying a password live in a JSON file outside the project
+  that no backup touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
+  `~/.critter-cam/secrets.json` elsewhere, or `$CRITTER_CAM_SECRETS` (format and `config.secret()`
+  in `config_local.example.py`). A key still set in `config_local.py` keeps working and still
+  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`, and
+  the database snapshot still carries your live cameras' passwords. See
+  [SECURITY.md → Where secrets live](SECURITY.md#where-secrets-live-the-secrets-file).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without
   bound** — there is no crop pruner and no DB retention policy. Measured on one camera after about

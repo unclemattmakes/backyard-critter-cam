@@ -163,8 +163,8 @@ What follows from that:
   as you and log into your cameras. If you share it, share a subfolder that is not `snapshots/`.
 - **Rotate rather than assume.** If that folder was ever shared, public, or on an account you no
   longer control, rotate the Resend key, the operator token and the camera passwords. They are
-  in every daily zip going back to the day you started, not just the newest one.
-- **Deleting the newest copy is not enough.** These zips are per-day and they accumulate. A
+  in every snapshot going back to the day you started, not just the newest one.
+- **Deleting the newest copy is not enough.** These snapshots accumulate. A
   secret leaked once is in every zip written since.
 - **`weights-archive.zip` and the media zips hold no credentials** — but the media is timestamped
   video of your property, and possibly of people walking past it.
