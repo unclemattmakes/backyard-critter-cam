@@ -11,18 +11,34 @@ permissions:
 
 jobs:
   pytest:
-    name: pytest (ubuntu, CPU-only)
-    runs-on: ubuntu-latest
+    # Branch protection requires the ubuntu check by this exact name -- don't change its string.
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A Windows failure must not cancel the required ubuntu check (and vice versa).
+      fail-fast: false
+      matrix:
+        include:
+          # 3.12 is the floor job: pyproject's floor is 3.10, and 3.12 is the version every
+          # dependency here has had prebuilt wheels for the longest.
+          - name: pytest (ubuntu, CPU-only)
+            os: ubuntu-latest
+            python: "3.12"
+          # The rig's real platform: Windows + Python 3.14. Every requirement (CPU torch
+          # included) has win_amd64 cp314 wheels, so nothing builds from source here.
+          - name: pytest (windows, Python 3.14, CPU-only)
+            os: windows-latest
+            python: "3.14"
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          # 3.12 rather than the 3.14 this rig runs on: pyproject's floor is 3.10, and 3.12 is the
-          # version every dependency here has had prebuilt wheels for the longest. The suite is
-          # pure logic, so the interpreter version it passes on is not the interesting variable.
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: requirements.txt
 
@@ -35,10 +51,15 @@ jobs:
           # test file rather than fail -- install it so CI actually covers the non-animal gate.
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-          # A GitHub runner has no libGL.so.1, so `import cv2` from the normal opencv-python wheel
-          # dies at collection (four test modules import it). Swap in the headless build AFTER
-          # requirements, because ultralytics' metadata requires opencv-python and pulls it back.
-          # Nothing in the suite imports ultralytics, so the dangling requirement is harmless.
+
+      # A GitHub ubuntu runner has no libGL.so.1, so `import cv2` from the normal opencv-python
+      # wheel dies at collection (four test modules import it). Swap in the headless build AFTER
+      # requirements, because ultralytics' metadata requires opencv-python and pulls it back.
+      # Nothing in the suite imports ultralytics, so the dangling requirement is harmless.
+      # Windows ships the GUI libraries, so it keeps the same opencv-python the rig runs.
+      - name: Swap in headless OpenCV (Linux)
+        if: runner.os == 'Linux'
+        run: |
           pip uninstall -y opencv-python
           pip install "opencv-python-headless>=4.10,<5"
 
@@ -47,8 +68,9 @@ jobs:
 
       # Lint after the tests (and even if they failed) so one red step doesn't hide the other.
       # Pinned so a new ruff release can't turn the build red on its own; config is in pyproject.
+      # Once is enough -- the result doesn't depend on the OS.
       - name: Lint (ruff)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           pip install "ruff==0.16.9"
           ruff check .
