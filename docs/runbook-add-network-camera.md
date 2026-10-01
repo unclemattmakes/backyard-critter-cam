@@ -225,9 +225,9 @@ pruned oldest-first *across every source in it*. On 2026-08-21 `glass_door_cam` 
 already at **9.89 GB of that 10** — so the first gigabyte the new camera recorded would have
 deleted the oldest glass-door clips to make room. Silently: the prune logs a count, not a
 victim, and that bucket gets **no archive guard** (the "never delete the only copy" protection
-is scoped to `clips_irreplaceable_sources`, i.e. the trail cam). `backup.py` runs weekly and
-skips today, so a fast enough prune destroys clips before they are ever archived — the same
-cadence collision that lost the 2026-07-30 trail-cam clips.
+is scoped to `clips_irreplaceable_sources`, i.e. the trail cam). `backup.py` archives media daily
+(snapshots weekly) and skips today, so a fast enough prune destroys clips before they are ever
+archived — the same cadence collision that lost the 2026-07-30 trail-cam clips.
 
 ```python
 cfg.clips_max_gb_by_source["yard_ir"] = 10.0

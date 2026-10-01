@@ -344,6 +344,9 @@ class Config:
     # at a folder your cloud client syncs (Google Drive / Dropbox / OneDrive) and the upload
     # takes care of itself. None = backup.py refuses to run until told where (or --dest).
     backup_dest: Path | None = None
+    # Days between writes of backup.py's snapshots/ family (~2.5 GB DB, meta, labels, CSV export);
+    # media is archived every run regardless. 0 = every run. `--snapshots-now` forces them.
+    backup_snapshot_every_days: int = 7
 
     # ---- Identity of this capture source (V1 constant) --------------------------
     # Written verbatim into detections.source. Future sources: 'trail_cam_sd', etc.
@@ -551,7 +554,7 @@ class Config:
     # is formatted EVERY import cycle. For these sources the pruner REFUSES to delete a file the
     # day-archive does not already contain: the budget is a preference, "the only copy" is not.
     # Until this shipped the protection was a ritual -- remember --backup-first, keep the budget
-    # generous, remember that backup.py runs weekly and skips today, so the newest day always lags.
+    # generous, remember that backup.py archives media daily and skips today, so the newest day lags.
     # A ritual is a thing you can forget once. Set to () to go back to a budget-only prune.
     clips_irreplaceable_sources: tuple = ("trail_cam_sd",)
     clips_dir: Path = ROOT / "clips"

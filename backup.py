@@ -36,9 +36,10 @@ Design notes (why it looks the way it does):
   beside the live capture thread and the naming helper (WAL writers keep writing; we get a
   consistent point-in-time copy), then PRAGMA quick_check'd before it's accepted. SQLite files
   deflate well (~2-4x), so the snapshot zip IS compressed.
-* Idempotent: run it as often as you like; work already archived is skipped. The weekly
-  schedule (Task Scheduler, Monday 03:30) is deliberately tighter than "monthly" because of
-  the pruning window above -- a month between runs would lose whatever clips_max_gb ate.
+* Idempotent: run it as often as you like; work already archived is skipped. Media is archived
+  on every (daily) run so a day is zipped before the clip pruner reaches it; the snapshots/
+  family (~2.5 GB DB, meta, label ledger, CSV export) only every backup_snapshot_every_days
+  (weekly by default, --snapshots-now forces them).
 
 Restore: `python migrate.py restore <dest>` from a fresh clone reassembles the rig from these
 archives (and the same tool's `pack` writes a right-now bundle in this exact format, for moving
@@ -51,6 +52,7 @@ Usage:
     python backup.py                 # destination from config (backup_dest in config_local.py)
     python backup.py --dest E:\\somewhere
     python backup.py --dry-run       # print what would be done, write nothing
+    python backup.py --snapshots-now # write the snapshots/ family even if the last is recent
 """
 from __future__ import annotations
 
@@ -143,14 +145,14 @@ def _mtime_before(p: Path, cutoff_epoch: float) -> bool:
         return False
 
 
-def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
+def day_dirs(src_root: Path, *, quiet: bool = False) -> list[tuple[Path, str]]:
     """The date-named day folders under a media root, as (folder, archive-name-stem) pairs,
     oldest days first -- oldest first so we archive the days nearest the pruning axe before it
     falls. Handles BOTH clip layouts: the legacy flat clips/<date>/ AND the multi-camera
     clips/<source>/<date>/ (each camera writes under its own source name since 2026-06-26), so
     those archives are per-camera-per-day: clips-glass_door_cam-2026-06-26.zip. NOT_ARCHIVED
     entries are passed over quietly; anything else is surfaced (a future layout change should be
-    noticed, not silently skipped)."""
+    noticed, not silently skipped; `quiet` is for a second pass over the same root)."""
     out: list[tuple[Path, str]] = []
     if not src_root.is_dir():
         return out
@@ -167,9 +169,9 @@ def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
             for q in sorted(p.iterdir()):
                 if q.is_dir() and DAY_DIR_RE.match(q.name):
                     out.append((q, f"{src_root.name}-{p.name}-{q.name}"))
-                else:
+                elif not quiet:
                     log.warning("ignoring unexpected entry (not a YYYY-MM-DD folder): %s", q)
-        else:
+        elif not quiet:
             log.warning("ignoring unexpected entry (not a YYYY-MM-DD folder): %s", p)
     out.sort(key=lambda pair: pair[0].name)  # oldest DAYS first, across layouts and cameras
     return out
@@ -387,6 +389,71 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
     return stats
 
 
+def _archived_days(out_dir: Path) -> dict[str, set[str]] | None:
+    """Archive-name prefix ("clips-<camera>", or "clips" for the legacy layout) -> the days that
+    have at least one part. None if the folder cannot be listed."""
+    try:
+        names = [q.name for q in out_dir.iterdir()]
+    except OSError:
+        return None
+    out: dict[str, set[str]] = {}
+    for n in names:
+        if not n.endswith(".zip"):
+            continue
+        stem = PART_RE.sub("", n) if PART_RE.search(n) else n[:-4]
+        prefix, sep, day = stem[:-11], stem[-11:-10], stem[-10:]
+        if sep == "-" and DAY_DIR_RE.match(day):
+            out.setdefault(prefix, set()).add(day)
+    return out
+
+
+def clip_coverage(clips_root: Path, out_dir: Path, today: date) -> tuple[list[str], list[str]] | None:
+    """(status lines, lost days) for clips/, per camera: the oldest day still holding clips on disk
+    vs the newest archived day, and the days whose clips were pruned before any archive held them.
+    None if the archive folder cannot be listed.
+
+    "Lost" = a past day folder that is now EMPTY and has no archive part. The pruner deletes files
+    but leaves their folder, so an empty folder proves the day once held clips. Days older than the
+    camera's first archive predate the backup and are not reported."""
+    archived = _archived_days(out_dir)
+    if archived is None:
+        return None
+    oldest_on_disk: dict[str, str] = {}
+    lost: list[str] = []
+    for day, stem in day_dirs(clips_root, quiet=True):
+        cam = stem[:-11]
+        if any(p.is_file() for p in day.rglob("*")):
+            oldest_on_disk.setdefault(cam, day.name)     # day_dirs is oldest first
+            continue
+        have = archived.get(cam)
+        if day.name < today.isoformat() and have and day.name not in have and day.name > min(have):
+            lost.append(f"{_camera_label(cam)}/{day.name}")
+    lines = []
+    for cam in sorted(set(oldest_on_disk) | set(archived)):
+        newest = max(archived[cam]) if cam in archived else "never"
+        lines.append(f"clips {_camera_label(cam)}: oldest day on disk "
+                     f"{oldest_on_disk.get(cam, 'none')}, newest archived {newest}")
+    return lines, lost
+
+
+def report_clip_coverage(clips_root: Path, out_dir: Path, today: date) -> list[str]:
+    """Log clip_coverage (lost days at WARNING) and return it as STATUS.txt lines."""
+    cov = clip_coverage(clips_root, out_dir, today)
+    if cov is None:
+        log.warning("could not list %s -- clip coverage not checked", out_dir)
+        return [f"clip coverage: NOT CHECKED, could not list {out_dir}"]
+    lines, lost = cov
+    for line in lines:
+        log.info("%s", line)
+    for d in lost:
+        log.warning("clips for %s were pruned before they were archived", d)
+    return lines + [f"clips for {d} were pruned before they were archived  <-- LOST" for d in lost]
+
+
+def _camera_label(prefix: str) -> str:
+    return prefix[len("clips-"):] if prefix.startswith("clips-") else "legacy"
+
+
 def _is_within(path: Path, root: Path) -> bool:
     """Is `path` inside `root` once both are resolved?"""
     try:
@@ -534,6 +601,69 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
         _publish(staged, out_zip)
     log.info("created %s  (db %.1f MB -> %.1f MB zipped, quick_check ok)", out_zip.name,
              db_path.stat().st_size / 2**20, out_zip.stat().st_size / 2**20)
+
+
+DB_SNAPSHOT_RE = re.compile(r"^backyard-db-(\d{4}-\d{2}-\d{2})\.zip$")
+
+
+def newest_db_snapshot_day(out_dir: Path) -> date | None:
+    """The date in the newest backyard-db-<date>.zip's name, or None if there is none. The name,
+    not the mtime: a copied or re-synced file keeps its name."""
+    days = []
+    try:
+        for q in out_dir.iterdir():
+            m = DB_SNAPSHOT_RE.match(q.name)
+            if m:
+                try:
+                    days.append(date.fromisoformat(m.group(1)))
+                except ValueError:
+                    pass
+    except OSError:
+        return None
+    return max(days, default=None)
+
+
+def snapshots_due(out_dir: Path, today: date, every_days: int, force: bool = False) -> bool:
+    """Whether this run writes the snapshots/ family: the newest DB snapshot is at least
+    `every_days` old, there is none, `every_days` <= 0, or `force`."""
+    newest = newest_db_snapshot_day(out_dir)
+    if force or newest is None or every_days <= 0:
+        return True
+    age = (today - newest).days
+    if age >= every_days:
+        return True
+    log.info("snapshots skipped (db, meta, labels, CSV export): newest db snapshot is %d day(s) "
+             "old, due every %d; --snapshots-now forces them", age, every_days)
+    return False
+
+
+def _export_csv(out_dir: Path, dry_run: bool) -> None:
+    import export as _export
+    _export.export_bundle(out_dir, dry_run=dry_run)
+    # Keep the newest few (the DB snapshots hold the deep history).
+    if not dry_run:
+        for old_file in sorted(out_dir.glob("export-*.zip"))[:-4]:
+            old_file.unlink(missing_ok=True)
+
+
+def run_snapshots(out_dir: Path, today: date, dry_run: bool, *, every_days: int,
+                  force: bool = False) -> int:
+    """The snapshots/ family on one cadence, keyed off the DB snapshot, so a daily schedule only
+    adds media and the ledger diff / keep-N retentions stay weekly. Returns failures."""
+    if not snapshots_due(out_dir, today, every_days, force):
+        return 0
+    failures = 0
+    for what, step in (
+            ("database snapshot", lambda: snapshot_db(CONFIG.db_path, out_dir, today, dry_run)),
+            ("meta snapshot", lambda: snapshot_meta(out_dir, today, dry_run)),
+            ("label ledger", lambda: export_labels(out_dir, today, dry_run)),
+            ("CSV export", lambda: _export_csv(out_dir, dry_run))):
+        try:
+            step()
+        except Exception:
+            log.exception("%s failed", what)
+            failures += 1
+    return failures
 
 
 def _tree_bytes(items: list[Path]) -> int:
@@ -730,17 +860,18 @@ def export_labels(out_dir: Path, today: date, dry_run: bool) -> None:
         old_file.unlink(missing_ok=True)
 
 
-def write_status(dest: Path, failures: int, dry_run: bool) -> None:
+def write_status(dest: Path, failures: int, dry_run: bool, notes: list[str] | None = None) -> None:
     """STATUS.txt -- the heartbeat that reaches the owner. The project has no notification
-    channel of any kind; this file, rewritten by every weekly run into the Drive-synced folder,
+    channel of any kind; this file, rewritten by every run into the Drive-synced folder,
     is the cheapest one that already exists: its CONTENTS say how the rig is, and its absence
     or staleness (mtime on the phone's Drive app) IS the alarm. Everything here is read-only
     and best-effort -- a status writer that can crash the backup would be a bad joke."""
     if dry_run:
         log.info("would write STATUS.txt")
         return
-    lines = [f"Backyard Critter Cam -- weekly status, {datetime.now().astimezone().isoformat()}",
-             f"backup: {'FAILED (' + str(failures) + ' failure(s))' if failures else 'ok'}"]
+    lines = [f"Backyard Critter Cam -- status, {datetime.now().astimezone().isoformat()}",
+             f"backup: {'FAILED (' + str(failures) + ' failure(s))' if failures else 'ok'}",
+             *(notes or [])]
     try:
         log_p = ROOT / "logs" / "backyard_cam.log"
         if log_p.exists():
@@ -831,7 +962,8 @@ def _older_than_days(iso_ts, days: int) -> bool:
 README = """Backyard Critter Cam -- content backups
 =========================================
 
-Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03:30).
+Written by backup.py in the project repo; runs daily (Task Scheduler). clips/crops are
+archived every run; everything in snapshots/ is written weekly.
 
   clips/      one zip per camera per day of video clips (clips-<camera>-<date>.zip; days
               before the multi-camera layout are just clips-<date>.zip). Uncompressed
@@ -886,12 +1018,19 @@ backup legitimately holds MORE days of video than the machine does. That's the p
 """
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Archive generated content (clips, crops, db) to a synced folder.")
     ap.add_argument("--dest", type=Path, default=CONFIG.backup_dest,
                     help="destination root (default: backup_dest from config_local.py)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be done; write nothing")
-    args = ap.parse_args()
+    ap.add_argument("--snapshots-now", "--db-now", dest="snapshots_now", action="store_true",
+                    help="write the snapshots/ family (db, meta, labels, CSV export) even if the "
+                         "newest db snapshot is under backup_snapshot_every_days old")
+    return ap
+
+
+def main() -> int:
+    args = _parser().parse_args()
 
     if args.dest is None:
         raise SystemExit(
@@ -948,39 +1087,24 @@ def main() -> int:
             log.exception("archiving %s failed", src_root.name)
             failures += 1
 
+    notes: list[str] = []
+    if CONFIG.clips_dir.is_dir():
+        try:
+            notes = report_clip_coverage(CONFIG.clips_dir, dest / CONFIG.clips_dir.name, today)
+        except Exception:
+            log.exception("clip coverage check failed")   # a report, never a failure of the run
+
+    failures += run_snapshots(dest / "snapshots", today, args.dry_run,
+                              every_days=CONFIG.backup_snapshot_every_days,
+                              force=args.snapshots_now)
     try:
-        snapshot_db(CONFIG.db_path, dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("database snapshot failed")
-        failures += 1
-    try:
-        snapshot_meta(dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("meta snapshot failed")
-        failures += 1
-    try:
-        snapshot_weights(dest / "snapshots", args.dry_run)
+        snapshot_weights(dest / "snapshots", args.dry_run)    # once ever; not on the cadence
     except Exception:
         log.exception("weights archive failed")
         failures += 1
-    try:
-        export_labels(dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("label ledger failed")
-        failures += 1
-    try:
-        import export as _export
-        _export.export_bundle(dest / "snapshots", dry_run=args.dry_run)
-        # One export per run; keep the newest few (the DB snapshots hold the deep history).
-        if not args.dry_run:
-            for old_file in sorted((dest / "snapshots").glob("export-*.zip"))[:-4]:
-                old_file.unlink(missing_ok=True)
-    except Exception:
-        log.exception("CSV export failed")
-        failures += 1
 
     try:
-        write_status(dest, failures, args.dry_run)
+        write_status(dest, failures, args.dry_run, notes)
     except Exception:
         log.exception("status write failed")     # never let the heartbeat sink the backup
 
