@@ -1529,9 +1529,30 @@ def _print_suggestion(s, matcher):
         print(f"      note: {s['note']}")
 
 
+def _audit_species_mismatch(db_path) -> int:
+    """Print db.species_mismatched_labels over a READ-ONLY connection (mode=ro)."""
+    conn = db.connect_readonly(db_path)
+    if conn is None:
+        print(f"No database at {db_path}.")
+        return 1
+    try:
+        r = db.species_mismatched_labels(conn)
+    finally:
+        conn.close()
+    print(f"{r['total']} labelled crop(s) whose species differs from their individual's.")
+    for g in r["groups"]:
+        print(f"  {g['name']} ({g['individual_species']}): {g['n']} '{g['species']}' crop(s), "
+              f"source {g['individual_source']}")
+        for e in g["examples"]:
+            print(f"      det #{e['id']}  visit #{e['visit_id']}  {e['timestamp']}  {e['source']}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Phase 3: suggest-confirm loop for individual ID.")
-    p.add_argument("--species", default="raccoon", help="Species to suggest for (default raccoon).")
+    p.add_argument("--species", default=None,
+                   help="Species to suggest for (default raccoon). With --confirm: the species "
+                        "whose crops take the name (default: the individual's own, from its labels).")
     p.add_argument("--queue", action="store_true", help="Recent unconfirmed visits + suggestions.")
     p.add_argument("--visit", type=int, default=None, help="Suggestion read-out for one visit id.")
     p.add_argument("--bootstrap", action="store_true",
@@ -1546,17 +1567,31 @@ def main() -> int:
                    help="With --auto-assign: report what would be named, write nothing.")
     p.add_argument("--confirm", nargs=2, metavar=("VISIT_ID", "NAME"), default=None,
                    help="Confirm a visit's individual, e.g. --confirm 1014 Stan.")
+    p.add_argument("--audit-species-mismatch", action="store_true",
+                   help="READ-ONLY: list labelled crops whose species differs from their "
+                        "individual's. Writes nothing.")
+    p.add_argument("--db", default=None, help="Database path (default: config db_path).")
     p.add_argument("--limit", type=int, default=25, help="Queue length (default 25).")
     args = p.parse_args()
+    db_path = args.db or config.CONFIG.db_path
 
-    conn = db.connect(config.CONFIG.db_path)
+    if args.audit_species_mismatch:
+        return _audit_species_mismatch(db_path)
+
+    confirm_species = args.species
+    args.species = args.species or "raccoon"
+    conn = db.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if args.confirm is not None:
-            vid, name = int(args.confirm[0]), args.confirm[1].strip()
-            n = db.label_visit(conn, vid, name or None)
-            print(f"Visit #{vid}: stamped individual_id='{name}' on {n} crop(s). "
-                  f"It is now a suggestion template.")
+            vid, name = int(args.confirm[0]), args.confirm[1].strip() or None
+            sp = db.confirm_species(conn, vid, name, confirm_species)
+            n = db.label_visit(conn, vid, name, species=sp)
+            if sp and not n:
+                print(f"Visit #{vid}: no {sp} crops to name -- nothing written.")
+                return 1
+            print(f"Visit #{vid}: stamped individual_id='{name or ''}' on {n} "
+                  f"{sp or 'dominant-species'} crop(s). It is now a suggestion template.")
             return 0
 
         matcher = VisitMatcher(conn, args.species)
