@@ -976,6 +976,14 @@ then:
   instructions land in a `README.txt` beside the archives — and restoring is automated:
   `python migrate.py restore <backup folder>` from a fresh clone reassembles the whole rig
   (see [Moving the rig to a new machine](#moving-the-rig-to-a-new-machine)).
+- **Old snapshots are kept forever unless you opt in.** Each `backyard-db-<date>.zip` is a
+  full copy (~2.5 GB and growing), so the folder only grows. To thin it, set
+  `cfg.backup_snapshot_retention = {"weekly": 8, "monthly": 12}` in `config_local.py`: keep
+  the newest 8 DB snapshots, plus the newest one from each of the 12 most recent months, and
+  the same for `meta-<date>.zip`. The newest 3 are always kept, because `restore` falls back
+  to older ones when the newest is bad. Nothing is deleted on a run whose own DB or meta
+  snapshot failed. Preview it first with `backup.py --dry-run --snapshots-now`, which lists
+  each file it would delete and the space it would free.
 - **Four things beyond the media**, because "the weights re-download themselves" is only true
   for some of them and a database is not the same thing as a readable record:
   - `weights-archive.zip` — a **one-time** mirror of the model weights (MegaDetector plus the

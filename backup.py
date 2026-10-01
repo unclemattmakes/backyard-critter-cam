@@ -40,6 +40,10 @@ Design notes (why it looks the way it does):
   on every (daily) run so a day is zipped before the clip pruner reaches it; the snapshots/
   family (~2.5 GB DB, meta, label ledger, CSV export) only every backup_snapshot_every_days
   (weekly by default, --snapshots-now forces them).
+* Old DB and meta snapshots are kept forever unless backup_snapshot_retention is set, e.g.
+  {"weekly": 8, "monthly": 12}: the newest 8 of each, plus the newest of each of the 12 most
+  recent months. The newest 3 are always kept, and nothing is deleted on a run whose own DB or
+  meta snapshot did not land. `--dry-run --snapshots-now` lists what it would delete.
 
 Restore: `python migrate.py restore <dest>` from a fresh clone reassembles the rig from these
 archives (and the same tool's `pack` writes a right-now bundle in this exact format, for moving
@@ -647,12 +651,15 @@ def _export_csv(out_dir: Path, dry_run: bool) -> None:
 
 
 def run_snapshots(out_dir: Path, today: date, dry_run: bool, *, every_days: int,
-                  force: bool = False) -> int:
+                  force: bool = False, retention: dict | None = None) -> int:
     """The snapshots/ family on one cadence, keyed off the DB snapshot, so a daily schedule only
-    adds media and the ledger diff / keep-N retentions stay weekly. Returns failures."""
+    adds media and the ledger diff / keep-N retentions stay weekly. Old DB and meta snapshots are
+    thinned by `retention` (prune_snapshots) only after both of this run's landed. Returns
+    failures."""
     if not snapshots_due(out_dir, today, every_days, force):
         return 0
     failures = 0
+    failed: set[str] = set()
     for what, step in (
             ("database snapshot", lambda: snapshot_db(CONFIG.db_path, out_dir, today, dry_run)),
             ("meta snapshot", lambda: snapshot_meta(out_dir, today, dry_run)),
@@ -663,7 +670,137 @@ def run_snapshots(out_dir: Path, today: date, dry_run: bool, *, every_days: int,
         except Exception:
             log.exception("%s failed", what)
             failures += 1
+            failed.add(what)
+    try:
+        prune_snapshots(out_dir, today, retention, dry_run=dry_run,
+                        fresh=not failed & {"database snapshot", "meta snapshot"})
+    except Exception:
+        log.exception("snapshot retention failed -- nothing more deleted")
+        failures += 1
     return failures
+
+
+# --- snapshot retention ------------------------------------------------------------------------
+#
+# Opt-in (backup_snapshot_retention; None keeps everything). Grandfather-father-son over the date
+# in each name: the newest `weekly` snapshots, plus the newest one in each of the `monthly` most
+# recent calendar months that have any. DB and meta are thinned independently.
+
+META_SNAPSHOT_RE = re.compile(r"^meta-(\d{4}-\d{2}-\d{2})\.zip$")
+SNAPSHOT_FAMILIES = (("backyard-db", DB_SNAPSHOT_RE), ("meta", META_SNAPSHOT_RE))
+# restore falls back from a bad newest snapshot to older ones, so these are never deleted.
+RETENTION_MIN_KEEP = 3
+RETENTION_KEYS = frozenset({"weekly", "monthly"})
+
+
+def _check_retention(policy: dict) -> tuple[int, int]:
+    """(weekly, monthly) from a retention policy. Anything unexpected raises: a misspelt key
+    read as 0 would delete the history it was meant to keep."""
+    if not isinstance(policy, dict) or set(policy) - RETENTION_KEYS:
+        raise ValueError(f"backup_snapshot_retention must be a dict with only "
+                         f"{sorted(RETENTION_KEYS)} keys, got {policy!r}")
+    counts = [policy.get(k, 0) for k in ("weekly", "monthly")]
+    if any(type(c) is not int or c < 0 for c in counts):
+        raise ValueError(f"backup_snapshot_retention counts must be ints >= 0, got {policy!r}")
+    return counts[0], counts[1]
+
+
+def _dated(names, pattern: re.Pattern) -> list[tuple[date, str]]:
+    """(date, name) for every name matching `pattern` exactly with a real date, newest first."""
+    out = []
+    for n in names:
+        m = pattern.fullmatch(n)
+        if m:
+            try:
+                out.append((date.fromisoformat(m.group(1)), n))
+            except ValueError:
+                pass
+    return sorted(out, reverse=True)
+
+
+def retention_plan(names, pattern: re.Pattern, policy: dict) -> tuple[list[str], list[str]]:
+    """(keep, delete) for one snapshot family, both oldest first. Pure: names in, names out.
+    Names not matching `pattern` are in neither list -- they are never ours to delete."""
+    weekly, monthly = _check_retention(policy)
+    dated = _dated(names, pattern)
+    keep = {n for _, n in dated[:max(weekly, RETENTION_MIN_KEEP)]}
+    months: set[tuple[int, int]] = set()
+    for d, n in dated:                                  # newest first: first seen = month's newest
+        if (d.year, d.month) not in months and len(months) < monthly:
+            months.add((d.year, d.month))
+            keep.add(n)
+    oldest_first = [n for _, n in reversed(dated)]
+    return ([n for n in oldest_first if n in keep], [n for n in oldest_first if n not in keep])
+
+
+def _todays_snapshots_landed(out_dir: Path, names: list[str], today: date) -> bool:
+    """Is today's snapshot the newest of each family, on disk, and openable as a zip?"""
+    for family, pattern in SNAPSHOT_FAMILIES:
+        dated = _dated(names, pattern)
+        mine = f"{family}-{today.isoformat()}.zip"
+        if not dated or dated[0][1] != mine:
+            log.warning("snapshot retention skipped: %s is not the newest %s snapshot -- nothing "
+                        "deleted", mine, family)
+            return False
+        try:
+            with zipfile.ZipFile(out_dir / mine) as zf:     # central directory only; cheap
+                if not zf.namelist():
+                    raise zipfile.BadZipFile("empty")
+        except (OSError, zipfile.BadZipFile) as e:
+            log.warning("snapshot retention skipped: %s will not open (%s) -- nothing deleted",
+                        mine, e)
+            return False
+    return True
+
+
+def prune_snapshots(out_dir: Path, today: date, policy: dict | None, *, dry_run: bool,
+                    fresh: bool) -> list[str]:
+    """Delete DB and meta snapshots `policy` does not keep; returns the names deleted (or, in a
+    dry run, that would be). `fresh` = this run's DB and meta snapshots both succeeded; without
+    that, and without today's files verified on disk, nothing is touched. A dry run plans as if
+    today's snapshots had landed."""
+    if policy is None:
+        log.debug("snapshot retention off (backup_snapshot_retention is None) -- keeping all")
+        return []
+    _check_retention(policy)
+    if not fresh:
+        log.warning("snapshot retention skipped: this run's database or meta snapshot failed -- "
+                    "nothing deleted")
+        return []
+    try:
+        names = [q.name for q in out_dir.iterdir() if q.is_file()]
+    except OSError as e:
+        log.warning("snapshot retention skipped: cannot list %s (%s)", out_dir, e)
+        return []
+    if dry_run:
+        names += [f"{fam}-{today.isoformat()}.zip" for fam, _ in SNAPSHOT_FAMILIES]
+    elif not _todays_snapshots_landed(out_dir, names, today):
+        return []
+    verb = "would delete" if dry_run else "deleted"
+    gone: list[str] = []
+    total = 0
+    for family, pattern in SNAPSHOT_FAMILIES:
+        keep, delete = retention_plan(set(names), pattern, policy)
+        freed = n_gone = 0
+        for n in delete:
+            p = out_dir / n
+            try:
+                size = p.stat().st_size
+                if not dry_run:
+                    p.unlink()
+            except OSError as e:
+                log.warning("snapshot retention: could not delete %s: %s", n, e)
+                continue
+            log.info("snapshot retention: %s %s (%.1f MB)", verb, n, size / 2**20)
+            gone.append(n)
+            freed += size
+            n_gone += 1
+        log.info("snapshot retention (%s): kept %d, %s %d (%.2f GB)", family, len(keep), verb,
+                 n_gone, freed / 2**30)
+        total += freed
+    log.info("snapshot retention %s %d snapshot(s), %.2f GB, policy %s", verb, len(gone),
+             total / 2**30, policy)
+    return gone
 
 
 def _tree_bytes(items: list[Path]) -> int:
@@ -987,6 +1124,8 @@ archived every run; everything in snapshots/ is written weekly.
                                         holds all of that -- share the folder accordingly, and
                                         rotate those secrets if it ever went somewhere it
                                         shouldn't have.
+              Old db and meta snapshots are thinned only if backup_snapshot_retention is
+              set in config_local.py (the newest 3 are always kept).
               weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging
                                         Face checkpoints); never rebuilt -- insurance for
                                         the day a hub repo disappears
@@ -1096,7 +1235,8 @@ def main() -> int:
 
     failures += run_snapshots(dest / "snapshots", today, args.dry_run,
                               every_days=CONFIG.backup_snapshot_every_days,
-                              force=args.snapshots_now)
+                              force=args.snapshots_now,
+                              retention=CONFIG.backup_snapshot_retention)
     try:
         snapshot_weights(dest / "snapshots", args.dry_run)    # once ever; not on the cadence
     except Exception:

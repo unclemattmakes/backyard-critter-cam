@@ -1051,6 +1051,223 @@ def test_names_that_merely_look_like_snapshots_are_ignored(tmp_path):
     assert backup.newest_db_snapshot_day(snaps) == date(2026, 7, 1)
 
 
+# --- retention: old DB and meta snapshots are thinned only on request ----------------------------
+
+GFS = {"weekly": 8, "monthly": 12}
+
+
+def _db_names(*days: str) -> list[str]:
+    return [f"backyard-db-{d}.zip" for d in days]
+
+
+def _plan(names, policy=GFS, pattern=backup.DB_SNAPSHOT_RE):
+    return backup.retention_plan(names, pattern, policy)
+
+
+def test_retention_keeps_the_newest_n_plus_the_newest_of_each_month():
+    days = ["2026-05-03", "2026-05-31", "2026-06-07", "2026-06-14", "2026-06-28",
+            "2026-07-05", "2026-07-12", "2026-07-19", "2026-07-26"]
+    keep, delete = _plan(_db_names(*days), {"weekly": 3, "monthly": 3})
+
+    assert keep == _db_names("2026-05-31", "2026-06-28", "2026-07-12", "2026-07-19", "2026-07-26")
+    assert delete == _db_names("2026-05-03", "2026-06-07", "2026-06-14", "2026-07-05")
+
+
+def test_monthly_counts_months_that_have_a_snapshot_not_the_calendar():
+    """A rig that was off for months still keeps one from each of its N most recent months."""
+    keep, _ = _plan(_db_names("2025-01-10", "2025-01-20", "2025-06-01", "2026-07-26"),
+                    {"weekly": 0, "monthly": 3})
+    assert keep == _db_names("2025-01-20", "2025-06-01", "2026-07-26")
+
+
+@pytest.mark.parametrize("policy", [{"weekly": 0, "monthly": 0}, {}, {"weekly": 1}])
+def test_the_newest_three_are_kept_whatever_the_policy(policy):
+    days = [f"2026-07-{d:02d}" for d in range(1, 11)]
+    keep, delete = _plan(_db_names(*days), policy)
+
+    assert keep == _db_names("2026-07-08", "2026-07-09", "2026-07-10")
+    assert len(delete) == 7
+
+
+def test_names_that_are_not_exactly_a_snapshot_are_never_planned_for_deletion():
+    odd = ["backyard-db-2026-07-01.zip.tmp", "backyard-db-latest.zip", "backyard-db-2026-13-45.zip",
+           "backyard-db-2026-07-02 (1).zip", "Backyard-db-2026-07-03.zip", "meta-2026-07-04.zip",
+           "export-2026-07-05.zip", "labels-2026-07-06.jsonl", "weights-archive.zip"]
+    names = odd + _db_names(*[f"2026-07-{d:02d}" for d in range(10, 20)])
+    keep, delete = _plan(names, {"weekly": 0, "monthly": 0})
+
+    assert not set(odd) & (set(keep) | set(delete))
+    assert len(keep) + len(delete) == 10
+
+
+def test_meta_snapshots_are_planned_on_their_own_dates():
+    names = _db_names("2026-07-26") + [f"meta-2026-07-{d:02d}.zip" for d in range(20, 27)]
+    keep, delete = _plan(names, {"weekly": 0, "monthly": 0}, backup.META_SNAPSHOT_RE)
+
+    assert keep == [f"meta-2026-07-{d}.zip" for d in (24, 25, 26)]
+    assert delete == [f"meta-2026-07-{d}.zip" for d in (20, 21, 22, 23)]
+
+
+@pytest.mark.parametrize("policy", [{"weekly": 8, "montly": 12}, {"weekly": -1},
+                                    {"weekly": "8"}, {"weekly": True}, [8, 12]])
+def test_a_malformed_policy_is_refused_rather_than_read_as_zero(policy):
+    with pytest.raises(ValueError):
+        _plan(_db_names("2026-07-26"), policy)
+
+
+@pytest.fixture
+def snapping(monkeypatch, tmp_path):
+    """run_snapshots with the DB and meta steps writing small real zips; labels/CSV stubbed out.
+    Set .fail to a step name ("db" / "meta") to make it raise, or .torn to write a non-zip DB."""
+    state = SimpleNamespace(fail=None, torn=False)
+
+    def step(family):
+        def run(*args):
+            out_dir, today, dry_run = args[-3:]
+            if state.fail == family:
+                raise RuntimeError(f"{family} snapshot failed quick_check")
+            if not dry_run:
+                p = out_dir / f"{'backyard-db' if family == 'db' else 'meta'}-{today}.zip"
+                if family == "db" and state.torn:
+                    p.write_bytes(b"PK")
+                else:
+                    _snap(p)
+        return run
+    monkeypatch.setattr(backup, "CONFIG", SimpleNamespace(db_path=tmp_path / "x.db"))
+    monkeypatch.setattr(backup, "snapshot_db", step("db"))
+    monkeypatch.setattr(backup, "snapshot_meta", step("meta"))
+    monkeypatch.setattr(backup, "export_labels", lambda o, t, d: None)
+    monkeypatch.setattr(backup, "_export_csv", lambda o, d: None)
+    return state
+
+
+def _snap(p: Path, size: int = 1024) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("x", b"\0" * size)
+    return p
+
+
+def _history(snaps: Path, weeks: int = 10) -> list[str]:
+    """`weeks` weekly DB + meta snapshots ending the week before TODAY (all in July 2026 and
+    earlier), plus files retention must never touch."""
+    names = []
+    for i in range(1, weeks + 1):
+        d = date.fromordinal(TODAY.toordinal() - 7 * i).isoformat()
+        for fam in ("backyard-db", "meta"):
+            names.append(_snap(snaps / f"{fam}-{d}.zip").name)
+    for n in ("export-2026-07-01.zip", "labels-2026-07-01.jsonl", "weights-archive.zip",
+              "backyard-db-2026-06-01 (1).zip"):
+        (snaps / n).write_bytes(b"x")
+    return names
+
+
+def _remaining(snaps: Path) -> set[str]:
+    return {q.name for q in snaps.iterdir()}
+
+
+def test_retention_off_deletes_nothing(tmp_path, snapping):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps)) | {"export-2026-07-01.zip"}
+
+    assert backup.run_snapshots(snaps, TODAY, False, every_days=7, retention=None) == 0
+    assert before <= _remaining(snaps)
+
+
+def test_a_good_run_thins_old_snapshots_and_logs_each_one(tmp_path, snapping, caplog):
+    snaps = tmp_path / "snapshots"
+    _history(snaps, weeks=10)            # 2026-05-21 .. 2026-07-23, weekly
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        failures = backup.run_snapshots(snaps, TODAY, False, every_days=7,
+                                        retention={"weekly": 4, "monthly": 3})
+
+    assert failures == 0
+    db_left = sorted(n for n in _remaining(snaps) if backup.DB_SNAPSHOT_RE.match(n))
+    # newest 4 (today + 3 July) and the newest of May, June and July
+    assert db_left == _db_names("2026-05-28", "2026-06-25", "2026-07-09", "2026-07-16",
+                                "2026-07-23", "2026-07-30")
+    assert len([n for n in _remaining(snaps) if backup.META_SNAPSHOT_RE.match(n)]) == 6
+    assert {"export-2026-07-01.zip", "labels-2026-07-01.jsonl", "weights-archive.zip",
+            "backyard-db-2026-06-01 (1).zip"} <= _remaining(snaps)
+    assert "snapshot retention: deleted backyard-db-2026-05-21.zip (0.0 MB)" in caplog.text
+    assert "snapshot retention: deleted meta-2026-07-02.zip" in caplog.text
+    assert "snapshot retention (backyard-db): kept 6, deleted 5" in caplog.text
+    assert "snapshot retention deleted 10 snapshot(s)" in caplog.text
+
+
+@pytest.mark.parametrize("fail", ["db", "meta"])
+def test_nothing_is_deleted_when_this_runs_snapshot_failed(tmp_path, snapping, caplog, fail):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps))
+    snapping.fail = fail
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        failures = backup.run_snapshots(snaps, TODAY, False, every_days=7, retention={"weekly": 0})
+
+    assert failures == 1
+    assert before <= _remaining(snaps)
+    assert "snapshot retention skipped" in caplog.text
+
+
+def test_nothing_is_deleted_when_todays_db_snapshot_will_not_open(tmp_path, snapping, caplog):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps))
+    snapping.torn = True
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        backup.run_snapshots(snaps, TODAY, False, every_days=7, retention={"weekly": 0})
+
+    assert before <= _remaining(snaps)
+    assert "backyard-db-2026-07-30.zip will not open" in caplog.text
+
+
+def test_nothing_is_deleted_on_a_run_that_writes_no_snapshot(tmp_path, snapping):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps))
+    _snap(snaps / "backyard-db-2026-07-29.zip")      # recent, so the family is not due
+
+    backup.run_snapshots(snaps, TODAY, False, every_days=7, retention={"weekly": 0})
+
+    assert before <= _remaining(snaps)
+
+
+def test_nothing_is_deleted_when_a_newer_snapshot_than_todays_exists(tmp_path, snapping, caplog):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps)) | {_snap(snaps / "backyard-db-2026-08-30.zip").name}
+
+    with caplog.at_level(logging.WARNING, logger="backup"):
+        backup.run_snapshots(snaps, TODAY, False, every_days=7, force=True,
+                             retention={"weekly": 0})
+
+    assert before <= _remaining(snaps)
+    assert "is not the newest backyard-db snapshot" in caplog.text
+
+
+def test_a_malformed_policy_fails_the_run_and_deletes_nothing(tmp_path, snapping):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps))
+
+    assert backup.run_snapshots(snaps, TODAY, False, every_days=7,
+                                retention={"weekly": 8, "montly": 12}) == 1
+    assert before <= _remaining(snaps)
+
+
+def test_dry_run_lists_what_would_go_and_deletes_nothing(tmp_path, snapping, caplog):
+    snaps = tmp_path / "snapshots"
+    before = set(_history(snaps, weeks=10))
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        backup.run_snapshots(snaps, TODAY, True, every_days=7,
+                             retention={"weekly": 4, "monthly": 3})
+
+    assert _remaining(snaps) - {"export-2026-07-01.zip", "labels-2026-07-01.jsonl",
+                                "weights-archive.zip", "backyard-db-2026-06-01 (1).zip"} == before
+    assert "snapshot retention: would delete backyard-db-2026-05-21.zip" in caplog.text
+    assert "would delete backyard-db-2026-07-23.zip" not in caplog.text
+    assert "snapshot retention would delete 10 snapshot(s)" in caplog.text
+
+
 # --- clips pruned before backup.py ever archived them -----------------------------------------
 #
 # The pruner deletes clip FILES and leaves the day folder, so a past day folder that is empty and
