@@ -834,3 +834,47 @@ def test_preview_never_waits_for_dawn(tmp_path, monkeypatch):
                         lambda *a, **k: {"d": {"empty": True, "reason": "no data"}})
     newsletter.main(["--no-send"])
     assert not called
+
+
+# ---- a sub-threshold model species reaches the paper as Unidentified, end to end -----------
+
+def test_low_confidence_species_reads_unidentified_in_the_issue(conn, db_path):
+    from dataclasses import replace
+
+    import config
+    import db
+    import stats
+    tz = datetime.now().astimezone().tzinfo
+    pinned = datetime(2026, 8, 12, 9, 0, 0, tzinfo=tz)            # a morning -> the night edition
+    cfg = replace(config.CONFIG, db_path=db_path, species_display_min_confidence=0.5)
+    start = datetime.fromisoformat(stats.period_digest(cfg, now=pinned)["start"])
+
+    def crop(at, species, sp_conf):
+        did = db.insert_detection(conn, timestamp=at.isoformat(), source="glass_door_cam",
+                                  detection_class="animal", confidence=0.9, bbox=(0, 0, 10, 10),
+                                  frame_w=100, frame_h=100, crop_path="crops/x.jpg",
+                                  species=species, crop_quality=1.0)
+        conn.execute("UPDATE detections SET species_confidence = ?, species_source = 'bioclip' "
+                     "WHERE id = ?", (sp_conf, did))
+
+    for m in range(3):
+        crop(start + timedelta(hours=1, minutes=m), "raccoon", 0.97)
+        crop(start + timedelta(hours=3, minutes=m), "song sparrow", 0.31)   # its own visit
+    conn.commit()
+
+    d = stats.period_digest(cfg, now=pinned)
+    assert {s["species"] for s in d["species"]} == {"raccoon", "animal"}
+    assert d["n_species"] == 1                          # Unidentified is not a species
+    txt = newsletter.render_text(mkbundle(d))
+    assert "Unidentified" in txt and "Song Sparrow" not in txt
+    assert "from 1 species" in txt
+
+    off = stats.period_digest(replace(cfg, species_display_min_confidence=0), now=pinned)
+    assert {s["species"] for s in off["species"]} == {"raccoon", "song sparrow"}
+    assert off["n_species"] == 2
+    assert "Song Sparrow" in newsletter.render_text(mkbundle(off))
+
+
+def test_species_count_falls_back_without_n_species():
+    lede = " ".join(newsletter.compose_lede(mkbundle(mkdigest())))   # older payload shape
+    assert "1 species" in lede

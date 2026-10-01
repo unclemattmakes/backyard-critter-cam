@@ -44,6 +44,24 @@ def _spconf_of(r):
         return None
 
 
+def display_species_sql(cfg) -> str:
+    """`species` as shown to a human, as a SQL expression over a detections row: BioCLIP's guess
+    under cfg.species_display_min_confidence reads as NULL -- no species claim -- so every
+    surface's existing `species or detection_class` fallback counts it under 'animal', which the
+    dashboard and the Creature Report render "Unidentified". Only the species namer's own calls
+    are gated (source 'bioclip', or NULL on legacy rows); a human label always shows: verified, a
+    'human' correction, or a crop a human named as an individual. NULL confidence (unscored) shows.
+    0 disables. Use it in a SELECT (`{expr} AS species`), a WHERE, or a GROUP BY."""
+    t = float(getattr(cfg, "species_display_min_confidence", 0.0) or 0.0)
+    if t <= 0:
+        return "species"
+    return ("(CASE WHEN species_confidence < %r "
+            "AND COALESCE(species_source, 'bioclip') = 'bioclip' "
+            "AND COALESCE(species_verified, 0) != 1 AND labeled_by IS NULL "
+            "AND NOT (COALESCE(individual_source, '') = 'human' AND individual_id IS NOT NULL) "
+            "THEN NULL ELSE species END)" % t)
+
+
 def supported_species(visit, cfg) -> list[str]:
     """The species a visit's crops actually SUPPORT, best-attested first.
 
@@ -269,8 +287,8 @@ def compute_stats(cfg) -> dict | None:
         return None
     try:
         rows = conn.execute(
-            "SELECT id, source, timestamp, detection_class, species, confidence, "
-            "species_confidence, crop_path "
+            "SELECT id, source, timestamp, detection_class, "
+            f"{display_species_sql(cfg)} AS species, confidence, species_confidence, crop_path "
             "FROM detections ORDER BY timestamp"
         ).fetchall()
         clips = load_clips(conn)
@@ -354,8 +372,8 @@ def current_live_visit(cfg, source: str | None = None, lookback: int = 600) -> d
         return {"source": source, "count": 0}
     try:
         rows = conn.execute(
-            "SELECT timestamp, species FROM detections WHERE source = ? "
-            "ORDER BY id DESC LIMIT ?", (source, int(lookback))).fetchall()
+            f"SELECT timestamp, {display_species_sql(cfg)} AS species FROM detections "
+            "WHERE source = ? ORDER BY id DESC LIMIT ?", (source, int(lookback))).fetchall()
         # Walk back over the recent window by INSTANT, not insertion id: the live rig writes in
         # time order so the two agree, but sorting by parsed time keeps the gap detection correct
         # even if a backfill or clock hiccup left an out-of-order row in the window.
@@ -503,11 +521,14 @@ def species_overview(cfg) -> dict | None:
     if conn is None:
         return None
     try:
+        # Grouped by the DISPLAYED species: a sub-threshold guess is unidentified, and like an
+        # unclassified crop it has no catalogue card.
+        sp = display_species_sql(cfg)
         rows = conn.execute(
-            "SELECT species, COUNT(*) n, ROUND(AVG(species_confidence), 3) avg_conf, "
+            f"SELECT {sp} AS species, COUNT(*) n, ROUND(AVG(species_confidence), 3) avg_conf, "
             "SUM(CASE WHEN species_verified = 1 THEN 1 ELSE 0 END) verified, "
             "SUM(CASE WHEN species_verified = 0 THEN 1 ELSE 0 END) rejected "
-            "FROM detections WHERE species IS NOT NULL GROUP BY species ORDER BY n DESC"
+            f"FROM detections WHERE {sp} IS NOT NULL GROUP BY 1 ORDER BY n DESC"
         ).fetchall()
         # Drop non-critter human-correction labels (chair, bricks, "not an animal", person, ...)
         # so the catalogue and the "Rarely Seen" cards stay about real animals -- same filter the
@@ -516,7 +537,7 @@ def species_overview(cfg) -> dict | None:
         species = []
         for r in rows:
             s = conn.execute(
-                "SELECT crop_path FROM detections WHERE species = ? "
+                f"SELECT crop_path FROM detections WHERE species = ? AND {sp} IS NOT NULL "
                 "ORDER BY (species_verified = 1) DESC, species_confidence DESC LIMIT 1",
                 (r["species"],)).fetchone()
             species.append({
@@ -1183,17 +1204,18 @@ def crops_page(cfg, day=None, species=None, start=None, end=None, offset=0, limi
     if conn is None:
         return {"crops": [], "total": 0, "offset": 0, "limit": limit}
     try:
+        sp = display_species_sql(cfg)
         where, args = [], []
         if day:        where.append("timestamp LIKE ?");   args.append(str(day) + "%")
-        if species:    where.append("species = ?");        args.append(species)
+        if species:    where.append(f"species = ? AND {sp} IS NOT NULL"); args.append(species)
         if start:      where.append("timestamp >= ?");     args.append(start)
         if end:        where.append("timestamp <= ?");     args.append(end)
         if individual: where.append("individual_id = ?");  args.append(individual)
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         total = conn.execute(f"SELECT COUNT(*) FROM detections {clause}", args).fetchone()[0]
         rows = conn.execute(
-            f"SELECT id, timestamp, species, confidence, species_confidence, species_verified, "
-            f"crop_path FROM detections {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT id, timestamp, {sp} AS species, confidence, species_confidence, "
+            f"species_verified, crop_path FROM detections {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
             args + [int(limit), int(offset)]).fetchall()
         # One star lookup for the whole page (db.favorite_keys is two sets, not a query per row),
         # so every crop grid renders its hearts already filled -- no second round trip, and no
@@ -1214,9 +1236,11 @@ _VISITS_SCAN_ROWS = 15000   # newest detections scanned for the no-filter visits
 # The columns compute_visits + _shot_score + _named_of need to build a visit card. Shared by
 # visits_page and favorites_page so the two can never drift into rendering different cards for
 # the same visit (favorites_page re-derives a starred visit from scratch -- see _visit_at).
-_VISIT_ROW_COLS = ("id, source, timestamp, detection_class, species, confidence, "
-                   "species_confidence, crop_path, crop_quality, individual_id, "
-                   "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h")
+def _visit_row_cols(cfg) -> str:
+    return ("id, source, timestamp, detection_class, "
+            f"{display_species_sql(cfg)} AS species, confidence, "
+            "species_confidence, crop_path, crop_quality, individual_id, "
+            "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h")
 
 
 def visits_page(cfg, day=None, limit=200) -> dict:
@@ -1232,7 +1256,7 @@ def visits_page(cfg, day=None, limit=200) -> dict:
     if conn is None:
         return {"visits": [], "total": 0}
     try:
-        cols = _VISIT_ROW_COLS
+        cols = _visit_row_cols(cfg)
         windowed = False
         if day:
             rows = conn.execute(
@@ -1313,7 +1337,7 @@ def _visit_at(conn, cfg, source, started_at, clips=None):
     lo = (start_dt - timedelta(minutes=gap)).isoformat()
     hi = (start_dt + timedelta(hours=_FAV_VISIT_WINDOW_H)).isoformat()
     rows = conn.execute(
-        f"SELECT {_VISIT_ROW_COLS} FROM detections WHERE source = ? AND timestamp >= ? "
+        f"SELECT {_visit_row_cols(cfg)} FROM detections WHERE source = ? AND timestamp >= ? "
         "AND timestamp <= ? ORDER BY timestamp LIMIT ?",
         (source, lo, hi, _FAV_VISIT_SCAN_ROWS)).fetchall()
     if not rows:
@@ -1370,8 +1394,9 @@ def favorites_page(cfg, limit: int = 300) -> dict:
         if det_ids:
             marks = ",".join("?" * len(det_ids))
             for r in conn.execute(
-                    "SELECT id, source, timestamp, species, confidence, species_confidence, "
-                    f"species_verified, crop_path, individual_id FROM detections WHERE id IN ({marks})",
+                    f"SELECT id, source, timestamp, {display_species_sql(cfg)} AS species, "
+                    "confidence, species_confidence, species_verified, crop_path, individual_id "
+                    f"FROM detections WHERE id IN ({marks})",
                     det_ids):
                 crops[r["id"]] = {
                     "id": r["id"], "source": r["source"], "timestamp": r["timestamp"],
@@ -1427,8 +1452,8 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
             return {"found": False, "name": name}
 
         species_mix = [{"species": r["sp"], "n": r["n"]} for r in conn.execute(
-            "SELECT COALESCE(species, detection_class) sp, COUNT(*) n FROM detections "
-            "WHERE individual_id = ? GROUP BY sp ORDER BY n DESC", (name,))]
+            f"SELECT COALESCE({display_species_sql(cfg)}, detection_class) sp, COUNT(*) n "
+            "FROM detections WHERE individual_id = ? GROUP BY sp ORDER BY n DESC", (name,))]
         stamp_mix = {(r["s"] or "human"): r["n"] for r in conn.execute(
             "SELECT individual_source s, COUNT(*) n FROM detections "
             "WHERE individual_id = ? GROUP BY s", (name,))}
@@ -1442,7 +1467,8 @@ def individual_profile(cfg, name, visit_limit: int = 200) -> dict:
         # Every crop of every visit the name appears in -- the co-present animals' crops too, so
         # each visit's classes/companions/span reflect the whole visit, not just this animal.
         rows = conn.execute(
-            "SELECT id, source, timestamp, detection_class, species, confidence, "
+            "SELECT id, source, timestamp, detection_class, "
+            f"{display_species_sql(cfg)} AS species, confidence, "
             "species_confidence, crop_path, crop_quality, individual_id, visit_id, "
             "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
             "FROM detections WHERE visit_id IN "
@@ -1789,8 +1815,8 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
     if conn is None:
         return {"empty": True, "edition": edition, "reason": "no database yet"}
     raw = conn.execute(
-        "SELECT id, timestamp, source, detection_class, species, confidence, species_confidence, "
-        "species_verified, crop_path, crop_quality, individual_id, "
+        f"SELECT id, timestamp, source, detection_class, {display_species_sql(cfg)} AS species, "
+        "confidence, species_confidence, species_verified, crop_path, crop_quality, individual_id, "
         "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h "
         "FROM detections ORDER BY timestamp").fetchall()
     clips = load_clips(conn)
@@ -2119,6 +2145,9 @@ def period_digest(cfg, edition="auto", now=None, date=None, *, regular_frac=0.4,
     out.update({
         "empty": False, "visits": len(visits), "crops": len(pr), "species": species_roll,
         "n_surprising": n_surprising,
+        # Species the period asserts: the roll minus its questions and its Unidentified row.
+        "n_species": sum(1 for s in species_roll
+                         if s["species"] != "animal" and not s.get("surprising")),
         "coverage": coverage,
         "novel": novel, "quiet": quiet[:4], "reel": reel, "visit_log": visit_log,
         "plate": {"crop_path": _web(plate["crop_path"]), "species": plate["label"],
