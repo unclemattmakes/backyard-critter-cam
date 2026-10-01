@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -87,6 +89,168 @@ def test_migrate_directly_idempotent(conn):
     db._migrate(conn)  # must not raise "duplicate column name"
     cols = _columns(conn, "detections")
     assert "species_source" in cols
+
+
+# --- schema version (PRAGMA user_version) -------------------------------------------------
+
+def _user_version(path) -> int:
+    raw = sqlite3.connect(path)
+    try:
+        return raw.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        raw.close()
+
+
+def _legacy_db(path) -> None:
+    """A pre-versioning backyard.db: user_version 0, WAL (like the live one), and a detections
+    table missing every column _migrate adds."""
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA journal_mode = WAL")
+    raw.execute("""CREATE TABLE detections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, source TEXT NOT NULL,
+        detection_class TEXT NOT NULL, confidence REAL NOT NULL,
+        bbox_x1 REAL NOT NULL, bbox_y1 REAL NOT NULL, bbox_x2 REAL NOT NULL, bbox_y2 REAL NOT NULL,
+        frame_w INTEGER NOT NULL, frame_h INTEGER NOT NULL, crop_path TEXT NOT NULL,
+        frame_path TEXT, species TEXT, individual_id TEXT)""")
+    raw.execute("INSERT INTO detections (timestamp, source, detection_class, confidence, "
+                "bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h, crop_path, individual_id) "
+                "VALUES ('2026-06-01T20:00:00-07:00', 'glass_door_cam', 'animal', 0.9, "
+                "0, 0, 10, 10, 100, 100, 'crops/old.jpg', 'Stan')")
+    raw.commit()
+    raw.close()
+
+
+def _count_migrates(monkeypatch, delay=0.0) -> list:
+    calls = []
+    real = db._migrate
+
+    def spy(conn):
+        calls.append(1)
+        if delay:
+            time.sleep(delay)      # hold the write lock so racing connects really contend
+        real(conn)
+    monkeypatch.setattr(db, "_migrate", spy)
+    return calls
+
+
+def _forbid_migration(monkeypatch) -> None:
+    def boom(conn):
+        raise AssertionError("_migrate ran on a DB that did not need it")
+    monkeypatch.setattr(db, "_migrate", boom)
+    monkeypatch.setattr(db, "SCHEMA", "THIS IS NOT SQL")   # executescript(SCHEMA) would raise too
+
+
+def test_fresh_db_is_migrated_and_versioned(db_path, monkeypatch):
+    calls = _count_migrates(monkeypatch)
+    db.connect(db_path).close()
+    assert len(calls) == 1
+    assert _user_version(db_path) == db.SCHEMA_VERSION
+
+
+def test_old_db_is_migrated_then_versioned(db_path):
+    _legacy_db(db_path)
+    assert _user_version(db_path) == 0
+    c = db.connect(db_path)
+    try:
+        cols = _columns(c, "detections")
+        for col in ("species_source", "visit_id", "model_species", "labelled_at", "suppressed_at"):
+            assert col in cols
+        assert c.execute("SELECT individual_id FROM detections").fetchone()[0] == "Stan"
+        assert "cameras" in _table_names(c)
+    finally:
+        c.close()
+    assert _user_version(db_path) == db.SCHEMA_VERSION
+
+
+def test_current_db_skips_schema_and_migrate(db_path, monkeypatch):
+    db.connect(db_path).close()
+    _forbid_migration(monkeypatch)
+    c = db.connect(db_path)          # must not touch SCHEMA or _migrate ...
+    try:
+        # ... but every per-connection pragma is still set.
+        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert c.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert "detections" in _table_names(c)
+    finally:
+        c.close()
+
+
+def test_newer_db_is_neither_migrated_nor_downgraded(db_path, monkeypatch, caplog):
+    db.connect(db_path).close()
+    newer = db.SCHEMA_VERSION + 5
+    raw = sqlite3.connect(db_path)
+    raw.execute(f"PRAGMA user_version = {newer}")
+    raw.close()
+    _forbid_migration(monkeypatch)
+    monkeypatch.setattr(db, "_warned_newer", False)
+    with caplog.at_level("WARNING", logger="db"):
+        db.connect(db_path).close()
+        db.connect(db_path).close()
+    assert _user_version(db_path) == newer
+    warnings = [r for r in caplog.records if r.name == "db" and "newer" in r.getMessage()]
+    assert len(warnings) == 1        # once per process, not once per connect
+
+
+def test_version_is_rechecked_under_the_lock(db_path, monkeypatch):
+    """Another process finished migrating between our first (unlocked) read and BEGIN IMMEDIATE:
+    the re-check must see that and skip _migrate."""
+    db.connect(db_path).close()
+    real = db._user_version
+    reads = []
+
+    def stale_first(conn):
+        reads.append(1)
+        return 0 if len(reads) == 1 else real(conn)
+    monkeypatch.setattr(db, "_user_version", stale_first)
+    monkeypatch.setattr(db, "_migrate",
+                        lambda conn: (_ for _ in ()).throw(AssertionError("migrated twice")))
+    db.connect(db_path).close()
+    assert len(reads) == 2
+    assert _user_version(db_path) == db.SCHEMA_VERSION
+
+
+def test_concurrent_first_connects_migrate_once(db_path, monkeypatch):
+    _legacy_db(db_path)
+    calls = _count_migrates(monkeypatch, delay=0.3)
+    n = 4
+    gate = threading.Barrier(n)
+    errors = []
+
+    def worker():
+        try:
+            gate.wait(timeout=10)
+            c = db.connect(db_path)
+            assert "labelled_at" in _columns(c, "detections")
+            c.close()
+        except BaseException as e:      # surfaced below; a thread can't fail the test itself
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "connect() deadlocked"
+    assert errors == []
+    assert len(calls) == 1
+    assert _user_version(db_path) == db.SCHEMA_VERSION
+
+
+def test_readonly_connection_never_writes_the_version(db_path, monkeypatch):
+    _legacy_db(db_path)
+    _forbid_migration(monkeypatch)
+    ro = db.connect_readonly(db_path)
+    try:
+        assert ro.execute("SELECT individual_id FROM detections").fetchone()[0] == "Stan"
+    finally:
+        ro.close()
+    assert _user_version(db_path) == 0
+    raw = sqlite3.connect(db_path)
+    try:
+        assert "labelled_at" not in _columns(raw, "detections")
+    finally:
+        raw.close()
 
 
 # --- insert_detection round-trip --------------------------------------------------------

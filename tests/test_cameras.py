@@ -247,9 +247,10 @@ def test_connect_erases_passwords_left_on_older_tombstones(db_path):
     c = db.connect(db_path)
     old = _net(c, password="hunter2")
     live = _net(c, source="feeder", password="other")
-    # The pre-fix tombstone: deleted_at set, password still there.
+    # The pre-fix tombstone: deleted_at set, password still there, in a DB from before versioning.
     c.execute("UPDATE cameras SET deleted_at = '2026-09-01T00:00:00-07:00' WHERE id = ?",
               (old["id"],))
+    c.execute("PRAGMA user_version = 0")
     c.commit()
     c.close()
     for _ in range(2):                                         # idempotent
