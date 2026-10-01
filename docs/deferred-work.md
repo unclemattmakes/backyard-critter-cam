@@ -31,8 +31,10 @@ numbers in that file.
 3. **Scheduled tasks need a logged-in user.** Every critter-cam task runs only while the owner is
    logged on, so a reboot to the lock screen stops everything (24.5 h once). Re-register the tasks
    to run whether or not anyone is logged on (the rig itself needs a desktop session for its
-   preview window, so headless config comes with it), or set auto-logon. *S, human (needs the
-   account password).*
+   preview window, so headless config comes with it), or set auto-logon. The morning email's
+   *Rig health* box now flags a watchdog that has stopped running, but the email is one of those
+   tasks too, so it goes quiet at the same moment; only the off-host `heartbeat_url` covers that.
+   *S, human (needs the account password).*
 4. **Rotate the credentials that rode into old backups.** Until #36, the camera password and the
    mail API key sat in `config_local.py`, so every meta zip in the cloud backup folder carries
    them. Rotate both, then thin or delete the old meta zips. *S, human.*
@@ -72,16 +74,14 @@ numbers in that file.
     surface, behind the existing tests, one file per PR. *L, low urgency.*
 15. **Exercise the never-fired safety paths on purpose.** The auto-assign reject tombstone and
     the USB-wedge self-heal have never run outside tests; trigger each once deliberately. *S.*
-16. **The morning email's dashboard link uses the configured `web_port`**, so it is wrong when the
-    rig fell back to 8000 at startup. *S.*
-17. **Trail-cam view epochs.** `view_epochs` is empty for the trail cam (and holds one wrong row
+16. **Trail-cam view epochs.** `view_epochs` is empty for the trail cam (and holds one wrong row
     for the glass door), which blocks both an occupancy map and the trail-cam half of the
     furniture veto. The segmenter method is measured and works; build the read-only reporter
     first. *M.*
-18. **Linux/macOS ops parity.** Everything that keeps the rig alive unattended is
+17. **Linux/macOS ops parity.** Everything that keeps the rig alive unattended is
     Windows-shaped (`.bat`, `schtasks`, Power Requests). Document or provide cron/systemd
     equivalents. *M.*
-19. **Weather join.** Backfill Open-Meteo history by date so a wet night stops looking like a
+18. **Weather join.** Backfill Open-Meteo history by date so a wet night stops looking like a
     quiet one. *S.*
 
 ## Killed, with reasons

@@ -292,6 +292,13 @@ STALE` when the newest `reports/eval_*.json` is older than `batch_stale_hours` (
 meaning the nightly batch has not finished a run since, and `rig is down and HELD` while a
 `--hold` is keeping a down rig down, so a forgotten hold still leaves a trace.
 
+The log is for post-mortems. What reaches you is the **Rig health** box: rigwatch keeps its
+current alarms in `.rigwatch_state.json` (cleared as soon as the condition clears), `backup.py`
+keeps its last verdict in `.backup_state.json`, and `health.py` combines them, adding an alarm
+of its own when rigwatch has not run for 30 minutes or no backup has succeeded for 36 hours. The
+[morning email](#a-morning-email) shows that box above the lede, and the dashboard shows it as
+a banner (`/api/health`); when nothing needs you, neither shows anything.
+
 One limit: the scheduled tasks in this README are registered without a stored password, so they
 run only while you are logged on. After a reboot that stops at the lock screen nothing runs (no
 rigwatch, no rig, no nightly batch, no backup) until someone logs in; on this rig that once cost
@@ -1078,7 +1085,9 @@ then:
 - **Clips pruned before they were archived are reported.** After the media pass, `STATUS.txt`
   gets a line per camera ("oldest day on disk, newest archived"), and a past day folder that is
   empty with no archive at all is logged as `clips for <camera>/<day> were pruned before they
-  were archived` and marked `LOST` in `STATUS.txt`.
+  were archived`, once, on the run that first finds it. `STATUS.txt` carries one summary line
+  (`N clip days lost before archiving (newest ..., first reported ...)`, marked `LOST` when a run
+  adds to it), and the next morning email mentions the new ones.
 - **Idempotent** — run it as often as you like; finished days are skipped in seconds. Restore
   instructions land in a `README.txt` beside the archives — and restoring is automated:
   `python migrate.py restore <backup folder>` from a fresh clone reassembles the whole rig
@@ -1201,8 +1210,8 @@ opens its catalogue sheet, a cast member opens their profile, the hero opens tha
 Those links reach the rig **over your own network only** (the dashboard has no login — see
 [Security & privacy](#security--privacy)), so they work from the sofa and not from the bus.
 The address is auto-detected per issue: your machine's **LAN IP** (e.g. `http://192.168.1.50`,
-with the port added only when `web_port` isn't 80; a rig that fell back to 8000 at startup isn't
-detected, so set the URL below if yours does), not its Windows hostname, because
+with the port the dashboard actually bound, so a rig that fell back to 8000 at startup gets
+`:8000`), not its Windows hostname, because
 phones resolve mDNS rather than NetBIOS and a bare PC name simply fails on iOS and Android.
 Re-deriving it every morning means a DHCP change heals itself; override with
 `cfg.email_dashboard_url` for a fixed name, a different port, or a reverse proxy.

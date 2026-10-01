@@ -567,6 +567,17 @@ async function refreshEvalStatus(){
     : `Nightly eval (${when}): ran without a baseline to diff against (this run IS the baseline).`;
 }
 
+/* The rig's own health (/api/health = health.rig_health, the list the morning email boxes):
+   one line per thing that needs a human, hidden when the list is empty. Slow poll -- rigwatch
+   only re-judges every 5 minutes. */
+async function refreshRigHealth(){
+  const el=$('#righealth'); if(!el) return;
+  let h; try{ h=await fetch('/api/health').then(r=>r.json()); }catch(e){ return; }
+  const items=(h&&h.items)||[];
+  el.hidden=!items.length;
+  el.innerHTML=items.map(it=>`<div>${it.severity==='info'?'·':'⚠'} ${esc(it.message)}</div>`).join('');
+}
+
 /* What regressed: baseline-diff metrics by name, floor breaches as "value < floor". Older
    artifacts carry no floor_breaches, so they read exactly as before. */
 function evalWhat(ev){
@@ -3435,7 +3446,7 @@ function maybeFirstRun(s){
 }
 function dismissIntro(){ localStorage.setItem('cc-introDismissed','1'); const el=document.getElementById('firstrun'); if(el) el.hidden=true; }
 
-loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); refreshEvalStatus(); refreshRole(); refreshLabeler();
+loadCameras(); refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); refreshEvalStatus(); refreshRigHealth(); refreshRole(); refreshLabeler();
 // Land wherever the URL hash points — a tab, a profile, a day, a species sheet, a dated
 // dispatch (deep links and refresh keep their place); else the Visit Log — the
 // scroll-around-and-see-what-happened surface. maybeFirstRun still redirects a brand-new
@@ -3455,6 +3466,7 @@ vispoll(checkFeeds,8000);
 vispoll(refreshWhoshere,6000);
 vispoll(()=>{ const m=$('#settings'); if(m && !m.hidden) refreshControls(); },2000);   // live controls while the panel's open
 vispoll(refreshEvalStatus,30*60*1000);   // the eval artifact changes once a day (~2pm batch)
+vispoll(refreshRigHealth,5*60*1000);     // rigwatch re-judges every 5 min
 document.addEventListener('visibilitychange',()=>{
   if(document.hidden) return;
   refreshLive(); refreshHeader(); refreshNaming(); refreshWhoshere(); checkFeeds();

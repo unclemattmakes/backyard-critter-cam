@@ -59,11 +59,12 @@ import urllib.request
 from datetime import datetime, timezone
 
 import config
+from health import read_json, write_json
 
 ROOT = config.ROOT
 PAUSE_MARKER = ROOT / ".rig_pause"
 HOLD_MARKER = ROOT / ".rig_hold"
-STATE_FILE = ROOT / ".rigwatch_state.json"
+STATE_FILE = config.RIGWATCH_STATE_FILE
 LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
 REPORTS_DIR = ROOT / "reports"
@@ -205,8 +206,9 @@ def naming_health() -> dict:
     return out
 
 
-def check_naming(health: dict) -> bool:
-    """Log a line when naming is not doing its job. Returns True if something was reported.
+def check_naming(health: dict, alarms: dict | None = None) -> bool:
+    """Log a line when naming is not doing its job. Returns True if something was reported, and
+    records the alarm in `alarms` (kind -> (severity, message)) for the health record.
 
     Deliberately does NOT restart anything: the rig supervises its own naming child, and the point
     here is that a failure of BOTH becomes visible within five minutes instead of two weeks."""
@@ -223,9 +225,16 @@ def check_naming(health: dict) -> bool:
             f"written {when}, so the naming loop is not running. New crops are NOT being named, "
             f"which also stops visits, re-ID templates and the nightly eval. "
             f"See logs/naming.log.")
+        _raise(alarms, "naming_stale", "alarm",
+               f"Species naming has stopped: its heartbeat was last written {when}, so new "
+               f"crops are not being named (and visits, re-ID and the nightly eval stall). "
+               f"See logs/naming.log.")
         return True
     if health["state"] == "error":
         log(f"NAMING IS ERRORING: {health.get('detail') or 'see logs/naming.log'}.")
+        _raise(alarms, "naming_error", "alarm",
+               f"Species naming is erroring: {str(health.get('detail') or 'no detail')[:160]}. "
+               f"See logs/naming.log.")
         return True
 
     backlog, prev = health.get("backlog"), _state().get("naming_backlog")
@@ -235,6 +244,9 @@ def check_naming(health: dict) -> bool:
         if isinstance(prev, int) and backlog >= prev:
             log(f"NAMING IS NOT KEEPING UP: {backlog} crops are waiting to be named and the "
                 f"backlog has not fallen since the last check ({prev}). See logs/naming.log.")
+            _raise(alarms, "naming_backlog", "warn",
+                   f"Species naming is not keeping up: {backlog} crops are waiting and the "
+                   f"backlog is not falling. See logs/naming.log.")
             return True
     return False
 
@@ -270,10 +282,15 @@ def batch_health() -> dict:
     return out
 
 
-def check_batch(health: dict) -> bool:
-    """Log (hourly) when the nightly batch has stopped producing results. True if stale."""
+def check_batch(health: dict, alarms: dict | None = None) -> bool:
+    """Log (hourly) when the nightly batch has stopped producing results. True if stale. The alarm
+    is recorded in `alarms` on every run: the hourly limit is for the log, not the record."""
     if not health["stale"]:
         return False
+    _raise(alarms, "batch_stale", "warn",
+           f"The nightly batch has not finished a night in {health['age_s'] / 3600.0:.0f} h "
+           f"(limit {config.CONFIG.batch_stale_hours:g} h): embeddings, auto-assign and the "
+           f"regression gate are not running. See logs/clipmotion_batch.log.")
     if _due("batch_logged_at"):
         log(f"NIGHTLY BATCH IS STALE: the newest eval artifact ({health['newest']}) is "
             f"{health['age_s'] / 3600.0:.0f} h old (limit {config.CONFIG.batch_stale_hours:g} h), "
@@ -283,17 +300,40 @@ def check_batch(health: dict) -> bool:
 
 
 def _state() -> dict:
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"starts": []}
+    return read_json(STATE_FILE) or {"starts": []}
 
 
 def _write_state(st: dict) -> None:
-    try:
-        STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
-    except OSError:
-        pass
+    write_json(STATE_FILE, st)
+
+
+def _raise(alarms: dict | None, kind: str, severity: str, message: str) -> None:
+    """Note a condition that holds on THIS run; _sync_alarms turns the set into the record."""
+    if alarms is not None:
+        alarms[kind] = (severity, message)
+
+
+def _sync_alarms(current: dict) -> None:
+    """Make the state file's "alarms" exactly this run's set: a standing alarm keeps its
+    first_seen, a new one starts now, one that did not recur is cleared (and logged as such).
+    "checked_at" lets a reader tell a quiet watchdog from a dead one."""
+    st = _state()
+    now = time.time()
+    prev = st.get("alarms") if isinstance(st.get("alarms"), dict) else {}
+    out = {}
+    for kind, (severity, message) in current.items():
+        old = prev.get(kind) if isinstance(prev.get(kind), dict) else {}
+        first = old.get("first_seen")
+        out[kind] = {"severity": severity, "message": message,
+                     "first_seen": first if isinstance(first, (int, float)) else now,
+                     "last_seen": now}
+    for kind in sorted(set(prev) - set(out)):
+        first = prev[kind].get("first_seen") if isinstance(prev[kind], dict) else None
+        since = (f" (raised {datetime.fromtimestamp(first):%Y-%m-%d %H:%M})"
+                 if isinstance(first, (int, float)) else "")
+        log(f"cleared: {kind}{since}")
+    st["alarms"], st["checked_at"] = out, now
+    _write_state(st)
 
 
 def _due(key: str, every_s: float = REPEAT_ALARM_S) -> bool:
@@ -415,22 +455,33 @@ def main() -> int:
             flag = "  <-- STALE" if b["stale"] else ""
             print(f"nightly batch   : last eval {b['age_s'] / 3600.0:.0f} h ago ({b['newest']}), "
                   f"limit {config.CONFIG.batch_stale_hours:g} h{flag}")
+        active = _state().get("alarms")
+        active = active if isinstance(active, dict) else {}
+        print("active alarms   : " + ("none" if not active else f"{len(active)}"))
+        for kind, a in active.items():
+            if isinstance(a, dict):
+                print(f"  [{a.get('severity')}] {kind}: {a.get('message')}")
         url = str(config.CONFIG.heartbeat_url or "").strip()
         print("off-host ping   : " + (f"on, to {_url_host(url)}"
                                       if url else "off (set heartbeat_url in config_local.py)"))
         return 0
 
-    rc, healthy = _watch_rig(args, pids)
+    alarms: dict = {}
+    rc, healthy = _watch_rig(args, pids, alarms)
     try:
-        healthy = not check_batch(batch_health()) and healthy
+        healthy = not check_batch(batch_health(), alarms) and healthy
     except Exception as e:                      # noqa: BLE001 -- never let a report sink the run
         log(f"batch check failed: {type(e).__name__}: {e}")
         healthy = False
+    try:
+        _sync_alarms(alarms)
+    except Exception as e:                      # noqa: BLE001 -- the record is a report too
+        log(f"recording alarms failed: {type(e).__name__}: {e}")
     ping_heartbeat(healthy)                     # last: the restart above must never wait on it
     return rc
 
 
-def _watch_rig(args, pids) -> tuple[int, bool]:
+def _watch_rig(args, pids, alarms: dict | None = None) -> tuple[int, bool]:
     """The restart decision: start the rig if it is down and nothing says to leave it.
 
     Returns (exit code, healthy). Healthy = up with naming OK, or down because a human said so."""
@@ -440,13 +491,16 @@ def _watch_rig(args, pids) -> tuple[int, bool]:
         # forever. Refuse, and say why.
         log("cannot tell whether the rig is running (psutil is not installed) -- doing nothing. "
             "Fix: pip install psutil")
+        _raise(alarms, "psutil_missing", "alarm",
+               "The watchdog cannot tell whether the rig is running (psutil is not installed), "
+               "so it will not restart it. Fix: pip install psutil.")
         return 1, False
     if pids:
         clear_pause_marker()                  # rig is up, so any deliberate-stop marker is spent
         # Up is not the same as working. check_naming stays quiet when naming is fine, so this
         # keeps the "say nothing, every 5 minutes, forever" contract for a genuinely healthy rig.
         health = naming_health()
-        naming_bad = check_naming(health)
+        naming_bad = check_naming(health, alarms)
         _record_backlog(health.get("backlog"))
         return 0, not naming_bad
     if held():
@@ -455,6 +509,9 @@ def _watch_rig(args, pids) -> tuple[int, bool]:
         if _due("hold_logged_at"):
             log("rig is down and HELD (.rig_hold) -- not starting it. "
                 "`python rigwatch.py --release` to guard it again.")
+        _raise(alarms, "rig_held", "warn",
+               "The rig is down and held (.rig_hold), so the watchdog will not start it. "
+               "`python rigwatch.py --release` guards it again.")
         return 0, True
     if paused() and not args.force:
         return 0, True                        # stopped on purpose this session -- leave it alone
@@ -462,6 +519,9 @@ def _watch_rig(args, pids) -> tuple[int, bool]:
         log(f"rig is down but it has been started {MAX_STARTS_PER_HOUR}x in the last hour -- "
             f"it is crashing on startup, not just missing. Backing off; needs a human. "
             f"See logs/backyard_cam.log.")
+        _raise(alarms, "restart_storm", "alarm",
+               f"The rig keeps crashing on startup: started {MAX_STARTS_PER_HOUR}x in the last "
+               f"hour, so the watchdog has backed off. See logs/backyard_cam.log.")
         return 1, False
     return start_rig(), False                 # it was down: worth a /fail even if it comes back
 

@@ -65,6 +65,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import db
+import health
 import mdns
 import stats
 
@@ -242,11 +243,14 @@ def dashboard_base(cfg) -> str:
 
     Built through mdns.url so a link on the default port 80 comes out as "http://192.168.1.50"
     rather than "...:80" -- the same number a browser would have assumed, and one more thing for
-    a reader to mistrust in a link they are being asked to tap."""
+    a reader to mistrust in a link they are being asked to tap.
+
+    The port is the one the rig last BOUND (mdns.served_port), not the configured one: when 80 is
+    taken the rig serves on web_port_fallback, and a link to the configured port goes nowhere."""
     base = getattr(cfg, "email_dashboard_url", None)
     if base:
         return str(base).rstrip("/")
-    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower())
+    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower(), port=mdns.served_port(cfg))
 
 
 def dashboard_answering(base, timeout=1.5) -> bool | None:
@@ -297,8 +301,12 @@ def collect_issue(cfg, edition="night", date=None, now=None) -> dict:
         plate = pick_plate(cfg, d) or d.get("plate")
     except Exception:
         plate = d.get("plate")
+    try:
+        alarms = health.rig_health(now)
+    except Exception:
+        alarms = []                            # the box is a courtesy; never cost the issue
     return {"d": d, "rc": rc, "plate": plate, "issue_no": issue_no,
-            "base_url": base, "lan_ok": dashboard_answering(base),
+            "base_url": base, "lan_ok": dashboard_answering(base), "health": alarms,
             "generated": (now or datetime.now().astimezone()).isoformat()}
 
 
@@ -880,6 +888,8 @@ def render_email(bundle, images, img_src) -> str:
       <div style="font-size:12px;color:{_C['soft']};">{issue}{_esc(d.get('title') or '')} · {_esc(datestr)}{moonstr}</div>
     </div>""")
 
+    parts.append(_health_box(bundle.get("health")))
+
     # -- lede + flags -------------------------------------------------------------
     parts.append(f'<p style="font-size:15px;line-height:1.55;margin:18px 2px 10px;">{" ".join(_esc(s) for s in lede)}</p>')
     flags = []
@@ -1146,6 +1156,51 @@ def render_email(bundle, images, img_src) -> str:
   </td></tr></table></body></html>"""
 
 
+# The rig's own health (health.rig_health), boxed above the lede when anything needs a human and
+# absent otherwise -- an all-clear line every morning would teach the reader to skip the box.
+def _since(iso) -> str:
+    try:
+        d = datetime.fromisoformat(str(iso)).astimezone()
+    except (TypeError, ValueError):
+        return ""
+    return f"since {d:%b} {d.day}, {_clock(iso)}"
+
+
+def _health_head(items) -> str:
+    n = len(items)
+    return f"Rig health · {n} thing{'' if n == 1 else 's'} to look at"
+
+
+def _health_box(items) -> str:
+    if not items:
+        return ""
+    rows = []
+    for it in items:
+        quiet = it.get("severity") == "info"
+        when = _since(it.get("since"))
+        rows.append(f'<div style="margin:5px 0 0;{"color:" + _C["soft"] + ";" if quiet else ""}">'
+                    f'{"·" if quiet else "⚠"} {_esc(it.get("message"))}'
+                    + (f' <span style="color:{_C["faint"]};font-size:11px;white-space:nowrap;">'
+                       f'— {_esc(when)}</span>' if when else "") + '</div>')
+    return (f'<div style="margin:16px 0 0;padding:10px 14px;background:{_C["warn_bg"]};'
+            f'color:{_C["warn_ink"]};border:1px solid {_C["rule"]};'
+            f'border-left:4px solid {_C["warn_ink"]};border-radius:6px;font-size:13px;'
+            f'line-height:1.5;"><div style="font-size:11px;letter-spacing:2px;'
+            f'text-transform:uppercase;font-weight:700;">{_esc(_health_head(items))}</div>'
+            f'{"".join(rows)}</div>')
+
+
+def _health_text(items) -> list[str]:
+    if not items:
+        return []
+    out = [_health_head(items).upper()]
+    for it in items:
+        when = _since(it.get("since"))
+        out.append(f"  {'·' if it.get('severity') == 'info' else '⚠'} {it.get('message')}"
+                   + (f" ({when})" if when else ""))
+    return out + [""]
+
+
 def _section(title, note) -> str:
     return (f'<h2 style="font-size:13px;letter-spacing:2px;text-transform:uppercase;'
             f'border-bottom:1px solid {_C["ink"]};padding-bottom:4px;margin:22px 0 8px;">'
@@ -1160,6 +1215,7 @@ def render_text(bundle) -> str:
     ed = d.get("edition") or "night"
     masthead = "THE MORNING DISPATCH" if ed == "night" else "THE EVENING DISPATCH"
     out = [masthead, d.get("title") or "", ""]
+    out += _health_text(bundle.get("health"))
     out += compose_lede(bundle) + [""]
     for v in d.get("visit_log") or []:
         sp = _species_line(v.get("species"))

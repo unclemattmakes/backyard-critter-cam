@@ -88,6 +88,11 @@ config_local.py
 .rig_pause
 .rig_hold
 .rigwatch_state.json
+# backup.py's last-run verdict + lost-day ledger (health.py reads it), the port the dashboard
+# actually bound (the morning email's links), and the temp files their atomic writes leave.
+.backup_state.json
+.web_bound.json
+.*.json.*.tmp
 
 # backup.py's local index of what each day's archives hold; rebuilt by the next run.
 .archive_index/
