@@ -14,6 +14,7 @@ Only stdlib sqlite3 is used.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,12 @@ _ROOT = Path(__file__).resolve().parent
 # meaning of the column is obvious to whoever reads the DB later.
 SOURCE_GLASS_DOOR_CAM = "glass_door_cam"  # V1: live webcam at the glass door. Primary rig, all species, day+night.
 SOURCE_TRAIL_CAM_SD = "trail_cam_sd"      # FUTURE: wider-yard weatherproof trail cam; batch SD-card import, IR at night.
+
+log = logging.getLogger("db")
+
+# Stored in PRAGMA user_version. connect() runs SCHEMA + _migrate only while a DB is below it, so
+# ANY change to either (a table, column, index or data step) must bump this or no existing DB sees it.
+SCHEMA_VERSION = 1
 
 SCHEMA = """
 -- One row per detected object above the confidence threshold.
@@ -516,10 +523,44 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     # rig keeps writing, without lock contention.
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")  # wait out the live rig's writes rather than erroring
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    conn.commit()
+    _ensure_schema(conn)
     return conn
+
+
+_warned_newer = False
+
+
+def _user_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Bring the DB up to SCHEMA_VERSION, or do nothing if it is already there (the common case:
+    one header read, no lock). Several processes may race here on the first connect after a deploy;
+    BEGIN IMMEDIATE lets exactly one migrate while the rest wait out busy_timeout, re-check, and skip."""
+    global _warned_newer
+    version = _user_version(conn)
+    if version == SCHEMA_VERSION:
+        return
+    if version > SCHEMA_VERSION:
+        # Written by newer code. Never migrate or downgrade it; this build simply runs as it is.
+        if not _warned_newer:
+            _warned_newer = True
+            log.warning("database schema version %d is newer than this code's %d; "
+                        "skipping migration", version, SCHEMA_VERSION)
+        return
+    # CREATE ... IF NOT EXISTS is safe unlocked and concurrently (as it always ran). It stays outside
+    # the transaction because executescript() commits any open one first.
+    conn.executescript(SCHEMA)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _user_version(conn) < SCHEMA_VERSION:   # another connection may have finished meanwhile
+            _migrate(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def connect_readonly(db_path: Path | str) -> Optional[sqlite3.Connection]:
@@ -780,7 +821,8 @@ def assign_visit(conn: sqlite3.Connection, detection_ids: Sequence[int], visit_i
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Add columns introduced after the original schema (keeps existing DBs current)."""
+    """Add columns introduced after the original schema (keeps existing DBs current). Idempotent;
+    run by connect() only while PRAGMA user_version < SCHEMA_VERSION -- bump it with any change here."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(detections)")}
     if "species_confidence" not in cols:
         conn.execute("ALTER TABLE detections ADD COLUMN species_confidence REAL")
@@ -916,8 +958,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if col not in cols:
             conn.execute(f"ALTER TABLE detections ADD COLUMN {col} {decl}")
     # 2026-09-30: a removed camera keeps no password (see remove_camera). Rows tombstoned before
-    # that still hold one; erase it. Checked with a read first, because this runs on every
-    # connect and an UPDATE would take the write lock even when it matched nothing.
+    # that still hold one; erase it. (The read-first check dates from when _migrate ran on every
+    # connect, where an UPDATE took the write lock even when it matched nothing.)
     if conn.execute("SELECT 1 FROM cameras WHERE deleted_at IS NOT NULL "
                     "AND password IS NOT NULL LIMIT 1").fetchone():
         conn.execute("UPDATE cameras SET password = NULL "
