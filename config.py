@@ -347,6 +347,12 @@ class Config:
     # Days between writes of backup.py's snapshots/ family (~2.5 GB DB, meta, labels, CSV export);
     # media is archived every run regardless. 0 = every run. `--snapshots-now` forces them.
     backup_snapshot_every_days: int = 7
+    # Thinning of old snapshots/backyard-db-*.zip and meta-*.zip. None = keep every one.
+    # Recommended: {"weekly": 8, "monthly": 12} -- the newest 8, plus the newest of each of the 12
+    # most recent months that have one; DB and meta separately. The newest 3 are always kept, and
+    # nothing is deleted unless this run's DB and meta snapshots landed.
+    # Preview: backup.py --dry-run --snapshots-now
+    backup_snapshot_retention: dict | None = None
 
     # ---- Identity of this capture source (V1 constant) --------------------------
     # Written verbatim into detections.source. Future sources: 'trail_cam_sd', etc.
