@@ -141,3 +141,7 @@ def apply(cfg):
     # cfg.mqtt_username = "critter-cam"
     # cfg.mqtt_password = "..."
     # cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*" = every animal
+
+    # Off-host heartbeat: rigwatch pings this every run (<url>/fail when unhealthy), and the
+    # service alarms when the pings stop -- the one alert that works with this machine down.
+    # cfg.heartbeat_url = "https://hc-ping.com/your-check-uuid"

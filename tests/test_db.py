@@ -332,6 +332,78 @@ def test_apply_visit_label_stamps_labelled_at(conn):
                         (a,)).fetchone()["labelled_at"] is not None
 
 
+def _outvoted(conn, *, n_raccoon=2, n_noise=3, ts="2026-06-26T00:53:00-07:00"):
+    """A raccoon visit whose crop-count vote went to 'not an animal' (visits.species)."""
+    rac = [_insert_one(conn, species="raccoon", timestamp=ts) for _ in range(n_raccoon)]
+    noise = [_insert_one(conn, species="not an animal", timestamp=ts) for _ in range(n_noise)]
+    return _visit_over(conn, rac + noise, species="not an animal"), rac, noise
+
+
+def _ids_named(conn, name):
+    return {r[0] for r in conn.execute("SELECT id FROM detections WHERE individual_id = ?",
+                                       (name,))}
+
+
+def test_individual_species_reads_the_individuals_own_labels(conn):
+    rac = [_insert_one(conn, species="raccoon") for _ in range(3)]
+    stray = _insert_one(conn, species="not an animal")
+    db.set_individual_bulk(conn, rac + [stray], "Notch")          # human, majority raccoon
+    assert db.individual_species(conn, "Notch") == "raccoon"
+    assert db.individual_species(conn, "notch") == "raccoon"      # typed case may differ
+    assert db.individual_species(conn, "Nobody") is None
+    assert db.individual_species(conn, None) is None
+    # A group label with no crops of its own takes its first known member's species.
+    assert db.individual_species(conn, "Kits + Notch") == "raccoon"
+    assert db.individual_species(conn, "Kits + Nobody") is None
+
+
+def test_individual_species_prefers_human_labels_over_auto(conn):
+    rac = _insert_one(conn, species="raccoon")
+    noise = [_insert_one(conn, species="not an animal") for _ in range(3)]
+    db.set_individual_bulk(conn, [rac], "Notch")
+    conn.execute(f"UPDATE detections SET individual_id = 'Notch', individual_source = 'auto' "
+                 f"WHERE id IN ({','.join('?' * len(noise))})", noise)
+    conn.commit()
+    assert db.individual_species(conn, "Notch") == "raccoon"
+
+
+def test_confirm_species_explicit_then_individual_then_current_label(conn):
+    vid, rac, noise = _outvoted(conn)
+    assert db.confirm_species(conn, vid, "Notch", "raccoon") == "raccoon"
+    assert db.confirm_species(conn, vid, "Notch") is None          # never labelled: unknown
+    db.label_visit(conn, vid, "Notch", species="raccoon")
+    assert db.confirm_species(conn, vid, "Notch") == "raccoon"
+    assert db.confirm_species(conn, vid, None) == "raccoon"        # a clear: the name it carries
+
+
+def test_species_mismatch_audit_reports_without_writing(conn):
+    vid, rac, noise = _outvoted(conn, n_raccoon=3, n_noise=1)
+    db.label_visit(conn, vid, "Notch", species="raccoon")
+    db.set_individual_bulk(conn, noise, "Notch")       # the 06-12 shape: one noise crop named
+    before = conn.total_changes
+    r = db.species_mismatched_labels(conn)
+    assert conn.total_changes == before
+    assert r["total"] == 1
+    (g,) = r["groups"]
+    assert (g["name"], g["individual_species"], g["species"], g["n"]) ==         ("Notch", "raccoon", "not an animal", 1)
+    assert [e["id"] for e in g["examples"]] == noise
+
+
+def test_apply_visit_label_names_a_known_individuals_own_species(conn):
+    """The Explorer / live-sighting stamp: an outvoted raccoon span named for a known raccoon
+    stamps the raccoon crops, not the noise boxes that won the vote."""
+    old = _insert_one(conn, species="raccoon", timestamp="2026-06-01T00:00:00-07:00")
+    db.set_individual_bulk(conn, [old], "Notch")
+    vid, rac, noise = _outvoted(conn)
+    res = db.apply_visit_label(conn, visit_id=vid, name="Notch")
+    assert res["dominant_species"] == "not an animal" and res["named_species"] == "raccoon"
+    assert _ids_named(conn, "Notch") == {old, *rac}
+    # A name with no labels yet keeps the dominant-species scope.
+    vid2, rac2, noise2 = _outvoted(conn, ts="2026-06-27T00:53:00-07:00")
+    db.apply_visit_label(conn, visit_id=vid2, name="Newbie")
+    assert _ids_named(conn, "Newbie") == set(noise2)
+
+
 def test_coverage_dark_seconds_pairs_transitions_and_admits_ignorance(conn):
     """The effort ledger: up/down transitions pair into dark spans; a window the ledger can't
     speak for (no event at or before its start) reads None -- unknown and fully-covered must

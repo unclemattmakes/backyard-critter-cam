@@ -836,3 +836,315 @@ def test_meta_zip_names_the_secrets_it_is_about_to_upload(tmp_path):
     assert str(dest) in joined                        # ...and WHERE it is going
     # An item that carries no secret says nothing: a warning on every line is a warning on none.
     assert backup._secret_notice([tmp_path / "reid", tmp_path / "tuning"], dest) == []
+
+
+# --- the local archive index: what lets the prune guard check membership cheaply ------------
+
+def _index(index_dir: Path, stem: str):
+    return backup.read_archive_index(index_dir, stem)
+
+
+def test_archiving_a_day_records_which_archive_holds_each_file(project, dest, tmp_path):
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert holds is not None
+    assert set(holds) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1}
+    assert set(holds.values()) == {ZIP}
+
+
+def test_a_top_up_extends_the_index_with_the_new_part(project, dest, tmp_path):
+    """The guard checks that the archive NAMED for a clip is still present, so the index has to
+    say which part holds what -- not merely that the day is covered."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+    _clips(project, BATCH2)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert {holds[f"clips/trail_cam_sd/{DAY}/{n}"] for n in BATCH1} == {ZIP}
+    assert {holds[f"clips/trail_cam_sd/{DAY}/{n}"] for n in BATCH2} == {f"{STEM}.part2.zip"}
+
+
+def test_a_day_needing_no_new_archive_still_gets_indexed(project, dest, tmp_path):
+    """How every day archived before the index existed gets one: the day is skipped for WRITING,
+    but its central directories were read to decide that, so recording them is free. Without this
+    the guard would hold the whole back catalogue until each day happened to gain a file."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False)   # no index yet
+    assert _index(idx, STEM) is None
+
+    stats = backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False,
+                                 index_dir=idx)
+
+    assert stats["skipped"] == 1 and stats["created"] == 0
+    assert set(_index(idx, STEM)) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1}
+
+
+def test_a_dry_run_writes_no_index(project, dest, tmp_path):
+    """--dry-run writes nothing anywhere, and an index claiming an archive that was never written
+    would license deleting the footage it claims to cover."""
+    idx = tmp_path / "archive-index"
+    _clips(project, BATCH1)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=True, index_dir=idx)
+
+    assert _index(idx, STEM) is None
+
+
+def test_no_index_is_written_for_roots_that_have_no_guard(project, dest, tmp_path):
+    """Only clips/ has a prune guard reading one. crops/ and frames/ would be thousands of
+    entries a day that nothing ever reads."""
+    idx = tmp_path / "archive-index"
+    _write(project / "crops" / DAY, ["a.jpg", "b.jpg"])
+
+    backup.archive_media(project / "crops", dest / "crops", TODAY, dry_run=False)
+
+    assert not idx.exists()
+
+
+def test_the_index_records_what_landed_not_what_was_intended(project, dest, tmp_path, monkeypatch):
+    """zip_tree drops a file the pruner deletes out from under it, and an index claiming a clip is
+    archived when it is not would license deleting the last copy. So the archive is read back."""
+    idx = tmp_path / "archive-index"
+    day = _clips(project, BATCH1)
+    real_write = backup.zipfile.ZipFile.write
+
+    def drop_one(self, filename, arcname=None, *a, **k):
+        if str(filename).endswith(BATCH1[0]):
+            raise FileNotFoundError(filename)       # vanished mid-zip, exactly as the pruner does
+        return real_write(self, filename, arcname, *a, **k)
+    monkeypatch.setattr(backup.zipfile.ZipFile, "write", drop_one)
+
+    backup.archive_media(project / "clips", dest / "clips", TODAY, dry_run=False, index_dir=idx)
+
+    holds = _index(idx, STEM)
+    assert f"clips/trail_cam_sd/{DAY}/{BATCH1[0]}" not in holds, \
+        "the index claimed a file the archive does not hold"
+    assert set(holds) == {f"clips/trail_cam_sd/{DAY}/{n}" for n in BATCH1[1:]}
+    assert (day / BATCH1[0]).exists()
+
+
+# --- the snapshots/ family runs on its own, slower cadence ------------------------------------
+#
+# Media is archived every (daily) run; the DB snapshot, meta zip, label ledger and CSV export only
+# when the newest backyard-db-<date>.zip is backup_snapshot_every_days old.
+
+FAMILY = ("db", "meta", "labels", "csv")
+
+
+@pytest.fixture
+def family(monkeypatch, tmp_path):
+    """Stub every snapshots/ step; returns the calls as (step, day). The fake DB step writes a
+    real-looking backyard-db-<date>.zip, since that file is what the cadence is keyed off."""
+    calls: list[tuple[str, date]] = []
+
+    def db_step(db_path, out_dir, today, dry_run):
+        calls.append(("db", today))
+        if not dry_run:
+            _old_snapshot(out_dir, today.isoformat())
+    monkeypatch.setattr(backup, "CONFIG", SimpleNamespace(db_path=tmp_path / "x.db"))
+    monkeypatch.setattr(backup, "snapshot_db", db_step)
+    monkeypatch.setattr(backup, "snapshot_meta", lambda o, t, d: calls.append(("meta", t)))
+    monkeypatch.setattr(backup, "export_labels", lambda o, t, d: calls.append(("labels", t)))
+    # The CSV step takes no date; it runs right after the ledger, so it inherits that run's day.
+    monkeypatch.setattr(backup, "_export_csv", lambda o, d: calls.append(("csv", calls[-1][1])))
+    return calls
+
+
+def _old_snapshot(out_dir: Path, day: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"backyard-db-{day}.zip").write_bytes(b"PK")
+
+
+def test_snapshots_are_skipped_while_the_newest_db_snapshot_is_recent(tmp_path, family, caplog):
+    snaps = tmp_path / "snapshots"
+    _old_snapshot(snaps, "2026-07-20")
+    _old_snapshot(snaps, "2026-07-27")          # the newest one is what counts
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        failures = backup.run_snapshots(snaps, TODAY, False, every_days=7)
+
+    assert failures == 0 and family == []
+    assert "snapshots skipped (db, meta, labels, CSV export): newest db snapshot is 3 day(s) old"         in caplog.text
+
+
+@pytest.mark.parametrize("newest", ["2026-07-23", "2026-06-01", None])
+def test_the_whole_family_runs_once_the_newest_is_old_enough_or_absent(tmp_path, family, newest):
+    snaps = tmp_path / "snapshots"
+    if newest:
+        _old_snapshot(snaps, newest)
+
+    assert backup.run_snapshots(snaps, TODAY, False, every_days=7) == 0
+    assert [step for step, _ in family] == list(FAMILY)
+
+
+def test_a_real_db_snapshot_is_written_when_there_is_none(tmp_path):
+    live = _live_db(tmp_path / "backyard.db")
+    snaps = tmp_path / "dest" / "snapshots"
+
+    assert backup.snapshots_due(snaps, TODAY, 7)
+    backup.snapshot_db(live, snaps, TODAY, False)
+    assert backup.newest_db_snapshot_day(snaps) == TODAY
+    assert not backup.snapshots_due(snaps, TODAY, 7)
+
+
+def test_snapshots_now_forces_the_family_over_a_recent_snapshot(tmp_path, family):
+    snaps = tmp_path / "snapshots"
+    _old_snapshot(snaps, TODAY.isoformat())     # one from earlier today
+
+    backup.run_snapshots(snaps, TODAY, False, every_days=7, force=True)
+
+    assert [step for step, _ in family] == list(FAMILY)
+
+
+@pytest.mark.parametrize("flag", ["--snapshots-now", "--db-now"])
+def test_db_now_is_kept_as_an_alias(flag):
+    assert backup._parser().parse_args([flag]).snapshots_now
+    assert not backup._parser().parse_args([]).snapshots_now
+
+
+def test_every_days_zero_writes_snapshots_on_every_run(tmp_path, family):
+    snaps = tmp_path / "snapshots"
+    _old_snapshot(snaps, TODAY.isoformat())
+
+    backup.run_snapshots(snaps, TODAY, False, every_days=0)
+
+    assert [step for step, _ in family] == list(FAMILY)
+
+
+def test_daily_runs_keep_the_ledger_and_exports_weekly(tmp_path, family):
+    """The point of one cadence: on a daily schedule the label ledger still diffs against the one
+    from a week ago, and keep-12 / keep-4 still mean twelve and four WEEKS."""
+    snaps = tmp_path / "snapshots"
+    days = [date.fromordinal(TODAY.toordinal() + i) for i in range(15)]
+
+    for day in days:
+        backup.run_snapshots(snaps, day, False, every_days=7)
+
+    for step in FAMILY:
+        assert [d for s, d in family if s == step] == [days[0], days[7], days[14]], step
+
+
+def test_a_failing_step_does_not_stop_the_rest(tmp_path, family, monkeypatch):
+    def boom(o, t, d):
+        raise RuntimeError("meta broke")
+    monkeypatch.setattr(backup, "snapshot_meta", boom)
+
+    assert backup.run_snapshots(tmp_path / "snapshots", TODAY, False, every_days=7) == 1
+    assert [step for step, _ in family] == ["db", "labels", "csv"]
+
+
+def test_names_that_merely_look_like_snapshots_are_ignored(tmp_path):
+    snaps = tmp_path / "snapshots"
+    snaps.mkdir()
+    for n in ("backyard-db-2026-07-29.zip.tmp", "backyard-db-latest.zip", "meta-2026-07-29.zip",
+              "backyard-db-2026-13-45.zip"):
+        (snaps / n).write_bytes(b"x")
+    _old_snapshot(snaps, "2026-07-01")
+
+    assert backup.newest_db_snapshot_day(snaps) == date(2026, 7, 1)
+
+
+# --- clips pruned before backup.py ever archived them -----------------------------------------
+#
+# The pruner deletes clip FILES and leaves the day folder, so a past day folder that is empty and
+# has no archive part once held clips that are now gone for good.
+
+GLASS = "glass_door_cam"
+
+
+def _empty_day(project: Path, day: str, source: str = GLASS) -> Path:
+    d = project / "clips" / source / day
+    d.mkdir(parents=True)
+    return d
+
+
+def _lost_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "pruned before they were archived" in r.getMessage()]
+
+
+def test_a_day_pruned_before_it_was_archived_is_reported(project, dest, caplog):
+    _clips(project, ["a.mp4"], day="2026-07-20", source=GLASS)
+    _archive(project, dest)                                  # last run archived up to 07-20
+    _empty_day(project, "2026-07-21")                        # recorded, then pruned unarchived
+    _clips(project, ["b.mp4"], day="2026-07-22", source=GLASS)
+
+    _archive(project, dest)
+    with caplog.at_level(logging.INFO, logger="backup"):
+        notes = backup.report_clip_coverage(project / "clips", dest / "clips", TODAY)
+
+    assert _lost_warnings(caplog) == [
+        f"clips for {GLASS}/2026-07-21 were pruned before they were archived"]
+    assert f"clips {GLASS}: oldest day on disk 2026-07-20, newest archived 2026-07-22" in notes
+    assert any("2026-07-21 were pruned" in n and "LOST" in n for n in notes)
+
+
+def test_empty_days_that_are_not_losses_stay_quiet(project, dest, caplog):
+    """Pruned AFTER archiving, older than the camera's first archive (before backups existed),
+    today's folder, and a camera with no archive at all: none of these is a loss to report."""
+    _empty_day(project, "2026-07-01")                        # predates the first archive
+    _clips(project, ["a.mp4"], day="2026-07-20", source=GLASS)
+    _archive(project, dest)
+    for p in (project / "clips" / GLASS / "2026-07-20").iterdir():
+        p.unlink()                                           # pruned after it was archived
+    _empty_day(project, TODAY.isoformat())                   # today: not archived until tomorrow
+    _empty_day(project, "2026-07-25", source="reolink_side") # no archives for this camera yet
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        notes = backup.report_clip_coverage(project / "clips", dest / "clips", TODAY)
+
+    assert _lost_warnings(caplog) == []
+    assert f"clips {GLASS}: oldest day on disk none, newest archived 2026-07-20" in notes
+
+
+def test_a_day_with_only_a_later_part_still_counts_as_archived(project, dest, caplog):
+    (dest / "clips").mkdir(parents=True)
+    (dest / "clips" / f"clips-{GLASS}-2026-07-18.zip").write_bytes(b"PK")
+    (dest / "clips" / f"clips-{GLASS}-2026-07-21.part2.zip").write_bytes(b"PK")
+    _empty_day(project, "2026-07-21")
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        backup.report_clip_coverage(project / "clips", dest / "clips", TODAY)
+
+    assert _lost_warnings(caplog) == []
+
+
+def test_legacy_flat_days_are_checked_too(project, dest, caplog):
+    _write(project / "clips" / "2026-06-01", ["a.mp4"])
+    _archive(project, dest)
+    (project / "clips" / "2026-06-02").mkdir()
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        backup.report_clip_coverage(project / "clips", dest / "clips", TODAY)
+
+    assert _lost_warnings(caplog) == [
+        "clips for legacy/2026-06-02 were pruned before they were archived"]
+
+
+def test_an_unlistable_archive_folder_reports_nothing_lost(project, dest, caplog):
+    """A missing or unplugged destination must not read as "nothing was ever archived"."""
+    _empty_day(project, "2026-07-21")
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        notes = backup.report_clip_coverage(project / "clips", dest / "nowhere", TODAY)
+
+    assert _lost_warnings(caplog) == []
+    assert any("NOT CHECKED" in n for n in notes)
+
+
+def test_status_txt_carries_the_coverage_notes(project, dest, monkeypatch):
+    monkeypatch.setattr(backup, "CONFIG", SimpleNamespace(db_path=project / "no.db"))
+    dest.mkdir()
+
+    backup.write_status(dest, 0, False, ["clips x: oldest day on disk none, newest archived never"])
+
+    text = (dest / "STATUS.txt").read_text(encoding="utf-8").splitlines()
+    assert text[1] == "backup: ok"
+    assert text[2] == "clips x: oldest day on disk none, newest archived never"

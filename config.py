@@ -344,6 +344,9 @@ class Config:
     # at a folder your cloud client syncs (Google Drive / Dropbox / OneDrive) and the upload
     # takes care of itself. None = backup.py refuses to run until told where (or --dest).
     backup_dest: Path | None = None
+    # Days between writes of backup.py's snapshots/ family (~2.5 GB DB, meta, labels, CSV export);
+    # media is archived every run regardless. 0 = every run. `--snapshots-now` forces them.
+    backup_snapshot_every_days: int = 7
 
     # ---- Identity of this capture source (V1 constant) --------------------------
     # Written verbatim into detections.source. Future sources: 'trail_cam_sd', etc.
@@ -524,6 +527,15 @@ class Config:
     # and only crops inside mqtt_window_s count. A visit "leaves" after visit_gap_minutes of quiet.
     mqtt_sources: tuple[str, ...] | list[str] | None = None
 
+    # ---- Watchdog (rigwatch.py) ------------------------------------------------------
+    # rigwatch alarms when the newest reports/eval_*.json is older than this: the nightly batch
+    # writes one every successful night, so 36 h means a whole night was missed.
+    batch_stale_hours: float = 36.0
+    # Off-host "dead man's switch", e.g. a healthchecks.io ping URL; set it in config_local.py (it
+    # is a secret token). Each run GETs it when all is well and <url>/fail when something is not
+    # (healthchecks.io's convention); the service alarms when pings stop, i.e. when this box is down.
+    heartbeat_url: str | None = None
+
     # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
     # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
     # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust
@@ -551,7 +563,7 @@ class Config:
     # is formatted EVERY import cycle. For these sources the pruner REFUSES to delete a file the
     # day-archive does not already contain: the budget is a preference, "the only copy" is not.
     # Until this shipped the protection was a ritual -- remember --backup-first, keep the budget
-    # generous, remember that backup.py runs weekly and skips today, so the newest day always lags.
+    # generous, remember that backup.py archives media daily and skips today, so the newest day lags.
     # A ritual is a thing you can forget once. Set to () to go back to a budget-only prune.
     clips_irreplaceable_sources: tuple = ("trail_cam_sd",)
     clips_dir: Path = ROOT / "clips"

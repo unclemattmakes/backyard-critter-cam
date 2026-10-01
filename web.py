@@ -1703,7 +1703,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 conn.close()
 
         def _reid_confirm(self, data):
-            """Confirm (or clear) WHO one visit was: {"visit_id": 1014, "name": "Stan"}.
+            """Confirm (or clear) WHO one visit was: {"visit_id": 1014, "name": "Stan",
+            "species": "raccoon"} (species optional; see db.confirm_species).
             name=""/null clears; add "reject": true to clear AND leave the human's "not them"
             tombstone (individual_source 'human' with a NULL id), which stops the nightly
             auto-assign pass from re-naming the visit. Stamps the visit's species-matching crops
@@ -1720,10 +1721,18 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             reject = bool(data.get("reject")) and name is None
             conn = db.connect(cfg.db_path)
             try:
+                # Scope to the species the card was reviewed as (the queue sends it), else the
+                # individual's own -- never the visit's crop-count vote alone.
+                sp = db.confirm_species(conn, vid, name, str(data.get("species") or "").strip())
                 n = db.label_visit(conn, vid, name, reject=reject,
-                                   labeled_by=_labeler(data))
+                                   labeled_by=_labeler(data), species=sp)
+                if sp and not n and conn.execute("SELECT 1 FROM visits WHERE id = ?",
+                                                 (vid,)).fetchone():
+                    self._json({"error": f"visit #{vid} has no {sp} crops to "
+                                         f"{'name' if name else 'clear'}"}, code=409)
+                    return
                 self._json({"ok": True, "visit_id": vid, "name": name, "stamped": n,
-                            "rejected": reject})
+                            "rejected": reject, "species": sp})
             finally:
                 conn.close()
 

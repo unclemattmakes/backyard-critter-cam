@@ -2008,6 +2008,10 @@ function reidPage(delta){
    correct. Each confirmation becomes a new appearance template, so suggestions sharpen as the
    cast grows. Before anything is confirmed, name the bootstrap visit-GROUPS instead. */
 let REID_BOOT=[];
+/* The species the queue was matched for. Every /api/reid/confirm carries it, so a name lands on
+   that species' crops even where detector noise outvoted the animal (visits.species). */
+let REID_SPECIES=null;
+function reidBody(o){ if(REID_SPECIES) o.species=REID_SPECIES; return JSON.stringify(o); }
 function reidWhen(ts){ return ts? ts.slice(5,16).replace('T',' ') : '?'; }
 function reidInput(id,ph){ return `<input id="${id}" placeholder="${ph}" style="width:110px;padding:5px 8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.2);border-radius:4px;color:inherit" onkeydown="if(event.key==='Enter')this.nextElementSibling.click()">`; }
 /* Clips that rolled during each queued visit, stashed at render time so a card's "▶ N clips"
@@ -2616,7 +2620,7 @@ async function focusAnswer(name,opts){
     else if(opts.clear){ body.name=''; }
     else body.name=name;
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)}).then(r=>r.json());
+      body:reidBody(body)}).then(r=>r.json());
     restore();
     if(r&&r.error){ alert(r.error); return; }
     delete f.cache[vid];          // its verdict changed; re-fetch if we come back
@@ -2717,7 +2721,7 @@ async function reidConfirmMany(visitIds,name,btn){
   try{
     for(const vid of visitIds){
       await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({visit_id:vid,name})});
+        body:reidBody({visit_id:vid,name})});
       done++;
       if(btn) btn.textContent=`saving ${done}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
     }
@@ -2758,7 +2762,7 @@ async function reidConfirm(vid,name,clear,reject){
   }
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
+      body:reidBody({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
     if(r.error){ restore(); alert(r.error); return; }
     loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
   }catch(e){ restore(); connFail(); }
@@ -2769,7 +2773,7 @@ async function reidUnreject(vid){
   const restore=busyBtn();
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({visit_id:vid,name:null,reject:false})}).then(r=>r.json());
+      body:reidBody({visit_id:vid,name:null,reject:false})}).then(r=>r.json());
     if(r.error){ restore(); alert(r.error); return; }
     loadIndividuals();
   }catch(e){ restore(); connFail(); }
@@ -2782,7 +2786,7 @@ async function reidNameGroup(i){
   try{
     for(const vid of g.visits)
       await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({visit_id:vid,name})});
+        body:reidBody({visit_id:vid,name})});
     loadIndividuals();
   }catch(e){ alert('Could not save: '+e); }
 }
@@ -2901,6 +2905,7 @@ function renderIndividuals(d,q){
   const body=$('#indiv-body');
   REID_BOOT=(q&&q.bootstrap)||[];
   REID_REFIT=(q&&q.refit)||null;
+  if(q&&q.species) REID_SPECIES=q.species;
   const queueHTML=reidQueueHTML(q);
   const groups=(d&&d.groups)||[];
   if(!groups.length&&!queueHTML){ body.innerHTML='<p class="empty">No individuals to name yet. As more animals visit, look-alike groups will appear here for you to name — this is the slowest part, since it needs a good number of clear photos first.</p>'; return; }
