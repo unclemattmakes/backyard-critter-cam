@@ -1424,9 +1424,12 @@ class VisitMatcher:
             0.119 -> 0.137 for LESS coverage). It is a fact the human supplies and the machine
             cannot infer, and it is a DATE test: visits from before the departure are still
             auto-nameable, and the departed individual is still ranked, suggested and templated
-            everywhere else. See is_departed().
+            everywhere else. See is_departed();
+          - SPECIES SCOPE: the name is written only onto this matcher's species' crops, never onto
+            the visit's dominant species (`no_matching_species` when there are none).
 
-        Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped}."""
+        Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped,
+        no_matching_species: [visit_id, ...]}."""
         cfg = self.cfg
         threshold = cfg.reid_auto_threshold if threshold is None else threshold
         margin = cfg.reid_auto_margin if margin is None else margin
@@ -1436,7 +1439,7 @@ class VisitMatcher:
                     "note": "disabled -- set reid_auto_threshold from eval.py --reid's sweep"}
         out = {"enabled": True, "threshold": threshold, "margin": margin,
                "min_templates": min_templates,
-               "assigned": [], "skipped": defaultdict(int)}
+               "assigned": [], "skipped": defaultdict(int), "no_matching_species": []}
         if not self.templates():
             out["skipped"]["no_templates"] = len(self.protos)
             out["skipped"] = dict(out["skipped"])
@@ -1484,8 +1487,13 @@ class VisitMatcher:
             if self.is_departed(name, self.visit_started.get(vid)):
                 out["skipped"]["departed"] += 1
                 continue
-            if not dry_run:
-                db.label_visit(conn, vid, name, source="auto")
+            # The name goes on THIS species' crops only, never the visit's dominant species: a
+            # raccoon visit outvoted by 'not an animal' boxes would hand them the name instead.
+            if not self._co_rows.get(vid) or (not dry_run and not db.label_visit(
+                    conn, vid, name, source="auto", species=self.species)):
+                out["skipped"]["no_matching_species"] += 1
+                out["no_matching_species"].append(vid)
+                continue
             out["assigned"].append({"visit_id": vid, "name": name,
                                     "similarity": round(sim, 3), "margin": round(lead, 3),
                                     "started": self.visit_started.get(vid)})
@@ -1568,6 +1576,9 @@ def main() -> int:
             for a in r["assigned"]:
                 print(f"  visit #{a['visit_id']:<6} {_fmt_started(a['started'])}  "
                       f"{a['name']}  sim {a['similarity']:.2f}  lead {a['margin']:.2f}")
+            for vid in r.get("no_matching_species", ()):
+                print(f"  visit #{vid:<6} {_fmt_started(matcher.visit_started.get(vid))}  "
+                      f"skipped: no {args.species} crops to name")
             if r["skipped"]:
                 parts = ", ".join(f"{k} {v}" for k, v in sorted(r["skipped"].items()))
                 print(f"  (skipped: {parts})")

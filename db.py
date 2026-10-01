@@ -1108,12 +1108,17 @@ def is_group_label(name) -> bool:
 
 def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional[str],
                 source: str = "human", *, reject: bool = False,
-                labeled_by: Optional[str] = None) -> int:
+                labeled_by: Optional[str] = None, species: Optional[str] = None) -> int:
     """Confirm WHO a visit was: stamp `individual_id` onto the visit's detections that match the
     visit's dominant species (a stray mid-visit crow crop keeps its own identity), and mirror it
     onto the visits row. The visit is the labelling unit -- one solo animal per visit, so one
     confirmation labels every crop AND makes the visit a template for future suggestions.
     `individual_id=None` clears. Returns crops stamped.
+
+    `species` overrides the visit's dominant species as the scope. A caller that KNOWS whose
+    species the name belongs to (the auto-assign pass, which matched only raccoon crops) must pass
+    it: the visits row's species is a crop-count vote, and a raccoon visit outvoted by detector
+    noise carries species 'not an animal'.
 
     `source` records who decided: 'human' feeds the suggestion templates, 'auto' (the nightly
     auto-assign) never does. `reject=True` (with individual_id=None) is the human's "leave this
@@ -1126,7 +1131,7 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     v = conn.execute("SELECT species FROM visits WHERE id = ?", (int(visit_id),)).fetchone()
     if v is None:
         return 0
-    sp = v[0]
+    sp = species or v[0]
     where = "visit_id = ?" + ("" if sp is None else " AND species = ?")
     params = [int(visit_id)] + ([] if sp is None else [sp])
     cur = conn.execute(
@@ -1134,6 +1139,9 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
         f"labeled_by = ? WHERE {where}",
         [individual_id, None if (individual_id is None and not reject) else source,
          now_local_iso(), labeled_by] + params)
+    if species and not cur.rowcount:
+        conn.commit()            # release the write lock the no-op UPDATE took
+        return 0                 # nothing of that species here -- don't name the visits row either
     conn.execute("UPDATE visits SET individual_id = ? WHERE id = ?",
                  (individual_id, int(visit_id)))
     conn.commit()
