@@ -23,24 +23,36 @@ Two things the setup scripts do not install:
 
 Local settings live in `config_local.py`, which is gitignored — copy
 `config_local.example.py` and edit that. Never commit a `config_local.py`; it holds your
-coordinates, camera indices, and ignore zones.
+coordinates, camera indices, and ignore zones. Keys and passwords go in the secrets file outside
+the project (`~/.critter-cam/secrets.json`, or `$CRITTER_CAM_SECRETS`) rather than in
+`config_local.py`, which rides into every backup; see [SECURITY.md](SECURITY.md).
 
 ## Tests
 
+From the repo root, with the project's virtual environment:
+
 ```
-python -m pytest tests/ -q
+.venv\Scripts\python.exe -m pytest tests -q      # Windows
+.venv/bin/python -m pytest tests -q               # Linux/macOS
 ```
 
-328 tests at the time of writing, and they should stay green. They are pure logic: no GPU, no
-camera, no model download, no network. A test that needs any of those four is a test that will
-be skipped forever, which is worse than no test.
+1,288 `def test_` functions across 43 test files as of 2026-10-01 (parametrized cases run
+more), and they should stay green. They are pure logic: no GPU, no camera, no model download, no
+network. `tests/conftest.py` also points `CRITTER_CAM_SECRETS` at a file that cannot exist, so
+your real secrets never reach a test. A test that needs any of those four is a test that will be
+skipped forever, which is worse than no test. They do need cv2, numpy and (CPU) torch installed;
+`tests/test_clipfilter.py` is skipped without torch.
+
+**Python versions.** The declared floor is 3.10 (`pyproject.toml`, and `config.py` refuses
+anything older). CI runs the suite on 3.12 only (`.github/workflows/tests.yml`); the live rig
+runs 3.14. Code that needs something newer than 3.10 has to say so.
 
 Two rules that are load-bearing rather than stylistic:
 
 - **Every test that touches a database uses `tmp_path`.** The `conn` / `db_path` fixtures in
   `tests/conftest.py` build a throwaway SQLite file per test, with the real schema, inside
-  pytest's temp dir. The live `backyard.db` is 810 MB of irreplaceable raccoon history and no
-  test may open it, ever.
+  pytest's temp dir. The live `backyard.db` is several GB of irreplaceable raccoon history
+  (~3.8 GB on 2026-10-01) and no test may open it, ever.
 - **Drive behaviour through the real insert helpers** (`db.insert_detection`, `visits.refresh`,
   …) with controlled timestamps, rather than hand-writing rows. That is what makes the
   gap-boundary and dominant-label assertions deterministic instead of lucky.
