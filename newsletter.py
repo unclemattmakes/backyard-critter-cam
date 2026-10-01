@@ -242,11 +242,14 @@ def dashboard_base(cfg) -> str:
 
     Built through mdns.url so a link on the default port 80 comes out as "http://192.168.1.50"
     rather than "...:80" -- the same number a browser would have assumed, and one more thing for
-    a reader to mistrust in a link they are being asked to tap."""
+    a reader to mistrust in a link they are being asked to tap.
+
+    The port is the one the rig last BOUND (mdns.served_port), not the configured one: when 80 is
+    taken the rig serves on web_port_fallback, and a link to the configured port goes nowhere."""
     base = getattr(cfg, "email_dashboard_url", None)
     if base:
         return str(base).rstrip("/")
-    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower())
+    return mdns.url(cfg, _lan_ip() or socket.gethostname().lower(), port=mdns.served_port(cfg))
 
 
 def dashboard_answering(base, timeout=1.5) -> bool | None:

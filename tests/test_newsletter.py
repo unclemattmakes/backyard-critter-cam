@@ -878,3 +878,18 @@ def test_low_confidence_species_reads_unidentified_in_the_issue(conn, db_path):
 def test_species_count_falls_back_without_n_species():
     lede = " ".join(newsletter.compose_lede(mkbundle(mkdigest())))   # older payload shape
     assert "1 species" in lede
+
+
+def test_dashboard_link_uses_the_port_the_rig_actually_bound(tmp_path, monkeypatch):
+    """Port 80 was taken and the rig fell back to 8000: the links must follow the socket."""
+    import mdns
+    monkeypatch.setattr(newsletter, "_lan_ip", lambda: "192.168.1.101")
+    cfg = mkcfg(tmp_path, web_port=80, web_port_fallback=8000)
+    assert newsletter.dashboard_base(cfg) == "http://192.168.1.101"          # nothing recorded
+    mdns.record_bound_port(cfg, 8000)
+    assert json.loads((tmp_path / ".web_bound.json").read_text())["port"] == 8000
+    assert newsletter.dashboard_base(cfg) == "http://192.168.1.101:8000"
+    mdns.record_bound_port(cfg, 80)                                          # back on 80
+    assert newsletter.dashboard_base(cfg) == "http://192.168.1.101"
+    (tmp_path / ".web_bound.json").write_text("{torn")                       # unreadable: config
+    assert newsletter.dashboard_base(cfg) == "http://192.168.1.101"
