@@ -47,6 +47,11 @@ skipped forever, which is worse than no test. They do need cv2, numpy and (CPU) 
 anything older). CI runs the suite on 3.12 only (`.github/workflows/tests.yml`); the live rig
 runs 3.14. Code that needs something newer than 3.10 has to say so.
 
+CI runs the suite on ubuntu + Python 3.12 and on Windows + Python 3.14 (the rig's platform),
+installing the exact versions in `requirements-lock.txt`, then runs `ruff check .` (lint only,
+config in `pyproject.toml`; there is no formatter). If you change `requirements.txt`, regenerate
+the lock with the command in its header.
+
 Two rules that are load-bearing rather than stylistic:
 
 - **Every test that touches a database uses `tmp_path`.** The `conn` / `db_path` fixtures in

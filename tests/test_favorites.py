@@ -17,7 +17,6 @@ Two things are worth pinning here, and they are the two that would rot silently.
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import urllib.error
 import urllib.request

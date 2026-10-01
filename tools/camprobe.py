@@ -46,9 +46,9 @@ sys.path.insert(0, str(ROOT))               # tools/ sits one below the project 
 VENV_PY = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 try:
-    import cv2                                   # noqa: E402
-    import config                                # noqa: E402
-    from cameras import parse_stream_url         # noqa: E402  (one URL parser, not two)
+    import cv2
+    import config
+    from cameras import parse_stream_url         # one URL parser, not two
 except ModuleNotFoundError as exc:               # pragma: no cover - depends on the interpreter
     # A bare `python` is not this project's interpreter: on the rig it resolves to the system
     # Python, which has no OpenCV. Fail with the command to run instead of a raw traceback --

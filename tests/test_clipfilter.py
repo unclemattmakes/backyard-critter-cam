@@ -18,8 +18,8 @@ import pytest
 # runs the other 280-odd tests.
 torch = pytest.importorskip("torch")
 
-import clipfilter
-from clipfilter import AnimalFilter, decision
+import clipfilter  # noqa: E402 -- after the importorskip, on purpose
+from clipfilter import AnimalFilter, decision  # noqa: E402
 
 
 def _protos():

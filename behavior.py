@@ -28,7 +28,6 @@ import argparse
 import sqlite3
 import sys
 from collections import Counter
-from datetime import datetime
 
 import config
 import db
@@ -233,7 +232,6 @@ def yard_politics(conn, *, min_events: int = 8, horizon_h: float = 24.0):
         return len(hours_of(A) & hours_of(B)) >= 2
 
     # Baseline inter-arrival gap per species (minutes, capped at the horizon), per source pooled.
-    base_gaps = Counter()
     gaps_by_sp = {}
     for src, vs in by_src.items():
         per_sp = {}

@@ -30,6 +30,9 @@ if [ ! -d ".venv" ]; then
   "$PY" -m venv .venv
 fi
 VPY=".venv/bin/python"
+# The torch VERSION is the same on every path below (and in setup.bat and requirements-lock.in);
+# only the build -- cu130, cu126, CPU or macOS -- is chosen per machine. Bump all of them together.
+TORCH_PKGS="torch==2.12.0 torchvision==0.27.0"
 "$VPY" -m pip install --upgrade pip >/dev/null
 
 # 3) Install torch matched to the GPU GENERATION, not just GPU-or-not. CUDA wheels drop kernels
@@ -50,17 +53,17 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     echo "NVIDIA GPU detected (compute capability ${CC} -- Maxwell/Pascal/Volta era)."
     echo "The newest CUDA wheels dropped this generation, so installing the cu126 build"
     echo "-- with cu130 this card would silently go unused."
-    "$VPY" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+    "$VPY" -m pip install $TORCH_PKGS --index-url https://download.pytorch.org/whl/cu126
   else
     echo "NVIDIA GPU detected (compute capability ${CC:-unknown}) -- installing the CUDA (cu130) torch build ..."
-    "$VPY" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+    "$VPY" -m pip install $TORCH_PKGS --index-url https://download.pytorch.org/whl/cu130
   fi
 elif [ "$(uname -s)" = "Darwin" ]; then
   echo "macOS detected -- installing the default torch build (CPU/MPS) ..."
-  "$VPY" -m pip install torch torchvision
+  "$VPY" -m pip install $TORCH_PKGS
 else
   echo "No NVIDIA GPU detected -- installing the CPU torch build (slower, but it works) ..."
-  "$VPY" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  "$VPY" -m pip install $TORCH_PKGS --index-url https://download.pytorch.org/whl/cpu
 fi
 
 # 4) The rest of the dependencies.

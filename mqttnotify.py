@@ -299,7 +299,7 @@ class SightingNotifier:
                 "updated": now.isoformat()}
 
     def _emit(self, events: list[dict], now: datetime) -> None:
-        enc = lambda obj: json.dumps(obj).encode("utf-8")   # noqa: E731
+        enc = lambda obj: json.dumps(obj).encode("utf-8")
         msgs = [(self._topic("sighting", ev["slug"]), enc(ev), False) for ev in events]
         msgs.append((self._topic("present"), enc(self._present(now)), True))
         arrivals = [ev for ev in events if ev["event"] == "arrived"]

@@ -27,7 +27,6 @@ import sys
 import time
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
 
 import cv2
 import numpy as np

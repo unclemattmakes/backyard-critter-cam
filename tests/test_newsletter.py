@@ -366,7 +366,7 @@ def noisy_image(w, h, sharp_centre: bool):
         out[y0:y1, x0:x1] = noise[y0:y1, x0:x1]
     else:
         out[y0:y1, x0:x1] = flat[y0:y1, x0:x1]
-    return Image.fromarray(out, "L")
+    return Image.fromarray(out)                      # 2-D uint8 -> mode "L"
 
 
 def test_focus_stats_finds_where_the_sharpness_lives():

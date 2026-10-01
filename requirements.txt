@@ -14,22 +14,29 @@
 #
 #   pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
 #
-# (Older NVIDIA GPUs and CPU-only boxes use the default wheels -- setup.bat / setup.sh pick for
-# you. This file intentionally does NOT pin torch, so it stays correct on every machine.)
+# (Older NVIDIA GPUs and CPU-only boxes use the cu126 / CPU wheels of the SAME version --
+# setup.bat / setup.sh pick the build for you. This file intentionally does NOT list torch, so
+# it stays correct on every machine.)
+#
+# These are ranges. The exact versions CI tests against -- this rig's, CPU torch included --
+# are pinned in requirements-lock.txt, generated from requirements-lock.in (command in its
+# header). Regenerate it after changing this file.
 #
 # Then install the rest from this file. (ultralytics pulls numpy/pillow/etc.; it will reuse
 # the cu130 torch already present rather than replacing it.)
 
 opencv-python>=4.10,<5
 # ultralytics>=8.4 deliberately excludes 8.3.41/8.3.42 -- the Dec-2024 PyPI releases that shipped a
-# cryptominer -- and <9 stops a future major auto-installing. For a stronger guarantee, generate a
-# hashed lockfile (pip-compile --generate-hashes) and install with --require-hashes.
+# cryptominer -- and <9 stops a future major auto-installing. requirements-lock.txt pins the exact
+# release CI tests.
 ultralytics>=8.4,<9
 # numpy and pillow are imported DIRECTLY all over this codebase (embed.py, reid.py, eval.py,
 # import_trailcam.py, ...), so they are declared directly -- ultralytics/pybioclip happen to pull
 # them in today, but an upstream dropping a transitive dep must not break this install.
 numpy>=1.26,<3
-pillow>=10,<12
+# <13, not <12: the full suite passes on Pillow 12.3 (2026-10-01). Image.fromarray's `mode`
+# argument is deprecated (slated for removal in 13) -- nothing here passes it any more.
+pillow>=10,<13
 # The general-CLIP "is this even an animal?" gate (clipfilter.py) imports open_clip directly;
 # declared in its own right rather than ridden in as a pybioclip dependency.
 open_clip_torch>=2.24,<3

@@ -44,9 +44,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import config                                                    # noqa: E402
-import db                                                        # noqa: E402
-import staticfilter                                              # noqa: E402
+import config
+import db
+import staticfilter
 
 # One dominant species from this set is the proxy for "really an animal". Birds are excluded on
 # purpose: they are small, they perch on the furniture, and a static post reads as a different

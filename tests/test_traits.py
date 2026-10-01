@@ -31,6 +31,8 @@ never turn into a red test about something else.
 """
 from __future__ import annotations
 
+import sqlite3
+
 import cv2
 import numpy as np
 import pytest
@@ -49,7 +51,7 @@ def _animal(scale: float = 1.0, *, fur: int = 150, n_rings: int = 5, tail: bool 
     a darker one can be compared against the SAME black mask and white muzzle references."""
     rng = np.random.default_rng(seed)
     W, H = int(420 * scale), int(240 * scale)
-    s = lambda v: int(round(v * scale))                                    # noqa: E731
+    s = lambda v: int(round(v * scale))
     img = np.full((H, W, 3), (70, 62, 55), np.uint8)                       # cool background
     mask = np.zeros((H, W), np.uint8)
     body_c, body_ax = (s(130), s(120)), (s(105), s(78))
@@ -582,7 +584,7 @@ def test_cli_connection_is_read_only(db_path):
     dbmod.connect(db_path).close()
     conn = traits._ro_conn(db_path)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
             conn.execute("INSERT INTO detections (timestamp, source, detection_class, confidence,"
                          " bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h, crop_path)"
                          " VALUES ('x','y','animal',1,0,0,1,1,10,10,'c.jpg')")
