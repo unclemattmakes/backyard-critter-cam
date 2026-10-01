@@ -3,7 +3,10 @@
 **Status:** open. **The PSU was replaced on 2026-09-13 and the box hung again 11 minutes after
 the rig came back up.** Power delivery *at the PSU* is effectively excluded; see *Results*.
 **Machine:** OLVR (ASUS PRIME X299-DELUXE, i7-7820X, RTX 3070, 64 GB, BIOS 1401 / 2018-05-09).
-**Last updated:** 2026-09-23 — see *2026-09-23: interval result*. Earlier: 2026-09-13 23:30 — supersedes both the 2026-08-26 reading and the earlier
+**2026-10-01 status:** since the naming helper was capped to AVX2 on 4 threads (2026-09-23), there
+have been no Kernel-Power 41 events through 2026-10-01: 8+ days, against a previous best of 8.8
+days. Encouraging, not conclusive. See *2026-10-01: eight days on the AVX2 cap*.
+**Last updated:** 2026-10-01. Before that 2026-09-23 — see *2026-09-23: interval result*. Earlier: 2026-09-13 23:30 — supersedes both the 2026-08-26 reading and the earlier
 2026-09-13 one. See *The recorder's blind spot*, which is now the most important section here.
 
 This is not a bug in the rig. It is written down here because the rig is what surfaced it, the
@@ -299,6 +302,18 @@ Two changes, both 2026-09-23:
   until `--release`. Before this, `.rig_pause` aged out at every crash-reboot, and rigwatch started
   the rig straight back into the hang (09-15 18:03, 09-23 13:33), so the machine could not be
   kept quiet for debugging. **A hold is set as of 2026-09-23 13:42.**
+
+## 2026-10-01: eight days on the AVX2 cap
+
+No Kernel-Power 41 events from the 2026-09-23 cap through 2026-10-01, which is 8+ days. The
+previous best was 8.8 days (the capped-GPU run of 2026-08-28 to 09-06), so this run has not yet
+beaten it. The three hangs before the cap all came in the first four minutes after a start, so
+the startup window matters more than the total. The variance has always been huge, so read this
+as encouraging, not conclusive: the cap is not proven to be the fix until the box clearly outlasts
+8.8 days, ideally across several rig restarts. It also only counts for the days the rig was
+actually up rather than held, so check `logs/rigwatch.log` for `HELD` lines before quoting it.
+The BIOS update and HWiNFO logging below are still the next steps. (The rigwatch naming check
+that *The collateral damage* below calls uncommitted has since been committed.)
 
 ## The detector-interval experiment — ran 2026-09-14 21:16 to 2026-09-23 (see above)
 
