@@ -34,7 +34,9 @@ ultralytics>=8.4,<9
 # import_trailcam.py, ...), so they are declared directly -- ultralytics/pybioclip happen to pull
 # them in today, but an upstream dropping a transitive dep must not break this install.
 numpy>=1.26,<3
-pillow>=10,<12
+# <13, not <12: the full suite passes on Pillow 12.3 (2026-10-01). Image.fromarray's `mode`
+# argument is deprecated (slated for removal in 13) -- nothing here passes it any more.
+pillow>=10,<13
 # The general-CLIP "is this even an animal?" gate (clipfilter.py) imports open_clip directly;
 # declared in its own right rather than ridden in as a pybioclip dependency.
 open_clip_torch>=2.24,<3
