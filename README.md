@@ -264,6 +264,26 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
+`NAMING IS STALE` when species naming stops, and `NIGHTLY BATCH IS STALE` when the newest
+`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
+has not finished a run since.
+
+#### Hearing about it when the whole machine is down
+
+Every alarm above is written on the rig's own machine, so a hung or powered-off box says nothing.
+For that, point rigwatch at any free "dead man's switch" service ([healthchecks.io](https://healthchecks.io),
+or anything that takes a ping URL) and give the check a 5-minute period with some grace:
+
+```python
+cfg.heartbeat_url = "https://hc-ping.com/your-check-uuid"    # config_local.py: the URL is a secret
+```
+
+Each rigwatch run then pings that URL when everything is fine (rig up, or held/paused by you; naming
+and the nightly batch OK), and `<url>/fail` when it is not, which healthchecks.io treats as an
+immediate alarm. The point is the opposite case: when the pings **stop**, the service emails or
+texts you, from off the box. A network error never stops rigwatch, and only the host is logged.
+
 #### Telling someone else how to connect
 
 The LAN launcher gives the rig a **name on your network**, so nobody has to be handed an IP
@@ -1303,7 +1323,7 @@ everyone-operates behaviour.
   If you want real remote access, put it behind a VPN or an authenticating reverse proxy — and only
   then set `lan_only = False` in `config_local.py`.
 - **`config_local.py` holds the sensitive bits** — your latitude/longitude, any RTSP camera
-  credentials, your `email_resend_api_key`, your `mqtt_password` and your `operator_token`. It's gitignored, so it never
+  credentials, your `email_resend_api_key`, your `mqtt_password`, your `heartbeat_url` and your `operator_token`. It's gitignored, so it never
   rides along in a commit; note that `backup.py` *does* copy it into the `meta-<date>.zip`, and
   the database snapshot beside it carries your camera passwords. Both usually land in a
   cloud-synced folder, unencrypted, in **every daily zip** — so whoever can read that folder can
