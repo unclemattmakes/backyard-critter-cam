@@ -752,6 +752,25 @@ class Config:
     # BEFORE the auto tier is turned on. This is the fallback used in that case.
     reid_queue_ambiguous_margin: float = 0.02
 
+    # ---- Nightly eval gate (eval.py, run by run_clipmotion.bat) ---------------------
+    # ABSOLUTE FLOORS: a metric below its floor fails the gate (exit 1, auto-assign skipped)
+    # whatever the baseline says, so a slide made of nightly steps each inside --tolerance still
+    # trips it. Keys are dotted artifact paths (see eval.BASELINE_METRICS; `[field=value]` picks a
+    # list row). These are THIS AUTHOR'S corpus: the 2026-09-28 run scored 0.610 / 0.703 / 0.459 /
+    # 0.906, and each floor sits ~0.03-0.04 under (roughly twice the nightly 0.02 tolerance, a
+    # handful of probes on ~150). For your yard: run `python eval.py`, read each value from the
+    # artifact, subtract the same margin, and set them in config_local.py. {} disables.
+    eval_floors: dict[str, float] = field(default_factory=lambda: {
+        "reid.separation.auc": 0.58,
+        "reid.identification_loo.blocked.top1_accuracy": 0.67,
+        "reid.identification_loo.embargo_curve[embargo_days=7].top1_accuracy": 0.42,
+        "species.trust_rule_check.conf_ge_0.8.accuracy": 0.87,
+    })
+    # STALENESS: exit 3 (logged, auto-assign still runs) once the scored corpus and every headline
+    # metric have been identical for this many earlier nights -- a frozen corpus diffs at 0.000
+    # and passes any baseline, which is how a 2-week naming outage went unseen. 0 disables.
+    eval_stale_nights: int = 7
+
     # ---- ANATOMY TRAITS (traits.py) ---------------------------------------------
     # Descriptors measured off the animal's own body rather than off a global appearance embedding.
     # Nothing here is wired into the matcher: traits.py is a standalone extractor with a dry-run

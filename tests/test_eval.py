@@ -658,6 +658,9 @@ def test_baseline_flag_exits_non_zero_on_a_regression(conn, db_path, tmp_path, m
         "reid.auto_assign_sweep.held_out_procedure.pooled.coverage": 0.0,
         "reid.auto_assign_sweep.held_out_procedure.pooled.error_rate": 1.0})))
 
+    # This test is about the baseline diff alone: no floors, and an empty history for staleness.
+    monkeypatch.setattr(config.CONFIG, "eval_floors", {})
+    monkeypatch.setattr(evalmod, "REPORTS_DIR", tmp_path / "reports")
     original_db_path = config.CONFIG.db_path
     try:
         def _run(baseline):
@@ -685,3 +688,223 @@ def test_latest_artifact_picks_the_newest_stamp(tmp_path):
 def test_load_artifact_missing_file_is_a_clean_exit(tmp_path):
     with pytest.raises(SystemExit):
         evalmod.load_artifact(tmp_path / "nope.json")
+
+
+# ---------------------------------------------------------------------------
+# The gate beyond --baseline latest: pinned baseline, absolute floors, staleness, exit codes.
+# ---------------------------------------------------------------------------
+
+def _gate_artifact(run_at="2026-09-01T17:30:00-07:00", **overrides) -> dict:
+    """_artifact plus the pieces the gate reads: the embargo curve, the conf >= 0.8 bucket and the
+    scored-corpus counts the staleness fingerprint is built from."""
+    a = _artifact()
+    a["meta"]["run_at"] = run_at
+    a["reid"]["identification_loo"]["embargo_curve"] = [
+        {"embargo_days": None, "top1_accuracy": 0.74}, {"embargo_days": 1, "top1_accuracy": 0.70},
+        {"embargo_days": 7, "top1_accuracy": 0.46}, {"embargo_days": 21, "top1_accuracy": 0.16}]
+    a["reid"]["confirmed_visits"] = {"total": 230, "solo_with_prototype": 148,
+                                     "solo_by_individual": {"Stan": 50, "Notch": 48},
+                                     "distinct_nights": 49}
+    a["species"]["trust_rule_check"] = {"conf_ge_0.8": {"n": 2446, "accuracy": 0.906}}
+    a["species"]["ground_truth"] = {"verified_rows_total": 7581}
+    a["species"]["graded_rows"] = 4271
+    for dotted, val in overrides.items():
+        cur = a
+        parts = dotted.split(".")
+        for p in parts[:-1]:
+            cur = cur[p]
+        cur[parts[-1]] = val
+    return a
+
+
+def _write(dirpath, stamp, artifact):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    p = dirpath / f"eval_{stamp}.json"
+    p.write_text(json.dumps(artifact))
+    return p
+
+
+SEVEN_DAY = "reid.identification_loo.embargo_curve[embargo_days=7].top1_accuracy"
+FLOORS = {"reid.separation.auc": 0.58,
+          "reid.identification_loo.blocked.top1_accuracy": 0.67,
+          SEVEN_DAY: 0.42,
+          "species.trust_rule_check.conf_ge_0.8.accuracy": 0.87}
+
+
+def test_dig_reads_list_rows_and_dotted_keys():
+    a = _gate_artifact()
+    assert evalmod._dig(a, SEVEN_DAY) == pytest.approx(0.46)
+    assert evalmod._dig(
+        a, "reid.identification_loo.embargo_curve[embargo_days=None].top1_accuracy") == 0.74
+    assert evalmod._dig(a, "reid.identification_loo.embargo_curve[embargo_days=3]") is None
+    assert evalmod._dig(a, "species.trust_rule_check.conf_ge_0.8.accuracy") == pytest.approx(0.906)
+    assert evalmod._dig(a, "reid.separation[x=1]") is None          # selector on a dict
+    assert evalmod._dig(a, "reid.separation.auc.deeper") is None
+
+
+def test_seven_day_embargo_is_in_the_diff():
+    base = _gate_artifact()
+    worse = _gate_artifact()
+    worse["reid"]["identification_loo"]["embargo_curve"][2]["top1_accuracy"] = 0.40
+    diff = evalmod.compare_artifacts(base, worse, tolerance=0.02)
+    assert [r["metric"] for r in diff["regressions"]] == ["LOO top-1, 7-day embargo"]
+    # An artifact from before the curve existed: reported, never a regression.
+    old = _gate_artifact()
+    del old["reid"]["identification_loo"]["embargo_curve"]
+    assert evalmod.compare_artifacts(old, worse, tolerance=0.02)["ok"]
+
+
+def test_shipped_floors_are_addressable_paths():
+    # A typo'd floor path would read 'unmeasurable' and fail every night; pin that they resolve.
+    a = _gate_artifact()
+    for path in config.Config().eval_floors:
+        assert isinstance(evalmod._dig(a, path), float), path
+
+
+def test_pin_baseline_copies_and_survives_newer_artifacts(tmp_path):
+    reports = tmp_path / "reports"
+    _write(reports, "20260901T000000Z", _gate_artifact(**{"reid.separation.auc": 0.70}))
+    dest = evalmod.pin_baseline("latest", reports)
+    assert dest.name == "pinned_baseline.json"
+    _write(reports, "20260902T000000Z", _gate_artifact(**{"reid.separation.auc": 0.60}))
+
+    assert evalmod.latest_artifact(reports).name == "eval_20260902T000000Z.json"  # pin not matched
+    pinned = evalmod.load_artifact(evalmod.resolve_baseline("pinned", reports))
+    assert pinned["reid"]["separation"]["auc"] == 0.70
+    assert pinned["pinned"]["source"].endswith("eval_20260901T000000Z.json")
+
+
+def test_pinned_baseline_catches_slow_drift_that_latest_misses(tmp_path):
+    # Each night slips 0.015 -- inside the 0.02 tolerance -- so night-over-night always passes,
+    # but against the pinned point the slide is caught.
+    reports = tmp_path / "reports"
+    nights = [0.74, 0.725, 0.71, 0.695]
+    _write(reports, "20260901T000000Z", _gate_artifact(
+        **{"reid.identification_loo.blocked.top1_accuracy": nights[0]}))
+    evalmod.pin_baseline("latest", reports)
+    for i, v in enumerate(nights[1:], start=2):
+        cur = _gate_artifact(**{"reid.identification_loo.blocked.top1_accuracy": v})
+        prev = evalmod.load_artifact(evalmod.latest_artifact(reports))
+        assert evalmod.compare_artifacts(prev, cur, tolerance=0.02)["ok"]
+        _write(reports, f"202609{i:02d}T000000Z", cur)
+    pinned = evalmod.load_artifact(evalmod.resolve_baseline("pinned", reports))
+    diff = evalmod.compare_artifacts(pinned, cur, tolerance=0.02)
+    assert [r["metric"] for r in diff["regressions"]] == ["LOO top-1 (session-blocked)"]
+
+
+def test_pinned_without_a_pin_is_a_clean_exit(tmp_path):
+    with pytest.raises(SystemExit, match="pin-baseline"):
+        evalmod.resolve_baseline("pinned", tmp_path)
+
+
+def test_floors_breach_pass_and_missing():
+    ok = evalmod.check_floors(_gate_artifact(), FLOORS)
+    assert ok["ok"] and len(ok["rows"]) == 4
+
+    low = _gate_artifact()
+    low["reid"]["identification_loo"]["embargo_curve"][2]["top1_accuracy"] = 0.41
+    res = evalmod.check_floors(low, FLOORS)
+    assert [r["metric"] for r in res["breaches"]] == ["LOO top-1, 7-day embargo"]
+
+    # The re-ID eval ran but measured nothing (a collapsed corpus): that IS a breach...
+    collapsed = _gate_artifact(**{"reid.separation": {"note": "too few solo visits"}})
+    res = evalmod.check_floors(collapsed, FLOORS)
+    assert [r["path"] for r in res["breaches"]] == ["reid.separation.auc"]
+    assert res["breaches"][0]["note"] == "unmeasurable"
+    # ...but an eval this run skipped (--species only) is not.
+    species_only = {"meta": {}, "species": _gate_artifact()["species"]}
+    res = evalmod.check_floors(species_only, FLOORS)
+    assert res["ok"] and sum(r["note"] == "eval not run" for r in res["rows"]) == 3
+    assert evalmod.check_floors(_gate_artifact(), {})["ok"]
+
+
+def _history(reports, n, start_day=1, **overrides):
+    for d in range(start_day, start_day + n):
+        _write(reports, f"202609{d:02d}T003000Z",
+               _gate_artifact(run_at=f"2026-09-{d:02d}T17:30:00-07:00", **overrides))
+
+
+def test_staleness_counts_identical_nights(tmp_path):
+    reports = tmp_path / "reports"
+    _history(reports, 6)                                               # Sep 1..6
+    today = _gate_artifact(run_at="2026-09-07T17:30:00-07:00")
+    s = evalmod.check_staleness(today, 7, reports)
+    assert s["unchanged_nights"] == 6 and not s["stale"]
+    _history(reports, 1, start_day=7)                                  # Sep 7
+    s = evalmod.check_staleness(_gate_artifact(run_at="2026-09-08T17:30:00-07:00"), 7, reports)
+    assert s["unchanged_nights"] == 7 and s["stale"]
+    assert s["unchanged_since"] == "eval_20260901T003000Z.json"
+    assert not evalmod.check_staleness(today, 0, reports)["stale"]    # 0 disables
+
+
+def test_staleness_resets_on_a_change_and_counts_nights_not_runs(tmp_path):
+    reports = tmp_path / "reports"
+    _history(reports, 4, start_day=1)
+    _history(reports, 3, start_day=5, **{"species.graded_rows": 4280})   # labels moved on Sep 5
+    # Two runs on one night count once, and today's own earlier run doesn't count at all.
+    _write(reports, "20260907T053000Z", _gate_artifact(run_at="2026-09-07T22:30:00-07:00",
+                                                       **{"species.graded_rows": 4280}))
+    _write(reports, "20260908T003000Z", _gate_artifact(run_at="2026-09-08T17:30:00-07:00",
+                                                       **{"species.graded_rows": 4280}))
+    today = _gate_artifact(run_at="2026-09-08T20:00:00-07:00", **{"species.graded_rows": 4280})
+    s = evalmod.check_staleness(today, 7, reports)
+    assert s["unchanged_nights"] == 3 and s["unchanged_since"] == "eval_20260905T003000Z.json"
+
+
+def test_staleness_sees_a_metric_change_with_identical_counts(tmp_path):
+    reports = tmp_path / "reports"
+    _history(reports, 7)
+    moved = _gate_artifact(run_at="2026-09-08T17:30:00-07:00", **{"reid.separation.auc": 0.81})
+    assert evalmod.check_staleness(moved, 7, reports)["unchanged_nights"] == 0
+
+
+def _gate_main(monkeypatch, tmp_path, result, argv, floors=None, stale_nights=7):
+    """main() with the DB eval replaced by a canned result, reports/ in tmp_path."""
+    monkeypatch.setattr(evalmod, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(config.CONFIG, "eval_floors", FLOORS if floors is None else floors)
+    monkeypatch.setattr(config.CONFIG, "eval_stale_nights", stale_nights)
+    monkeypatch.setattr(evalmod, "run", lambda *a, **k: json.loads(json.dumps(result)))
+    monkeypatch.setattr(evalmod, "_print_header", lambda m: None)
+    monkeypatch.setattr(evalmod, "_print_species", lambda s: None)
+    monkeypatch.setattr(evalmod, "_print_reid", lambda r: None)
+    monkeypatch.setattr("sys.argv", ["eval.py", "--no-save", *argv])
+    return evalmod.main()
+
+
+def test_exit_codes(monkeypatch, tmp_path, capsys):
+    reports = tmp_path / "reports"
+    today = _gate_artifact(run_at="2026-09-20T17:30:00-07:00")
+    assert _gate_main(monkeypatch, tmp_path, today, []) == 0              # clean, no history
+
+    _history(reports, 7)
+    assert _gate_main(monkeypatch, tmp_path, today, []) == evalmod.EXIT_STALE == 3
+    assert "STALE" in capsys.readouterr().out
+    assert _gate_main(monkeypatch, tmp_path, today, [], stale_nights=0) == 0
+
+    low = _gate_artifact(run_at="2026-09-20T17:30:00-07:00", **{"reid.separation.auc": 0.50})
+    assert _gate_main(monkeypatch, tmp_path, low, []) == evalmod.EXIT_REGRESSION == 1
+    assert "BELOW FLOOR" in capsys.readouterr().out
+
+    # Stale AND regressed: the regression wins (it is the one that must skip auto-assign).
+    evalmod.pin_baseline("latest", reports)                             # pinned at top-1 0.74
+    _history(reports, 7, start_day=10, **{"reid.identification_loo.blocked.top1_accuracy": 0.69})
+    stale_low = _gate_artifact(run_at="2026-09-20T17:30:00-07:00",
+                               **{"reid.identification_loo.blocked.top1_accuracy": 0.69})
+    tol = ["--tolerance", "0.02"]                                       # as the batch runs it
+    assert _gate_main(monkeypatch, tmp_path, stale_low, ["--baseline", "latest", *tol]) == 3
+    assert _gate_main(monkeypatch, tmp_path, stale_low, ["--baseline", "pinned", *tol]) == 1
+    out = capsys.readouterr().out
+    assert "REGRESSION" in out and "pinned_baseline.json" in out
+
+
+def test_pin_baseline_cli_runs_no_eval(monkeypatch, tmp_path, capsys):
+    _write(tmp_path / "reports", "20260901T000000Z", _gate_artifact())
+
+    def _boom(*a, **k):
+        raise AssertionError("--pin-baseline must not touch the DB")
+    monkeypatch.setattr(evalmod, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(evalmod, "run", _boom)
+    monkeypatch.setattr("sys.argv", ["eval.py", "--pin-baseline", "latest"])
+    assert evalmod.main() == 0
+    assert (tmp_path / "reports" / "pinned_baseline.json").exists()
+    assert "LOO top-1, 7-day embargo" in capsys.readouterr().out

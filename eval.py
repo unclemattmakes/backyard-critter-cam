@@ -78,13 +78,20 @@ It runs two evaluations, both pure offline numpy (no cloud, no LLM, no GPU, no m
     python eval.py --baseline latest      # diff against the newest reports/ artifact; EXIT 1 on a
                                           #   regression past --tolerance (the regression gate)
     python eval.py --baseline reports/eval_20260718T030508Z.json --tolerance 0.02
+    python eval.py --pin-baseline latest  # copy the newest artifact to reports/pinned_baseline.json
+    python eval.py --baseline pinned      # diff against that fixed point instead of last night
     python eval.py --at-point 0.88,0.02   # also score this fixed auto-assign point (repeatable)
+
+  Every run also checks config.eval_floors (EXIT 1 below a floor, baseline or not) and staleness:
+  EXIT 3 when the scored corpus and headline metrics have not changed for
+  config.eval_stale_nights earlier nights. A regression outranks staleness.
 """
 from __future__ import annotations
 
 import argparse
 import itertools
 import json
+import re
 import subprocess
 import sqlite3
 import sys
@@ -910,16 +917,45 @@ BASELINE_METRICS = (
     ("species accuracy", ("species.precision_recall_f1.accuracy",), "higher"),
     ("species chance (majority class)", ("species.chance.rate",), "info"),
     ("species calibration ECE", ("species.calibration.ece",), "lower"),
+    # Identity only holds for about a week, so the 7-day embargo is the number the product lives on.
+    ("LOO top-1, 7-day embargo",
+     ("reid.identification_loo.embargo_curve[embargo_days=7].top1_accuracy",), "higher"),
+    ("species accuracy, conf >= 0.8", ("species.trust_rule_check.conf_ge_0.8.accuracy",), "higher"),
 )
+
+# Exit codes of the gate. Distinct so the batch can log a stale corpus without skipping auto-assign.
+EXIT_REGRESSION = 1
+EXIT_STALE = 3
+
+_SELECTOR = re.compile(r"^(?P<key>[^\[]+)\[(?P<field>\w+)=(?P<val>[^\]]*)\]$")
 
 
 def _dig(d, dotted: str):
-    """Walk a dotted path into nested dicts; None if any step is missing or not a dict."""
-    cur = d
-    for part in dotted.split("."):
-        if not isinstance(cur, dict) or part not in cur:
+    """Walk a dotted path into nested dicts; None if any step is missing. A key that itself holds
+    a dot ("conf_ge_0.8") is matched greedily, and `name[field=value]` picks the first row of a
+    list whose `field` prints as `value` (embargo_curve[embargo_days=7])."""
+    parts = dotted.split(".")
+    cur, i = d, 0
+    while i < len(parts):
+        if not isinstance(cur, dict):
             return None
-        cur = cur[part]
+        for j in range(len(parts), i, -1):
+            key = ".".join(parts[i:j])
+            m = _SELECTOR.match(key)
+            name = m["key"] if m else key
+            if name not in cur:
+                continue
+            cur = cur[name]
+            if m:
+                rows = cur if isinstance(cur, list) else []
+                cur = next((r for r in rows if isinstance(r, dict)
+                            and str(r.get(m["field"])) == m["val"]), None)
+                if cur is None:
+                    return None
+            i = j
+            break
+        else:
+            return None
     return cur
 
 
@@ -949,6 +985,43 @@ def latest_artifact(reports_dir=None):
     d = Path(reports_dir) if reports_dir else REPORTS_DIR
     files = sorted(d.glob("eval_*.json")) if d.exists() else []
     return files[-1] if files else None
+
+
+# The pinned baseline is a COPY (not a pointer), so pruning reports/ can't orphan it. Its name
+# deliberately does not match eval_*.json, or 'latest' and the staleness scan would pick it up.
+PINNED_NAME = "pinned_baseline.json"
+
+
+def pinned_path(reports_dir=None) -> Path:
+    return (Path(reports_dir) if reports_dir else REPORTS_DIR) / PINNED_NAME
+
+
+def resolve_baseline(spec: str, reports_dir=None) -> Path:
+    """--baseline PATH|latest|pinned -> the artifact path to diff against."""
+    if spec == "latest":
+        p = latest_artifact(reports_dir)
+        if p is None:
+            raise SystemExit(f"--baseline latest: no artifacts in {reports_dir or REPORTS_DIR}")
+        return p
+    if spec == "pinned":
+        p = pinned_path(reports_dir)
+        if not p.exists():
+            raise SystemExit(f"--baseline pinned: nothing pinned at {p} "
+                             f"(run: python eval.py --pin-baseline latest)")
+        return p
+    return Path(spec)
+
+
+def pin_baseline(spec: str, reports_dir=None) -> Path:
+    """Copy an artifact ('latest' or a path) to reports/pinned_baseline.json, stamped with where
+    it came from. The nightly gate then diffs against this fixed point instead of last night."""
+    src = resolve_baseline(spec, reports_dir)
+    art = load_artifact(src)
+    art["pinned"] = {"source": str(src), "pinned_at": datetime.now().astimezone().isoformat()}
+    dest = pinned_path(reports_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(art, indent=2, default=_json_default))
+    return dest
 
 
 def compare_artifacts(baseline: dict, current: dict, tolerance: float = 0.05) -> dict:
@@ -987,6 +1060,80 @@ def compare_artifacts(baseline: dict, current: dict, tolerance: float = 0.05) ->
             "current_commit": _dig(current, "meta.git_commit")}
 
 
+def _metric_label(path: str) -> str:
+    return next((lab for lab, paths, _ in BASELINE_METRICS if path in paths), path)
+
+
+def check_floors(current: dict, floors: dict | None) -> dict:
+    """Absolute floors (config.eval_floors): a metric below its floor fails the gate whatever the
+    baseline says, which is what catches a slide made of steps each inside the tolerance. An eval
+    this run skipped (--species/--reid) is not failed; one that RAN but could not produce the
+    metric is, since 'unmeasurable' is how a corpus collapse looks (2026-08-09: 0 solo visits)."""
+    rows, breaches = [], []
+    for path, floor in (floors or {}).items():
+        v = _dig(current, path)
+        v = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        ran = path.split(".")[0] in current
+        note = None if v is not None else ("unmeasurable" if ran else "eval not run")
+        row = {"metric": _metric_label(path), "path": path, "floor": float(floor), "current": v,
+               "breached": (v < float(floor)) if v is not None else ran, "note": note}
+        rows.append(row)
+        if row["breached"]:
+            breaches.append(row)
+    return {"rows": rows, "breaches": breaches, "ok": not breaches}
+
+
+# What the eval actually SCORES. confirmed_visits.total is left out on purpose: group/multi labels
+# move it without changing a single scored input, and the 2026-09 outage did exactly that.
+FINGERPRINT_PATHS = (
+    "species.ground_truth.verified_rows_total",
+    "species.graded_rows",
+    "reid.confirmed_visits.solo_with_prototype",
+    "reid.confirmed_visits.solo_by_individual",
+    "reid.confirmed_visits.distinct_nights",
+)
+
+
+def corpus_fingerprint(artifact: dict) -> list:
+    """Cheap identity of a run's inputs + headline outputs: the scored-corpus counts and every
+    BASELINE_METRICS value (rounded, so float noise can't fake a change)."""
+    fp = [json.dumps(_dig(artifact, p), sort_keys=True) for p in FINGERPRINT_PATHS]
+    for _, paths, _ in BASELINE_METRICS:
+        v, _p = _first_present(artifact, paths)
+        fp.append(None if v is None else round(v, 6))
+    return fp
+
+
+def _run_date(artifact: dict, path: Path | None = None) -> str:
+    run_at = _dig(artifact, "meta.run_at")
+    if isinstance(run_at, str) and len(run_at) >= 10:
+        return run_at[:10]
+    return path.stem[5:13] if path is not None else ""
+
+
+def check_staleness(current: dict, nights: int, reports_dir=None) -> dict:
+    """Count the distinct earlier nights whose artifact has the SAME fingerprint as this run,
+    walking back from the newest until one differs. A frozen corpus scores delta 0.000 against any
+    baseline and passes, so this is the only thing that notices labelling has stopped."""
+    d = Path(reports_dir) if reports_dir else REPORTS_DIR
+    files = sorted(d.glob("eval_*.json"), reverse=True) if d.exists() else []
+    fp, today = corpus_fingerprint(current), _run_date(current)
+    dates, since = set(), None
+    for f in files:
+        try:
+            art = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            break
+        if not isinstance(art, dict) or corpus_fingerprint(art) != fp:
+            break
+        dates.add(_run_date(art, f))
+        since = f.name
+    dates.discard(today)
+    n = len(dates)
+    return {"unchanged_nights": n, "threshold": nights, "unchanged_since": since,
+            "stale": bool(nights) and n >= nights}
+
+
 def _print_baseline_diff(diff: dict, baseline_path) -> None:
     print("\n" + "=" * 74)
     print("BASELINE DIFF  (regression gate)")
@@ -1006,10 +1153,34 @@ def _print_baseline_diff(diff: dict, baseline_path) -> None:
         if r["note"]:
             print(f"      {'':40}   note: {r['note']}")
     if diff["ok"]:
-        print("\n  -> no regression past tolerance. (exit 0)")
+        print("\n  -> no regression past tolerance.")
     else:
         print(f"\n  -> {len(diff['regressions'])} REGRESSION(S) past tolerance: "
-              f"{', '.join(r['metric'] for r in diff['regressions'])}  (exit 1)")
+              f"{', '.join(r['metric'] for r in diff['regressions'])}")
+
+
+def _print_gate(floors: dict, stale: dict, exit_code: int) -> None:
+    print("\n" + "=" * 74)
+    print("GATE  (absolute floors + staleness)")
+    print("=" * 74)
+    if floors["rows"]:
+        print(f"    {'metric':42} {'floor':>9} {'current':>9}")
+        for r in floors["rows"]:
+            c = "      n/a" if r["current"] is None else f"{r['current']:9.3f}"
+            flag = ("  <- BELOW FLOOR" if r["breached"] else "") + \
+                (f"  ({r['note']})" if r["note"] else "")
+            print(f"    {r['metric'][:42]:42} {r['floor']:9.3f} {c}{flag}")
+    else:
+        print("    no floors configured (config.eval_floors)")
+    print(f"\n    scored corpus + headline metrics unchanged for {stale['unchanged_nights']} "
+          f"earlier night(s)" + (f", since {stale['unchanged_since']}" if stale["unchanged_since"]
+                                 else "") + f"   (stale at {stale['threshold'] or 'off'})")
+    if stale["stale"]:
+        print("    WARNING: STALE -- no new labels have reached the eval in "
+              f"{stale['unchanged_nights']} nights; every diff is 0.000 and proves nothing. "
+              "Check the naming helper and the review queue.")
+    verdict = {0: "ok", EXIT_REGRESSION: "REGRESSION", EXIT_STALE: "STALE"}.get(exit_code, "?")
+    print(f"\n  -> GATE: {verdict}  (exit {exit_code})")
 
 
 def _fmt_pct(x):
@@ -1335,10 +1506,13 @@ def main() -> int:
                    help="Also print the full machine-readable result JSON to stdout.")
     p.add_argument("--no-save", action="store_true",
                    help="Don't write the reports/ JSON artifact (console summary only).")
-    p.add_argument("--baseline", default=None, metavar="PATH|latest",
+    p.add_argument("--baseline", default=None, metavar="PATH|latest|pinned",
                    help="Diff this run against a saved reports/eval_*.json ('latest' picks the "
-                        "newest). EXITS NON-ZERO when a headline metric regresses past "
-                        "--tolerance -- this is the regression gate for a .bat or a hook.")
+                        "newest, 'pinned' the copy --pin-baseline made). EXITS 1 when a headline "
+                        "metric regresses past --tolerance -- the regression gate for a .bat.")
+    p.add_argument("--pin-baseline", default=None, metavar="PATH|latest",
+                   help="Copy this artifact to reports/pinned_baseline.json for --baseline pinned, "
+                        "then exit without running any eval.")
     p.add_argument("--tolerance", type=float, default=0.05,
                    help="How far a metric may move the wrong way before --baseline calls it a "
                         "regression (absolute, metric's own units; default 0.05).")
@@ -1352,6 +1526,16 @@ def main() -> int:
                    help="Seed for the k-fold shuffle -- fixed so a re-run reproduces (default 0).")
     args = p.parse_args()
 
+    if args.pin_baseline:
+        dest = pin_baseline(args.pin_baseline)
+        pinned = load_artifact(dest)
+        print(f"Pinned {pinned['pinned']['source']} -> {dest}")
+        for label, paths, direction in BASELINE_METRICS:
+            v, _p = _first_present(pinned, paths)
+            if direction != "info" and v is not None:
+                print(f"    {label[:42]:42} {v:9.3f}")
+        return 0
+
     cfg = config.CONFIG
     if args.db:
         cfg.db_path = Path(args.db)
@@ -1361,9 +1545,7 @@ def main() -> int:
     # run against itself and always pass.
     baseline_path = baseline = None
     if args.baseline:
-        baseline_path = latest_artifact() if args.baseline == "latest" else Path(args.baseline)
-        if baseline_path is None:
-            raise SystemExit(f"--baseline latest: no artifacts in {REPORTS_DIR}")
+        baseline_path = resolve_baseline(args.baseline)
         baseline = load_artifact(baseline_path)
 
     # No flag, or neither of the two selectors -> run both.
@@ -1380,12 +1562,21 @@ def main() -> int:
     if "reid" in result:
         _print_reid(result["reid"])
 
-    exit_code = 0
+    regressed = False
     if baseline is not None:
         diff = compare_artifacts(baseline, result, args.tolerance)
+        diff["baseline_path"] = str(baseline_path)
         result["baseline_diff"] = diff
         _print_baseline_diff(diff, baseline_path)
-        exit_code = 0 if diff["ok"] else 1
+        regressed = not diff["ok"]
+
+    # Floors and staleness run on every invocation: neither needs a baseline to mean something.
+    floors = check_floors(result, getattr(cfg, "eval_floors", None))
+    stale = check_staleness(result, int(getattr(cfg, "eval_stale_nights", 0) or 0))
+    regressed = regressed or not floors["ok"]
+    exit_code = EXIT_REGRESSION if regressed else (EXIT_STALE if stale["stale"] else 0)
+    result["gate"] = {"floors": floors, "staleness": stale, "exit_code": exit_code}
+    _print_gate(floors, stale, exit_code)
 
     if not args.no_save:
         path = _save_artifact(result)

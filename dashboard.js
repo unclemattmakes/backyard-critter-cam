@@ -525,8 +525,12 @@ async function refreshHeader(){
     if(wedged){ warn.textContent='⚠ '+v.wedge.message; warn.className='rig-warn wedge'; warn.hidden=false; }
     else if(batt){ warn.textContent='⚠ '+v.power.warning; warn.className='rig-warn'; warn.hidden=false; }
     else if(ev && ev.ok===false){
-      warn.textContent='⚠ Last night’s eval found a regression ('+(ev.regressions||[]).join(', ')
+      warn.textContent='⚠ Last night’s eval found a regression ('+evalWhat(ev)
         +') — auto-naming paused itself; see reports/'+(ev.artifact||'');
+      warn.className='rig-warn'; warn.hidden=false;
+    }
+    else if(ev && ev.stale){
+      warn.textContent='⚠ '+evalStaleText(ev)+' — is the naming helper running?';
       warn.className='rig-warn'; warn.hidden=false;
     }
     else warn.hidden=true;
@@ -555,10 +559,25 @@ async function refreshEvalStatus(){
   const when=(ev.run_at||'').slice(0,10);
   line.hidden=false;
   line.textContent = ev.ok===false
-    ? `Nightly eval (${when}): REGRESSION — ${(ev.regressions||[]).join(', ')}. Auto-naming paused itself; the full diff is in reports/${ev.artifact}.`
+    ? `Nightly eval (${when}): REGRESSION — ${evalWhat(ev)}. Auto-naming paused itself; the full diff is in reports/${ev.artifact}.`
+    : ev.stale
+    ? `Nightly eval (${when}): STALE — ${evalStaleText(ev)}. Auto-naming still ran.`
     : ev.ok===true
-    ? `Nightly eval (${when}): no regression past tolerance.`
+    ? `Nightly eval (${when}): no regression past tolerance${ev.baseline_artifact?` (vs ${ev.baseline_artifact})`:''}.`
     : `Nightly eval (${when}): ran without a baseline to diff against (this run IS the baseline).`;
+}
+
+/* What regressed: baseline-diff metrics by name, floor breaches as "value < floor". Older
+   artifacts carry no floor_breaches, so they read exactly as before. */
+function evalWhat(ev){
+  const fb=ev.floor_breaches||[], fbNames=new Set(fb.map(f=>f.metric));
+  const f3=x=>(x==null?'n/a':Number(x).toFixed(3));
+  return [...(ev.regressions||[]).filter(m=>!fbNames.has(m)),
+          ...fb.map(f=>`${f.metric} ${f3(f.current)} < floor ${f3(f.floor)}`)].join(', ');
+}
+function evalStaleText(ev){
+  const n=ev.stale_nights;
+  return `eval inputs unchanged for ${n==null?'several':n} night${n===1?'':'s'}: no new labels are reaching it`;
 }
 
 /* The Instrument Panel controls act on the SELECTED camera. A networked camera exposes no
