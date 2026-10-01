@@ -22,3 +22,25 @@ license = "AGPL-3.0-only"
 # the suite working before this file existed -- but that only helps once conftest has been
 # imported, and it depended on pytest picking the right rootdir. This makes it explicit.
 pythonpath = ["."]
+
+[tool.ruff]
+# Lint only -- the formatter is not used. 100 is the house width (~99% of lines fit); E501 is not
+# selected, so the few longer lines are left alone.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# A small set aimed at real bugs, not style: pyflakes (undefined names, unused imports/variables),
+# bugbear, pylint's error class, E402 (the sys.path-tweak imports carry a noqa saying why), and
+# RUF100 so a stale `# noqa` is reported instead of rotting.
+select = ["F", "B", "E402", "PLE", "RUF100"]
+ignore = [
+    "F541",  # f-string without placeholders: cosmetic, and none of them hid a missing {}
+    "B007",  # unused loop variable: naming style
+    "B904",  # raise without `from` inside except: tracebacks chain implicitly anyway
+    "B905",  # zip() without strict=: adding strict would turn a short list into a crash on the rig
+]
+# BLE001 (blind except) is NOT selected -- ~150 deliberate catch-alls keep a best-effort rig
+# running. The existing `# noqa: BLE001 -- why` markers stay as documentation, and listing the
+# code here stops RUF100 from stripping them.
+external = ["BLE001"]

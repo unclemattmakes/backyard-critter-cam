@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
-import camprobe  # noqa: E402
+import camprobe
 
 
 class _Cfg:

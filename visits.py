@@ -29,7 +29,7 @@ import argparse
 import sqlite3
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import config
 import db

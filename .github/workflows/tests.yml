@@ -44,3 +44,11 @@ jobs:
 
       - name: Run the test suite
         run: python -m pytest tests/ -q
+
+      # Lint after the tests (and even if they failed) so one red step doesn't hide the other.
+      # Pinned so a new ruff release can't turn the build red on its own; config is in pyproject.
+      - name: Lint (ruff)
+        if: ${{ !cancelled() }}
+        run: |
+          pip install "ruff==0.16.9"
+          ruff check .

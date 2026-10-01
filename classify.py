@@ -259,7 +259,7 @@ def classify_rows(conn, clf, device: str, rows, batch_size: int, total: int | No
                 for _rid, pth in valid:
                     try:
                         preds.extend(clf.predict([pth]))
-                    except OSError as e2:      # noqa: PERF203 -- the slow path, only after a failure
+                    except OSError as e2:      # the slow path, only after a failure
                         print(f"  unreadable crop, skipped: {pth} ({e2})")
 
             best: dict[str, tuple[str, float]] = {}

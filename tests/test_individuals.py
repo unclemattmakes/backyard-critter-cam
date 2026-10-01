@@ -231,7 +231,8 @@ def test_record_live_sighting_solo_stamps_the_span(conn):
 def test_record_live_sighting_pair_does_not_stamp(conn):
     """Two+ names = co-presence: the names are logged, but NO single id is stamped on both
     animals (the documented pair gotcha that contaminates a template)."""
-    d1, d2 = _det(conn, minutes=0), _det(conn, minutes=0.5)
+    _det(conn, minutes=0)
+    _det(conn, minutes=0.5)
     r = db.record_live_sighting(conn, source=db.SOURCE_GLASS_DOOR_CAM, names=["Notch", "Elliot"],
                                 span_start=_ts(0), span_end=_ts(1))
     assert r["multi"] is True and r["stamped"] == 0 and r["names"] == ["Notch", "Elliot"]
@@ -453,7 +454,7 @@ def test_auto_assign_never_writes_a_group_name(conn, cfg):
     -- a family name can never be auto-written onto a solo visit."""
     cfg.reid_auto_threshold, cfg.reid_auto_margin, cfg.reid_auto_min_templates = 0.5, 0.0, 1
     family = _three_crop_visit(conn, [1, 0, 0], start_min=0)
-    lookalike = _three_crop_visit(conn, [1, 0.02, 0], start_min=60)  # would match, if allowed
+    _lookalike = _three_crop_visit(conn, [1, 0.02, 0], start_min=60)  # would match, if allowed
     db.label_visit(conn, family, "Stan + Kits")
 
     m = VisitMatcher(conn, "raccoon", cfg)
@@ -788,8 +789,8 @@ def test_auto_assign_names_only_the_unambiguous(conn, cfg):
     clear = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)      # unmistakably Stan
     # [1, 0.75, 0]: ~0.80 to Stan but ~0.60 to Notch -- above the similarity bar, but the lead
     # (~0.20) is under the 0.25 margin: a confident-looking near-tie the pass must NOT call.
-    tie = _three_crop_visit(conn, [1, 0.75, 0], start_min=90)
-    weak = _three_crop_visit(conn, [0, 0, 1], start_min=120)         # looks like nobody
+    _tie = _three_crop_visit(conn, [1, 0.75, 0], start_min=90)
+    _weak = _three_crop_visit(conn, [0, 0, 1], start_min=120)         # looks like nobody
 
     m = VisitMatcher(conn, "raccoon", cfg)
     # min_templates=1: this test is about the similarity/margin bars, so the per-individual
@@ -834,7 +835,7 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
         b = _det(conn, minutes=200 + k, bbox=(50, 50, 60, 60))
         _embed(conn, a, _unit(1, 0.01, 0))
         ids += [a, b]
-    pair = _visit(conn, ids, start_min=200, end_min=203)
+    _pair = _visit(conn, ids, start_min=200, end_min=203)
 
     m = VisitMatcher(conn, "raccoon", cfg)
     r = m.auto_assign(conn, threshold=0.8, margin=0.1, min_templates=1)   # floor: tested below
@@ -856,7 +857,7 @@ def test_auto_assign_respects_rejection_multi_and_dry_run(conn, cfg):
 def _outvoted_raccoon_visit(conn, vec, *, start_min, n_noise=4):
     """A raccoon visit whose crop-count vote went to 'not an animal' -- the 2026-06-26 visit:
     30 raccoon crops, 43 low-confidence 'not an animal' boxes, visits.species 'not an animal'."""
-    ids, raccoon = [], []
+    raccoon = []
     for k in range(3):
         d = _det(conn, minutes=start_min + k * 0.2)
         _embed(conn, d, _unit(*vec))

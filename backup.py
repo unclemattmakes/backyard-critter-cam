@@ -955,7 +955,6 @@ def snapshot_weights(out_dir: Path, dry_run: bool) -> None:
     n = 0
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:   # weights don't deflate
         for src in sources:
-            base = src.parent
             for p in sorted(src.rglob("*")):
                 if p.is_file() and not p.is_symlink():
                     try:

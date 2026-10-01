@@ -161,7 +161,7 @@ from config import CONFIG
 # convention as glass-door crops (same padded/clamped box, same filename, same crops_dir/<date>/
 # layout). Importing them keeps a single source of truth -- if save_crop changes, both rigs move.
 from backyard_cam import _rel, save_crop
-from detector import CudaUnavailableError, Detection, Detector
+from detector import CudaUnavailableError, Detector
 
 # Image extensions we ingest. Trail cams write JPEG; PNG is accepted for completeness / exports.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
