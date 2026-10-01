@@ -172,6 +172,33 @@ def test_a_hold_is_not_cleared_by_a_running_rig_and_release_undoes_it(monkeypatc
     assert rigwatch.held() is False
 
 
+def _log_text() -> str:
+    return rigwatch.LOG_FILE.read_text(encoding="utf-8") if rigwatch.LOG_FILE.exists() else ""
+
+
+def test_a_hold_that_keeps_a_down_rig_down_says_so_once_an_hour(monkeypatch):
+    rigwatch.HOLD_MARKER.write_text("held")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("must respect --hold"))
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    assert rigwatch.main() == 0                         # five minutes later: no second line
+    assert _log_text().count("HELD") == 1
+    st = rigwatch._state()
+    st["hold_logged_at"] = time.time() - rigwatch.REPEAT_ALARM_S - 1
+    rigwatch._write_state(st)
+    assert rigwatch.main() == 0
+    assert _log_text().count("HELD") == 2
+
+
+def test_a_hold_on_a_running_rig_logs_nothing(monkeypatch):
+    rigwatch.HOLD_MARKER.write_text("held")
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
+    monkeypatch.setattr("sys.argv", ["rigwatch.py"])
+    assert rigwatch.main() == 0
+    assert "HELD" not in _log_text()
+
+
 def test_restart_storms_are_capped(monkeypatch):
     monkeypatch.setattr(rigwatch, "rig_pids", lambda: [])
     monkeypatch.setattr("sys.argv", ["rigwatch.py"])

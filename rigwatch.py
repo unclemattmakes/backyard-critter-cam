@@ -67,6 +67,7 @@ LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
 
 MAX_STARTS_PER_HOUR = 3
+REPEAT_ALARM_S = 3600.0         # a standing condition is logged once an hour, not every 5 min
 
 # A LIVENESS CHECK IS NOT A HEALTH CHECK.
 # This watchdog asked one question for its whole life -- "is there a backyard_cam.py pid?" -- and
@@ -240,13 +241,28 @@ def _state() -> dict:
         return {"starts": []}
 
 
-def _record_start() -> None:
-    st = _state()
-    st["starts"] = [t for t in st.get("starts", []) if time.time() - t < 3600] + [time.time()]
+def _write_state(st: dict) -> None:
     try:
         STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
     except OSError:
         pass
+
+
+def _due(key: str, every_s: float = REPEAT_ALARM_S) -> bool:
+    """True, and stamps `key` in the state file, if `key` has not fired in the last every_s."""
+    st = _state()
+    last = st.get(key)
+    if isinstance(last, (int, float)) and 0 <= time.time() - last < every_s:
+        return False
+    st[key] = time.time()
+    _write_state(st)
+    return True
+
+
+def _record_start() -> None:
+    st = _state()
+    st["starts"] = [t for t in st.get("starts", []) if time.time() - t < 3600] + [time.time()]
+    _write_state(st)
 
 
 def _recent_starts() -> int:
@@ -259,10 +275,7 @@ def _record_backlog(backlog) -> None:
         return
     st = _state()
     st["naming_backlog"] = backlog
-    try:
-        STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
-    except OSError:
-        pass
+    _write_state(st)
 
 
 def start_rig() -> int:
@@ -335,7 +348,12 @@ def main() -> int:
         _record_backlog(health.get("backlog"))
         return 0
     if held():
-        return 0                              # --hold: a human is debugging, even across reboots
+        # --hold: a human is debugging, even across reboots. Still say so, or a dead rig under a
+        # forgotten hold leaves no trace at all.
+        if _due("hold_logged_at"):
+            log("rig is down and HELD (.rig_hold) -- not starting it. "
+                "`python rigwatch.py --release` to guard it again.")
+        return 0
     if paused() and not args.force:
         return 0                              # stopped on purpose this session -- leave it alone
     if _recent_starts() >= MAX_STARTS_PER_HOUR and not args.force:
