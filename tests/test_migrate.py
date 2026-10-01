@@ -71,6 +71,8 @@ def env(tmp_path, monkeypatch):
         for mod in (migrate, backup):
             monkeypatch.setattr(mod, "ROOT", root)
             monkeypatch.setattr(mod, "CONFIG", cfg)
+        # Bound to the real ROOT at import; left alone, pack() indexes into the live checkout.
+        monkeypatch.setattr(backup, "ARCHIVE_INDEX_DIR", root / ".archive_index")
         return cfg
 
     monkeypatch.setattr(migrate.heavyio, "acquire", lambda *a, **k: 0)

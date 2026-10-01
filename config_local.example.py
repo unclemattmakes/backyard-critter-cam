@@ -116,6 +116,9 @@ def apply(cfg):
     # a rolling window (clips_max_gb) -- the backup is what outlives the pruning.
     # from pathlib import Path
     # cfg.backup_dest = Path(r"C:\cloud-synced-folder\backyard")
+    # Old DB/meta snapshots are kept forever by default (~2.5 GB each and growing). To thin them,
+    # preview with `python backup.py --dry-run --snapshots-now` first:
+    # cfg.backup_snapshot_retention = {"weekly": 8, "monthly": 12}
 
     # The morning email (newsletter.py) -- last night's Creature Report as a small newspaper in your
     # inbox. Sending needs a free https://resend.com account with a verified sender domain; all
@@ -141,3 +144,7 @@ def apply(cfg):
     # cfg.mqtt_username = "critter-cam"
     # cfg.mqtt_password = "..."
     # cfg.mqtt_alert_species = ["raccoon", "Virginia opossum"]   # default "*" = every animal
+
+    # Off-host heartbeat: rigwatch pings this every run (<url>/fail when unhealthy), and the
+    # service alarms when the pings stop -- the one alert that works with this machine down.
+    # cfg.heartbeat_url = "https://hc-ping.com/your-check-uuid"

@@ -54,7 +54,9 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
@@ -65,8 +67,13 @@ HOLD_MARKER = ROOT / ".rig_hold"
 STATE_FILE = ROOT / ".rigwatch_state.json"
 LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
+REPORTS_DIR = ROOT / "reports"
 
 MAX_STARTS_PER_HOUR = 3
+REPEAT_ALARM_S = 3600.0         # a standing condition is logged once an hour, not every 5 min
+HEARTBEAT_TIMEOUT_S = 10.0      # the ping must never hold up the next 5-minute run
+# An honest agent string: Cloudflare-fronted services 403 urllib's default one (see newsletter.py).
+USER_AGENT = "backyard-critter-cam-rigwatch/1.0"
 
 # A LIVENESS CHECK IS NOT A HEALTH CHECK.
 # This watchdog asked one question for its whole life -- "is there a backyard_cam.py pid?" -- and
@@ -233,6 +240,49 @@ def check_naming(health: dict) -> bool:
     return False
 
 
+def batch_health() -> dict:
+    """How old the nightly batch's newest eval artifact is. Returns {present, newest, age_s, stale}.
+
+    reports/eval_*.json, not the BATCH COMPLETE log line: the log's %date% %time% stamps are
+    locale-formatted, the log rotates, and the batch prints BATCH COMPLETE even when its steps
+    failed. An artifact exists only if the eval step actually ran, and its name carries a UTC stamp."""
+    out = {"present": False, "newest": None, "age_s": None, "stale": False}
+    try:
+        files = list(REPORTS_DIR.glob("eval_*.json"))
+    except OSError:
+        files = []
+    best = None
+    for p in files:
+        try:
+            ts = datetime.strptime(p.stem[len("eval_"):], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            try:
+                ts = p.stat().st_mtime         # a hand-named artifact: trust the file instead
+            except OSError:
+                continue
+        if best is None or ts > best[0]:
+            best = (ts, p)
+    if best is None:
+        return out                             # never run on this machine: nothing to be late for
+    out["present"], out["newest"] = True, best[1].name
+    out["age_s"] = max(0.0, time.time() - best[0])
+    out["stale"] = out["age_s"] > float(config.CONFIG.batch_stale_hours) * 3600.0
+    return out
+
+
+def check_batch(health: dict) -> bool:
+    """Log (hourly) when the nightly batch has stopped producing results. True if stale."""
+    if not health["stale"]:
+        return False
+    if _due("batch_logged_at"):
+        log(f"NIGHTLY BATCH IS STALE: the newest eval artifact ({health['newest']}) is "
+            f"{health['age_s'] / 3600.0:.0f} h old (limit {config.CONFIG.batch_stale_hours:g} h), "
+            f"so run_clipmotion.bat has not finished a night since. Embeddings, auto-assign and "
+            f"the regression gate are not running. See logs/clipmotion_batch.log.")
+    return True
+
+
 def _state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -240,13 +290,28 @@ def _state() -> dict:
         return {"starts": []}
 
 
-def _record_start() -> None:
-    st = _state()
-    st["starts"] = [t for t in st.get("starts", []) if time.time() - t < 3600] + [time.time()]
+def _write_state(st: dict) -> None:
     try:
         STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
     except OSError:
         pass
+
+
+def _due(key: str, every_s: float = REPEAT_ALARM_S) -> bool:
+    """True, and stamps `key` in the state file, if `key` has not fired in the last every_s."""
+    st = _state()
+    last = st.get(key)
+    if isinstance(last, (int, float)) and 0 <= time.time() - last < every_s:
+        return False
+    st[key] = time.time()
+    _write_state(st)
+    return True
+
+
+def _record_start() -> None:
+    st = _state()
+    st["starts"] = [t for t in st.get("starts", []) if time.time() - t < 3600] + [time.time()]
+    _write_state(st)
 
 
 def _recent_starts() -> int:
@@ -259,10 +324,37 @@ def _record_backlog(backlog) -> None:
         return
     st = _state()
     st["naming_backlog"] = backlog
+    _write_state(st)
+
+
+def _url_host(url: str) -> str:
+    """Just the host of a URL, for logs: the rest of a ping URL is the secret."""
     try:
-        STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
-    except OSError:
-        pass
+        return urllib.parse.urlsplit(url).hostname or "?"
+    except ValueError:
+        return "?"
+
+
+def ping_heartbeat(healthy: bool) -> None:
+    """GET Config.heartbeat_url (or <url>/fail when unhealthy). Never raises, never logs the URL."""
+    url = str(config.CONFIG.heartbeat_url or "").strip()
+    if not url:
+        return
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if not healthy:
+            parts = parts._replace(path=parts.path.rstrip("/") + "/fail")
+        req = urllib.request.Request(urllib.parse.urlunsplit(parts),
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=HEARTBEAT_TIMEOUT_S) as resp:
+            resp.read(256)
+    except Exception as e:                      # noqa: BLE001 -- offline must not break the watchdog
+        if _due("heartbeat_logged_at"):
+            # Type and HTTP code only: some exception messages quote the URL, which is the token.
+            code = getattr(e, "code", None)
+            log(f"heartbeat to {_url_host(url)} failed "
+                f"({type(e).__name__}{f' {code}' if code else ''}); the off-host monitor will "
+                f"alarm if this keeps up.")
 
 
 def start_rig() -> int:
@@ -317,33 +409,62 @@ def main() -> int:
             flag = "  <-- STALE, the loop is not running" if h["stale"] else ""
             print(f"species naming  : {h['state']} on {h['device']}, heartbeat {age}{flag}")
             print(f"  named this run: {h['named']}   backlog: {h['backlog']}")
+        b = batch_health()
+        if not b["present"]:
+            print("nightly batch   : no reports/eval_*.json yet (it has never finished here)")
+        else:
+            flag = "  <-- STALE" if b["stale"] else ""
+            print(f"nightly batch   : last eval {b['age_s'] / 3600.0:.0f} h ago ({b['newest']}), "
+                  f"limit {config.CONFIG.batch_stale_hours:g} h{flag}")
+        url = str(config.CONFIG.heartbeat_url or "").strip()
+        print("off-host ping   : " + (f"on, to {_url_host(url)}"
+                                      if url else "off (set heartbeat_url in config_local.py)"))
         return 0
 
+    rc, healthy = _watch_rig(args, pids)
+    try:
+        healthy = not check_batch(batch_health()) and healthy
+    except Exception as e:                      # noqa: BLE001 -- never let a report sink the run
+        log(f"batch check failed: {type(e).__name__}: {e}")
+        healthy = False
+    ping_heartbeat(healthy)                     # last: the restart above must never wait on it
+    return rc
+
+
+def _watch_rig(args, pids) -> tuple[int, bool]:
+    """The restart decision: start the rig if it is down and nothing says to leave it.
+
+    Returns (exit code, healthy). Healthy = up with naming OK, or down because a human said so."""
     if pids is None:
         # "No pids" and "cannot see pids" are the same value to a caller that only checks
         # emptiness, and acting on the second would restart a healthy rig every five minutes
         # forever. Refuse, and say why.
         log("cannot tell whether the rig is running (psutil is not installed) -- doing nothing. "
             "Fix: pip install psutil")
-        return 1
+        return 1, False
     if pids:
         clear_pause_marker()                  # rig is up, so any deliberate-stop marker is spent
         # Up is not the same as working. check_naming stays quiet when naming is fine, so this
         # keeps the "say nothing, every 5 minutes, forever" contract for a genuinely healthy rig.
         health = naming_health()
-        check_naming(health)
+        naming_bad = check_naming(health)
         _record_backlog(health.get("backlog"))
-        return 0
+        return 0, not naming_bad
     if held():
-        return 0                              # --hold: a human is debugging, even across reboots
+        # --hold: a human is debugging, even across reboots. Still say so, or a dead rig under a
+        # forgotten hold leaves no trace at all.
+        if _due("hold_logged_at"):
+            log("rig is down and HELD (.rig_hold) -- not starting it. "
+                "`python rigwatch.py --release` to guard it again.")
+        return 0, True
     if paused() and not args.force:
-        return 0                              # stopped on purpose this session -- leave it alone
+        return 0, True                        # stopped on purpose this session -- leave it alone
     if _recent_starts() >= MAX_STARTS_PER_HOUR and not args.force:
         log(f"rig is down but it has been started {MAX_STARTS_PER_HOUR}x in the last hour -- "
             f"it is crashing on startup, not just missing. Backing off; needs a human. "
             f"See logs/backyard_cam.log.")
-        return 1
-    return start_rig()
+        return 1, False
+    return start_rig(), False                 # it was down: worth a /fail even if it comes back
 
 
 if __name__ == "__main__":

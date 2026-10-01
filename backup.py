@@ -36,9 +36,14 @@ Design notes (why it looks the way it does):
   beside the live capture thread and the naming helper (WAL writers keep writing; we get a
   consistent point-in-time copy), then PRAGMA quick_check'd before it's accepted. SQLite files
   deflate well (~2-4x), so the snapshot zip IS compressed.
-* Idempotent: run it as often as you like; work already archived is skipped. The weekly
-  schedule (Task Scheduler, Monday 03:30) is deliberately tighter than "monthly" because of
-  the pruning window above -- a month between runs would lose whatever clips_max_gb ate.
+* Idempotent: run it as often as you like; work already archived is skipped. Media is archived
+  on every (daily) run so a day is zipped before the clip pruner reaches it; the snapshots/
+  family (~2.5 GB DB, meta, label ledger, CSV export) only every backup_snapshot_every_days
+  (weekly by default, --snapshots-now forces them).
+* Old DB and meta snapshots are kept forever unless backup_snapshot_retention is set, e.g.
+  {"weekly": 8, "monthly": 12}: the newest 8 of each, plus the newest of each of the 12 most
+  recent months. The newest 3 are always kept, and nothing is deleted on a run whose own DB or
+  meta snapshot did not land. `--dry-run --snapshots-now` lists what it would delete.
 
 Restore: `python migrate.py restore <dest>` from a fresh clone reassembles the rig from these
 archives (and the same tool's `pack` writes a right-now bundle in this exact format, for moving
@@ -51,6 +56,7 @@ Usage:
     python backup.py                 # destination from config (backup_dest in config_local.py)
     python backup.py --dest E:\\somewhere
     python backup.py --dry-run       # print what would be done, write nothing
+    python backup.py --snapshots-now # write the snapshots/ family even if the last is recent
 """
 from __future__ import annotations
 
@@ -92,6 +98,11 @@ NOT_ARCHIVED = frozenset({"reels"})
 # so the peak is about 1.7x -- and a snapshot that dies half-written for want of disk looks exactly
 # like one that died of corruption, so the room is checked up front and the shortfall is named.
 SCRATCH_HEADROOM = 2.0
+
+# Local record of what each clips day's archives hold (arcname -> part filename), so the prune
+# guard can check membership without opening a zip on the cloud drive (that pulls the whole file
+# into Drive's cache).
+ARCHIVE_INDEX_DIR = ROOT / ".archive_index"
 
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
@@ -138,14 +149,14 @@ def _mtime_before(p: Path, cutoff_epoch: float) -> bool:
         return False
 
 
-def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
+def day_dirs(src_root: Path, *, quiet: bool = False) -> list[tuple[Path, str]]:
     """The date-named day folders under a media root, as (folder, archive-name-stem) pairs,
     oldest days first -- oldest first so we archive the days nearest the pruning axe before it
     falls. Handles BOTH clip layouts: the legacy flat clips/<date>/ AND the multi-camera
     clips/<source>/<date>/ (each camera writes under its own source name since 2026-06-26), so
     those archives are per-camera-per-day: clips-glass_door_cam-2026-06-26.zip. NOT_ARCHIVED
     entries are passed over quietly; anything else is surfaced (a future layout change should be
-    noticed, not silently skipped)."""
+    noticed, not silently skipped; `quiet` is for a second pass over the same root)."""
     out: list[tuple[Path, str]] = []
     if not src_root.is_dir():
         return out
@@ -162,9 +173,9 @@ def day_dirs(src_root: Path) -> list[tuple[Path, str]]:
             for q in sorted(p.iterdir()):
                 if q.is_dir() and DAY_DIR_RE.match(q.name):
                     out.append((q, f"{src_root.name}-{p.name}-{q.name}"))
-                else:
+                elif not quiet:
                     log.warning("ignoring unexpected entry (not a YYYY-MM-DD folder): %s", q)
-        else:
+        elif not quiet:
             log.warning("ignoring unexpected entry (not a YYYY-MM-DD folder): %s", p)
     out.sort(key=lambda pair: pair[0].name)  # oldest DAYS first, across layouts and cameras
     return out
@@ -248,23 +259,60 @@ def archived_names(zip_path: Path) -> set[str] | None:
         return None
 
 
-def archived_names_across(parts: list[Path]) -> set[str] | None:
-    """Union of the arcnames a day's parts hold, or None if ANY of them is unreadable.
+def archived_index(parts: list[Path]) -> dict[str, str] | None:
+    """Every arcname a day's parts hold, mapped to the archive holding it, or None if ANY part is
+    unreadable.
 
     All-or-nothing on purpose. A part we cannot read is a part whose contents we cannot rule out,
     and treating it as empty would write files it already holds into yet another part -- storing
-    the same footage twice and making the duplicate look like a top-up that was needed."""
-    have: set[str] = set()
+    the same footage twice and making the duplicate look like a top-up that was needed.
+
+    Mapped to the part rather than collected into a set because the prune guard needs to check
+    that the archive holding a given clip is still THERE: a zip has gone missing from Drive
+    before now, and "some archive of that day exists" is not the same promise."""
+    have: dict[str, str] = {}
     for part in parts:
         names = archived_names(part)
         if names is None:
             return None
-        have |= names
+        have.update({n: part.name for n in names})
     return have
 
 
+def read_archive_index(index_dir: Path, stem: str) -> dict[str, str] | None:
+    """What the last backup saw in this day's archives: arcname -> archive filename. None when
+    there is no usable record, which every caller must read as "cannot prove anything"."""
+    try:
+        data = json.loads((index_dir / f"{stem}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_archive_index(index_dir: Path, stem: str, holds: dict[str, str]) -> None:
+    """Record what a day's archives hold. Best-effort and never fatal: this is a local convenience
+    for the prune guard, and the guard fails closed without it -- footage is kept, not lost."""
+    try:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        out = index_dir / f"{stem}.json"
+        tmp = out.with_name(out.name + ".tmp")          # local disk: a .tmp costs nothing here
+        tmp.write_text(json.dumps(holds, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, out)
+    except OSError as e:
+        log.warning("could not write the archive index for %s (%s) -- the prune guard will hold "
+                    "that day's clips until the next successful run", stem, e)
+
+
+def _record_index(index_dir: Path | None, stem: str, holds: dict[str, str],
+                  dry_run: bool) -> None:
+    """Write the day's index, unless this caller keeps none (crops/frames) or it is a dry run."""
+    if index_dir is not None and not dry_run:
+        write_archive_index(index_dir, stem, holds)
+
+
 def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
-                  include_today: bool = False, settle_s: float = 0.0) -> dict:
+                  include_today: bool = False, settle_s: float = 0.0,
+                  index_dir: Path | None = None) -> dict:
     """Per-day archives for one media root (clips/crops/frames). Today's folder is skipped -- it's
     still being written to; the next run finalizes it. `include_today` (migrate.py's pack) archives
     it anyway: a half day sealed today is merely topped up by the next run, because these archives
@@ -302,7 +350,7 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             continue  # a pruned-empty leftover folder; nothing to archive
         parts = archive_parts(out_dir, stem)
         if parts:
-            have = archived_names_across(parts)
+            have = archived_index(parts)
             if have is None:
                 log.warning("%s: one of its %d archive(s) cannot be read -- leaving the whole day "
                             "alone; check it by hand (a good archive is never overwritten or "
@@ -312,6 +360,9 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
             new = [p for p in source if p.relative_to(ROOT).as_posix() not in have]
             if not new:
                 stats["skipped"] += 1
+                # Nothing to write, but the day was READ -- so record it. This is what backfills
+                # the index for every day archived before it existed, on the first run.
+                _record_index(index_dir, stem, have, dry_run)
                 continue
             out_zip = next_part(out_dir, stem, parts)
             log.info("%s gained %d file(s) since it was archived (%d already across %d archive(s))"
@@ -321,12 +372,90 @@ def archive_media(src_root: Path, out_dir: Path, today: date, *, dry_run: bool,
                             dry_run=dry_run, files=new)
             stats["merged"] += 1
         else:
-            n, b = zip_tree(day, out_dir / f"{stem}.zip", arc_root=ROOT,
-                            compression=zipfile.ZIP_STORED, dry_run=dry_run, files=source)
+            have = {}
+            out_zip = out_dir / f"{stem}.zip"
+            n, b = zip_tree(day, out_zip, arc_root=ROOT, compression=zipfile.ZIP_STORED,
+                            dry_run=dry_run, files=source)
             stats["created"] += 1
+        if not dry_run:
+            # Read back what actually landed rather than what we meant to write: zip_tree drops a
+            # file that the pruner deletes out from under it, and an index claiming a clip is
+            # archived when it is not would license deleting the last copy of it.
+            fresh = archived_names(out_zip)
+            if fresh is None:
+                log.warning("%s was written but will not open -- not indexing it; the prune guard "
+                            "will hold that day's clips", out_zip.name)
+            else:
+                _record_index(index_dir, stem, {**have, **{q: out_zip.name for q in fresh}},
+                              dry_run)
         stats["files"] += n
         stats["bytes"] += b
     return stats
+
+
+def _archived_days(out_dir: Path) -> dict[str, set[str]] | None:
+    """Archive-name prefix ("clips-<camera>", or "clips" for the legacy layout) -> the days that
+    have at least one part. None if the folder cannot be listed."""
+    try:
+        names = [q.name for q in out_dir.iterdir()]
+    except OSError:
+        return None
+    out: dict[str, set[str]] = {}
+    for n in names:
+        if not n.endswith(".zip"):
+            continue
+        stem = PART_RE.sub("", n) if PART_RE.search(n) else n[:-4]
+        prefix, sep, day = stem[:-11], stem[-11:-10], stem[-10:]
+        if sep == "-" and DAY_DIR_RE.match(day):
+            out.setdefault(prefix, set()).add(day)
+    return out
+
+
+def clip_coverage(clips_root: Path, out_dir: Path, today: date) -> tuple[list[str], list[str]] | None:
+    """(status lines, lost days) for clips/, per camera: the oldest day still holding clips on disk
+    vs the newest archived day, and the days whose clips were pruned before any archive held them.
+    None if the archive folder cannot be listed.
+
+    "Lost" = a past day folder that is now EMPTY and has no archive part. The pruner deletes files
+    but leaves their folder, so an empty folder proves the day once held clips. Days older than the
+    camera's first archive predate the backup and are not reported."""
+    archived = _archived_days(out_dir)
+    if archived is None:
+        return None
+    oldest_on_disk: dict[str, str] = {}
+    lost: list[str] = []
+    for day, stem in day_dirs(clips_root, quiet=True):
+        cam = stem[:-11]
+        if any(p.is_file() for p in day.rglob("*")):
+            oldest_on_disk.setdefault(cam, day.name)     # day_dirs is oldest first
+            continue
+        have = archived.get(cam)
+        if day.name < today.isoformat() and have and day.name not in have and day.name > min(have):
+            lost.append(f"{_camera_label(cam)}/{day.name}")
+    lines = []
+    for cam in sorted(set(oldest_on_disk) | set(archived)):
+        newest = max(archived[cam]) if cam in archived else "never"
+        lines.append(f"clips {_camera_label(cam)}: oldest day on disk "
+                     f"{oldest_on_disk.get(cam, 'none')}, newest archived {newest}")
+    return lines, lost
+
+
+def report_clip_coverage(clips_root: Path, out_dir: Path, today: date) -> list[str]:
+    """Log clip_coverage (lost days at WARNING) and return it as STATUS.txt lines."""
+    cov = clip_coverage(clips_root, out_dir, today)
+    if cov is None:
+        log.warning("could not list %s -- clip coverage not checked", out_dir)
+        return [f"clip coverage: NOT CHECKED, could not list {out_dir}"]
+    lines, lost = cov
+    for line in lines:
+        log.info("%s", line)
+    for d in lost:
+        log.warning("clips for %s were pruned before they were archived", d)
+    return lines + [f"clips for {d} were pruned before they were archived  <-- LOST" for d in lost]
+
+
+def _camera_label(prefix: str) -> str:
+    return prefix[len("clips-"):] if prefix.startswith("clips-") else "legacy"
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -476,6 +605,202 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
         _publish(staged, out_zip)
     log.info("created %s  (db %.1f MB -> %.1f MB zipped, quick_check ok)", out_zip.name,
              db_path.stat().st_size / 2**20, out_zip.stat().st_size / 2**20)
+
+
+DB_SNAPSHOT_RE = re.compile(r"^backyard-db-(\d{4}-\d{2}-\d{2})\.zip$")
+
+
+def newest_db_snapshot_day(out_dir: Path) -> date | None:
+    """The date in the newest backyard-db-<date>.zip's name, or None if there is none. The name,
+    not the mtime: a copied or re-synced file keeps its name."""
+    days = []
+    try:
+        for q in out_dir.iterdir():
+            m = DB_SNAPSHOT_RE.match(q.name)
+            if m:
+                try:
+                    days.append(date.fromisoformat(m.group(1)))
+                except ValueError:
+                    pass
+    except OSError:
+        return None
+    return max(days, default=None)
+
+
+def snapshots_due(out_dir: Path, today: date, every_days: int, force: bool = False) -> bool:
+    """Whether this run writes the snapshots/ family: the newest DB snapshot is at least
+    `every_days` old, there is none, `every_days` <= 0, or `force`."""
+    newest = newest_db_snapshot_day(out_dir)
+    if force or newest is None or every_days <= 0:
+        return True
+    age = (today - newest).days
+    if age >= every_days:
+        return True
+    log.info("snapshots skipped (db, meta, labels, CSV export): newest db snapshot is %d day(s) "
+             "old, due every %d; --snapshots-now forces them", age, every_days)
+    return False
+
+
+def _export_csv(out_dir: Path, dry_run: bool) -> None:
+    import export as _export
+    _export.export_bundle(out_dir, dry_run=dry_run)
+    # Keep the newest few (the DB snapshots hold the deep history).
+    if not dry_run:
+        for old_file in sorted(out_dir.glob("export-*.zip"))[:-4]:
+            old_file.unlink(missing_ok=True)
+
+
+def run_snapshots(out_dir: Path, today: date, dry_run: bool, *, every_days: int,
+                  force: bool = False, retention: dict | None = None) -> int:
+    """The snapshots/ family on one cadence, keyed off the DB snapshot, so a daily schedule only
+    adds media and the ledger diff / keep-N retentions stay weekly. Old DB and meta snapshots are
+    thinned by `retention` (prune_snapshots) only after both of this run's landed. Returns
+    failures."""
+    if not snapshots_due(out_dir, today, every_days, force):
+        return 0
+    failures = 0
+    failed: set[str] = set()
+    for what, step in (
+            ("database snapshot", lambda: snapshot_db(CONFIG.db_path, out_dir, today, dry_run)),
+            ("meta snapshot", lambda: snapshot_meta(out_dir, today, dry_run)),
+            ("label ledger", lambda: export_labels(out_dir, today, dry_run)),
+            ("CSV export", lambda: _export_csv(out_dir, dry_run))):
+        try:
+            step()
+        except Exception:
+            log.exception("%s failed", what)
+            failures += 1
+            failed.add(what)
+    try:
+        prune_snapshots(out_dir, today, retention, dry_run=dry_run,
+                        fresh=not failed & {"database snapshot", "meta snapshot"})
+    except Exception:
+        log.exception("snapshot retention failed -- nothing more deleted")
+        failures += 1
+    return failures
+
+
+# --- snapshot retention ------------------------------------------------------------------------
+#
+# Opt-in (backup_snapshot_retention; None keeps everything). Grandfather-father-son over the date
+# in each name: the newest `weekly` snapshots, plus the newest one in each of the `monthly` most
+# recent calendar months that have any. DB and meta are thinned independently.
+
+META_SNAPSHOT_RE = re.compile(r"^meta-(\d{4}-\d{2}-\d{2})\.zip$")
+SNAPSHOT_FAMILIES = (("backyard-db", DB_SNAPSHOT_RE), ("meta", META_SNAPSHOT_RE))
+# restore falls back from a bad newest snapshot to older ones, so these are never deleted.
+RETENTION_MIN_KEEP = 3
+RETENTION_KEYS = frozenset({"weekly", "monthly"})
+
+
+def _check_retention(policy: dict) -> tuple[int, int]:
+    """(weekly, monthly) from a retention policy. Anything unexpected raises: a misspelt key
+    read as 0 would delete the history it was meant to keep."""
+    if not isinstance(policy, dict) or set(policy) - RETENTION_KEYS:
+        raise ValueError(f"backup_snapshot_retention must be a dict with only "
+                         f"{sorted(RETENTION_KEYS)} keys, got {policy!r}")
+    counts = [policy.get(k, 0) for k in ("weekly", "monthly")]
+    if any(type(c) is not int or c < 0 for c in counts):
+        raise ValueError(f"backup_snapshot_retention counts must be ints >= 0, got {policy!r}")
+    return counts[0], counts[1]
+
+
+def _dated(names, pattern: re.Pattern) -> list[tuple[date, str]]:
+    """(date, name) for every name matching `pattern` exactly with a real date, newest first."""
+    out = []
+    for n in names:
+        m = pattern.fullmatch(n)
+        if m:
+            try:
+                out.append((date.fromisoformat(m.group(1)), n))
+            except ValueError:
+                pass
+    return sorted(out, reverse=True)
+
+
+def retention_plan(names, pattern: re.Pattern, policy: dict) -> tuple[list[str], list[str]]:
+    """(keep, delete) for one snapshot family, both oldest first. Pure: names in, names out.
+    Names not matching `pattern` are in neither list -- they are never ours to delete."""
+    weekly, monthly = _check_retention(policy)
+    dated = _dated(names, pattern)
+    keep = {n for _, n in dated[:max(weekly, RETENTION_MIN_KEEP)]}
+    months: set[tuple[int, int]] = set()
+    for d, n in dated:                                  # newest first: first seen = month's newest
+        if (d.year, d.month) not in months and len(months) < monthly:
+            months.add((d.year, d.month))
+            keep.add(n)
+    oldest_first = [n for _, n in reversed(dated)]
+    return ([n for n in oldest_first if n in keep], [n for n in oldest_first if n not in keep])
+
+
+def _todays_snapshots_landed(out_dir: Path, names: list[str], today: date) -> bool:
+    """Is today's snapshot the newest of each family, on disk, and openable as a zip?"""
+    for family, pattern in SNAPSHOT_FAMILIES:
+        dated = _dated(names, pattern)
+        mine = f"{family}-{today.isoformat()}.zip"
+        if not dated or dated[0][1] != mine:
+            log.warning("snapshot retention skipped: %s is not the newest %s snapshot -- nothing "
+                        "deleted", mine, family)
+            return False
+        try:
+            with zipfile.ZipFile(out_dir / mine) as zf:     # central directory only; cheap
+                if not zf.namelist():
+                    raise zipfile.BadZipFile("empty")
+        except (OSError, zipfile.BadZipFile) as e:
+            log.warning("snapshot retention skipped: %s will not open (%s) -- nothing deleted",
+                        mine, e)
+            return False
+    return True
+
+
+def prune_snapshots(out_dir: Path, today: date, policy: dict | None, *, dry_run: bool,
+                    fresh: bool) -> list[str]:
+    """Delete DB and meta snapshots `policy` does not keep; returns the names deleted (or, in a
+    dry run, that would be). `fresh` = this run's DB and meta snapshots both succeeded; without
+    that, and without today's files verified on disk, nothing is touched. A dry run plans as if
+    today's snapshots had landed."""
+    if policy is None:
+        log.debug("snapshot retention off (backup_snapshot_retention is None) -- keeping all")
+        return []
+    _check_retention(policy)
+    if not fresh:
+        log.warning("snapshot retention skipped: this run's database or meta snapshot failed -- "
+                    "nothing deleted")
+        return []
+    try:
+        names = [q.name for q in out_dir.iterdir() if q.is_file()]
+    except OSError as e:
+        log.warning("snapshot retention skipped: cannot list %s (%s)", out_dir, e)
+        return []
+    if dry_run:
+        names += [f"{fam}-{today.isoformat()}.zip" for fam, _ in SNAPSHOT_FAMILIES]
+    elif not _todays_snapshots_landed(out_dir, names, today):
+        return []
+    verb = "would delete" if dry_run else "deleted"
+    gone: list[str] = []
+    total = 0
+    for family, pattern in SNAPSHOT_FAMILIES:
+        keep, delete = retention_plan(set(names), pattern, policy)
+        freed = n_gone = 0
+        for n in delete:
+            p = out_dir / n
+            try:
+                size = p.stat().st_size
+                if not dry_run:
+                    p.unlink()
+            except OSError as e:
+                log.warning("snapshot retention: could not delete %s: %s", n, e)
+                continue
+            log.info("snapshot retention: %s %s (%.1f MB)", verb, n, size / 2**20)
+            gone.append(n)
+            freed += size
+            n_gone += 1
+        log.info("snapshot retention (%s): kept %d, %s %d (%.2f GB)", family, len(keep), verb,
+                 n_gone, freed / 2**30)
+        total += freed
+    log.info("snapshot retention %s %d snapshot(s), %.2f GB, policy %s", verb, len(gone),
+             total / 2**30, policy)
+    return gone
 
 
 def _tree_bytes(items: list[Path]) -> int:
@@ -672,17 +997,18 @@ def export_labels(out_dir: Path, today: date, dry_run: bool) -> None:
         old_file.unlink(missing_ok=True)
 
 
-def write_status(dest: Path, failures: int, dry_run: bool) -> None:
+def write_status(dest: Path, failures: int, dry_run: bool, notes: list[str] | None = None) -> None:
     """STATUS.txt -- the heartbeat that reaches the owner. The project has no notification
-    channel of any kind; this file, rewritten by every weekly run into the Drive-synced folder,
+    channel of any kind; this file, rewritten by every run into the Drive-synced folder,
     is the cheapest one that already exists: its CONTENTS say how the rig is, and its absence
     or staleness (mtime on the phone's Drive app) IS the alarm. Everything here is read-only
     and best-effort -- a status writer that can crash the backup would be a bad joke."""
     if dry_run:
         log.info("would write STATUS.txt")
         return
-    lines = [f"Backyard Critter Cam -- weekly status, {datetime.now().astimezone().isoformat()}",
-             f"backup: {'FAILED (' + str(failures) + ' failure(s))' if failures else 'ok'}"]
+    lines = [f"Backyard Critter Cam -- status, {datetime.now().astimezone().isoformat()}",
+             f"backup: {'FAILED (' + str(failures) + ' failure(s))' if failures else 'ok'}",
+             *(notes or [])]
     try:
         log_p = ROOT / "logs" / "backyard_cam.log"
         if log_p.exists():
@@ -773,7 +1099,8 @@ def _older_than_days(iso_ts, days: int) -> bool:
 README = """Backyard Critter Cam -- content backups
 =========================================
 
-Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03:30).
+Written by backup.py in the project repo; runs daily (Task Scheduler). clips/crops are
+archived every run; everything in snapshots/ is written weekly.
 
   clips/      one zip per camera per day of video clips (clips-<camera>-<date>.zip; days
               before the multi-camera layout are just clips-<date>.zip). Uncompressed
@@ -797,6 +1124,8 @@ Written by backup.py in the project repo; runs weekly (Task Scheduler, Monday 03
                                         holds all of that -- share the folder accordingly, and
                                         rotate those secrets if it ever went somewhere it
                                         shouldn't have.
+              Old db and meta snapshots are thinned only if backup_snapshot_retention is
+              set in config_local.py (the newest 3 are always kept).
               weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging
                                         Face checkpoints); never rebuilt -- insurance for
                                         the day a hub repo disappears
@@ -828,12 +1157,19 @@ backup legitimately holds MORE days of video than the machine does. That's the p
 """
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Archive generated content (clips, crops, db) to a synced folder.")
     ap.add_argument("--dest", type=Path, default=CONFIG.backup_dest,
                     help="destination root (default: backup_dest from config_local.py)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be done; write nothing")
-    args = ap.parse_args()
+    ap.add_argument("--snapshots-now", "--db-now", dest="snapshots_now", action="store_true",
+                    help="write the snapshots/ family (db, meta, labels, CSV export) even if the "
+                         "newest db snapshot is under backup_snapshot_every_days old")
+    return ap
+
+
+def main() -> int:
+    args = _parser().parse_args()
 
     if args.dest is None:
         raise SystemExit(
@@ -880,7 +1216,9 @@ def main() -> int:
         if not src_root.is_dir():
             continue
         try:
-            s = archive_media(src_root, dest / src_root.name, today, dry_run=args.dry_run)
+            # Only clips/ keeps a local index: it is the only root with a prune guard reading one.
+            s = archive_media(src_root, dest / src_root.name, today, dry_run=args.dry_run,
+                              index_dir=ARCHIVE_INDEX_DIR if src_root == CONFIG.clips_dir else None)
             log.info("%s: %d day(s) archived, %d topped up (%d files, %.1f MB), %d already done",
                      src_root.name, s["created"], s["merged"], s["files"], s["bytes"] / 2**20,
                      s["skipped"])
@@ -888,39 +1226,25 @@ def main() -> int:
             log.exception("archiving %s failed", src_root.name)
             failures += 1
 
+    notes: list[str] = []
+    if CONFIG.clips_dir.is_dir():
+        try:
+            notes = report_clip_coverage(CONFIG.clips_dir, dest / CONFIG.clips_dir.name, today)
+        except Exception:
+            log.exception("clip coverage check failed")   # a report, never a failure of the run
+
+    failures += run_snapshots(dest / "snapshots", today, args.dry_run,
+                              every_days=CONFIG.backup_snapshot_every_days,
+                              force=args.snapshots_now,
+                              retention=CONFIG.backup_snapshot_retention)
     try:
-        snapshot_db(CONFIG.db_path, dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("database snapshot failed")
-        failures += 1
-    try:
-        snapshot_meta(dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("meta snapshot failed")
-        failures += 1
-    try:
-        snapshot_weights(dest / "snapshots", args.dry_run)
+        snapshot_weights(dest / "snapshots", args.dry_run)    # once ever; not on the cadence
     except Exception:
         log.exception("weights archive failed")
         failures += 1
-    try:
-        export_labels(dest / "snapshots", today, args.dry_run)
-    except Exception:
-        log.exception("label ledger failed")
-        failures += 1
-    try:
-        import export as _export
-        _export.export_bundle(dest / "snapshots", dry_run=args.dry_run)
-        # One export per run; keep the newest few (the DB snapshots hold the deep history).
-        if not args.dry_run:
-            for old_file in sorted((dest / "snapshots").glob("export-*.zip"))[:-4]:
-                old_file.unlink(missing_ok=True)
-    except Exception:
-        log.exception("CSV export failed")
-        failures += 1
 
     try:
-        write_status(dest, failures, args.dry_run)
+        write_status(dest, failures, args.dry_run, notes)
     except Exception:
         log.exception("status write failed")     # never let the heartbeat sink the backup
 
