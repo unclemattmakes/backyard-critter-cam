@@ -922,6 +922,56 @@ def test_label_visit_species_overrides_the_visits_dominant_species(conn):
     assert db.label_visit(conn, vid, "Stan") == len(noise)
 
 
+def _cli(monkeypatch, db_path, *argv):
+    monkeypatch.setattr("sys.argv", ["individuals.py", "--db", str(db_path), *argv])
+    return individuals.main()
+
+
+def test_cli_confirm_names_the_individuals_own_species_on_an_outvoted_visit(
+        conn, db_path, monkeypatch, capsys):
+    """--confirm carries no species; it derives Notch's from his labels, so the raccoon crops
+    are named and the 'not an animal' boxes that won the vote are not."""
+    _named_visits(conn, "Notch", [[0, 1, 0]], first_min=0)
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100)
+    assert _cli(monkeypatch, db_path, "--confirm", str(vid), "Notch") == 0
+    named = _names(conn, raccoon + noise)
+    assert all(named[d] == ("Notch", "human") for d in raccoon)
+    assert all(named[d] == (None, None) for d in noise)
+    assert "raccoon crop(s)" in capsys.readouterr().out
+
+
+def test_cli_confirm_takes_an_explicit_species_and_refuses_when_none_match(
+        conn, db_path, monkeypatch, capsys):
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100)
+    assert _cli(monkeypatch, db_path, "--species", "raccoon", "--confirm", str(vid), "Newbie") == 0
+    assert all(_names(conn, raccoon)[d][0] == "Newbie" for d in raccoon)
+    assert _cli(monkeypatch, db_path, "--species", "Virginia opossum",
+                "--confirm", str(vid), "Possum") == 1
+    assert "nothing written" in capsys.readouterr().out
+    assert not conn.execute("SELECT 1 FROM detections WHERE individual_id = 'Possum'").fetchone()
+    assert conn.execute("SELECT individual_id FROM visits WHERE id=?", (vid,)).fetchone()[0]         == "Newbie"
+
+
+def test_cli_confirm_scopes_a_group_label_to_its_members_species(conn, db_path, monkeypatch):
+    _named_visits(conn, "CutiePie", [[0, 1, 0]], first_min=0)
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100)
+    assert _cli(monkeypatch, db_path, "--confirm", str(vid), "CutiePie + Kits") == 0
+    named = _names(conn, raccoon + noise)
+    assert all(named[d][0] == "CutiePie + Kits" for d in raccoon)
+    assert all(named[d][0] is None for d in noise)
+
+
+def test_audit_species_mismatch_is_read_only(conn, db_path, monkeypatch, capsys):
+    _named_visits(conn, "Notch", [[0, 1, 0]], first_min=0)
+    vid, raccoon, noise = _outvoted_raccoon_visit(conn, [0, 1, 0.02], start_min=100, n_noise=2)
+    db.label_visit(conn, vid, "Notch")            # the pre-fix human path: lands on the noise
+    monkeypatch.setattr(db, "connect", lambda *a, **k: pytest.fail("audit opened read-write"))
+    assert _cli(monkeypatch, db_path, "--audit-species-mismatch") == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"{len(noise)} labelled crop(s)")
+    assert "Notch (raccoon): 2 'not an animal' crop(s), source human" in out
+
+
 # ---------------------------------------------------------------------------
 # Auto-assign guardrails: the per-individual TEMPLATE FLOOR and the SOURCE GUARD.
 # Both are refusals that protect the human label set (docs/identity-eval-2026-08-05.md,

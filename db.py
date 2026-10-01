@@ -1116,9 +1116,9 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     `individual_id=None` clears. Returns crops stamped.
 
     `species` overrides the visit's dominant species as the scope. A caller that KNOWS whose
-    species the name belongs to (the auto-assign pass, which matched only raccoon crops) must pass
-    it: the visits row's species is a crop-count vote, and a raccoon visit outvoted by detector
-    noise carries species 'not an animal'.
+    species the name belongs to (the auto-assign pass, which matched only raccoon crops; the human
+    confirm paths, via confirm_species) must pass it: the visits row's species is a crop-count
+    vote, and a raccoon visit outvoted by detector noise carries species 'not an animal'.
 
     `source` records who decided: 'human' feeds the suggestion templates, 'auto' (the nightly
     auto-assign) never does. `reject=True` (with individual_id=None) is the human's "leave this
@@ -1148,6 +1148,77 @@ def label_visit(conn: sqlite3.Connection, visit_id: int, individual_id: Optional
     return cur.rowcount
 
 
+def _labelled_species(conn: sqlite3.Connection, name: str, cmp: str) -> Optional[str]:
+    for src in ("AND individual_source = 'human'", ""):   # human verdicts outrank auto names
+        row = conn.execute(
+            f"SELECT species FROM detections WHERE individual_id = ? {cmp} {src} "
+            f"AND species IS NOT NULL GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1",
+            (name,)).fetchone()
+        if row:
+            return row[0]
+    return None
+
+
+def individual_species(conn: sqlite3.Connection, name) -> Optional[str]:
+    """The species an individual IS, read from its labels: the majority species of its
+    human-confirmed crops (any labelled crops if none are human). A group label with no crops of
+    its own ("CutiePie + Kits") takes its first known member's. None for a name never labelled."""
+    name = str(name or "").strip()
+    if not name:
+        return None
+    sp = (_labelled_species(conn, name, "")
+          or _labelled_species(conn, name, "COLLATE NOCASE"))   # typed case may differ
+    if sp is None and is_group_label(name):
+        for part in name.split(" + "):
+            if part.strip() and not is_group_label(part):
+                sp = individual_species(conn, part)
+                if sp:
+                    break
+    return sp
+
+
+def confirm_species(conn: sqlite3.Connection, visit_id: int, individual_id: Optional[str],
+                    species: Optional[str] = None) -> Optional[str]:
+    """The species a HUMAN confirm (or clear) of a visit should scope label_visit to: the
+    caller's `species` when it has one (the review queue's), else the species of the individual
+    being named -- or, for a clear, of the name the visit carries now. None = nothing known, and
+    label_visit falls back to the visit's dominant species."""
+    if species:
+        return species
+    if individual_id is None:
+        row = conn.execute(
+            "SELECT individual_id FROM detections WHERE visit_id = ? AND individual_id IS NOT NULL "
+            "GROUP BY individual_id ORDER BY COUNT(*) DESC LIMIT 1", (int(visit_id),)).fetchone()
+        individual_id = row[0] if row else None
+    return individual_species(conn, individual_id)
+
+
+def species_mismatched_labels(conn: sqlite3.Connection, examples: int = 5) -> dict:
+    """READ-ONLY audit: labelled detections whose species differs from their individual's
+    (individual_species). Writes nothing -- the owner reviews and repairs by hand."""
+    names = [r[0] for r in conn.execute(
+        "SELECT DISTINCT individual_id FROM detections WHERE individual_id IS NOT NULL")]
+    groups, total = [], 0
+    for name in names:
+        sp = individual_species(conn, name)
+        if sp is None:
+            continue
+        rows = conn.execute(
+            "SELECT species, individual_source, COUNT(*) FROM detections "
+            "WHERE individual_id = ? AND species != ? GROUP BY species, individual_source "
+            "ORDER BY COUNT(*) DESC", (name, sp)).fetchall()
+        for det_sp, src, n in rows:
+            ex = [dict(zip(("id", "visit_id", "timestamp", "source"), r)) for r in conn.execute(
+                "SELECT id, visit_id, timestamp, source FROM detections WHERE individual_id = ? "
+                "AND species = ? AND individual_source IS ? ORDER BY timestamp LIMIT ?",
+                (name, det_sp, src, int(examples)))]
+            groups.append({"name": name, "individual_species": sp, "species": det_sp,
+                           "individual_source": src, "n": int(n), "examples": ex})
+            total += int(n)
+    groups.sort(key=lambda g: -g["n"])
+    return {"total": total, "groups": groups}
+
+
 _UNSET = object()   # sentinel: "argument not provided" (distinct from None = "clear the label")
 
 
@@ -1165,7 +1236,8 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
                             verified, source='human').
       verify=True        -> (no species) just confirm the existing species on every crop.
       name='Stan'        -> set individual_id on the crops matching the visit's DOMINANT species
-                            (a stray crow crop in a raccoon visit keeps its own identity);
+                            (a stray crow crop in a raccoon visit keeps its own identity) -- or
+                            Stan's own species (individual_species) when the span has any;
                             name=None clears; omit `name` to leave identity untouched.
 
     Species is applied first, so naming after a correction scopes to the corrected species. Naming
@@ -1217,22 +1289,31 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
     elif verify:
         conn.execute(f"UPDATE detections SET species_verified = 1 WHERE {where}", params)
 
-    dominant = None
+    dominant = scope = None
     if name is not _UNSET:
         row = conn.execute(
             f"SELECT species FROM detections WHERE {where} AND species IS NOT NULL "
             f"GROUP BY species ORDER BY COUNT(*) DESC LIMIT 1", params).fetchone()
         dominant = row[0] if row else None
+        scope = dominant
+        if name is not None and not species:
+            # A known individual names its own species' crops when the span has any (an outvoted
+            # raccoon visit's noise boxes must not take the raccoon's name).
+            own = individual_species(conn, name)
+            if own and own != dominant and conn.execute(
+                    f"SELECT 1 FROM detections WHERE {where} AND species = ? LIMIT 1",
+                    params + [own]).fetchone():
+                scope = own
         src = None if name is None else "human"
         at = now_local_iso()      # WHEN the label was applied (detections.labelled_at)
-        if dominant is None:
+        if scope is None:
             conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
                          f"labelled_at = ?, labeled_by = ? WHERE {where}",
                          [name, src, at, labeled_by] + params)
         else:
             conn.execute(f"UPDATE detections SET individual_id = ?, individual_source = ?, "
                          f"labelled_at = ?, labeled_by = ? WHERE {where} AND species = ?",
-                         [name, src, at, labeled_by] + params + [dominant])
+                         [name, src, at, labeled_by] + params + [scope])
 
     # Sync the visits-table rows these detections belong to (subquery, no big IN list).
     vsub = f"id IN (SELECT DISTINCT visit_id FROM detections WHERE {where} AND visit_id IS NOT NULL)"
@@ -1241,7 +1322,7 @@ def apply_visit_label(conn: sqlite3.Connection, *, visit_id: Optional[int] = Non
     if name is not _UNSET:
         conn.execute(f"UPDATE visits SET individual_id = ? WHERE {vsub}", [name] + params)
     conn.commit()
-    return {"detections": int(n), "dominant_species": dominant,
+    return {"detections": int(n), "dominant_species": dominant, "named_species": scope,
             "species_set": species or None, "named": None if name is _UNSET else name}
 
 
