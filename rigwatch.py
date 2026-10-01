@@ -54,7 +54,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
@@ -65,6 +65,7 @@ HOLD_MARKER = ROOT / ".rig_hold"
 STATE_FILE = ROOT / ".rigwatch_state.json"
 LOG_FILE = ROOT / "logs" / "rigwatch.log"
 LAUNCHER = ROOT / "start_critter_cam.bat"
+REPORTS_DIR = ROOT / "reports"
 
 MAX_STARTS_PER_HOUR = 3
 REPEAT_ALARM_S = 3600.0         # a standing condition is logged once an hour, not every 5 min
@@ -234,6 +235,49 @@ def check_naming(health: dict) -> bool:
     return False
 
 
+def batch_health() -> dict:
+    """How old the nightly batch's newest eval artifact is. Returns {present, newest, age_s, stale}.
+
+    reports/eval_*.json, not the BATCH COMPLETE log line: the log's %date% %time% stamps are
+    locale-formatted, the log rotates, and the batch prints BATCH COMPLETE even when its steps
+    failed. An artifact exists only if the eval step actually ran, and its name carries a UTC stamp."""
+    out = {"present": False, "newest": None, "age_s": None, "stale": False}
+    try:
+        files = list(REPORTS_DIR.glob("eval_*.json"))
+    except OSError:
+        files = []
+    best = None
+    for p in files:
+        try:
+            ts = datetime.strptime(p.stem[len("eval_"):], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            try:
+                ts = p.stat().st_mtime         # a hand-named artifact: trust the file instead
+            except OSError:
+                continue
+        if best is None or ts > best[0]:
+            best = (ts, p)
+    if best is None:
+        return out                             # never run on this machine: nothing to be late for
+    out["present"], out["newest"] = True, best[1].name
+    out["age_s"] = max(0.0, time.time() - best[0])
+    out["stale"] = out["age_s"] > float(config.CONFIG.batch_stale_hours) * 3600.0
+    return out
+
+
+def check_batch(health: dict) -> bool:
+    """Log (hourly) when the nightly batch has stopped producing results. True if stale."""
+    if not health["stale"]:
+        return False
+    if _due("batch_logged_at"):
+        log(f"NIGHTLY BATCH IS STALE: the newest eval artifact ({health['newest']}) is "
+            f"{health['age_s'] / 3600.0:.0f} h old (limit {config.CONFIG.batch_stale_hours:g} h), "
+            f"so run_clipmotion.bat has not finished a night since. Embeddings, auto-assign and "
+            f"the regression gate are not running. See logs/clipmotion_batch.log.")
+    return True
+
+
 def _state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -330,8 +374,25 @@ def main() -> int:
             flag = "  <-- STALE, the loop is not running" if h["stale"] else ""
             print(f"species naming  : {h['state']} on {h['device']}, heartbeat {age}{flag}")
             print(f"  named this run: {h['named']}   backlog: {h['backlog']}")
+        b = batch_health()
+        if not b["present"]:
+            print("nightly batch   : no reports/eval_*.json yet (it has never finished here)")
+        else:
+            flag = "  <-- STALE" if b["stale"] else ""
+            print(f"nightly batch   : last eval {b['age_s'] / 3600.0:.0f} h ago ({b['newest']}), "
+                  f"limit {config.CONFIG.batch_stale_hours:g} h{flag}")
         return 0
 
+    rc = _watch_rig(args, pids)
+    try:
+        check_batch(batch_health())
+    except Exception as e:                      # noqa: BLE001 -- never let a report sink the run
+        log(f"batch check failed: {type(e).__name__}: {e}")
+    return rc
+
+
+def _watch_rig(args, pids) -> int:
+    """The restart decision itself: start the rig if it is down and nothing says to leave it."""
     if pids is None:
         # "No pids" and "cannot see pids" are the same value to a caller that only checks
         # emptiness, and acting on the second would restart a healthy rig every five minutes

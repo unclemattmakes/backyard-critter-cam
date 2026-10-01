@@ -524,6 +524,11 @@ class Config:
     # and only crops inside mqtt_window_s count. A visit "leaves" after visit_gap_minutes of quiet.
     mqtt_sources: tuple[str, ...] | list[str] | None = None
 
+    # ---- Watchdog (rigwatch.py) ------------------------------------------------------
+    # rigwatch alarms when the newest reports/eval_*.json is older than this: the nightly batch
+    # writes one every successful night, so 36 h means a whole night was missed.
+    batch_stale_hours: float = 36.0
+
     # ---- Behaviour clips (phase 4 capture: short video around each visit) --------
     # Stills capture WHO and WHEN; a short VIDEO clip captures HOW -- gait, approach speed,
     # dwell, vigilance, who-defers-to-whom. Motion is the behaviour signal (and a confound-robust

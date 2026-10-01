@@ -264,6 +264,11 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
+`NAMING IS STALE` when species naming stops, and `NIGHTLY BATCH IS STALE` when the newest
+`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
+has not finished a run since.
+
 #### Telling someone else how to connect
 
 The LAN launcher gives the rig a **name on your network**, so nobody has to be handed an IP
