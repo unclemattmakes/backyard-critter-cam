@@ -848,6 +848,48 @@ def test_evalstatus_endpoint_degrades_honestly(corpus, db_path):
         t.join(timeout=5)
 
 
+def _evalstatus_for(tmp_path, monkeypatch, name, artifact):
+    reports = tmp_path / "reports"
+    reports.mkdir(exist_ok=True)
+    (reports / name).write_text(json.dumps(artifact))
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setitem(web._EVAL_STATUS_CACHE, "key", None)
+    return web._eval_status()
+
+
+def test_evalstatus_reads_the_gate_floor_breach_and_stale(tmp_path, monkeypatch):
+    """eval.py's `gate` section reaches the chip: a floor breach is a regression even when the
+    baseline diff passed, and a frozen corpus is STALE -- a warning, not a regression."""
+    meta = {"run_at": "2026-10-01T17:30:00-07:00"}
+    diff_ok = {"ok": True, "regressions": [], "baseline_run_at": "2026-09-29T17:49:16-07:00",
+               "baseline_path": "D:\\rig\\reports\\pinned_baseline.json"}
+    breach = {"metric": "LOO top-1, 7-day embargo", "current": 0.41, "floor": 0.42,
+              "path": "reid.identification_loo.embargo_curve[embargo_days=7].top1_accuracy",
+              "breached": True}
+    s = _evalstatus_for(tmp_path, monkeypatch, "eval_20261001T003000Z.json", {
+        "meta": meta, "baseline_diff": diff_ok,
+        "gate": {"floors": {"ok": False, "rows": [breach], "breaches": [breach]},
+                 "staleness": {"stale": False, "unchanged_nights": 0}, "exit_code": 1}})
+    assert s["ok"] is False and s["stale"] is False
+    assert s["regressions"] == ["LOO top-1, 7-day embargo"]
+    assert s["floor_breaches"] == [{"metric": "LOO top-1, 7-day embargo",
+                                    "current": 0.41, "floor": 0.42}]
+    assert s["baseline_artifact"] == "pinned_baseline.json"
+
+    s = _evalstatus_for(tmp_path, monkeypatch, "eval_20261002T003000Z.json", {
+        "meta": meta, "baseline_diff": diff_ok,
+        "gate": {"floors": {"ok": True, "rows": [], "breaches": []},
+                 "staleness": {"stale": True, "unchanged_nights": 9}, "exit_code": 3}})
+    assert s["ok"] is True and s["stale"] is True and s["stale_nights"] == 9
+    assert s["regressions"] == [] and s["floor_breaches"] == []
+
+    # An artifact from before the gate existed reads exactly as it always did.
+    s = _evalstatus_for(tmp_path, monkeypatch, "eval_20261003T003000Z.json", {
+        "meta": meta, "baseline_diff": {"ok": False, "regressions": [{"metric": "pair AUC"}]}})
+    assert s["ok"] is False and s["regressions"] == ["pair AUC"]
+    assert s["stale"] is False and s["floor_breaches"] == [] and s["baseline_artifact"] is None
+
+
 # ---- the roster: marking an individual as no longer resident -------------------------
 # Templates outlive the animal. Notch's last labelled crop is 2026-06-30 and Matt confirms it
 # stopped coming, but at the recommended operating point the auto tier still lined up to write

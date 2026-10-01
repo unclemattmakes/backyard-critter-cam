@@ -2052,14 +2052,28 @@ def _eval_status() -> dict:
     except (OSError, ValueError):
         return {"available": False}
     diff = art.get("baseline_diff") or {}
+    # `gate` (floors + staleness) is absent from artifacts before 2026-09-30; those read as before.
+    gate = art.get("gate") or {}
+    floors = [{"metric": r.get("metric"), "current": r.get("current"), "floor": r.get("floor")}
+              for r in ((gate.get("floors") or {}).get("breaches") or [])]
+    stale = gate.get("staleness") or {}
+    ok = diff.get("ok") if diff else None
+    if floors:
+        ok = False
     out = {
         "available": True,
         "artifact": p.name,
         "run_at": (art.get("meta") or {}).get("run_at"),
-        # ok True/False when the run diffed a baseline; None = no gate ran (first artifact).
-        "ok": diff.get("ok") if diff else None,
-        "regressions": [r.get("metric") for r in (diff.get("regressions") or [])],
+        # ok True/False when the run diffed a baseline or broke a floor; None = no gate ran.
+        "ok": ok,
+        "regressions": [r.get("metric") for r in (diff.get("regressions") or [])]
+                       + [f["metric"] for f in floors],
+        "floor_breaches": floors,
         "baseline_run_at": diff.get("baseline_run_at"),
+        "baseline_artifact": Path(diff["baseline_path"]).name if diff.get("baseline_path") else None,
+        # Stale = labels stopped reaching the eval; a warning, not a regression (auto-assign runs).
+        "stale": bool(stale.get("stale")),
+        "stale_nights": stale.get("unchanged_nights"),
     }
     _EVAL_STATUS_CACHE["key"], _EVAL_STATUS_CACHE["value"] = key, out
     return out
