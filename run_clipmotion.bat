@@ -23,17 +23,21 @@ REM                                tracklet splitter is blind without it
 REM   3) clipembed.py           -- appearance vectors for new sustained tracklets
 REM   4) clipmotion.py --link   -- attach solo-clip tracks to their HUMAN-named
 REM                                individual (auto names don't ground behaviour)
-REM   5) eval.py --baseline latest -- the REGRESSION GATE, run nightly so a
+REM   5) eval.py --baseline pinned -- the REGRESSION GATE, run nightly so a
 REM                                metric slide is noticed the day it happens
 REM                                (the 0.81 -> 0.635 AUC drift accumulated for
 REM                                weeks because this step was a docstring, not
 REM                                a scheduler line). Read-only over the DB, no
 REM                                GPU: it scores the embeddings already stored.
+REM                                Diffs the pinned baseline (eval.py
+REM                                --pin-baseline), else last night's artifact;
+REM                                exit 1 = regression or floor, 3 = stale.
 REM   6) individuals.py --auto-assign -- name the unambiguous new solo visits
 REM                                (bars from eval.py's sweep; auto names never
 REM                                feed the suggestion templates; review in the
 REM                                dashboard queue). SKIPPED when the gate just
-REM                                reported a regression: a matcher that
+REM                                reported a regression (not when stale): a
+REM                                matcher that
 REM                                measurably got worse today should not spend
 REM                                tonight writing names.
 REM   7) warm the dashboard's re-ID queue cache -- the first Individuals-tab
@@ -125,17 +129,27 @@ echo [%date% %time%] linking solo tracks to named individuals...
 ".venv\Scripts\python.exe" clipmotion.py --link
 if errorlevel 1 (echo [%date% %time%]   *** clipmotion --link FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   clipmotion --link ok)
 echo [%date% %time%] nightly eval + regression gate...
-set EVAL_REGRESSED=0
-if exist "reports\eval_*.json" (
-    ".venv\Scripts\python.exe" eval.py --baseline latest --tolerance 0.02
-    if errorlevel 1 set EVAL_REGRESSED=1
+REM Pinned baseline if one exists, else last night's; neither = first run, which WRITES one.
+set "EVAL_BASE="
+if exist "reports\eval_*.json" set "EVAL_BASE=latest"
+if exist "reports\pinned_baseline.json" set "EVAL_BASE=pinned"
+if defined EVAL_BASE (
+    ".venv\Scripts\python.exe" eval.py --baseline %EVAL_BASE% --tolerance 0.02
 ) else (
-    REM First run on this machine: nothing to diff against yet; this run WRITES the baseline.
     ".venv\Scripts\python.exe" eval.py
 )
-if "%EVAL_REGRESSED%"=="1" (
-    echo [%date% %time%] *** EVAL REGRESSION -- auto-assign SKIPPED tonight. See the diff above
-    echo [%date% %time%] *** and the newest reports\eval_*.json; the dashboard shows the verdict.
+set "EVAL_RC=%ERRORLEVEL%"
+REM 3 = stale corpus: logged, but auto-assign still runs. Anything else non-zero skips it.
+set "EVAL_SKIP=1"
+if "%EVAL_RC%"=="0" set "EVAL_SKIP=0"
+if "%EVAL_RC%"=="3" set "EVAL_SKIP=0"
+if "%EVAL_RC%"=="3" (
+    echo [%date% %time%] *** EVAL STALE -- labels and metrics unchanged for days, see the GATE block above.
+    echo [%date% %time%] *** Is the naming helper running? Auto-assign still runs tonight.
+)
+if "%EVAL_SKIP%"=="1" (
+    if "%EVAL_RC%"=="1" (echo [%date% %time%] *** EVAL REGRESSION -- auto-assign SKIPPED tonight. See the diff above) else (echo [%date% %time%] *** EVAL FAILED, exit %EVAL_RC% -- auto-assign SKIPPED tonight. See the output above)
+    echo [%date% %time%] *** and the GATE block in the newest reports\eval_*.json.
 ) else (
     echo [%date% %time%] auto-naming unambiguous visits...
     ".venv\Scripts\python.exe" individuals.py --auto-assign
