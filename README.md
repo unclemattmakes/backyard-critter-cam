@@ -225,7 +225,7 @@ Each is one-time; they land in the Hugging Face cache (`~/.cache/huggingface`) a
 > CPU-only torch instead:
 >
 > ```
-> pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+> pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
 > ```
 >
 > then `pip install -r requirements.txt` as usual, and run with **`--device cpu`**. If the box

@@ -40,17 +40,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements-lock.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # requirements.txt deliberately omits torch (setup.sh / setup.bat pick a build per
-          # machine). This runner has no GPU, so take the CPU wheels -- ~250MB instead of ~3GB.
-          # tests/test_clipfilter.py importorskips torch, so omitting this would silently skip a
-          # test file rather than fail -- install it so CI actually covers the non-animal gate.
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements.txt
+          # The lock pins this rig's exact versions, with the CPU build of torch (the file names
+          # the PyTorch CPU index itself) -- ~250MB instead of ~3GB of CUDA wheels.
+          pip install -r requirements-lock.txt
+          # tests/test_clipfilter.py importorskips torch, so a missing torch would silently skip
+          # a test file rather than fail. Fail here instead.
+          python -c "import torch; print('torch', torch.__version__)"
 
       # A GitHub ubuntu runner has no libGL.so.1, so `import cv2` from the normal opencv-python
       # wheel dies at collection (four test modules import it). Swap in the headless build AFTER
@@ -60,8 +60,9 @@ jobs:
       - name: Swap in headless OpenCV (Linux)
         if: runner.os == 'Linux'
         run: |
+          CV=$(python -c "import importlib.metadata as m; print(m.version('opencv-python'))")
           pip uninstall -y opencv-python
-          pip install "opencv-python-headless>=4.10,<5"
+          pip install "opencv-python-headless==$CV"
 
       - name: Run the test suite
         run: python -m pytest tests/ -q

@@ -37,6 +37,9 @@ if not exist ".venv" (
   %PY% -m venv .venv || (echo [ERROR] venv creation failed. & pause & exit /b 1)
 )
 set "VPY=.venv\Scripts\python.exe"
+REM The torch VERSION is the same on every path below (and in setup.sh and requirements-lock.in);
+REM only the build -- cu130, cu126 or CPU -- is chosen per machine. Bump all of them together.
+set "TORCH_PKGS=torch==2.12.0 torchvision==0.27.0"
 "%VPY%" -m pip install --upgrade pip >nul
 
 REM 3) Install torch, matched to the GPU GENERATION, not just GPU-or-not. CUDA wheels drop
@@ -62,14 +65,14 @@ if %errorlevel%==0 (
     echo NVIDIA GPU detected ^(compute capability !CCMAJ!.!CCMIN! -- Maxwell/Pascal/Volta era^).
     echo The newest CUDA wheels dropped this generation, so installing the cu126 build
     echo -- with cu130 this card would silently go unused.
-    "%VPY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 || (echo [ERROR] torch install failed. & pause & exit /b 1)
+    "%VPY%" -m pip install %TORCH_PKGS% --index-url https://download.pytorch.org/whl/cu126 || (echo [ERROR] torch install failed. & pause & exit /b 1)
   ) else (
     echo NVIDIA GPU detected ^(compute capability !CCMAJ!.!CCMIN!^) -- installing the CUDA ^(cu130^) torch build ...
-    "%VPY%" -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130 || (echo [ERROR] torch install failed. & pause & exit /b 1)
+    "%VPY%" -m pip install %TORCH_PKGS% --index-url https://download.pytorch.org/whl/cu130 || (echo [ERROR] torch install failed. & pause & exit /b 1)
   )
 ) else (
   echo No NVIDIA GPU detected -- installing the CPU torch build ^(slower, but it works^) ...
-  "%VPY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu || (echo [ERROR] torch install failed. & pause & exit /b 1)
+  "%VPY%" -m pip install %TORCH_PKGS% --index-url https://download.pytorch.org/whl/cpu || (echo [ERROR] torch install failed. & pause & exit /b 1)
 )
 
 REM 4) The rest of the dependencies.

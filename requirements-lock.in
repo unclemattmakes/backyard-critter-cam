@@ -1,0 +1,15 @@
+# Input for requirements-lock.txt: the exact CPU environment CI installs, pinned to this rig's own
+# versions so CI tests what the rig runs. Regenerate with the command in the lock's header (uv;
+# `pip install uv` anywhere). uv keeps the lock's current pins where they still fit, so a
+# regenerate after editing requirements.txt moves only what has to move.
+#
+# The torch version here is the one setup.bat / setup.sh install on every path (cu130, cu126,
+# CPU, macOS) -- bump them together.
+#
+# No --generate-hashes: the hashes would have to cover every platform's torch wheel from a second
+# index, and Linux CI swaps in headless OpenCV after the install, which would need a hashed file
+# of its own. Exact pins already stop a new (e.g. hijacked) release from sneaking in, and PyPI
+# never lets a published file be replaced in place.
+-r requirements.txt
+torch==2.12.0
+torchvision==0.27.0
