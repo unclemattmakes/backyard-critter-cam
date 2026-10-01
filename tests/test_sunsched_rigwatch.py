@@ -105,6 +105,10 @@ def _isolated_rigwatch(tmp_path, monkeypatch):
     monkeypatch.setattr(rigwatch, "STATE_FILE", tmp_path / ".rigwatch_state.json")
     monkeypatch.setattr(rigwatch, "LOG_FILE", tmp_path / "logs" / "rigwatch.log")
     monkeypatch.setattr(rigwatch, "REPORTS_DIR", tmp_path / "reports")
+    # A config_local.py heartbeat_url must never be pinged from a test, and nothing may reach the net.
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", None)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("network call from a test"))
     yield
 
 
@@ -338,3 +342,111 @@ def test_status_shows_the_batch_and_changes_nothing(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "nightly batch" in out and "STALE" in out
     assert "NIGHTLY BATCH" not in _log_text()
+
+
+# --------------------------------------------------------------------------- off-host heartbeat
+# Every alarm above lives on the same box; when the box is down, only an outside service that
+# notices the pings stopping can tell anyone.
+URL = "https://hc-ping.example/0b1c-secret-token"
+
+
+class _Resp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        return b"OK"
+
+
+@pytest.fixture
+def pings(monkeypatch):
+    sent = []
+
+    def fake_urlopen(req, timeout=None):
+        assert timeout is not None and timeout <= 10
+        assert req.get_method() == "GET"
+        sent.append(req.full_url)
+        return _Resp()
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen", fake_urlopen)
+    # Pinned so a real .naming_status.json on the machine cannot decide healthy vs /fail.
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {"present": False, "stale": False})
+    return sent
+
+
+def _run(monkeypatch, pids, *argv):
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: pids)
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", *argv])
+    return rigwatch.main()
+
+
+def test_a_healthy_run_pings_the_heartbeat(monkeypatch, pings):
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL]
+
+
+def test_a_held_or_paused_down_rig_still_counts_as_healthy(monkeypatch, pings):
+    rigwatch.HOLD_MARKER.write_text("held")
+    assert _run(monkeypatch, []) == 0
+    rigwatch.HOLD_MARKER.unlink()
+    monkeypatch.setattr(rigwatch, "paused", lambda: True)
+    assert _run(monkeypatch, []) == 0
+    assert pings == [URL, URL]
+
+
+def test_stale_naming_pings_fail(monkeypatch, pings):
+    monkeypatch.setattr(rigwatch, "naming_health", lambda: {
+        "present": True, "state": "ready", "age_s": 3600.0, "stale": True, "backlog": None})
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL + "/fail"]
+
+
+def test_a_stale_batch_pings_fail(monkeypatch, pings):
+    _eval_artifact(50)
+    assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL + "/fail"]
+
+
+def test_a_restart_storm_or_blind_watchdog_pings_fail(monkeypatch, pings):
+    assert _run(monkeypatch, None) == 1
+    for _ in range(rigwatch.MAX_STARTS_PER_HOUR):
+        rigwatch._record_start()
+    assert _run(monkeypatch, []) == 1
+    assert pings == [URL + "/fail"] * 2
+
+
+def test_fail_keeps_a_query_string_intact(monkeypatch, pings):
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL + "/?rid=abc")
+    rigwatch.ping_heartbeat(False)
+    assert pings == [URL + "/fail?rid=abc"]
+
+
+def test_the_restart_happens_before_the_ping_and_survives_a_dead_network(monkeypatch):
+    order = []
+
+    def boom(req, timeout=None):
+        order.append("ping")
+        raise OSError("connect to https://hc-ping.example/0b1c-secret-token timed out")
+    monkeypatch.setattr(config.CONFIG, "heartbeat_url", URL)
+    monkeypatch.setattr(rigwatch.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: order.append("start") or 0)
+    assert _run(monkeypatch, []) == 0
+    assert order == ["start", "ping"]
+    text = _log_text()
+    assert "heartbeat to hc-ping.example failed" in text
+    assert "secret-token" not in text                    # the URL is the secret: host only
+
+
+def test_no_url_means_no_network_at_all(monkeypatch):
+    # The autouse fixture fails the test on any urlopen; heartbeat_url is None there.
+    assert _run(monkeypatch, [123]) == 0
+
+
+def test_status_never_pings_and_shows_only_the_host(monkeypatch, pings, capsys):
+    assert _run(monkeypatch, [123], "--status") == 0
+    out = capsys.readouterr().out
+    assert pings == []
+    assert "hc-ping.example" in out and "secret-token" not in out
