@@ -2070,7 +2070,9 @@ def _eval_status() -> dict:
                        + [f["metric"] for f in floors],
         "floor_breaches": floors,
         "baseline_run_at": diff.get("baseline_run_at"),
-        "baseline_artifact": Path(diff["baseline_path"]).name if diff.get("baseline_path") else None,
+        # Split on both separators: the artifact records a Windows path, and CI reads it on Linux.
+        "baseline_artifact": (re.split(r"[\\/]", diff["baseline_path"])[-1]
+                              if diff.get("baseline_path") else None),
         # Stale = labels stopped reaching the eval; a warning, not a regression (auto-assign runs).
         "stale": bool(stale.get("stale")),
         "stale_nights": stale.get("unchanged_nights"),
