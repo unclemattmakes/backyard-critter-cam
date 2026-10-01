@@ -12,6 +12,8 @@ resolves the name is a property of the phone. That was verified by hand against 
 """
 from __future__ import annotations
 
+import socket
+
 import pytest
 
 import mdns
@@ -96,6 +98,28 @@ def test_local_candidates_keeps_port_zero_meaning_ephemeral():
     test at the real HTTP port."""
     assert mdns.local_candidates(FakeCfg(web_port=0))[0] == 0
     assert mdns.port_of(FakeCfg(web_port=0)) == 80
+
+
+def _closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_wait_local_finds_the_rig_on_its_fallback_port():
+    """run_clipmotion.bat warms the dashboard cache at whatever URL `mdns.py --wait-local
+    --timeout 0` prints, so one pass must find a rig that lost its first-choice port."""
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        live = srv.getsockname()[1]
+        cfg = FakeCfg(web_port=_closed_port(), web_port_fallback=live)
+        assert mdns.wait_local(cfg, timeout=0) == live
+
+
+def test_wait_local_gives_up_after_one_pass_when_nothing_answers():
+    cfg = FakeCfg(web_port=_closed_port(), web_port_fallback=0)
+    assert mdns.wait_local(cfg, timeout=0) is None
 
 
 # ---- when a name is worth publishing --------------------------------------------------

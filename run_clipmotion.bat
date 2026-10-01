@@ -1,6 +1,10 @@
 @echo off
 title Backyard Critter Cam - nightly re-ID + motion batch
-cd /d "%~dp0"
+REM Run from a temp copy: cmd.exe re-reads a running .bat by byte offset, so a checkout that
+REM rewrites this file mid-run can derail it. No CALL, so this file is never read again.
+if not "%~1"=="--from-copy" copy /y "%~f0" "%TEMP%\critter-nightly-batch.bat" >NUL && "%TEMP%\critter-nightly-batch.bat" --from-copy "%~dp0"
+REM In the copy %~2 is the project dir; if the copy failed we are still the original.
+if "%~1"=="--from-copy" (cd /d "%~2") else (cd /d "%~dp0")
 REM ---------------------------------------------------------------------------
 REM The nightly "keep individual-tracking automatic" batch. Task Scheduler runs
 REM this daily (task BackyardCritterCam-MotionTracks). The start time is NOT a
@@ -50,7 +54,8 @@ REM state for exactly that reason.)
 REM
 REM The footer line is load-bearing: every completed run ends with BATCH
 REM COMPLETE, so a log that just stops IS the signal that something killed the
-REM run rather than the run failing honestly.
+REM run rather than the run failing honestly. BATCH EXIT follows it once the
+REM batch is on its way out.
 REM ---------------------------------------------------------------------------
 
 if not exist "logs" mkdir "logs"
@@ -63,6 +68,8 @@ for %%A in ("%LOG%") do if %%~zA GTR 4000000 move /y "%LOG%" "%LOG%.1" >NUL 2>&1
 echo Running the nightly batch; full output goes to %LOG%
 call :run >> "%LOG%" 2>&1
 set "BATCH_RC=%ERRORLEVEL%"
+REM Logged after :run returns, so COMPLETE without EXIT means the hang was in between.
+>> "%LOG%" echo [%date% %time%] BATCH EXIT %BATCH_RC%
 echo Batch finished ^(exit %BATCH_RC%^). Log: %LOG%
 exit /b %BATCH_RC%
 
@@ -135,10 +142,15 @@ if "%EVAL_REGRESSED%"=="1" (
     if errorlevel 1 (echo [%date% %time%]   *** individuals --auto-assign FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   individuals --auto-assign ok)
 )
 echo [%date% %time%] warming the dashboard re-ID queue cache...
-curl -s -o NUL --max-time 180 "http://127.0.0.1:8000/api/reid/queue?mode=recent&offset=0&limit=30"
+REM The port is not fixed (web_port, else web_port_fallback): ask mdns.py which one answers.
+set "DASHURL="
+for /f "usebackq delims=" %%u in (`.venv\Scripts\python.exe mdns.py --wait-local --timeout 0`) do set "DASHURL=%%u"
+curl -s -o NUL --max-time 180 "%DASHURL%/api/reid/queue?mode=recent&offset=0&limit=30"
+if errorlevel 1 (echo [%date% %time%]   cache warm skipped ^(curl exit %ERRORLEVEL%^) -- rig down? tried "%DASHURL%") else (echo [%date% %time%]   cache warm ok at %DASHURL%)
 ".venv\Scripts\python.exe" heavyio.py --release batch
 if errorlevel 1 (echo [%date% %time%]   *** heavyio --release FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   heavyio --release ok)
 echo [%date% %time%] BATCH COMPLETE
-goto :eof
+REM Steps fail soft and are logged above, so reaching here is success.
+exit /b 0
 
 
