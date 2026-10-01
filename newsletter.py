@@ -1388,9 +1388,9 @@ def main(argv=None) -> int:
         _say("[newsletter] quiet period and email_send_quiet=False -- not sending.")
         return 0
     if not email_configured(cfg):
-        _say("[newsletter] email not configured -- set email_to / email_from / "
-             "email_resend_api_key in config_local.py (see config_local.example.py); "
-             "issue archived locally.", always_log=True)
+        _say("[newsletter] email not configured -- set email_to / email_from in "
+             "config_local.py and email_resend_api_key in the secrets file (see "
+             "config_local.example.py); issue archived locally.", always_log=True)
         return 1 if args.send else 0
     try:
         mail_id = send_issue(cfg, subject, html, text, images, to=args.to)
