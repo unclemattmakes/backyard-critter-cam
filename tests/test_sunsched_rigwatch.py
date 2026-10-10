@@ -6,6 +6,7 @@ allowed to do nothing, and neither may ever do something surprising -- restartin
 just stopped, or parking the batch on top of the raccoon peak."""
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -217,6 +218,14 @@ def test_restart_storms_are_capped(monkeypatch):
 def test_starts_older_than_an_hour_do_not_count_against_the_cap():
     rigwatch.STATE_FILE.write_text('{"starts": [1, 2, 3]}')   # epoch 1970
     assert rigwatch._recent_starts() == 0
+
+
+def test_starts_before_the_last_boot_do_not_count_against_the_cap(monkeypatch):
+    # Two manual restarts, each ending the rig the watchdog had just started, then one more start.
+    now = time.time()
+    rigwatch.STATE_FILE.write_text(json.dumps({"starts": [now - 2400, now - 900, now - 300]}))
+    monkeypatch.setattr(rigwatch, "boot_time", lambda: now - 600)
+    assert rigwatch._recent_starts() == 1
 
 
 # --------------------------------------------------------------------------- stale pause markers

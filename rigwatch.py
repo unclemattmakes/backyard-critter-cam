@@ -30,7 +30,8 @@ RESTART STORMS ARE CAPPED
 -------------------------
 If the rig is crashing on startup (bad config, wedged camera, no GPU), retrying forever would
 spawn a log window and a browser tab every cycle. Three starts in a rolling hour is the ceiling;
-after that it writes a loud line and waits the hour out.
+after that it writes a loud line and waits the hour out. Only starts since the last boot count: a
+reboot ends the rig it interrupts, so a start before it says nothing about a crash.
 
 USAGE
     python rigwatch.py            # one check -- what the scheduled task runs, every 5 min
@@ -314,7 +315,9 @@ def _record_start() -> None:
 
 
 def _recent_starts() -> int:
-    return len([t for t in _state().get("starts", []) if time.time() - t < 3600])
+    """Starts in the last hour and in this boot: a reboot ends the rig, it does not crash it."""
+    since = max(time.time() - 3600, boot_time())
+    return len([t for t in _state().get("starts", []) if t > since])
 
 
 def _record_backlog(backlog) -> None:
