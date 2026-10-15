@@ -498,9 +498,6 @@ def loo_units(protos: dict, labels: dict, started: dict | None = None) -> list:
         ts = (started or {}).get(vid)
         when = db.parse_local(ts) if ts else None
         out.append(em.LooUnit(key=vid, label=name, night=em.night_key(when), when=when))
-    # Time order, not id order: the k-fold split is drawn over this list's positions, and what a
-    # visit id encodes is visits.py's business -- a change there must not reshuffle the folds.
-    out.sort(key=lambda u: (u.when is None, u.when.timestamp() if u.when else 0.0, u.key))
     return out
 
 
