@@ -816,6 +816,11 @@ class Config:
     # inert while reid_auto_threshold is 0.0 (the shipped default), and this mode is most useful
     # BEFORE the auto tier is turned on. This is the fallback used in that case.
     reid_queue_ambiguous_margin: float = 0.02
+    # TONIGHT: the cosine distance (1 - similarity, average linkage) under which one night's
+    # unreviewed visits on one camera are grouped as probably the same animal, for naming in one
+    # go. The same 0.45 bootstrap and refit cluster at; it was not swept for this use. eval.py's
+    # night-group purity line measures it on your confirmed visits -- read that before trusting it.
+    reid_night_group_distance: float = 0.45
 
     # ---- Nightly eval gate (eval.py, run by run_clipmotion.bat) ---------------------
     # ABSOLUTE FLOORS: a metric below its floor fails the gate (exit 1, auto-assign skipped)

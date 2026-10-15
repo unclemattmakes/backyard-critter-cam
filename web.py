@@ -1183,13 +1183,16 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     off = _qs_int(q, "offset", 0, 0, 1_000_000)
                     md = (q.get("mode") or ["recent"])[0]
                     since = _qs_int(q, "since_h", DEFAULT_QUEUE_WINDOW_H, 0, 24 * 400)
+                    nt = (q.get("night") or [None])[0]
+                    nt = nt if nt and re.fullmatch(r"\d{4}-\d{2}-\d{2}", nt) else None
                     # The heaviest endpoint there is (~10s: a full VisitMatcher rebuild), so it
                     # leans hardest on the cache. Label POSTs clear it, so the queue is always
                     # fresh right after a confirm -- the rebuild then happens once, not per open.
-                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}:{since}",
+                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}:{since}:{nt}",
                                        lambda: _reid_queue(cfg, species=sp, limit=lim,
                                                            offset=off, mode=md,
-                                                           since_h=since), hold_s=60))
+                                                           since_h=since, night=nt),
+                                       hold_s=60))
                 elif path == "/api/reid/dossier":
                     # One visit, everything about it (see _reid_dossier). Cached per visit id:
                     # it rebuilds the whole VisitMatcher, and the one-at-a-time flow steps
@@ -2435,7 +2438,8 @@ DEFAULT_QUEUE_WINDOW_H = 48
 
 
 def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
-                mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H) -> dict:
+                mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H,
+                night: str | None = None) -> dict:
     """The Individuals tab's review queue: visits of `species` with a WHO suggestion each
     (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
     nothing is confirmed yet -- the cold-start visit-groups to name first. Read-only; the heavy
@@ -2445,7 +2449,11 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     `mode` picks WHICH visits (see QUEUE_MODES); `offset`/`limit` PAGINATE within that mode.
     Pagination rather than a bigger limit on purpose: the per-visit work below (clip overlap +
     crop strip) and the matcher rebuild are what cost, so a page stays cheap however deep the
-    filter reaches."""
+    filter reaches.
+
+    `night` (YYYY-MM-DD) picks which night the TONIGHT groups cover; None is the newest night with
+    work left. Those groups ride beside the queue rather than as a mode, because they are a
+    different shape (groups, not visits) and reuse the matcher this call already built."""
     import individuals
 
     conn = db.connect_readonly(cfg.db_path)
@@ -2623,6 +2631,20 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
                                  for g in r["novel_groups"]],
                 "untemplated": r["untemplated"], "n_fit": r["n_fit"], "n_novel": r["n_novel"]}
 
+        # TONIGHT: one night's unreviewed visits grouped within each camera, to name a group at a
+        # time (individuals.VisitMatcher.night_groups). Every member carries its own thumbnail,
+        # because the human unticks the odd one out before anything is written.
+        tonight = None
+        if has_templates:
+            tonight = matcher.night_groups(night=night)
+            for g in tonight["groups"]:
+                g["members"] = [{"visit_id": v, "started": st, "auto_as": a,
+                                 "rep_crop": _rep_for_visit(v)}
+                                for v, st, a in zip(g["visits"], g["started"], g["auto_as"])]
+                if g["suggestion"]:
+                    g["suggestion"]["lapse"] = (
+                        freshness.get(g["suggestion"]["name"]) or {}).get("lapse")
+
         # Heads-up when suggestions are running blind: high-conf crops still missing vectors.
         backlog = conn.execute(
             """SELECT COUNT(*) FROM detections d
@@ -2633,7 +2655,8 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
 
         return {"species": species, "queue": queue,
                 "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
-                "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
+                "bootstrap": bootstrap, "refit": refit, "tonight": tonight,
+                "unembedded": backlog,
                 "novel_threshold": cfg.reid_novel_threshold,
                 "mode": mode, "modes": list(QUEUE_MODES),
                 "offset": offset, "limit": limit, "n_matched": len(matched),

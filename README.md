@@ -615,7 +615,8 @@ has grown from a single live feed into **nine tabs**:
   itself, or is the cast known?).
 - **Individuals** — the "name the cast" workspace (see
   [phase 3](#individual-re-identification-phase-3)): a *Who is this?* review queue with
-  one-click confirm / correct / clear, bulk **Fit to the Cast**, per-individual **Poses** and
+  one-click confirm / correct / clear, **Night by Night** group naming, bulk **Fit to the
+  Cast**, per-individual **Poses** and
   **Clips**, and **Un-blend** for multi-animal visits. If you named the visit live (above),
   Un-blend reads that log: it shows *"📓 you logged Notch + Elliot here"* and, once one cluster
   matches a known template, names the **other by elimination** — so a never-solo pair member gets
@@ -823,6 +824,14 @@ The **dashboard's Individuals tab** is the intended surface: a "Who is this?" re
 with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
 anything is confirmed. Once you've named a few, it adds:
 
+- **Night by Night** — one night's unreviewed visits, grouped by look on each camera, newest
+  night first (chips step back through the last two weeks). Appearance is reliable *within* a
+  night and fades *across* nights, so the matcher groups the night and you say who each group is:
+  one decision per animal instead of per visit, and every visit you name is a fresh template.
+  Every visit is shown with a tick box, so untick the odd one out before naming. Multi-animal
+  visits and cameras with no confirmed visits are left out and counted. `python eval.py --reid`
+  replays the grouping on nights you've already named and reports how many visits naming a whole
+  group would have got wrong; read that before trusting `reid_night_group_distance`.
 - **Fit to the Cast** — re-fits the unconfirmed remainder against your confirmed individuals:
   "12 more visits look like Stan" with a one-click **bulk confirm**, plus the leftovers that
   *look like nobody on file* clustered into **candidate new individuals**. It also flags anyone

@@ -691,6 +691,46 @@ def nuisance_projection_arm(all_protos: dict, sessions: dict, units, *, ks=NUISA
                     "with a prototype; k = 0 is the baseline cosine"}
 
 
+NIGHT_GROUP_DISTANCES = (0.30, 0.45, 0.60)
+
+
+def night_group_purity(matcher, solo: dict, distances=NIGHT_GROUP_DISTANCES) -> list:
+    """How clean the dashboard's night-by-night groups would be, replayed on visits you have
+    already named: for every (camera, night) with 2+ confirmed solo visits, cluster them exactly
+    as VisitMatcher.night_groups does and compare each group with the names you gave.
+
+      groups / visits   -- clicks per visit; lower is less work.
+      minority_visits   -- visits whose name differs from their group's majority name: what
+                           naming a group in one go would get wrong if nobody unticked anything.
+      names_split       -- (name, night) pairs spread over 2+ groups: extra clicks, not errors.
+
+    Optimistic by construction, because confirmed visits are the ones a human found clear; read
+    minority_visits as a floor on the error, not the error."""
+    by: dict = defaultdict(list)
+    for v in solo:
+        n = matcher.night_of(v)
+        if n is not None and v in matcher.protos:
+            by[(matcher.visit_source.get(v), n)].append(v)
+    sessions = [vids for vids in by.values() if len(vids) >= 2]
+    rows = []
+    for d in sorted(set(distances) | {float(matcher.cfg.reid_night_group_distance)}):
+        groups = minority = split = 0
+        for vids in sessions:
+            gs = matcher._cluster_visits(vids, d)
+            groups += len(gs)
+            per_name: Counter = Counter()
+            for g in gs:
+                names = Counter(solo[v] for v in g["visits"])
+                minority += len(g["visits"]) - max(names.values())
+                per_name.update(names.keys())
+            split += sum(1 for c in per_name.values() if c > 1)
+        rows.append({"distance": d,
+                     "configured": d == float(matcher.cfg.reid_night_group_distance),
+                     "nights": len(sessions), "visits": sum(len(v) for v in sessions),
+                     "groups": groups, "minority_visits": minority, "names_split": split})
+    return rows
+
+
 def _auto_assign_sweep(probes: list, *, k: int = 5, repeats: int = 5, seed: int = 0,
                        at_points: list | None = None) -> dict:
     """Recommend an operating point for the nightly AUTO-ASSIGN pass -- and, unlike the version
@@ -870,6 +910,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
         night = em.night_key(db.parse_local(ts)) if ts else None
         sessions[v] = (matcher.visit_source.get(v), night) if night else None
     nuisance = nuisance_projection_arm(matcher.protos, sessions, units) if units else None
+    night_purity = night_group_purity(matcher, solo)
     loo_centroid = {
         "blocked": _identify_loo(protos, solo, cfg.reid_novel_threshold, nights,
                                  session_blocked=True),
@@ -908,6 +949,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
         "identification_loo": loo,
         "identification_loo_centroid": loo_centroid,
         "identification_nuisance_projection": nuisance,
+        "night_group_purity": night_purity,
         "iou_co_presence": iou_check,
         "auto_assign_sweep": auto_sweep,
         "config_threshold": {
@@ -1446,6 +1488,17 @@ def _print_reid(r: dict) -> None:
         print("   chance" + "".join(f"  {_fmt_pct(by_k[0][d]['chance']):>18}" for d in days))
         print("      (+gained/-lost = probes flipped right/wrong against k=0; * = capped by the "
               "number of camera-nights)")
+
+    ngp = r.get("night_group_purity") or []
+    if ngp and ngp[0]["nights"]:
+        print(f"\n    Night-by-night grouping, replayed on {ngp[0]['visits']} confirmed visits over "
+              f"{ngp[0]['nights']} camera-nights with 2+ of them:")
+        print(f"      {'distance':>8}  {'groups':>6}  {'wrong if bulk-named':>19}  {'names split':>11}")
+        for row in ngp:
+            mark = "  <- configured" if row["configured"] else ""
+            print(f"      {row['distance']:>8.2f}  {row['groups']:>6}  {row['minority_visits']:>19}  "
+                  f"{row['names_split']:>11}{mark}")
+        print("      (confirmed visits are the easy ones, so 'wrong' is a floor on the real rate)")
 
     cen = r.get("identification_loo_centroid") or {}
     cb = cen.get("blocked")

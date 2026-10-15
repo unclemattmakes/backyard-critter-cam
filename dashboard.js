@@ -1979,7 +1979,8 @@ let __indivSeq=0;
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
   const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`
-          +(REID_SINCE_H===null?'':`&since_h=${REID_SINCE_H}`);
+          +(REID_SINCE_H===null?'':`&since_h=${REID_SINCE_H}`)
+          +(REID_NIGHT?`&night=${encodeURIComponent(REID_NIGHT)}`:'');
   const seq=++__indivSeq;
   /* The queue can take SECONDS when the server's cache is cold — 24s measured 2026-08-08 after
      a 2,900-crop family night (the matcher rebuilds whenever the DB changed; the nightly batch
@@ -2245,6 +2246,68 @@ function reidBootCard(g,i){
     <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">${thumbs}</div>
     <div style="display:flex;gap:6px;align-items:center">${reidInput('rg-'+i,'name this individual…')}<button class="gear" onclick="reidNameGroup(${i})">Name all</button></div>
   </div>`;
+}
+/* NIGHT BY NIGHT: one night's unreviewed visits, grouped by look within each camera (the server's
+   VisitMatcher.night_groups). Inside a night the matcher is good at "same animal again"; across
+   nights it fades in about a week. So the machine groups the night and you say who each group
+   is -- one decision per animal instead of per visit, and every answer is a fresh template.
+   Every member is ticked by default and shown, so the odd one out gets unticked before saving. */
+let REID_NIGHT=null;                  // null = the newest night with work left
+function reidSetNight(n){ if(n===REID_NIGHT) return; REID_NIGHT=n; loadIndividuals(); }
+function reidTonightIds(i){
+  return Array.from(document.querySelectorAll(`input[data-tg="${i}"]`)).filter(x=>x.checked).map(x=>+x.value);
+}
+function reidTonightCard(g,i){
+  const members=(g.members||[]).map(m=>`<label style="display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer" title="visit #${m.visit_id} · ${reidWhen(m.started)}${m.auto_as?` · auto: ${esc(m.auto_as)}`:''}">
+      ${m.rep_crop?`<img src="/media/${encodeURI(m.rep_crop)}" loading="lazy" alt="visit ${m.visit_id} thumbnail" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`:`<span class="lbl" style="width:64px;height:64px;display:flex;align-items:center;justify-content:center;opacity:.6">#${m.visit_id}</span>`}
+      <span class="lbl" style="font-size:11px;opacity:.75"><input type="checkbox" data-tg="${i}" value="${m.visit_id}" checked aria-label="include visit ${m.visit_id}"> ${esc((m.started||'').slice(11,16))}</span></label>`).join('');
+  const s=g.suggestion, n=g.visits.length;
+  let sugg='';
+  if(s&&!s.novel){
+    sugg=`<span class="flag" title="the group's average look against confirmed ${esc(g.source)} visits; the nearest is #${s.via_visit}${s.same_night?', from this same night':''}">looks like <b>${esc(s.name)}</b> ${Math.round(s.similarity*100)}%${s.same_night?' · tonight':''}</span>`+lapseBadge(s.lapse);
+  }else if(s){
+    sugg=`<span class="flag" title="nobody on file looks this close">possibly someone new</span>`;
+  }
+  const keep=(s&&!s.novel)?`<button class="gear" onclick="reidTonightName(${i},${jarg(s.name)},this)" title="confirm every ticked visit as ${esc(s.name)}">✓ ticked are ${esc(s.name)}</button>`:'';
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">${n===1?'one visit':`${n} look-alike visits`}</div>
+      <div class="lbl" style="opacity:.72">${esc(g.source||'')} · ${reidWhen(g.started[0])}${n>1?` → ${reidWhen(g.started[n-1])} · look-alike ${g.cohesion}`:''}</div>
+      <div style="margin-top:4px">${sugg}</div></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;flex:1">${members}</div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${keep}${reidInput('rt-'+i,'or who…')}<button class="gear" onclick="reidTonightName(${i},null,this)">Name ticked</button></div>
+  </div>`;
+}
+function reidTonightName(i,name,btn){
+  if(!name){
+    const inp=document.getElementById('rt-'+i);
+    name=(inp&&inp.value||'').trim();
+    if(!name){ if(inp) inp.focus(); return; }
+  }
+  const ids=reidTonightIds(i);
+  if(!ids.length) return;
+  // Same two-tap guard as the bulk fit: the first tap arms the button in place, the second commits.
+  if(ids.length>1 && btn && btn.dataset.armed!=='1'){
+    btn.dataset.armed='1'; btn.dataset.label=btn.textContent;
+    btn.textContent=`really name ${ids.length} as ${name}? tap again`;
+    setTimeout(()=>{ if(btn.isConnected&&btn.dataset.armed==='1'){ btn.dataset.armed=''; btn.textContent=btn.dataset.label; } },6000);
+    return;
+  }
+  reidConfirmMany(ids,name,btn);
+}
+function reidTonightHTML(t){
+  if(!t||(!(t.groups||[]).length&&!(t.nights||[]).length)) return '';
+  const on='background:rgba(120,200,255,.18);border-color:rgba(120,200,255,.5);font-weight:600';
+  const chips=(t.nights||[]).map(x=>`<button class="gear" onclick="reidSetNight(${jarg(x.night)})" style="${x.night===t.night?on:''}">${esc(x.night.slice(5))} · ${x.n_visits}</button>`).join(' ');
+  const sk=t.skipped||{}, left=[];
+  if(sk.multi) left.push(`${sk.multi} with 2+ animals (un-blend those in the queue below)`);
+  if(sk.untemplated_source) left.push(`${sk.untemplated_source} from a camera with no confirmed visits yet`);
+  let html=`<h2 class="sec">Night by Night <span class="n">one night's visits, grouped by look — say who each group is</span></h2>`;
+  html+=`<p class="lbl" style="opacity:.75;margin:2px 0 8px">Within one night the matcher is good at spotting the same animal again; across nights it isn't. So these are one night's unreviewed visits, grouped by look on each camera. Untick any that isn't the same animal, then name the group. Every visit you name becomes a fresh template.${left.length?` Left out: ${left.join('; ')}.`:''}</p>`;
+  if(chips) html+=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px">${chips}</div>`;
+  html+=(t.groups||[]).length
+    ? `<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${t.groups.map(reidTonightCard).join('')}</div>`
+    : `<p class="empty">Nothing left to name on ${esc(t.night||'this night')}.</p>`;
+  return html;
 }
 /* Re-fit: once a cast exists, sort the unconfirmed remainder into "looks like <name>" buckets
    (bulk-confirm) and candidate-new-individual groups, and flag anyone named only on a pair visit. */
@@ -2660,6 +2723,7 @@ function reidQueueHTML(q){
   let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
   html+=reidFunnelHTML(q.funnel);
   if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops aren't analysed for appearance yet — naming suggestions sharpen once the re-ID step has run (see the README's “Individual re-identification”).</p>`;
+  html+=reidTonightHTML(q.tonight);
   if(q.bootstrap.length){
     html+=`<p class="lbl" style="opacity:.75;margin:4px 0 10px">Nothing confirmed yet, so here are the corpus' look-alike <b>visit groups</b> (each is probably one animal — your eye decides; skip the 2+-animal ones first pass). Naming a group confirms every visit in it.</p>`;
     html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${q.bootstrap.map(reidBootCard).join('')}</div>`;
