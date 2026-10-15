@@ -75,14 +75,20 @@ It runs two evaluations, both pure offline numpy (no cloud, no LLM, no GPU, no m
     python eval.py --reid-species raccoon # which species the re-ID eval runs on (default raccoon)
     python eval.py --json                 # print the full machine-readable result to stdout too
     python eval.py --no-save              # don't write the reports/ artifact (console only)
-    python eval.py --baseline latest      # diff against the newest reports/ artifact; EXIT 1 on a
-                                          #   regression past --tolerance (the regression gate)
+    python eval.py --baseline latest      # diff against the newest reports/ artifact; EXIT 1 when a
+                                          #   GATED metric regresses (the regression gate)
     python eval.py --baseline reports/eval_20260718T030508Z.json --tolerance 0.02
     python eval.py --pin-baseline latest  # copy the newest artifact to reports/pinned_baseline.json
     python eval.py --baseline pinned      # diff against that fixed point instead of last night
     python eval.py --at-point 0.88,0.02   # also score this fixed auto-assign point (repeatable)
 
-  Every run also checks config.eval_floors (EXIT 1 below a floor, baseline or not) and staleness:
+  Only the GATED metrics can fail the baseline diff (GATED_METRICS: what auto-assign ships on);
+  the rest are diagnostics, flagged when worse and never a reason to skip auto-assign. The top-1
+  rows are compared probe by probe on the visits both runs scored (an exact sign test), not with
+  the flat --tolerance, once both artifacts carry per-probe outcomes.
+
+  Every run also checks config.eval_floors (EXIT 1 below a floor, baseline or not), the configured
+  auto-assign point (EXIT 1 if it makes any wrong name on the confirmed corpus) and staleness:
   EXIT 3 when the scored corpus and headline metrics have not changed for
   config.eval_stale_nights earlier nights. A regression outranks staleness.
 """
@@ -852,6 +858,29 @@ def _iou_co_presence_check(conn, species: str, matcher: VisitMatcher, iou_cut: f
     }
 
 
+def _probe_outcomes(conn, solo: dict, probes: list, units, sim) -> dict:
+    """Right or wrong, per probe, for the two top-1 numbers the nightly gate judges: session-blocked
+    and the 7-day embargo. The gate compares two runs PROBE BY PROBE on the visits they share,
+    because a flat tolerance on two different probe sets cannot tell one new visit from a real
+    slide (~150 probes: one visit moves top-1 by ~0.007).
+
+    Keyed by the visit's camera and start time, not its id: an id is the ledger's handle and a
+    rebuild may change it, while camera + start time names the same visit in any artifact."""
+    ids = list(solo)
+    natural = {}
+    if ids:
+        natural = {r[0]: f"{r[1]}|{r[2]}" for r in conn.execute(
+            f"SELECT id, source, started_at FROM visits WHERE id IN ({','.join('?' * len(ids))})",
+            ids)}
+    seven = (em.leave_one_visit_out(units, sim, session_blocked=True, embargo_days=7)["probes"]
+             if units else [])
+
+    def _keyed(ps):
+        return {natural.get(p["key"], f"visit:{p['key']}"): int(bool(p["correct"])) for p in ps}
+    return {"key": "source|started_at of the visit", "blocked": _keyed(probes),
+            "embargo_7d": _keyed(seven)}
+
+
 def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int = 5,
               kfold_seed: int = 0, at_points: list | None = None) -> dict:
     """Re-ID separation eval for one species (default raccoon). Reuses VisitMatcher so the
@@ -905,6 +934,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
     probes = loo.pop("_probes")
     loo.pop("_probes_unblocked", None)
     loo["embargo_curve"] = _embargo_curve(units, sim)
+    probe_outcomes = _probe_outcomes(conn, solo, probes, units, sim)
     sessions = {}
     for v, ts in matcher.visit_started.items():
         night = em.night_key(db.parse_local(ts)) if ts else None
@@ -947,6 +977,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
         "separation_unblocked": overall_unblocked,
         "by_source": by_source,
         "identification_loo": loo,
+        "probe_outcomes": probe_outcomes,
         "identification_loo_centroid": loo_centroid,
         "identification_nuisance_projection": nuisance,
         "night_group_purity": night_purity,
@@ -998,8 +1029,9 @@ def _json_default(o):
 # ---------------------------------------------------------------------------
 
 # (label, candidate dotted paths in preference order, direction).
-#   "higher" -- a drop past the tolerance is a regression (accuracy, AUC, coverage).
-#   "lower"  -- a rise past the tolerance is a regression (error rate, calibration error).
+#   "higher" -- a drop is worse (accuracy, AUC, coverage).
+#   "lower"  -- a rise is worse (error rate, calibration error).
+#   Worse is a REGRESSION only for a row in GATED_METRICS (below); the rest are diagnostics.
 #   "info"   -- printed and never gated (chance rates, the recommended bars themselves: a moved
 #               operating point is news, not a failure, and gating on it would make the harness
 #               refuse to notice a corpus that legitimately changed).
@@ -1035,6 +1067,36 @@ BASELINE_METRICS = (
     ("LOO top-1, 7-day embargo",
      ("reid.identification_loo.embargo_curve[embargo_days=7].top1_accuracy",), "higher"),
     ("species accuracy, conf >= 0.8", ("species.trust_rule_check.conf_ge_0.8.accuracy",), "higher"),
+)
+
+# WHICH ROWS CAN FAIL THE GATE. A failed gate skips auto-assign, so only numbers that describe what
+# auto-assign actually ships on may fail it: production's nearest-template ranking, session-blocked,
+# now and at the 7-day embargo, and the blocked pair AUC. Every other row is a diagnostic (centroid
+# templates, the leaked unblocked view, the sweep procedure, species) -- still diffed and flagged
+# when it moves the wrong way, never a reason to stop naming: on ~150 probes a diagnostic moves
+# 0.02-0.03 when a single visit joins the corpus.
+GATED_METRICS = frozenset({
+    "pair AUC (session-blocked)",
+    "LOO top-1 (session-blocked)",
+    "LOO top-1, 7-day embargo",
+})
+
+# Top-1 rows judged PROBE BY PROBE (eval_reid's probe_outcomes) on the visits both runs scored:
+# an exact one-sided sign test on the probes that flipped, so one new visit can't fail the gate
+# and a real slide can't hide inside a flat tolerance. An artifact without per-probe outcomes
+# (before 2026-10-15) falls back to the tolerance.
+PAIRED_OUTCOMES = {
+    "LOO top-1 (session-blocked)": "reid.probe_outcomes.blocked",
+    "LOO top-1, 7-day embargo": "reid.probe_outcomes.embargo_7d",
+}
+PAIRED_ALPHA = 0.05
+
+# The re-ID corpus the gated rows are scored on. When it changed and the code did not, a worse
+# number is the labels talking (a new animal, a correction), not a regression.
+REID_CORPUS_PATHS = (
+    "reid.confirmed_visits.solo_with_prototype",
+    "reid.confirmed_visits.solo_by_individual",
+    "reid.confirmed_visits.distinct_nights",
 )
 
 # Exit codes of the gate. Distinct so the batch can log a stale corpus without skipping auto-assign.
@@ -1138,40 +1200,92 @@ def pin_baseline(spec: str, reports_dir=None) -> Path:
     return dest
 
 
+def _sign_test_p_worse(lost: int, gained: int) -> float | None:
+    """One-sided exact binomial: the chance of `lost` or more of the flipped probes going wrong if
+    a flip were as likely either way. None when nothing flipped."""
+    n = lost + gained
+    if not n:
+        return None
+    return sum(math.comb(n, i) for i in range(lost, n + 1)) / 2 ** n
+
+
+def paired_change(base: dict, cur: dict) -> dict:
+    """Compare two {probe key: 1 right / 0 wrong} maps on the probes both scored. `worse` when
+    more shared probes went right -> wrong than wrong -> right and the sign test says that is
+    unlikely by chance (p < PAIRED_ALPHA). Probes only one side scored are counted, not judged."""
+    common = set(base) & set(cur)
+    lost = sum(1 for k in common if base[k] and not cur[k])
+    gained = sum(1 for k in common if cur[k] and not base[k])
+    p = _sign_test_p_worse(lost, gained)
+    return {"n_common": len(common), "added": len(set(cur) - common),
+            "removed": len(set(base) - common), "lost": lost, "gained": gained,
+            "p_worse": p, "worse": lost > gained and p is not None and p < PAIRED_ALPHA}
+
+
 def compare_artifacts(baseline: dict, current: dict, tolerance: float = 0.05) -> dict:
     """Diff two eval artifacts on the headline metrics. Pure -- takes two dicts, returns a report.
 
-    A metric regresses when it moves the wrong way by MORE than `tolerance` (absolute, in the
-    metric's own units). The tolerance exists because this corpus is 138 visits over three
-    effective classes: single-visit noise moves top-1 by 0.007 and moves nothing real, and a gate
-    that fires on that gets muted within a week, which is worse than no gate. A metric missing
-    from either side is reported as such and never counted as a regression -- "the species eval
-    wasn't run today" is not a regression."""
+    Every row says whether it moved the wrong way (`worse`); only a GATED row can be a regression
+    (GATED_METRICS -- what auto-assign ships on). A top-1 row with per-probe outcomes on both sides
+    is judged by paired_change on the shared probes; anything else is worse when it moves the
+    wrong way by MORE than `tolerance` (absolute, in the metric's own units -- one visit moves
+    top-1 by ~0.007 on this corpus, and a gate that fires on that gets muted within a week).
+
+    When the re-ID corpus changed and the code did not (same git commit on both sides), a worse
+    gated row is the labels talking -- a new animal, a correction -- and is reported as a corpus
+    shift, not a regression; the absolute floors still apply. A metric missing from either side is
+    reported and never counted ("the species eval wasn't run today" is not a regression)."""
+    b_commit, c_commit = _dig(baseline, "meta.git_commit"), _dig(current, "meta.git_commit")
+    # Unknown on either side counts as changed: the gate must not wave a regression through on a
+    # guess that the code is the same.
+    code_changed = not (b_commit and c_commit and b_commit == c_commit)
+    corpus_changed = any(json.dumps(_dig(baseline, p), sort_keys=True)
+                         != json.dumps(_dig(current, p), sort_keys=True) for p in REID_CORPUS_PATHS)
+    corpus_only = corpus_changed and not code_changed
+
     rows, regressions = [], []
     for label, paths, direction in BASELINE_METRICS:
         b, bpath = _first_present(baseline, paths)
         c, cpath = _first_present(current, paths)
-        row = {"metric": label, "direction": direction, "baseline": b, "current": c,
+        gated = label in GATED_METRICS and direction != "info"
+        row = {"metric": label, "direction": direction, "gated": gated,
+               "baseline": b, "current": c,
                "delta": (c - b) if (b is not None and c is not None) else None,
-               "regressed": False, "note": None}
+               "worse": False, "regressed": False, "note": None}
         if b is None or c is None:
             row["note"] = ("not in the baseline artifact" if b is None
                            else "not measured in this run")
         else:
+            notes = []
             if bpath != cpath:
-                row["note"] = f"compared via fallback path ({bpath} -> {cpath})"
-            if direction == "higher" and c < b - tolerance:
-                row["regressed"] = True
-            elif direction == "lower" and c > b + tolerance:
-                row["regressed"] = True
+                notes.append(f"compared via fallback path ({bpath} -> {cpath})")
+            outcomes = PAIRED_OUTCOMES.get(label)
+            b_out = _dig(baseline, outcomes) if outcomes else None
+            c_out = _dig(current, outcomes) if outcomes else None
+            if isinstance(b_out, dict) and isinstance(c_out, dict):
+                row["paired"] = paired_change(b_out, c_out)
+                row["worse"] = row["paired"]["worse"]
+            else:
+                if outcomes:
+                    notes.append("unpaired: the baseline has no per-probe outcomes; re-pin to "
+                                 "compare probe by probe")
+                row["worse"] = ((direction == "higher" and c < b - tolerance)
+                                or (direction == "lower" and c > b + tolerance))
+            if row["worse"] and not gated and direction != "info":
+                notes.append("worse, but a diagnostic: never gates")
+            elif row["worse"] and gated and corpus_only:
+                notes.append("the corpus changed and the code did not: a corpus shift, "
+                             "not a regression")
+            row["regressed"] = row["worse"] and gated and not corpus_only
+            row["note"] = "; ".join(notes) or None
         if row["regressed"]:
             regressions.append(row)
         rows.append(row)
     return {"tolerance": tolerance, "rows": rows, "regressions": regressions,
             "ok": not regressions,
+            "code_changed": code_changed, "corpus_changed": corpus_changed,
             "baseline_run_at": _dig(baseline, "meta.run_at"),
-            "baseline_commit": _dig(baseline, "meta.git_commit"),
-            "current_commit": _dig(current, "meta.git_commit")}
+            "baseline_commit": b_commit, "current_commit": c_commit}
 
 
 def _metric_label(path: str) -> str:
@@ -1195,6 +1309,55 @@ def check_floors(current: dict, floors: dict | None) -> dict:
         if row["breached"]:
             breaches.append(row)
     return {"rows": rows, "breaches": breaches, "ok": not breaches}
+
+
+def check_operating_point(current: dict) -> dict:
+    """The auto-assign bars the rig is running, scored on tonight's confirmed corpus: does the
+    point that WRITES names make any wrong name or novel false-accept here? That is the question
+    the gate exists to answer before auto-assign runs, so it gates absolutely, like a floor.
+    Disabled (threshold 0) or a run without the re-ID eval: nothing to check."""
+    cfg_pt = _dig(current, "reid.config_auto_assign") or {}
+    t, m = cfg_pt.get("reid_auto_threshold"), cfg_pt.get("reid_auto_margin")
+    row = {"metric": "configured auto-assign point", "threshold": t, "margin": m,
+           "assigned": None, "errors": None, "breached": False, "note": None}
+    if "reid" not in current:
+        row["note"] = "eval not run"
+        return row
+    if not t:
+        row["note"] = "auto-assign disabled"
+        return row
+    for pt in _dig(current, "reid.auto_assign_sweep.at_points") or []:
+        o = (pt or {}).get("overall") or {}
+        if (o.get("threshold") is not None and round(o["threshold"], 4) == round(float(t), 4)
+                and round(o.get("margin") or 0.0, 4) == round(float(m or 0.0), 4)):
+            row.update(assigned=o.get("assigned"), errors=o.get("errors"),
+                       wrong=o.get("wrong"), novel_false_accepts=o.get("novel_false_accepts"))
+            row["breached"] = bool(o.get("errors"))
+            return row
+    # Ran, but the point was not scored (too few probes): unmeasurable is not proof of safety.
+    row["note"] = "not scored in this run"
+    return row
+
+
+def regression_streak(reports_dir=None, today: str = "") -> int:
+    """How many earlier nights in a row the gate failed (exit 1), newest first -- each one a night
+    auto-assign did not run. A regression against a frozen corpus never clears by itself, so the
+    gate says how long it has been holding rather than repeating itself silently."""
+    d = Path(reports_dir) if reports_dir else REPORTS_DIR
+    files = sorted(d.glob("eval_*.json"), reverse=True) if d.exists() else []
+    nights = set()
+    for f in files:
+        try:
+            art = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            break
+        night = _run_date(art, f) if isinstance(art, dict) else ""
+        if night == today:
+            continue
+        if _dig(art, "gate.exit_code") != EXIT_REGRESSION:
+            break
+        nights.add(night)
+    return len(nights)
 
 
 # What the eval actually SCORES. confirmed_visits.total is left out on purpose: group/multi labels
@@ -1256,26 +1419,39 @@ def _print_baseline_diff(diff: dict, baseline_path) -> None:
     print(f"    run at:  {diff['baseline_run_at'] or '(unknown)'}   "
           f"commit {(diff['baseline_commit'] or '?')[:8]}")
     print(f"    vs this run's commit {(diff['current_commit'] or '?')[:8]}   "
-          f"tolerance +/- {diff['tolerance']:.3f}")
+          f"tolerance +/- {diff['tolerance']:.3f} (rows without per-probe outcomes)")
+    if diff.get("corpus_changed") is not None:
+        print(f"    code {'changed' if diff.get('code_changed') else 'unchanged'}, "
+              f"re-ID corpus {'changed' if diff['corpus_changed'] else 'unchanged'}")
+    print("    * = gated (what auto-assign ships on); every other row is a diagnostic")
     print(f"\n    {'metric':42} {'baseline':>9} {'current':>9} {'delta':>9}")
     for r in diff["rows"]:
         b = "     n/a" if r["baseline"] is None else f"{r['baseline']:9.3f}"
         c = "     n/a" if r["current"] is None else f"{r['current']:9.3f}"
         d = "      n/a" if r["delta"] is None else f"{r['delta']:+9.3f}"
-        flag = "  <- REGRESSION" if r["regressed"] else ("  (info)" if r["direction"] == "info" else "")
-        print(f"    {r['metric'][:42]:42} {b} {c} {d}{flag}")
+        flag = ("  <- REGRESSION" if r["regressed"] else "  (worse)" if r.get("worse")
+                else "  (info)" if r["direction"] == "info" else "")
+        star = "*" if r.get("gated") else " "
+        print(f"   {star}{r['metric'][:42]:42} {b} {c} {d}{flag}")
+        pc = r.get("paired")
+        if pc:
+            p = "n/a" if pc["p_worse"] is None else f"{pc['p_worse']:.3f}"
+            print(f"      {'':40}   paired: {pc['lost']} lost / {pc['gained']} gained of "
+                  f"{pc['n_common']} shared probes (p {p}); {pc['added']} new, "
+                  f"{pc['removed']} gone")
         if r["note"]:
             print(f"      {'':40}   note: {r['note']}")
     if diff["ok"]:
-        print("\n  -> no regression past tolerance.")
+        print("\n  -> no regression in a gated metric.")
     else:
-        print(f"\n  -> {len(diff['regressions'])} REGRESSION(S) past tolerance: "
+        print(f"\n  -> {len(diff['regressions'])} REGRESSION(S) in a gated metric: "
               f"{', '.join(r['metric'] for r in diff['regressions'])}")
 
 
-def _print_gate(floors: dict, stale: dict, exit_code: int) -> None:
+def _print_gate(floors: dict, stale: dict, exit_code: int, *, point: dict | None = None,
+                streak: int = 0) -> None:
     print("\n" + "=" * 74)
-    print("GATE  (absolute floors + staleness)")
+    print("GATE  (absolute floors + the configured operating point + staleness)")
     print("=" * 74)
     if floors["rows"]:
         print(f"    {'metric':42} {'floor':>9} {'current':>9}")
@@ -1286,6 +1462,13 @@ def _print_gate(floors: dict, stale: dict, exit_code: int) -> None:
             print(f"    {r['metric'][:42]:42} {r['floor']:9.3f} {c}{flag}")
     else:
         print("    no floors configured (config.eval_floors)")
+    if point is not None:
+        if point.get("note"):
+            print(f"\n    configured auto-assign point: {point['note']}")
+        else:
+            print(f"\n    configured auto-assign point {point['threshold']} / {point['margin']}: "
+                  f"{point['assigned']} named, {point['errors']} wrong or novel on the confirmed "
+                  f"corpus" + ("  <- MAKES WRONG NAMES" if point["breached"] else ""))
     print(f"\n    scored corpus + headline metrics unchanged for {stale['unchanged_nights']} "
           f"earlier night(s)" + (f", since {stale['unchanged_since']}" if stale["unchanged_since"]
                                  else "") + f"   (stale at {stale['threshold'] or 'off'})")
@@ -1293,6 +1476,15 @@ def _print_gate(floors: dict, stale: dict, exit_code: int) -> None:
         print("    WARNING: STALE -- no new labels have reached the eval in "
               f"{stale['unchanged_nights']} nights; every diff is 0.000 and proves nothing. "
               "Check the naming helper and the review queue.")
+    if exit_code == EXIT_REGRESSION and streak:
+        print(f"\n    The gate also failed the {streak} night(s) before this one: auto-assign has "
+              f"not run since.")
+    if exit_code == EXIT_REGRESSION and stale["unchanged_nights"]:
+        # A regression measured against a corpus that is not changing will read the same every
+        # night until something changes -- it cannot clear by itself.
+        print("    The corpus is not changing, so this verdict will repeat every night. Read the "
+              "rows above: if it is real, fix it; if the baseline is what is wrong, re-pin it "
+              "with  python eval.py --pin-baseline latest")
     verdict = {0: "ok", EXIT_REGRESSION: "REGRESSION", EXIT_STALE: "STALE"}.get(exit_code, "?")
     print(f"\n  -> GATE: {verdict}  (exit {exit_code})")
 
@@ -1656,14 +1848,15 @@ def main() -> int:
                    help="Don't write the reports/ JSON artifact (console summary only).")
     p.add_argument("--baseline", default=None, metavar="PATH|latest|pinned",
                    help="Diff this run against a saved reports/eval_*.json ('latest' picks the "
-                        "newest, 'pinned' the copy --pin-baseline made). EXITS 1 when a headline "
-                        "metric regresses past --tolerance -- the regression gate for a .bat.")
+                        "newest, 'pinned' the copy --pin-baseline made). EXITS 1 when a gated "
+                        "metric regresses -- the regression gate for a .bat.")
     p.add_argument("--pin-baseline", default=None, metavar="PATH|latest",
                    help="Copy this artifact to reports/pinned_baseline.json for --baseline pinned, "
                         "then exit without running any eval.")
     p.add_argument("--tolerance", type=float, default=0.05,
-                   help="How far a metric may move the wrong way before --baseline calls it a "
-                        "regression (absolute, metric's own units; default 0.05).")
+                   help="How far a metric may move the wrong way before --baseline calls it worse "
+                        "(absolute, metric's own units; default 0.05). Top-1 rows with per-probe "
+                        "outcomes on both sides use a paired test instead.")
     p.add_argument("--at-point", action="append", default=None, metavar="THRESH,MARGIN",
                    help="Also score this FIXED auto-assign operating point directly "
                         "(e.g. 0.88,0.02). Repeatable. The live config's point is always scored.")
@@ -1718,13 +1911,17 @@ def main() -> int:
         _print_baseline_diff(diff, baseline_path)
         regressed = not diff["ok"]
 
-    # Floors and staleness run on every invocation: neither needs a baseline to mean something.
+    # Floors, the shipped operating point and staleness run on every invocation: none of them
+    # needs a baseline to mean something.
     floors = check_floors(result, getattr(cfg, "eval_floors", None))
+    point = check_operating_point(result)
     stale = check_staleness(result, int(getattr(cfg, "eval_stale_nights", 0) or 0))
-    regressed = regressed or not floors["ok"]
+    regressed = regressed or not floors["ok"] or point["breached"]
     exit_code = EXIT_REGRESSION if regressed else (EXIT_STALE if stale["stale"] else 0)
-    result["gate"] = {"floors": floors, "staleness": stale, "exit_code": exit_code}
-    _print_gate(floors, stale, exit_code)
+    streak = regression_streak(today=_run_date(result)) if regressed else 0
+    result["gate"] = {"floors": floors, "operating_point": point, "staleness": stale,
+                      "regression_streak": streak, "exit_code": exit_code}
+    _print_gate(floors, stale, exit_code, point=point, streak=streak)
 
     if not args.no_save:
         path = _save_artifact(result)

@@ -891,13 +891,25 @@ then `BATCH EXIT <code>`.
 
 **The eval gate.** Before auto-assign, the batch runs `eval.py` against a **pinned baseline**
 (`python eval.py --pin-baseline latest` copies the newest artifact to
-`reports/pinned_baseline.json`; without one it diffs last night's). It exits **1** when a
-headline metric falls more than the tolerance below the baseline or below an absolute floor in
-`eval_floors` (set your own from your own artifact; the shipped floors are this yard's), and
-then auto-assign is **skipped** that night. It exits **3** when the scored corpus and every metric
-have not changed for `eval_stale_nights` (default 7) nights, which is what a dead naming helper
-looks like; that is logged and auto-assign still runs. **0** is a pass. The dashboard's eval chip
-shows the same verdict.
+`reports/pinned_baseline.json`; without one it diffs last night's). Only the numbers auto-assign
+actually ships on can fail it: session-blocked top-1 now and at a 7-day embargo, and the blocked
+pair AUC. Every other row (centroid templates, the unblocked view, the sweep procedure, species)
+is a diagnostic that is flagged when it gets worse and never skips anything. The two top-1 rows
+are compared **probe by probe** on the visits both runs scored (an exact sign test on the probes
+that flipped), so one new visit the matcher can't place yet does not read as a slide; against an
+older baseline without per-probe outcomes they fall back to the tolerance, and the diff says so.
+When the corpus changed and the code did not, a worse number is reported as a corpus shift, not a
+regression.
+
+It exits **1** when a gated metric regresses, when anything drops below an absolute floor in
+`eval_floors` (set your own from your own artifact; the shipped floors are this yard's), or when
+the **configured auto-assign point makes a wrong name** on the confirmed corpus. Auto-assign is
+then **skipped** that night, and the gate says how many nights in a row that has happened. A
+regression measured against a corpus that is not changing repeats every night until something
+changes, so the gate says that too, and how to re-pin if the baseline is what is wrong. It exits
+**3** when the scored corpus and every metric have not changed for `eval_stale_nights`
+(default 7) nights, which is what a dead naming helper looks like; that is logged and auto-assign
+still runs. **0** is a pass. The dashboard's eval chip shows the same verdict.
 
 **Auto-assign** is the *review by exception* tier: a solo visit whose best match clears **both**
 an eval-measured similarity bar *and* a lead-over-the-runner-up margin gets named automatically,
