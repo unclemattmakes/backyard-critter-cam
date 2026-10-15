@@ -63,6 +63,7 @@ import numpy as np
 
 import config
 import db
+import evalmetrics as em
 import reidutil
 
 EMBED_MODEL = "megadescriptor-l-384"
@@ -1388,6 +1389,75 @@ class VisitMatcher:
         return {"fits": fits, "novel_groups": novel_groups,
                 "untemplated": untemplated,
                 "n_fit": sum(len(l) for l in fits.values()), "n_novel": len(novel)}
+
+    def night_of(self, visit_id: int):
+        """The NIGHT a visit belongs to (timestamp shifted -12h, so 01:10 counts as the evening
+        before), the same key the eval's session blocking uses. None if it has no start time."""
+        ts = self.visit_started.get(visit_id)
+        return em.night_key(db.parse_local(ts)) if ts else None
+
+    def night_groups(self, night=None, distance: float = None, max_nights: int = 14) -> dict:
+        """TONIGHT MODE: one night's unreviewed visits, grouped by appearance within each camera,
+        so the human names a group once instead of visit by visit.
+
+        Why one night: appearance holds inside a night (a template under a day old is right 92.5%
+        of the time) and fades within a week, so grouping inside a night uses the signal where it
+        is good. The human supplies the link it can't make across nights: which animal on file a
+        group is. A group is only a proposal -- the dashboard shows every member's crop and lets
+        each be unticked before anything is written.
+
+        Members are unconfirmed, unrejected, solo visits with a prototype, from a camera that has
+        templates. Multi-animal visits go to un-blend instead, and a camera with no templates is
+        left out (the trail cam's similarity is flat over time, 0.510 near vs 0.514 far, so its
+        groups would be noise). Auto-named visits are members: confirming one is its review.
+        Each group's suggestion ranks the group's mean prototype against its own camera's
+        templates, and says when the winning template is from the same night -- the case the
+        matcher is reliable at.
+
+        `night` is a night key (YYYY-MM-DD); None picks the newest night with work left."""
+        distance = self.cfg.reid_night_group_distance if distance is None else distance
+        template_sources = {self.visit_source.get(vid) for _n, vid, _p in self.templates()}
+        template_sources.discard(None)
+        by_night: dict = defaultdict(list)
+        skipped: dict = defaultdict(lambda: {"multi": 0, "untemplated_source": 0})
+        for v in self.protos:
+            if v in self.confirmed or v in self.rejected:
+                continue
+            n = self.night_of(v)
+            if n is None:
+                continue
+            if self.is_multi(v):
+                skipped[n]["multi"] += 1
+            elif self.visit_source.get(v) not in template_sources:
+                skipped[n]["untemplated_source"] += 1
+            else:
+                by_night[n].append(v)
+        nights = [{"night": n, "n_visits": len(by_night[n])}
+                  for n in sorted(by_night, reverse=True)[:max_nights]]
+        chosen = night or (nights[0]["night"] if nights else None)
+        groups = []
+        vids = by_night.get(chosen, [])
+        for src in sorted({self.visit_source.get(v) for v in vids}):
+            temps = self.templates(src)
+            for g in self._cluster_visits([v for v in vids if self.visit_source.get(v) == src],
+                                          distance):
+                P = np.stack([self.protos[v] for v in g["visits"]])
+                c = P.mean(axis=0)
+                c = c / (np.linalg.norm(c) or 1.0)
+                ranked = rank_templates(c, temps)
+                sug = None
+                if ranked:
+                    name, sim, via = ranked[0]
+                    sug = {"name": name, "similarity": round(sim, 3),
+                           "lead": round(sim - (ranked[1][1] if len(ranked) > 1 else 0.0), 3),
+                           "via_visit": via, "same_night": self.night_of(via) == chosen,
+                           "novel": sim < self.cfg.reid_novel_threshold}
+                groups.append({**g, "source": src, "suggestion": sug,
+                               "auto_as": [self.auto.get(v) for v in g["visits"]]})
+        groups.sort(key=lambda g: (-len(g["visits"]), g["started"][0]))
+        return {"night": chosen, "nights": nights, "groups": groups,
+                "n_visits": len(vids), "distance": distance,
+                "skipped": dict(skipped.get(chosen, {"multi": 0, "untemplated_source": 0}))}
 
     def auto_assign(self, conn, *, threshold: float = None, margin: float = None,
                     min_templates: int = None, dry_run: bool = False) -> dict:
