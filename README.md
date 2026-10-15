@@ -590,9 +590,9 @@ has grown from a single live feed into **nine tabs**:
   an optional note ("the night the kits came out") and the name of whoever kept it. Unlike every
   other verdict on the dashboard, a ♡ is **only taste** — it changes no label and nothing
   downstream reads it, so keeping the cutest photo of Stan can never become evidence that it *is*
-  Stan. A kept visit is remembered as a moment on a camera rather than a visit id (those get
-  renumbered), so it survives re-clustering — star a visit while the animal is still on camera
-  and the card grows to the finished span. A favourite whose crops are later purged is listed as
+  Stan. A kept visit is remembered as a moment on a camera rather than a visit id (those change
+  when a visit regroups), so it survives re-clustering — star a visit while the animal is still on
+  camera and the card grows to the finished span. A favourite whose crops are later purged is listed as
   gone rather than quietly disappearing.
 - **The Creature Report** — a newspaper-style **period digest** (☾ Night / ☀ Day,
   with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
@@ -1345,6 +1345,9 @@ window on one `source`, so the detections captured during it join by timestamp �
 A fourth table, **`visits`** (phase 4, built by `visits.py`), holds one row per collapsed visit
 event — `source`, dominant `species`/`individual_id`, `started_at`/`ended_at` (→ dwell),
 `detection_count`, and a `representative_detection_id`. Detections point back via `visit_id`.
+A visit's `id` is its lowest member detection id, so it stays put across rebuilds (the rig
+rebuilds the table after most naming bursts) until the visit itself regroups: merges with a
+neighbour, or loses its first crop.
 
 Two further tables back the clip-based behaviour and un-blend work. **`clip_tracks`** (built by
 `clipmotion.py`) holds one **motion fingerprint per animal per clip** — duration, path length,
@@ -1363,7 +1366,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 | `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
 | `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
 | `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
-| `favorites` | What a human kept — a crop (by `detection_id`) or a visit (by `source` + the moment it started, because visit ids are renumbered on every rebuild), plus an optional note and who kept it. Taste, not evidence: nothing machine-side reads it either. |
+| `favorites` | What a human kept — a crop (by `detection_id`) or a visit (by `source` + the moment it started, because a visit id changes whenever its visit regroups), plus an optional note and who kept it. Taste, not evidence: nothing machine-side reads it either. |
 | `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
 | `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
 | `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |

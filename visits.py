@@ -12,9 +12,12 @@ its span (started_at..ended_at -> dwell time), crop count, best confidence, and 
 crop as a representative. It can't yet split two animals present at once -- that needs reliable
 per-individual re-ID -- which is the documented V1/phase-3 limitation.
 
-Boring and robust: a full from-scratch rebuild each run (the detection set is small; simpler and
-safer than incremental upkeep). Re-run it after new capture, after classify.py names crops, or
-after reid.py assigns individuals.
+Boring and robust: a full from-scratch regrouping each run (the detection set is small; simpler
+and safer than incremental upkeep), written in ONE transaction so a reader never sees a half-built
+ledger. A visit's id is its lowest member detection id, so an id survives every rebuild that keeps
+the visit's first crop in it -- the review queue and the confirm buttons hand ids around, and the
+naming helper rebuilds after most naming bursts. Re-run it after new capture, after classify.py
+names crops, or after reid.py assigns individuals.
 
   python visits.py                 # rebuild visits at the configured gap (config.visit_gap_minutes)
   python visits.py --gap 10        # ... with a 10-minute gap instead
@@ -136,20 +139,11 @@ _DETECTION_COLUMNS = """SELECT id, source, timestamp, species, species_confidenc
                         FROM detections ORDER BY source, timestamp"""
 
 
-def build_visits(conn, gap_minutes: float, *, verbose: bool = True,
-                 weighted_species: bool | None = None,
-                 species_min_confidence: float | None = None) -> dict:
-    """Rebuild the visits table from scratch and stamp detections.visit_id. Returns a summary.
-
-    `weighted_species` / `species_min_confidence` default to config (shipped disabled = the
-    historical unweighted crop-count vote). THIS WRITES LABELS: run species_vote_report() first to
-    see what a change of vote would move."""
-    cfg = config.CONFIG
-    if weighted_species is None:
-        weighted_species = getattr(cfg, "species_vote_confidence_weighted", False)
-    if species_min_confidence is None:
-        species_min_confidence = getattr(cfg, "species_vote_min_confidence", 0.8)
-    rows = conn.execute(_DETECTION_COLUMNS).fetchall()
+def _plan_visits(conn, rows, gap_minutes: float, *, weighted_species: bool,
+                 species_min_confidence: float):
+    """Group `rows` into visits WITHOUT writing anything. Returns (planned, new_vid, n_conflict):
+    insert_visit kwargs per visit, {detection id: visit id}, and how many visits overlap a span a
+    human live-logged conflicting names over."""
     # Spans a human live-logged CONFLICTING names over -- flagged onto the visits they overlap so a
     # contested span is never mistaken for clean single-animal ground truth (db.record_live_sighting).
     # Parsed ONCE into instants, per source: the members already carry parsed datetimes, so the
@@ -160,46 +154,86 @@ def build_visits(conn, gap_minutes: float, *, verbose: bool = True,
         if lo is not None and hi is not None:
             conflict_by_source[src].append((lo, hi))
 
-    db.clear_visits(conn)
-    n_visits = 0
-    n_stamped = 0
-    n_conflict = 0
-
-    def _flush(source, members):
-        """Write one visit from its member (dt, row) tuples and stamp them."""
-        nonlocal n_visits, n_stamped, n_conflict
+    planned, new_vid, n_conflict = [], {}, 0
+    for source, members in _group_detections(rows, gap_minutes):
         sp, margin = _species_vote(members, weighted=weighted_species,
                                    min_confidence=species_min_confidence)
         indiv = Counter(m[1]["individual_id"] for m in members if m[1]["individual_id"])
         confs = [(m[1]["confidence"] or 0.0, m[1]["id"]) for m in members]
         best_conf, rep_id = max(confs, key=lambda c: c[0])
-        started, ended = members[0][1]["timestamp"], members[-1][1]["timestamp"]
         v0, v1 = members[0][0], members[-1][0]      # already-parsed instants
         conflict = any(lo <= v1 and v0 <= hi for lo, hi in conflict_by_source.get(source, ()))
-        vid = db.insert_visit(
-            conn, source=source, species=sp, individual_id=_dominant(indiv),
-            started_at=started, ended_at=ended,
+        # The lowest id, not the earliest timestamp: a trail-cam import can add older crops to a
+        # visit, but never a lower id, so a visit that only grows keeps its id.
+        vid = min(m[1]["id"] for m in members)
+        planned.append(dict(
+            visit_id=vid, source=source, species=sp, individual_id=_dominant(indiv),
+            started_at=members[0][1]["timestamp"], ended_at=members[-1][1]["timestamp"],
             detection_count=len(members), max_confidence=best_conf,
             representative_detection_id=rep_id,
-            species_margin=margin, sighting_conflict=conflict,
-        )
-        db.assign_visit(conn, [m[1]["id"] for m in members], vid)
-        n_visits += 1
-        n_stamped += len(members)
+            species_margin=margin, sighting_conflict=conflict))
+        for m in members:
+            new_vid[m[1]["id"]] = vid
         n_conflict += int(conflict)
+    return planned, new_vid, n_conflict
 
-    for source, members in _group_detections(rows, gap_minutes):
-        _flush(source, members)
 
-    conn.commit()
+def build_visits(conn, gap_minutes: float, *, verbose: bool = True,
+                 weighted_species: bool | None = None,
+                 species_min_confidence: float | None = None) -> dict:
+    """Rebuild the visits table and stamp detections.visit_id. Returns a summary.
+
+    All writes are one transaction: a reader sees the old ledger or the new one, never an empty or
+    half-written one, and a failure leaves the old ledger standing. Each visit's id is its lowest
+    member detection id, and only detections whose visit_id actually changes are re-stamped
+    (`restamped` in the summary), so a rebuild that changes nothing rewrites no detection.
+
+    `weighted_species` / `species_min_confidence` default to config (shipped disabled = the
+    historical unweighted crop-count vote). THIS WRITES LABELS: run species_vote_report() first to
+    see what a change of vote would move."""
+    cfg = config.CONFIG
+    if weighted_species is None:
+        weighted_species = getattr(cfg, "species_vote_confidence_weighted", False)
+    if species_min_confidence is None:
+        species_min_confidence = getattr(cfg, "species_vote_min_confidence", 0.8)
+
+    if conn.in_transaction:
+        conn.commit()     # the caller's own pending writes are theirs, not part of this rebuild
+    # Read and group WITHOUT the write lock -- that is the slow part, and the live rig and the
+    # nightly batch both write while this runs (a batch step waits 5 s for the lock, then fails).
+    rows = conn.execute(_DETECTION_COLUMNS).fetchall()
+    planned, new_vid, n_conflict = _plan_visits(
+        conn, rows, gap_minutes, weighted_species=weighted_species,
+        species_min_confidence=species_min_confidence)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # The re-stamp diff is taken against visit_id as it stands NOW, under the lock: a crop that
+        # arrived (or a rebuild that ran) since the read is set to what this plan says -- NULL if
+        # the plan never saw it, as a clear would -- so no crop points at a visit deleted here.
+        # The next rebuild picks the newcomers up.
+        restamp = [(new_vid.get(r[0]), r[0])
+                   for r in conn.execute("SELECT id, visit_id FROM detections")
+                   if r[1] != new_vid.get(r[0])]
+        conn.execute("DELETE FROM visits")
+        for kw in planned:
+            db.insert_visit(conn, **kw)
+        conn.executemany("UPDATE detections SET visit_id = ? WHERE id = ?", restamp)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+    n_visits, n_stamped = len(planned), len(new_vid)
     if verbose:
         print(f"Rebuilt {n_visits} visit(s) from {n_stamped} detection(s) "
               f"(gap {gap_minutes:g} min"
-              f"{', confidence-weighted species vote' if weighted_species else ''}).")
+              f"{', confidence-weighted species vote' if weighted_species else ''}; "
+              f"{len(restamp)} re-stamped).")
         if n_conflict:
             print(f"  {n_conflict} visit(s) flagged: a human live-logged conflicting names "
                   f"over the span.")
-    return {"visits": n_visits, "detections": n_stamped, "sighting_conflicts": n_conflict}
+    return {"visits": n_visits, "detections": n_stamped, "sighting_conflicts": n_conflict,
+            "restamped": len(restamp)}
 
 
 def refresh(conn, gap_minutes: float) -> bool:

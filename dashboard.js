@@ -1248,9 +1248,9 @@ async function loadCastStrip(){
    reads it, it is undone by tapping it again, and it can never be mistaken for a confirmed label.
 
    A crop is kept by its detection id. A VISIT is kept by source + the moment it started, never by
-   a visit id: the Visit Log re-clusters visits out of raw detections on every request and visits.py
-   renumbers the ledger, so an id is not a handle that survives the week (the same reason the ✎
-   label tools post source+start+end). See the `favorites` table comment in db.py. */
+   a visit id: the Visit Log re-clusters visits out of raw detections on every request, and a
+   visits.py id changes whenever its visit regroups, so an id is not a handle that survives the
+   week (the same reason the ✎ label tools post source+start+end). See the `favorites` table comment in db.py. */
 function favHeart(on, call, cls){
   const yes = !!on;
   return `<button class="fav${yes?' on':''}${cls?' '+cls:''}" type="button" aria-pressed="${yes?'true':'false'}"
@@ -2523,9 +2523,10 @@ function reidModesHTML(q){
    name one is a human noticing the glass door saw the same animal in the same minutes. That
    pairing exists for 109 of 521 glass-door raccoon visits and was shown nowhere until now.
 
-   Visit ids churn: visits.py rebuilds and renumbers from scratch (labels live on DETECTIONS and
-   survive, ids do not). So a dossier that comes back empty is EXPECTED, not an error -- the flow
-   skips it and says the list went stale rather than showing a broken card. */
+   Visit ids hold across rebuilds (an id is the visit's lowest crop id), but a visit that merges
+   with a neighbour or loses its first crop takes its id with it. So a dossier that comes back
+   empty is EXPECTED, not an error -- the flow skips it and says the list went stale rather than
+   showing a broken card. Labels live on the crops, so nothing already saved is lost. */
 let REID_FOCUS={ids:[],i:0,on:false,cache:{},stale:false};
 
 function focusStart(ids){
@@ -2555,12 +2556,12 @@ async function focusRender(){
   const f=REID_FOCUS, vid=f.ids[f.i];
   host.innerHTML=`<div class="panel" style="padding:14px"><p class="empty">Loading visit ${f.i+1} of ${f.ids.length}…</p></div>`;
   const d=await focusFetch(vid);
-  // A renumbered-away visit: skip forward to the next one that still exists.
+  // A visit that changed in a rebuild: skip forward to the next one that still exists.
   if(!d||!d.visit_id){
     f.stale=true;
     if(f.i+1<f.ids.length){ f.i++; focusRender(); return; }
     host.innerHTML=`<div class="panel" style="padding:14px">
-      <p class="empty">This review list is out of date — the visits were renumbered by a rebuild since it was built. Nothing was lost (names live on the crops); the list just needs rebuilding.</p>
+      <p class="empty">This review list is out of date — some of its visits changed (merged with a neighbour) since it was built. Nothing already saved was lost (names live on the crops); the list just needs rebuilding.</p>
       <button class="gear" onclick="focusExit()">↺ rebuild the list</button></div>`;
     return;
   }
@@ -2685,7 +2686,12 @@ async function focusAnswer(name,opts){
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:reidBody(body)}).then(r=>r.json());
     restore();
-    if(r&&r.error){ alert(r.error); return; }
+    if(r&&r.error){
+      alert(r.error);
+      // The visit changed under the list: drop its cached dossier so the re-render skips past it.
+      if(r.stale_visit){ delete f.cache[vid]; focusRender(); }
+      return;
+    }
     delete f.cache[vid];          // its verdict changed; re-fetch if we come back
     if(f.i+1<f.ids.length) focusGo(1); else focusRender();
   }catch(e){ restore(); connFail(); }
@@ -2781,14 +2787,18 @@ function visitSpeciesCorrect(target, selectId, after){
 }
 async function reidConfirmMany(visitIds,name,btn){
   let done=0;
+  const refused=[];   // the server's reason per visit it would not save (e.g. a visit that changed)
   if(btn) btn.disabled=true;
   try{
     for(const vid of visitIds){
-      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:reidBody({visit_id:vid,name})});
-      done++;
-      if(btn) btn.textContent=`saving ${done}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
+      const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:reidBody({visit_id:vid,name})}).then(r=>r.json());
+      if(r&&r.error) refused.push(r.error); else done++;
+      if(btn) btn.textContent=`saving ${done+refused.length}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
     }
+    // Every visit is accounted for: a group that half-saved must not read as a group that saved.
+    if(refused.length) alert(`Saved ${done} of ${visitIds.length} as ${name}. Not saved: `
+      +`${refused.length}.\n\n${refused[0]}${refused.length>1?`\n(and ${refused.length-1} more)`:''}`);
     loadIndividuals();
   }catch(e){
     alert(`Could not save: ${e}${done?` — ${done} of ${visitIds.length} were saved before the failure`:''}`);
@@ -2827,7 +2837,7 @@ async function reidConfirm(vid,name,clear,reject){
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:reidBody({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
-    if(r.error){ restore(); alert(r.error); return; }
+    if(r.error){ restore(); alert(r.error); if(r.stale_visit) loadIndividuals(); return; }
     loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
   }catch(e){ restore(); connFail(); }
 }
@@ -2847,12 +2857,7 @@ async function reidNameGroup(i){
   const name=(inp&&inp.value||'').trim();
   if(!name){ if(inp) inp.focus(); return; }
   const g=REID_BOOT[i]; if(!g) return;
-  try{
-    for(const vid of g.visits)
-      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:reidBody({visit_id:vid,name})});
-    loadIndividuals();
-  }catch(e){ alert('Could not save: '+e); }
+  reidConfirmMany(g.visits,name);
 }
 /* THE BADGE FACE. Chosen automatically (stats._avatar_for: human-vouched, sharp, confident,
    well-exposed, squarely framed) but pinnable, because the one thing the picker cannot judge is

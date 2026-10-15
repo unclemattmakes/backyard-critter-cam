@@ -377,8 +377,8 @@ def _overlap_s(a0, a1, b0, b1) -> float:
 
 def tracks_with_visits(conn, species: str = "raccoon"):
     """Every stored tracklet joined (by time overlap on the same source) to its visit. Returns
-    [{...track features, clip_id, started_at, visit_id, individual_id}, ...]. Visits renumber on
-    rebuild, so this join is computed fresh per call rather than stored."""
+    [{...track features, clip_id, started_at, visit_id, individual_id}, ...]. A visit's id
+    changes when a rebuild regroups it, so this join is computed fresh per call, not stored."""
     visits = conn.execute(
         "SELECT id, source, individual_id, started_at, ended_at FROM visits WHERE species = ?",
         (species,)).fetchall()

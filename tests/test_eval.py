@@ -966,3 +966,17 @@ def test_pin_baseline_cli_runs_no_eval(monkeypatch, tmp_path, capsys):
     assert evalmod.main() == 0
     assert (tmp_path / "reports" / "pinned_baseline.json").exists()
     assert "LOO top-1, 7-day embargo" in capsys.readouterr().out
+
+
+def test_loo_units_are_in_time_order_not_visit_id_order():
+    """The k-fold split is drawn over the unit list's positions, so the folds must not depend on
+    what a visit id happens to encode (visits.py ids are the lowest member detection id, and a
+    trail-cam import gives old visits high ids)."""
+    t0 = datetime(2026, 7, 1, 22, 0, tzinfo=datetime.now().astimezone().tzinfo)
+    v = np.asarray([1.0, 0.0], dtype=np.float32)
+    started = {900: t0.isoformat(),
+               5: (t0 + timedelta(days=2)).isoformat(),
+               40: (t0 + timedelta(days=1)).isoformat()}
+    labels = {5: "Stan", 40: "Stan", 900: "Notch", 77: "Stan"}   # 77 has no prototype
+    units = evalmod.loo_units({k: v for k in started}, labels, started)
+    assert [u.key for u in units] == [900, 40, 5]
