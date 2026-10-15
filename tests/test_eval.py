@@ -218,6 +218,64 @@ def test_eval_reid_reports_blocked_and_unblocked_side_by_side(conn):
     assert all(row["chance"] is not None for row in loo["embargo_curve"])
 
 
+def _scene_confounded_corpus():
+    """Animals A and B (dims 0, 1) and an unnamed C (dim 6); each night has its own scene (dims
+    2-5) weighing more than the animal. Probe A on night 2 shares a night with B, so the plain
+    cosine names it B off the scene. Returns ({visit: proto}, {visit: (cam, night)}, units)."""
+    def e(i):
+        z = np.zeros(8)
+        z[i] = 1.0
+        return z
+    who = {"A": e(0), "B": e(1), "C": e(6)}
+    visits = [(1, "A", 1, True), (2, "C", 1, False), (3, "A", 2, True), (4, "B", 2, True),
+              (5, "B", 3, True), (6, "C", 3, False), (7, "C", 4, False), (8, "A", 4, False)]
+    protos = {v: _u(*(who[w] + 1.2 * e(1 + n))) for v, w, n, _ in visits}
+    sessions = {v: ("cam", n) for v, _, n, _ in visits}
+    units = [em.LooUnit(v, w, f"n{n}") for v, w, n, named in visits if named]
+    return protos, sessions, units
+
+
+def test_nuisance_arm_recovers_identity_hidden_under_the_scene():
+    protos, sessions, units = _scene_confounded_corpus()
+    arm = evalmod.nuisance_projection_arm(protos, sessions, units, ks=(0, 2, 3), embargoes=(None,))
+    by_k = {row["k"]: row for row in arm["rows"]}
+    assert by_k[0]["top1_accuracy"] == pytest.approx(0.5)      # probes 3 and 4 match the scene
+    assert by_k[2]["top1_accuracy"] == pytest.approx(1.0)
+    assert (by_k[2]["gained"], by_k[2]["lost"]) == (2, 0)
+    # One direction more than the scene has, and identity starts going with it: the reason the
+    # report is a sweep rather than a chosen k.
+    assert by_k[3]["top1_accuracy"] < 1.0
+    assert arm["basis"] == {"n_visits": 8, "n_sessions": 4, "n_sessions_used": 4}
+
+
+def test_nuisance_arm_always_carries_the_k0_baseline_and_a_sign_test():
+    protos, sessions, units = _scene_confounded_corpus()
+    arm = evalmod.nuisance_projection_arm(protos, sessions, units, ks=(2,), embargoes=(None,))
+    assert [row["k"] for row in arm["rows"]] == [0, 2]
+    assert arm["rows"][0]["sign_p"] is None                     # nothing discordant with itself
+    assert evalmod._sign_test_p(2, 0) == pytest.approx(0.5)
+    assert evalmod._sign_test_p(25, 5) == pytest.approx(0.000325, abs=1e-5)
+
+
+def test_eval_reid_nuisance_k0_reproduces_the_baseline(conn):
+    cfg = config.Config()
+    cfg.reid_co_presence_min = 1
+    s1 = _solo_visit(conn, [1, 0, 0], start_min=0)
+    s2 = _solo_visit(conn, [1, 0.1, 0], start_min=8 * DAY)
+    t1 = _solo_visit(conn, [0, 1, 0], start_min=30)
+    t2 = _solo_visit(conn, [0.1, 1, 0], start_min=8 * DAY + 30)
+    for v, name in ((s1, "Stan"), (s2, "Stan"), (t1, "Notch"), (t2, "Notch")):
+        db.label_visit(conn, v, name)
+    r = evalmod.eval_reid(conn, cfg, "raccoon", kfold_repeats=1)
+    rows = r["identification_nuisance_projection"]["rows"]
+    k0 = {row["embargo_days"]: row for row in rows if row["k"] == 0}
+    curve = {row["embargo_days"]: row for row in r["identification_loo"]["embargo_curve"]}
+    for d in (None, 7):
+        assert k0[d]["top1_accuracy"] == curve[d]["top1_accuracy"]
+        assert k0[d]["n_probes"] == curve[d]["n_probes"]
+    assert r["identification_nuisance_projection"]["basis"]["n_sessions_used"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Read-only guarantee.
 # ---------------------------------------------------------------------------
