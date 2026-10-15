@@ -91,6 +91,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import re
 import subprocess
 import sqlite3
@@ -104,6 +105,7 @@ import numpy as np
 import config
 import db
 import evalmetrics as em
+import reidutil
 # NOTE: production's ranker (individuals.rank_templates) is NOT imported. The protocol's "max"
 # aggregation reproduces its semantics exactly (nearest template per individual, best first) but
 # takes a similarity CALLABLE instead of vectors -- that seam is what lets a future trait scorer be
@@ -625,6 +627,70 @@ def _embargo_curve(units, similarity, days=(None, 1, 3, 7, 14, 21)) -> list:
     return out
 
 
+# How many scene directions the nuisance arm strips. k = 0 is the shipped cosine and must
+# reproduce the baseline exactly; the rest is a sweep to be read for a knee, not mined for a winner
+# (139 probes: a difference under ~0.02 is one or two visits).
+NUISANCE_KS = (0, 2, 4, 8, 16, 32)
+NUISANCE_EMBARGOES = (None, 7, 21)
+
+
+def _sign_test_p(gained: int, lost: int) -> float | None:
+    """Two-sided exact binomial on the discordant probes, the paired test
+    docs/background-identity-2026-08-09.md quotes, so the two arms read the same way."""
+    n = gained + lost
+    if not n:
+        return None
+    tail = sum(math.comb(n, i) for i in range(min(gained, lost) + 1)) / 2 ** n
+    return min(1.0, 2.0 * tail)
+
+
+def nuisance_projection_arm(all_protos: dict, sessions: dict, units, *, ks=NUISANCE_KS,
+                            embargoes=NUISANCE_EMBARGOES) -> dict:
+    """Does stripping the scene out of the vectors leave any identity behind?
+
+    With the animal blanked out the matcher is still right 60% of the time, and at a 7-day embargo
+    the animal adds nothing over the scene (docs/background-identity-2026-08-09.md). This arm
+    learns the directions along which per-session (camera, night) mean prototypes spread, from
+    EVERY visit with a prototype, named or not (reidutil.session_nuisance_basis), projects the top
+    k out of every prototype, and re-runs the same session-blocked protocol. It reads no labels,
+    so the live matcher could do the same thing; the probes' own vectors help fit the basis, which
+    is the same transductive position production would be in.
+
+    Read it as: if top-1 at 7 days climbs with k while the blocked number holds, some animal signal
+    was hiding under the scene. If every column falls, what the embedding knows across a week is
+    the yard, and the next move is capture (resolution on the ear, a scale), not modelling.
+    `gained`/`lost` count probes this k gets right/wrong that k = 0 got wrong/right."""
+    keys = sorted(all_protos)
+    X = np.stack([all_protos[v] for v in keys])
+    sess = [sessions.get(v) for v in keys]
+    counts = Counter(s for s in sess if s is not None)
+    base: dict = {}
+    rows = []
+    for k in sorted(set(ks) | {0}):
+        U = reidutil.session_nuisance_basis(X, sess, k)
+        Y = dict(zip(keys, reidutil.project_out(X, U)))
+
+        def sim(a, b, Y=Y):
+            return float(Y[a] @ Y[b])
+
+        for d in embargoes:
+            r = em.leave_one_visit_out(units, sim, session_blocked=True, embargo_days=d)
+            right = {p["key"]: p["correct"] for p in r["probes"]}
+            if k == 0:
+                base[d] = right
+            gained = sum(1 for v, ok in right.items() if ok and not base[d].get(v))
+            lost = sum(1 for v, ok in right.items() if not ok and base[d].get(v))
+            rows.append({"k": k, "k_effective": int(U.shape[1]), "embargo_days": d,
+                         "n_probes": r["n_probes"], "top1_accuracy": r["top1_accuracy"],
+                         "chance": r["chance"]["rate"], "gained": gained, "lost": lost,
+                         "sign_p": _sign_test_p(gained, lost)})
+    return {"rows": rows,
+            "basis": {"n_visits": len(keys), "n_sessions": len(counts),
+                      "n_sessions_used": sum(1 for n in counts.values() if n >= 2)},
+            "note": "session = (camera, night); basis is label-free and fitted on every visit "
+                    "with a prototype; k = 0 is the baseline cosine"}
+
+
 def _auto_assign_sweep(probes: list, *, k: int = 5, repeats: int = 5, seed: int = 0,
                        at_points: list | None = None) -> dict:
     """Recommend an operating point for the nightly AUTO-ASSIGN pass -- and, unlike the version
@@ -799,6 +865,11 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
     probes = loo.pop("_probes")
     loo.pop("_probes_unblocked", None)
     loo["embargo_curve"] = _embargo_curve(units, sim)
+    sessions = {}
+    for v, ts in matcher.visit_started.items():
+        night = em.night_key(db.parse_local(ts)) if ts else None
+        sessions[v] = (matcher.visit_source.get(v), night) if night else None
+    nuisance = nuisance_projection_arm(matcher.protos, sessions, units) if units else None
     loo_centroid = {
         "blocked": _identify_loo(protos, solo, cfg.reid_novel_threshold, nights,
                                  session_blocked=True),
@@ -836,6 +907,7 @@ def eval_reid(conn, cfg, species: str, *, kfold_k: int = 5, kfold_repeats: int =
         "by_source": by_source,
         "identification_loo": loo,
         "identification_loo_centroid": loo_centroid,
+        "identification_nuisance_projection": nuisance,
         "iou_co_presence": iou_check,
         "auto_assign_sweep": auto_sweep,
         "config_threshold": {
@@ -1351,6 +1423,29 @@ def _print_reid(r: dict) -> None:
             lab = "none" if row["embargo_days"] is None else f"{row['embargo_days']}d"
             print(f"      {lab:>9}  {_fmt_pct(row['top1_accuracy'])}  "
                   f"{_fmt_pct(row['chance'])}  {row['n_probes']:>6}")
+
+    nap = r.get("identification_nuisance_projection") or {}
+    if nap.get("rows"):
+        b = nap["basis"]
+        days = list(dict.fromkeys(row["embargo_days"] for row in nap["rows"]))
+        print(f"\n    Scene directions projected out (label-free; fitted on {b['n_visits']} visits, "
+              f"{b['n_sessions_used']} of {b['n_sessions']} camera-nights with 2+ visits):")
+        print("      " + f"{'k':>3}" + "".join(
+            f"  {('blocked' if d is None else f'{d}d embargo'):>18}" for d in days))
+        by_k: dict = defaultdict(dict)
+        for row in nap["rows"]:
+            by_k[row["k"]][row["embargo_days"]] = row
+        for k, cells in by_k.items():
+            parts = []
+            for d in days:
+                c = cells[d]
+                delta = "" if k == 0 else f" +{c['gained']}/-{c['lost']}"
+                parts.append(f"  {(_fmt_pct(c['top1_accuracy']) + delta):>18}")
+            lab = f"{k}" if cells[days[0]]["k_effective"] == k else f"{cells[days[0]]['k_effective']}*"
+            print(f"      {lab:>3}" + "".join(parts))
+        print("   chance" + "".join(f"  {_fmt_pct(by_k[0][d]['chance']):>18}" for d in days))
+        print("      (+gained/-lost = probes flipped right/wrong against k=0; * = capped by the "
+              "number of camera-nights)")
 
     cen = r.get("identification_loo_centroid") or {}
     cb = cen.get("blocked")
