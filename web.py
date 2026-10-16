@@ -2088,18 +2088,25 @@ def _eval_status() -> dict:
     floors = [{"metric": r.get("metric"), "current": r.get("current"), "floor": r.get("floor")}
               for r in ((gate.get("floors") or {}).get("breaches") or [])]
     stale = gate.get("staleness") or {}
+    # The shipped auto-assign point making wrong names on the confirmed corpus (from 2026-10-15).
+    point = gate.get("operating_point") or {}
+    point_bad = ([f"{point.get('metric')}: {point.get('errors')} wrong"]
+                 if point.get("breached") else [])
     ok = diff.get("ok") if diff else None
-    if floors:
+    if floors or point_bad:
         ok = False
     out = {
         "available": True,
         "artifact": p.name,
         "run_at": (art.get("meta") or {}).get("run_at"),
-        # ok True/False when the run diffed a baseline or broke a floor; None = no gate ran.
+        # ok True/False when the run diffed a baseline, broke a floor or failed the operating-point
+        # check; None = no gate ran.
         "ok": ok,
         "regressions": [r.get("metric") for r in (diff.get("regressions") or [])]
-                       + [f["metric"] for f in floors],
+                       + [f["metric"] for f in floors] + point_bad,
         "floor_breaches": floors,
+        # Nights in a row before this one that the gate failed, i.e. auto-assign did not run.
+        "skipped_nights": gate.get("regression_streak"),
         "baseline_run_at": diff.get("baseline_run_at"),
         # Split on both separators: the artifact records a Windows path, and CI reads it on Linux.
         "baseline_artifact": (re.split(r"[\\/]", diff["baseline_path"])[-1]

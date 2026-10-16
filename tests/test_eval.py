@@ -656,11 +656,16 @@ def test_compare_artifacts_ignores_noise_inside_tolerance():
     assert evalmod.compare_artifacts(base, jittered, tolerance=0.05)["ok"]
 
 
-def test_compare_artifacts_direction_is_per_metric():
-    # An error rate RISING is the regression; an accuracy rising is not.
+def test_compare_artifacts_direction_is_per_metric_and_only_gated_rows_fail():
+    # An error rate RISING is worse; an accuracy rising is not. But the sweep PROCEDURE's error
+    # rate is a diagnostic -- auto-assign ships a fixed point, not the procedure -- so it never
+    # fails the gate.
     base = _artifact()
     worse = _artifact(**{"reid.auto_assign_sweep.held_out_procedure.pooled.error_rate": 0.30})
-    assert not evalmod.compare_artifacts(base, worse, tolerance=0.05)["ok"]
+    diff = evalmod.compare_artifacts(base, worse, tolerance=0.05)
+    row = [r for r in diff["rows"] if r["metric"] == "held-out error rate (procedure)"][0]
+    assert row["worse"] and not row["gated"] and not row["regressed"]
+    assert diff["ok"] and "diagnostic" in row["note"]
     better = _artifact(**{"reid.identification_loo.blocked.top1_accuracy": 0.99})
     assert evalmod.compare_artifacts(base, better, tolerance=0.05)["ok"]
 
@@ -966,3 +971,167 @@ def test_pin_baseline_cli_runs_no_eval(monkeypatch, tmp_path, capsys):
     assert evalmod.main() == 0
     assert (tmp_path / "reports" / "pinned_baseline.json").exists()
     assert "LOO top-1, 7-day embargo" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# What may fail the gate: only what auto-assign ships on, judged probe by probe.
+# ---------------------------------------------------------------------------
+
+def _outcomes(n_right: int, n_wrong: int, start: int = 0) -> dict:
+    keys = [f"glass_door_cam|2026-09-{1 + (i // 20):02d}T22:{i % 60:02d}" for i in
+            range(start, start + n_right + n_wrong)]
+    return {k: int(i < n_right) for i, k in enumerate(keys)}
+
+
+def _with_outcomes(art: dict, blocked: dict, seven: dict | None = None) -> dict:
+    art["reid"]["probe_outcomes"] = {"blocked": blocked, "embargo_7d": seven or dict(blocked)}
+    art["reid"]["identification_loo"]["blocked"]["top1_accuracy"] = (
+        sum(blocked.values()) / len(blocked))
+    return art
+
+
+def test_paired_change_needs_more_than_noise_to_call_it_worse():
+    base = _outcomes(100, 50)
+    two_flipped = dict(base)
+    for k in list(base)[:2]:                       # two right -> wrong
+        two_flipped[k] = 0
+    pc = evalmod.paired_change(base, two_flipped)
+    assert (pc["lost"], pc["gained"], pc["n_common"]) == (2, 0, 150)
+    assert not pc["worse"] and pc["p_worse"] == pytest.approx(0.25)
+
+    eight_flipped = dict(base)
+    for k in list(base)[:8]:
+        eight_flipped[k] = 0
+    pc = evalmod.paired_change(base, eight_flipped)
+    assert pc["worse"] and pc["p_worse"] == pytest.approx(1 / 256)
+
+    balanced = dict(eight_flipped)
+    for k in list(base)[100:108]:                  # eight wrong -> right
+        balanced[k] = 1
+    assert not evalmod.paired_change(base, balanced)["worse"]
+
+
+def test_new_probes_that_are_wrong_do_not_fail_the_gate():
+    """The corpus gains visits the matcher cannot place yet. The headline falls well past the
+    tolerance, but no visit both runs scored changed its answer."""
+    base = _with_outcomes(_artifact(), _outcomes(104, 44))
+    grown = dict(_outcomes(104, 44))
+    grown.update({f"glass_door_cam|2026-10-01T2{i}:00": 0 for i in range(10)})
+    cur = _with_outcomes(_artifact(), grown)
+    diff = evalmod.compare_artifacts(base, cur, tolerance=0.02)
+    row = [r for r in diff["rows"] if r["metric"] == "LOO top-1 (session-blocked)"][0]
+    assert row["delta"] < -0.02 and row["paired"]["added"] == 10 and row["paired"]["lost"] == 0
+    assert diff["ok"] and not row["worse"]
+
+
+def test_a_real_slide_on_the_shared_probes_fails_the_gate():
+    base = _with_outcomes(_artifact(), _outcomes(104, 44))
+    slid = dict(_outcomes(104, 44))
+    for k in list(slid)[:9]:
+        slid[k] = 0
+    cur = _with_outcomes(_artifact(**{"meta.git_commit": "c0ffee00"}), slid)
+    diff = evalmod.compare_artifacts(base, cur, tolerance=0.5)     # a wide tolerance is moot
+    assert [r["metric"] for r in diff["regressions"]] == ["LOO top-1 (session-blocked)"]
+
+
+def test_a_diagnostic_that_moves_never_fails_the_gate():
+    """Centroid templates, unblocked, 0.589 -> 0.561 against a 0.02 tolerance: about four probes
+    after one visit joined the corpus. It must be flagged and must not skip auto-assign."""
+    base = _artifact(**{"reid.identification_loo_centroid": {
+        "unblocked": {"top1_accuracy_scorable": 0.589}}})
+    cur = _artifact(**{"reid.identification_loo_centroid": {
+        "unblocked": {"top1_accuracy_scorable": 0.561}}})
+    diff = evalmod.compare_artifacts(base, cur, tolerance=0.02)
+    row = [r for r in diff["rows"] if r["metric"].startswith("centroid LOO")][0]
+    assert row["worse"] and not row["gated"] and diff["ok"]
+
+
+def test_only_the_shipped_metrics_are_gated():
+    assert evalmod.GATED_METRICS == {"pair AUC (session-blocked)", "LOO top-1 (session-blocked)",
+                                     "LOO top-1, 7-day embargo"}
+    labels = {label for label, _p, _d in evalmod.BASELINE_METRICS}
+    assert evalmod.GATED_METRICS <= labels and set(evalmod.PAIRED_OUTCOMES) <= labels
+
+
+def test_a_corpus_change_under_the_same_code_is_a_shift_not_a_regression():
+    base = _gate_artifact()
+    cur = _gate_artifact(**{"reid.separation.auc": 0.70,
+                            "reid.confirmed_visits.solo_with_prototype": 149})
+    diff = evalmod.compare_artifacts(base, cur, tolerance=0.02)     # same commit on both sides
+    row = [r for r in diff["rows"] if r["metric"] == "pair AUC (session-blocked)"][0]
+    assert diff["corpus_changed"] and not diff["code_changed"]
+    assert row["worse"] and not row["regressed"] and "corpus shift" in row["note"]
+    # The same numbers under different code ARE a regression.
+    cur["meta"]["git_commit"] = "c0ffee00"
+    assert [r["metric"] for r in evalmod.compare_artifacts(base, cur, 0.02)["regressions"]] == \
+        ["pair AUC (session-blocked)"]
+
+
+def test_an_unpaired_baseline_falls_back_to_the_tolerance_and_says_so():
+    base = _artifact()                                             # no per-probe outcomes
+    cur = _with_outcomes(_artifact(), _outcomes(70, 30))
+    diff = evalmod.compare_artifacts(base, cur, tolerance=0.05)
+    row = [r for r in diff["rows"] if r["metric"] == "LOO top-1 (session-blocked)"][0]
+    assert "paired" not in row and "re-pin" in row["note"]
+
+
+def _with_point(art, *, threshold=0.88, margin=0.02, errors=0, assigned=20):
+    art["reid"]["config_auto_assign"] = {"reid_auto_threshold": threshold,
+                                         "reid_auto_margin": margin}
+    art["reid"]["auto_assign_sweep"]["at_points"] = [{
+        "overall": {"threshold": 0.88, "margin": 0.02, "assigned": assigned, "errors": errors,
+                    "wrong": errors, "novel_false_accepts": 0},
+        "why": "in-sample recommendation"}]          # the configured point, deduplicated
+    return art
+
+
+def test_the_configured_point_gates_on_its_own_wrong_names():
+    assert not evalmod.check_operating_point(_with_point(_gate_artifact()))["breached"]
+    bad = evalmod.check_operating_point(_with_point(_gate_artifact(), errors=2))
+    assert bad["breached"] and bad["errors"] == 2 and bad["assigned"] == 20
+    off = evalmod.check_operating_point(_with_point(_gate_artifact(), threshold=0.0))
+    assert not off["breached"] and off["note"] == "auto-assign disabled"
+    elsewhere = evalmod.check_operating_point(_with_point(_gate_artifact(), threshold=0.76,
+                                                          margin=0.12))
+    assert not elsewhere["breached"] and elsewhere["note"] == "not scored in this run"
+    assert evalmod.check_operating_point({"meta": {}, "species": {}})["note"] == "eval not run"
+
+
+def test_regression_streak_counts_failed_nights_and_stops_at_a_pass(tmp_path):
+    reports = tmp_path / "reports"
+    for day, code in ((1, 0), (2, 1), (3, 1), (4, 1)):
+        art = _gate_artifact(run_at=f"2026-10-{day:02d}T17:30:00-07:00")
+        art["gate"] = {"exit_code": code}
+        _write(reports, f"202610{day:02d}T003000Z", art)
+    assert evalmod.regression_streak(reports, today="2026-10-05") == 3
+    assert evalmod.regression_streak(reports, today="2026-10-04") == 2   # today never counts
+    assert evalmod.regression_streak(tmp_path / "none", today="2026-10-05") == 0
+
+
+def test_main_fails_on_a_wrong_naming_point_and_says_how_long(monkeypatch, tmp_path, capsys):
+    reports = tmp_path / "reports"
+    for day in (17, 18, 19):
+        art = _gate_artifact(run_at=f"2026-09-{day}T17:30:00-07:00")
+        art["gate"] = {"exit_code": 1}
+        _write(reports, f"202609{day}T003000Z", art)
+    today = _with_point(_gate_artifact(run_at="2026-09-20T17:30:00-07:00"), errors=1)
+    assert _gate_main(monkeypatch, tmp_path, today, []) == evalmod.EXIT_REGRESSION
+    out = capsys.readouterr().out
+    assert "MAKES WRONG NAMES" in out and "failed the 3 night(s) before this one" in out
+    assert "--pin-baseline latest" in out           # unchanged corpus: say how to get out
+
+
+def test_eval_reid_records_per_probe_outcomes_by_camera_and_start(conn):
+    cfg = config.Config()
+    s1 = _solo_visit(conn, [1, 0, 0], start_min=0)
+    s2 = _solo_visit(conn, [1, 0.05, 0], start_min=2 * DAY)
+    n1 = _solo_visit(conn, [0, 1, 0], start_min=4 * DAY)
+    n2 = _solo_visit(conn, [0, 1, 0.05], start_min=6 * DAY)
+    for v, name in ((s1, "Stan"), (s2, "Stan"), (n1, "Notch"), (n2, "Notch")):
+        db.label_visit(conn, v, name)
+    r = evalmod.eval_reid(conn, cfg, "raccoon", kfold_repeats=1)
+    po = r["probe_outcomes"]
+    assert set(po["blocked"]) == {f"{db.SOURCE_GLASS_DOOR_CAM}|{_ts(m)}"
+                                  for m in (0, 2 * DAY, 4 * DAY, 6 * DAY)}
+    assert sum(po["blocked"].values()) == r["identification_loo"]["blocked"]["top1_correct"]
+    assert set(po["embargo_7d"]) == set(po["blocked"])

@@ -30,8 +30,12 @@ REM                                weeks because this step was a docstring, not
 REM                                a scheduler line). Read-only over the DB, no
 REM                                GPU: it scores the embeddings already stored.
 REM                                Diffs the pinned baseline (eval.py
-REM                                --pin-baseline), else last night's artifact;
-REM                                exit 1 = regression or floor, 3 = stale.
+REM                                --pin-baseline), else last night's artifact.
+REM                                Only what auto-assign ships on can fail it:
+REM                                exit 1 = a gated metric regressed (paired
+REM                                per probe), a floor broke, or the configured
+REM                                auto-assign point names a visit wrongly;
+REM                                3 = stale.
 REM   6) individuals.py --auto-assign -- name the unambiguous new solo visits
 REM                                (bars from eval.py's sweep; auto names never
 REM                                feed the suggestion templates; review in the
