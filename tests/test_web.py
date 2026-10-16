@@ -925,6 +925,22 @@ def test_evalstatus_reads_the_gate_floor_breach_and_stale(tmp_path, monkeypatch)
     assert s["stale"] is False and s["floor_breaches"] == [] and s["baseline_artifact"] is None
 
 
+def test_evalstatus_reports_a_wrong_naming_point_and_how_long_naming_has_paused(tmp_path,
+                                                                                monkeypatch):
+    """The configured auto-assign point making wrong names fails the gate on its own, and the chip
+    says how many nights auto-assign has not run."""
+    point = {"metric": "configured auto-assign point", "threshold": 0.88, "margin": 0.02,
+             "assigned": 20, "errors": 2, "breached": True, "note": None}
+    s = _evalstatus_for(tmp_path, monkeypatch, "eval_20261016T003000Z.json", {
+        "meta": {"run_at": "2026-10-15T17:30:00-07:00"},
+        "baseline_diff": {"ok": True, "regressions": []},
+        "gate": {"floors": {"ok": True, "rows": [], "breaches": []}, "operating_point": point,
+                 "staleness": {"stale": False, "unchanged_nights": 0},
+                 "regression_streak": 4, "exit_code": 1}})
+    assert s["ok"] is False and s["skipped_nights"] == 4
+    assert s["regressions"] == ["configured auto-assign point: 2 wrong"]
+
+
 # ---- the roster: marking an individual as no longer resident -------------------------
 # Templates outlive the animal. Notch's last labelled crop is 2026-06-30 and Matt confirms it
 # stopped coming, but at the recommended operating point the auto tier still lined up to write

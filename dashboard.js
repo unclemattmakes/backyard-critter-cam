@@ -559,7 +559,7 @@ async function refreshEvalStatus(){
   const when=(ev.run_at||'').slice(0,10);
   line.hidden=false;
   line.textContent = ev.ok===false
-    ? `Nightly eval (${when}): REGRESSION — ${evalWhat(ev)}. Auto-naming paused itself; the full diff is in reports/${ev.artifact}.`
+    ? `Nightly eval (${when}): REGRESSION — ${evalWhat(ev)}. Auto-naming paused itself${ev.skipped_nights?`, as it did the ${ev.skipped_nights} night${ev.skipped_nights===1?'':'s'} before`:''}; the full diff is in reports/${ev.artifact}.`
     : ev.stale
     ? `Nightly eval (${when}): STALE — ${evalStaleText(ev)}. Auto-naming still ran.`
     : ev.ok===true
