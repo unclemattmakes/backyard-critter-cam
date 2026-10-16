@@ -720,6 +720,132 @@ def test_veto_census_line_reaches_the_log_from_the_real_loop(tmp_path, monkeypat
     assert "box(es) judged" in out
 
 
+# ---- a capture that stops without failing --------------------------------------------
+# A network read that never returns used to hold the capture thread for good: no failed read to
+# count, so no reconnect, and the rest of the rig carried on as if it were watching. The read now
+# has a deadline, after which the connection is abandoned and a fresh one opened.
+
+NET_SPEC = config.CameraSpec("test_cam", "http://192.168.1.50:8080/stream")
+
+
+class _HangingCap(_FakeCap):
+    """Plays its frames, then parks in read() the way a stalled stream read does."""
+
+    def __init__(self, frames, stop_event):
+        super().__init__(frames, stop_event)
+        self.unblock = threading.Event()
+
+    def read(self):
+        if self._frames:
+            return True, self._frames.pop(0).copy()
+        self.unblock.wait(10)
+        return False, None
+
+
+def _coverage(cfg):
+    conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True)
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT event, reason FROM coverage_events ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def test_a_read_that_never_returns_is_abandoned_and_the_camera_reopened(tmp_path, monkeypatch,
+                                                                       capsys):
+    cfg = _loop_cfg(tmp_path / "hang", capture_read_timeout_s=0.2)
+    stop = threading.Event()
+    hung = _HangingCap([_yard()] * 3, stop)
+    fresh = _FakeCap([_yard()] * 4, stop)
+    opened = iter([hung, fresh])
+    monkeypatch.setattr(backyard_cam, "open_capture", lambda spec, c: next(opened))
+    beat = backyard_cam.capwatch.CaptureBeat(NET_SPEC.source)
+    results: dict = {}
+    try:
+        t0 = time.monotonic()
+        backyard_cam._run_camera(NET_SPEC, cfg, _ScriptedDetector([]), threading.Lock(),
+                                 {}, {}, {}, threading.Lock(), stop, results, beat=beat)
+        assert time.monotonic() - t0 < 5.0
+        assert beat.abandoned_reads == 1
+        assert beat.frames == 3 + 3                  # the reconnect's own check read takes one
+        assert beat.state == "stopped"
+        assert _coverage(cfg) == [("up", "opened"), ("down", "read-timeout"),
+                                  ("up", "reconnected"), ("down", "stopped")]
+        assert "a read has not returned in 0.2s" in capsys.readouterr().out
+        assert fresh.released
+        # The stuck read still owns the old capture; releasing it under that read is unsafe.
+        assert hung.released is False
+    finally:
+        hung.unblock.set()
+    deadline = time.monotonic() + 2.0
+    while not hung.released and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert hung.released                             # released once its read finally returned
+
+
+def test_a_local_camera_keeps_its_plain_capture(tmp_path):
+    cfg = _loop_cfg(tmp_path / "local")
+    cap = object()
+    assert backyard_cam.with_read_deadline(cap, cfg.camera_specs()[0], cfg) is cap
+    assert backyard_cam.with_read_deadline(None, NET_SPEC, cfg) is None
+    cfg.capture_read_timeout_s = 0
+    assert backyard_cam.with_read_deadline(cap, NET_SPEC, cfg) is cap
+
+
+# ---- a rig whose every camera thread has exited -----------------------------------------
+# The launchers read exit 0 as "stopped on purpose" and drop .rig_pause, which keeps rigwatch from
+# restarting the rig. A run that ended because its cameras died must not look like that.
+
+class _NoDetector:
+    device, device_name = "cpu", "cpu"
+
+    def __init__(self, *a, **k):
+        pass
+
+
+class _NoPower:
+    warning = None
+
+    def __init__(self, *a, **k):
+        pass
+
+    def poll(self, now):
+        pass
+
+    def monitor(self, stop_event):
+        stop_event.wait()
+
+    def snapshot(self):
+        return None
+
+
+def test_a_run_whose_cameras_all_exited_does_not_look_like_a_deliberate_stop(tmp_path,
+                                                                            monkeypatch):
+    cfg = _loop_cfg(tmp_path / "rig")
+    status = tmp_path / ".capture_status.json"
+    monkeypatch.setattr(config, "CAPTURE_STATUS_FILE", status)
+    for name, fake in {"_sweep_stale_naming": lambda: None, "_stop_naming": lambda *a: None,
+                       "keep_system_awake": lambda: True, "allow_system_sleep": lambda: None,
+                       "Detector": _NoDetector,
+                       "_run_camera": lambda *a, **k: None}.items():   # a thread that exits at once
+        monkeypatch.setattr(backyard_cam, name, fake)
+    monkeypatch.setattr(backyard_cam.powerguard, "PowerMonitor", _NoPower)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda: None)
+    assert backyard_cam.run(cfg) == backyard_cam.EXIT_CAMERAS_STOPPED
+    assert status.exists()                           # the watch ran, and wrote where rigwatch looks
+
+
+def test_main_passes_the_run_code_through(monkeypatch):
+    class Args:
+        list_cameras = stats = serve_only = False
+    monkeypatch.setattr(backyard_cam, "install_file_logging", lambda: None)
+    monkeypatch.setattr(backyard_cam, "parse_args", lambda: (config.Config(), Args()))
+    monkeypatch.setattr(backyard_cam, "run", lambda cfg: backyard_cam.EXIT_CAMERAS_STOPPED)
+    assert backyard_cam.main() == backyard_cam.EXIT_CAMERAS_STOPPED
+    monkeypatch.setattr(backyard_cam, "run", lambda cfg: 0)
+    assert backyard_cam.main() == 0
+
+
 # ---- the guard that keeps a camera password out of the log ---------------------------
 #
 # The masking itself is cameras.safe_src and is tested in tests/test_cameras.py -- it moved out of

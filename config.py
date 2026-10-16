@@ -36,6 +36,9 @@ ROOT = Path(__file__).resolve().parent
 # Where the live species-naming helper (classify.py --watch) writes its status, so the dashboard
 # can show "warming up" vs "naming" vs "stopped". A hidden file in the project root.
 NAMING_STATUS_FILE = ROOT / ".naming_status.json"
+# Where the rig's capture watch (capwatch.py) writes each camera's last-frame time, so rigwatch
+# can tell a rig that is up from a rig that is actually watching the yard.
+CAPTURE_STATUS_FILE = ROOT / ".capture_status.json"
 
 
 # ---- Secrets file -----------------------------------------------------------------
@@ -191,6 +194,14 @@ class Config:
     camera_controls: dict = field(default_factory=lambda: {"BACKLIGHT": 0})
     reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).
+    # A network camera's read() runs on a helper thread; one that has not returned in this long
+    # is abandoned and the camera reopened. Frames arrive every ~0.1 s, and FFmpeg's own read
+    # timeout is 30 s, so 20 s only ever fires on a read that is not coming back. 0 = off.
+    capture_read_timeout_s: float = 20.0
+    # No frame AND no reconnect attempt for this long means the capture thread is stuck somewhere.
+    # The rig then logs where (the thread's stack) and marks the camera stuck in
+    # CAPTURE_STATUS_FILE. Above the slowest healthy pass (open + clip prune + veto setup, ~30 s).
+    capture_stall_s: float = 120.0
 
     # ---- Auto-white-balance recovery --------------------------------------------
     # Some webcams have a BROKEN manual white balance. Measured on the 2026-07 glass-door cam
