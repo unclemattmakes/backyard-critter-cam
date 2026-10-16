@@ -406,7 +406,11 @@ def leave_one_visit_out(units: Sequence, similarity: Callable[[Hashable, Hashabl
     if aggregate not in ("max", "mean"):
         raise ValueError("aggregate must be 'max' or 'mean'")
     us = [_as_unit(u) for u in units]
-    us.sort(key=lambda u: _sort_key(u.key))          # deterministic probe order -> stable folds
+    # Deterministic probe order -> stable folds. Time first, key only to break ties: the k-fold
+    # split is drawn over these positions, and a key (a visit id) is the ledger's business -- a
+    # change in what ids encode must not reshuffle the folds.
+    us.sort(key=lambda u: (u.when is None, u.when.timestamp() if u.when else 0.0,
+                           _sort_key(u.key)))
     keys = [u.key for u in us]
     if len(set(keys)) != len(keys):
         raise ValueError("unit keys must be unique")

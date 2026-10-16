@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
@@ -148,6 +149,8 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_detection ON detection_embeddings(dete
 -- (Counting crows also needs co-occurrence -- who arrived together -- which behaviour.py reads
 -- off these rows; see PLAN.md phase 4.)
 CREATE TABLE IF NOT EXISTS visits (
+    -- visits.py sets this explicitly to the visit's LOWEST member detection id, so an id survives
+    -- every rebuild that leaves the visit's first crop in it (detection ids are never reused).
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     source          TEXT    NOT NULL,   -- which rig (matches detections.source).
     species         TEXT,               -- dominant species across the visit's crops (NULL if none classified).
@@ -487,9 +490,9 @@ CREATE INDEX IF NOT EXISTS idx_cameras_live ON cameras(deleted_at, id);
 --                  sweeps do delete rows) leaves nothing for the star to be about.
 --   'visit'     -> (source, started_at). Visit IDS ARE NOT STABLE: the dashboard's visit list is
 --                  re-clustered from raw detections on every request (stats.visits_page never even
---                  reads the visits table), and visits.py rebuilds that ledger from scratch, which
---                  renumbers it. This is the same reason apply_visit_label takes source+span
---                  instead of an id. `ended_at` is recorded as the span AS STARRED, for display,
+--                  reads the visits table), and a visits.py id changes whenever its visit
+--                  regroups (merges, or loses its first crop). This is the same reason
+--                  apply_visit_label takes source+span instead of an id. `ended_at` is recorded as the span AS STARRED, for display,
 --                  but is deliberately NOT part of the key: a visit still in progress grows its
 --                  end, and a star must not slide off the visit someone put it on. The gallery
 --                  re-derives the CURRENT span from started_at (stats.favorites_page).
@@ -563,9 +566,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         raise
 
 
-def connect_readonly(db_path: Path | str) -> Optional[sqlite3.Connection]:
+def connect_readonly(db_path: Path | str, *,
+                     snapshot: bool = False) -> Optional[sqlite3.Connection]:
     """Open the DB read-only (WAL-safe) for reporting -- usable while the live rig writes.
-    Returns None if the database doesn't exist yet."""
+    Returns None if the database doesn't exist yet.
+
+    `snapshot=True` holds one read transaction from the first query until close (see
+    read_snapshot): for a short-lived per-request connection whose queries join on visit ids.
+    Never for a connection kept open, which would stop seeing new rows."""
     p = Path(db_path)
     if not p.exists():
         return None
@@ -573,7 +581,44 @@ def connect_readonly(db_path: Path | str) -> Optional[sqlite3.Connection]:
     # would be parsed as a URI fragment/query and silently open the wrong (empty) database.
     conn = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    if snapshot:
+        conn.execute("BEGIN")     # closing the connection ends it
     return conn
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection):
+    """Hold ONE read transaction for the block, so every query in it sees the same database.
+
+    For readers that join several queries on visit ids (VisitMatcher, the review queue, the eval):
+    the naming helper rebuilds the visit ledger after most naming bursts, and a reader whose
+    queries straddle a rebuild pairs one ledger's ids with another's. WAL gives a transaction a
+    fixed snapshot, so this costs nothing but a slightly later checkpoint. Re-entrant: inside a
+    transaction already, it does nothing. For READS -- a write in the block fails if anything else
+    has written since the snapshot began."""
+    if conn.in_transaction:
+        yield conn
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    else:
+        if conn.in_transaction:
+            conn.commit()
+
+
+def visit_exists(conn: sqlite3.Connection, visit_id) -> bool:
+    """Is `visit_id` in the ledger now? A write path asks before trusting an id it was handed:
+    an id from a page loaded before its visit merged or lost its first crop names nothing."""
+    try:
+        vid = int(visit_id)
+    except (TypeError, ValueError):
+        return False
+    return conn.execute("SELECT 1 FROM visits WHERE id = ?", (vid,)).fetchone() is not None
 
 
 def now_local_iso() -> str:
@@ -767,7 +812,7 @@ def load_clip_track_embeddings(conn: sqlite3.Connection, model: str, *, species=
     """Read back tracklet appearance prototypes joined to clip + (time-overlapping) context, for
     matching/analysis. Returns rows with: track_id, clip_id, track_idx, n_hits, embedding,
     clip_started_at, clip_source. (Visit/individual attribution is done by the caller via time
-    overlap, as visits renumber on rebuild.)"""
+    overlap, as a visit's id changes when a rebuild regroups it.)"""
     return conn.execute(
         """SELECT e.track_id, t.clip_id, t.track_idx, t.n_hits, e.embedding, e.rep_crop,
                   t.individual_id, c.started_at AS clip_started_at, c.ended_at AS clip_ended_at,
@@ -780,8 +825,8 @@ def load_clip_track_embeddings(conn: sqlite3.Connection, model: str, *, species=
 
 
 def clear_visits(conn: sqlite3.Connection) -> None:
-    """Drop all visit rows and un-stamp every detection -- visits.py does a full rebuild (the
-    detection set is small and a from-scratch pass is simpler/safer than incremental upkeep)."""
+    """Drop all visit rows and un-stamp every detection, and COMMIT. visits.build_visits does not
+    use this: committing an empty ledger lets a reader see no visits at all mid-rebuild."""
     conn.execute("DELETE FROM visits")
     conn.execute("UPDATE detections SET visit_id = NULL WHERE visit_id IS NOT NULL")
     conn.commit()
@@ -792,20 +837,23 @@ def insert_visit(conn: sqlite3.Connection, *, source: str, species: Optional[str
                  detection_count: int, max_confidence: Optional[float],
                  representative_detection_id: Optional[int],
                  species_margin: Optional[float] = None,
-                 sighting_conflict: Optional[bool] = None) -> int:
-    """Phase 4: write one collapsed visit event; returns its new id.
+                 sighting_conflict: Optional[bool] = None,
+                 visit_id: Optional[int] = None) -> int:
+    """Phase 4: write one collapsed visit event; returns its id.
 
     `species_margin` (how decisive the species vote was) and `sighting_conflict` (a human logged
     conflicting names over this span) are optional so every existing caller keeps working and a
-    visit written without them is honestly NULL rather than falsely confident."""
+    visit written without them is honestly NULL rather than falsely confident. `visit_id` sets the
+    id explicitly (visits.build_visits' stable ids); None takes the next AUTOINCREMENT id."""
     cur = conn.execute(
         """
-        INSERT INTO visits (source, species, individual_id, started_at, ended_at,
+        INSERT INTO visits (id, source, species, individual_id, started_at, ended_at,
                             detection_count, max_confidence, representative_detection_id,
                             species_margin, sighting_conflict)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (source, species, individual_id, started_at, ended_at, int(detection_count),
+        (None if visit_id is None else int(visit_id),
+         source, species, individual_id, started_at, ended_at, int(detection_count),
          None if max_confidence is None else float(max_confidence),
          None if representative_detection_id is None else int(representative_detection_id),
          None if species_margin is None else float(species_margin),
@@ -2066,7 +2114,7 @@ def co_present_sighting_names(conn: sqlite3.Connection, source: str,
     observed_at instant). This is the ground truth that seeds un-blend -- the human said WHO the two
     animals are, even before any appearance template exists. De-dupes case-insensitively, newest
     first; `observed_at` is the most recent overlapping sighting (for display). Returns {names,
-    observed_at, n}. Matched by absolute time, so it survives the visit-id renumbering of a rebuild."""
+    observed_at, n}. Matched by absolute time, so it survives a rebuild that regroups visits."""
     try:
         rows = conn.execute(
             "SELECT observed_at, span_start, span_end, names FROM live_sightings WHERE source = ? "

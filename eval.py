@@ -1811,12 +1811,15 @@ def run(cfg, *, do_species: bool, do_reid: bool, reid_species: str,
     }
     result = {"meta": meta}
     try:
-        if do_species:
-            result["species"] = eval_species(conn, cfg)
-        if do_reid:
-            result["reid"] = eval_reid(conn, cfg, reid_species, kfold_k=kfold_k,
-                                       kfold_repeats=kfold_repeats, kfold_seed=kfold_seed,
-                                       at_points=at_points)
+        # One snapshot for the whole run: the re-ID section joins several queries on visit ids, and
+        # the live rig's naming helper rebuilds the visit ledger after most naming bursts.
+        with db.read_snapshot(conn):
+            if do_species:
+                result["species"] = eval_species(conn, cfg)
+            if do_reid:
+                result["reid"] = eval_reid(conn, cfg, reid_species, kfold_k=kfold_k,
+                                           kfold_repeats=kfold_repeats, kfold_seed=kfold_seed,
+                                           at_points=at_points)
     finally:
         conn.close()
     return result

@@ -1270,6 +1270,57 @@ def test_every_dashboard_confirm_sends_the_queue_species():
     assert calls and all("body:reidBody(" in c[:200] for c in calls)
 
 
+def test_every_dashboard_confirm_reads_the_servers_answer():
+    """A refused confirm (a 409) must never look like a saved one -- bulk loops included."""
+    src = (Path(__file__).resolve().parent.parent / "dashboard.js").read_text(encoding="utf-8")
+    calls = src.split("'/api/reid/confirm'")[1:]
+    assert calls and all(".then(r=>r.json())" in c[:200] for c in calls)
+
+
+# ---- a visit id the ledger no longer holds ----------------------------------------------
+# Ids are stable across rebuilds, but a visit that merges with a neighbour or loses its first
+# crop takes its id with it. A write aimed at such an id is refused, never an ok that saved nothing.
+
+def test_confirming_a_vanished_visit_is_refused_and_writes_nothing(corpus, conn, api_port):
+    before = conn.execute("SELECT COUNT(*) FROM detections WHERE individual_id = 'Stan'"
+                          ).fetchone()[0]
+    status, out = _post(api_port, "/api/reid/confirm", {"visit_id": 10_000_000, "name": "Stan"})
+    assert status == 409 and out["stale_visit"] is True and "Reload" in out["error"]
+    assert conn.execute("SELECT COUNT(*) FROM detections WHERE individual_id = 'Stan'"
+                        ).fetchone()[0] == before
+
+
+def test_labelling_a_vanished_visit_by_id_is_refused(corpus, api_port):
+    status, out = _post(api_port, "/api/visit/label", {"visit_id": 10_000_000, "name": "Stan"})
+    assert status == 409 and out["stale_visit"] is True
+
+
+def test_the_queue_pairs_its_matcher_and_its_pool_from_one_ledger(corpus, db_path, monkeypatch):
+    """The live bug: the matcher's ids and the visit pool came from different queries, a rebuild
+    landed between them, and every card read 'no embedded crops yet' with a funnel of zeros."""
+    real = individuals.VisitMatcher
+
+    class RebuildRightAfterLoading(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            w = db.connect(db_path)           # every id changes: the worst a rebuild can do
+            try:
+                w.execute("UPDATE visits SET id = id + 1000")
+                w.execute("UPDATE detections SET visit_id = visit_id + 1000 "
+                          "WHERE visit_id IS NOT NULL")
+                w.commit()
+            finally:
+                w.close()
+    monkeypatch.setattr(individuals, "VisitMatcher", RebuildRightAfterLoading)
+
+    out = _queue(_rq_cfg(db_path), since_h=0)
+    by_source = {s["source"]: s for s in out["funnel"]["by_source"]}
+    assert by_source[db.SOURCE_GLASS_DOOR_CAM]["confirmed"] == 2
+    assert by_source[db.SOURCE_GLASS_DOOR_CAM]["templated"] is True
+    card = next(v for v in out["queue"] if v["visit_id"] == corpus["stale_probe"])
+    assert card["n_embedded"] == 3 and card["candidates"][0]["name"] == "Stan"
+
+
 def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_path):
     """No logged_by -> labeled_by stays NULL, which reads as 'the operator, before attribution'.
     It must never be filled with a placeholder."""
@@ -1304,8 +1355,8 @@ def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_pat
 # CROSS-CAMERA pairing: a trail-cam visit cannot be appearance-matched at all, so a human noticing
 # that the other camera saw the same animal in the same minutes is the only evidence that can ever
 # name one. These tests pin that pairing, and pin the two ways it must NOT mislead -- a camera far
-# away in time is not a neighbour, and a visit id that no longer exists is a normal answer (visits
-# .py renumbers from scratch on every rebuild) rather than a crash.
+# away in time is not a neighbour, and a visit id that no longer exists is a normal answer (a
+# visit that merges in a rebuild takes its id with it) rather than a crash.
 # =====================================================================================
 def test_dossier_returns_the_visit_with_its_evidence_and_the_answer_options(corpus, db_path):
     cfg = _rq_cfg(db_path)
@@ -1320,8 +1371,8 @@ def test_dossier_returns_the_visit_with_its_evidence_and_the_answer_options(corp
     assert out["candidates"] and out["candidates"][0]["name"] == "Stan"
 
 
-def test_dossier_of_a_renumbered_away_visit_is_empty_not_an_error(corpus, db_path):
-    """visits.py rebuilds from scratch and renumbers; labels survive on the detections, ids do not.
+def test_dossier_of_a_vanished_visit_is_empty_not_an_error(corpus, db_path):
+    """A visit that merges in a rebuild takes its id with it; labels survive on the detections.
     The flow steps through ids captured earlier, so a vanished one must be an ordinary answer."""
     cfg = _rq_cfg(db_path)
     assert web._reid_dossier(cfg, 10_000_000) == {}

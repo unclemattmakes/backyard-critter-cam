@@ -368,6 +368,87 @@ def test_clear_visits_resets_table_and_stamps(conn):
     assert remaining == 0
 
 
+def _one_visit(conn, *, visit_id=None):
+    d = _insert_one(conn)
+    vid = db.insert_visit(
+        conn, source=db.SOURCE_GLASS_DOOR_CAM, species=None, individual_id=None,
+        started_at="2026-06-07T19:25:00-07:00", ended_at="2026-06-07T19:25:00-07:00",
+        detection_count=1, max_confidence=0.5, representative_detection_id=d, visit_id=visit_id)
+    conn.commit()
+    return vid
+
+
+def test_insert_visit_takes_an_explicit_id_or_the_next_one(conn):
+    assert _one_visit(conn, visit_id=4242) == 4242
+    assert db.visit_exists(conn, 4242)
+    assert _one_visit(conn) > 4242                 # AUTOINCREMENT still runs when none is given
+
+
+def test_visit_exists(conn):
+    vid = _one_visit(conn)
+    assert db.visit_exists(conn, vid) and db.visit_exists(conn, str(vid))
+    assert not db.visit_exists(conn, vid + 1)
+    assert not db.visit_exists(conn, None) and not db.visit_exists(conn, "garbage")
+
+
+# --- read snapshots ---------------------------------------------------------------------
+# A reader that joins several queries on visit ids must see ONE ledger; the live rig's naming
+# helper rebuilds it after most naming bursts.
+
+def _n_visits(c):
+    return c.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+
+
+def test_read_snapshot_holds_one_view_while_another_connection_writes(conn, db_path):
+    _one_visit(conn)
+    ro = db.connect_readonly(db_path)
+    try:
+        with db.read_snapshot(ro):
+            assert _n_visits(ro) == 1
+            _one_visit(conn)                      # committed by the writer meanwhile
+            assert _n_visits(ro) == 1             # still the snapshot
+        assert not ro.in_transaction
+        assert _n_visits(ro) == 2                 # and the next read sees the new row
+    finally:
+        ro.close()
+
+
+def test_read_snapshot_nests_inside_an_open_transaction(conn):
+    conn.execute("BEGIN")
+    with db.read_snapshot(conn):
+        assert conn.in_transaction
+    assert conn.in_transaction                    # the caller's transaction is the caller's
+    conn.rollback()
+
+
+def test_read_snapshot_ends_on_an_exception(db_path, conn):
+    ro = db.connect_readonly(db_path)
+    try:
+        with pytest.raises(ValueError):
+            with db.read_snapshot(ro):
+                _n_visits(ro)
+                raise ValueError("boom")
+        assert not ro.in_transaction
+    finally:
+        ro.close()
+
+
+def test_connect_readonly_snapshot_holds_until_close(conn, db_path):
+    _one_visit(conn)
+    ro = db.connect_readonly(db_path, snapshot=True)
+    try:
+        assert _n_visits(ro) == 1
+        _one_visit(conn)
+        assert _n_visits(ro) == 1
+    finally:
+        ro.close()
+    plain = db.connect_readonly(db_path)
+    try:
+        assert not plain.in_transaction and _n_visits(plain) == 2
+    finally:
+        plain.close()
+
+
 # --- insert_clip round-trip -------------------------------------------------------------
 
 def test_insert_clip_round_trip(conn):

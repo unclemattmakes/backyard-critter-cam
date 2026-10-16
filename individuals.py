@@ -251,6 +251,12 @@ def _multi_visit_ids(conn, visit_ids, cfg=None) -> set:
 
 
 def usable_template_visits(conn, species=None, cfg=None, names=None) -> dict:
+    """See _usable_template_visits. Its queries join on visit ids, so they share one snapshot."""
+    with db.read_snapshot(conn):
+        return _usable_template_visits(conn, species, cfg, names)
+
+
+def _usable_template_visits(conn, species=None, cfg=None, names=None) -> dict:
     """{visit_id: (name, started_at)} for every visit that is ACTUALLY USABLE as a template --
     VisitMatcher.templates()' set, derived without loading a single embedding vector.
 
@@ -1075,6 +1081,13 @@ class VisitMatcher:
     def __init__(self, conn, species: str, cfg=None):
         self.cfg = cfg or config.CONFIG
         self.species = species
+        # One snapshot for every query below: they join on visit ids, and a ledger rebuild landing
+        # between two of them would pair one ledger's ids with another's. A caller that reads more
+        # (the review queue's pool) wraps its own db.read_snapshot around this; it nests.
+        with db.read_snapshot(conn):
+            self._load(conn, species)
+
+    def _load(self, conn, species: str) -> None:
         rows = conn.execute(
             """SELECT d.id, d.visit_id, d.timestamp, d.crop_quality, d.confidence,
                       d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2, e.embedding
@@ -1496,7 +1509,9 @@ class VisitMatcher:
             auto-nameable, and the departed individual is still ranked, suggested and templated
             everywhere else. See is_departed();
           - SPECIES SCOPE: the name is written only onto this matcher's species' crops, never onto
-            the visit's dominant species (`no_matching_species` when there are none).
+            the visit's dominant species (`no_matching_species` when there are none);
+          - `visit_gone`: the visit merged or lost its first crop between loading and writing,
+            so the write found nothing -- counted apart so it never reads as a species problem.
 
         Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped,
         no_matching_species: [visit_id, ...]}."""
@@ -1559,8 +1574,14 @@ class VisitMatcher:
                 continue
             # The name goes on THIS species' crops only, never the visit's dominant species: a
             # raccoon visit outvoted by 'not an animal' boxes would hand them the name instead.
-            if not self._co_rows.get(vid) or (not dry_run and not db.label_visit(
-                    conn, vid, name, source="auto", species=self.species)):
+            wrote = bool(self._co_rows.get(vid)) and (dry_run or db.label_visit(
+                conn, vid, name, source="auto", species=self.species))
+            if not wrote:
+                # A write that stamped nothing because the visit merged or lost its first crop
+                # since this matcher loaded is not a species problem; say which it was.
+                if not dry_run and not db.visit_exists(conn, vid):
+                    out["skipped"]["visit_gone"] += 1
+                    continue
                 out["skipped"]["no_matching_species"] += 1
                 out["no_matching_species"].append(vid)
                 continue
@@ -1657,6 +1678,10 @@ def main() -> int:
             vid, name = int(args.confirm[0]), args.confirm[1].strip() or None
             sp = db.confirm_species(conn, vid, name, confirm_species)
             n = db.label_visit(conn, vid, name, species=sp)
+            if not n and not db.visit_exists(conn, vid):
+                print(f"Visit #{vid} is not in the visit list (check the id with --queue) "
+                      f"-- nothing written.")
+                return 1
             if sp and not n:
                 print(f"Visit #{vid}: no {sp} crops to name -- nothing written.")
                 return 1

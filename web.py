@@ -1548,7 +1548,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             """Assign an individual to an un-blend cluster: {"track_ids": [...], "name": "Notch"}
             labels clip TRACKLETS (clip-space, the clips basis); {"detection_ids": [...], "name":
             ...} stamps still CROPS directly (individual_source='human' -- the stills basis, whose
-            labels survive visit renumbering like every detection-level label). name=""/null
+            labels survive any visit-ledger rebuild like every detection-level label). name=""/null
             clears either way."""
             tids = data.get("track_ids") or []
             dids = data.get("detection_ids") or []
@@ -1573,9 +1573,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             """Confirm/correct a visit's SPECIES and/or name its INDIVIDUAL in one call -- the
             shared backend for the Individuals queue (sends visit_id) and the Explorer Visits
             list (sends source+start+end). Body: {visit_id | source,start,end} plus any of
-            {name (str|null), species (str), verify (bool)}. Deliberately does NOT rebuild visits
-            (a rebuild renumbers ids and would invalidate an open queue; labels live on the
-            detections and survive the next rebuild)."""
+            {name (str|null), species (str), verify (bool)}. Does NOT rebuild visits; labels live
+            on the detections and survive the next rebuild. A visit_id the ledger no longer holds
+            is a 409 with `stale_visit`."""
             kw = {}
             if data.get("visit_id") is not None:
                 try:
@@ -1604,6 +1604,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             conn = db.connect(cfg.db_path)
             try:
                 res = db.apply_visit_label(conn, **kw)
+                if ("visit_id" in kw and not res.get("detections")
+                        and not db.visit_exists(conn, kw["visit_id"])):
+                    self._json(_stale_visit_error(kw["visit_id"]), code=409)
+                    return
             finally:
                 conn.close()
             if (kw.get("verify") and "species" not in kw and "name" not in kw
@@ -1625,8 +1629,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
 
             The visit form takes source+start+end -- _visitTarget's shape, the same one
             /api/visit/label takes -- because a visit id is not a durable handle here (the Visit
-            Log re-clusters visits per request and visits.py renumbers the ledger). Only `start`
-            is the key; `end` is recorded for display. See the `favorites` table in db.py.
+            Log re-clusters visits per request, and a visits.py id changes when its visit
+            regroups). Only `start` is the key; `end` is recorded for display. See the
+            `favorites` table in db.py.
 
             This is the one write in the dashboard that says nothing about WHAT the animal is,
             so it never touches a label, a species or an identity -- and nothing downstream
@@ -1730,10 +1735,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             name=""/null clears; add "reject": true to clear AND leave the human's "not them"
             tombstone (individual_source 'human' with a NULL id), which stops the nightly
             auto-assign pass from re-naming the visit. Stamps the visit's species-matching crops
-            (individual_source='human') and mirrors the name onto the visits row. Deliberately
-            does NOT rebuild the visits table -- a rebuild renumbers visit ids and would
-            invalidate every other card in the open review queue; labels live on detections, so
-            the next rebuild inherits them anyway."""
+            (individual_source='human') and mirrors the name onto the visits row. Does NOT
+            rebuild the visits table; labels live on detections, so the next rebuild inherits
+            them. A visit id the ledger no longer holds is a 409 with `stale_visit`, never an ok
+            that stamped nothing."""
             try:
                 vid = int(data.get("visit_id"))
             except (TypeError, ValueError):
@@ -1748,8 +1753,12 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 sp = db.confirm_species(conn, vid, name, str(data.get("species") or "").strip())
                 n = db.label_visit(conn, vid, name, reject=reject,
                                    labeled_by=_labeler(data), species=sp)
-                if sp and not n and conn.execute("SELECT 1 FROM visits WHERE id = ?",
-                                                 (vid,)).fetchone():
+                # Asked AFTER the write, so a rebuild landing between a check and the write
+                # can't turn a dropped confirmation back into an ok.
+                if not n and not db.visit_exists(conn, vid):
+                    self._json(_stale_visit_error(vid), code=409)
+                    return
+                if sp and not n:
                     self._json({"error": f"visit #{vid} has no {sp} crops to "
                                          f"{'name' if name else 'clear'}"}, code=409)
                     return
@@ -2316,6 +2325,16 @@ CROSS_CAMERA_PAD_S = 600
 DOSSIER_MAX_CROPS = 60
 
 
+def _stale_visit_error(visit_id: int) -> dict:
+    """The 409 body for a write aimed at a visit id the ledger no longer holds. Ids are stable
+    across rebuilds, so this means the visit itself changed under an open page: it merged with a
+    neighbour or lost its first crop. Saying so beats an ok that stamped nothing."""
+    return {"error": f"visit #{visit_id} is no longer in the visit list (it merged with another "
+                     f"visit or lost its first crop when the list was rebuilt), so nothing was "
+                     f"saved. Reload and try again.",
+            "stale_visit": True, "visit_id": visit_id}
+
+
 def _reid_dossier(cfg, visit_id: int, species: str = "raccoon") -> dict:
     """EVERYTHING known about ONE visit -- the payload behind the one-at-a-time review flow.
 
@@ -2333,7 +2352,8 @@ def _reid_dossier(cfg, visit_id: int, species: str = "raccoon") -> dict:
     Read-only. Returns {} for an unknown visit."""
     import individuals
 
-    conn = db.connect_readonly(cfg.db_path)
+    # One snapshot: the visit row, the matcher and the neighbours all join on visit ids.
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)
     if conn is None:
         return {}
     try:
@@ -2463,7 +2483,10 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     different shape (groups, not visits) and reuse the matcher this call already built."""
     import individuals
 
-    conn = db.connect_readonly(cfg.db_path)
+    # One snapshot for the whole page. The matcher's ids and the visit pool below come from
+    # separate queries; a ledger rebuild between them would leave every card unmatched (no
+    # suggestions, "no embedded crops yet") and the funnel's per-camera counts at zero.
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)
     if conn is None:
         return {"species": species, "queue": [], "cast": [], "bootstrap": [], "mode": "recent",
                 "offset": 0, "limit": limit, "n_matched": 0, "funnel": {}}
@@ -2625,7 +2648,7 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
             r = matcher.refit()
             started = matcher.visit_started
             def _rep_for_visit(vid):
-                # The visit may have been renumbered/removed by a rebuild since refit() listed it,
+                # The visit may have been merged away by a rebuild since refit() listed it,
                 # so guard the row (fetchone() can be None) rather than index None[0] -> 500.
                 row = conn.execute(
                     "SELECT representative_detection_id FROM visits WHERE id=?", (vid,)).fetchone()
@@ -2688,7 +2711,7 @@ def _reid_unblend(cfg, visit_id: str) -> dict:
         vid = int(visit_id)
     except (TypeError, ValueError):
         return {"visit_id": None, "groups": [], "note": "bad visit_id"}
-    conn = db.connect_readonly(cfg.db_path)
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)   # matcher + this visit's rows agree
     if conn is None:
         return {"visit_id": vid, "groups": []}
     try:

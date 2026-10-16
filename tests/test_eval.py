@@ -973,6 +973,32 @@ def test_pin_baseline_cli_runs_no_eval(monkeypatch, tmp_path, capsys):
     assert "LOO top-1, 7-day embargo" in capsys.readouterr().out
 
 
+def test_probes_and_folds_follow_time_not_visit_id():
+    """The k-fold split is drawn over the protocol's probe positions, so the folds must not depend
+    on what a visit id happens to encode (visits.py ids are the lowest member detection id, and a
+    trail-cam import gives old visits high ids). Same visits, ids reshuffled: same probe order,
+    same folds, same held-out numbers."""
+    t0 = datetime(2026, 7, 1, 22, 0, tzinfo=datetime.now().astimezone().tzinfo)
+    names = ["Stan", "Notch", "Stan", "Notch", "Stan", "Notch", "Stan", "Notch"]
+    vecs = [np.asarray([1.0, 0.1 * i], dtype=np.float32) if n == "Stan"
+            else np.asarray([0.1 * i, 1.0], dtype=np.float32) for i, n in enumerate(names)]
+
+    def run(ids):
+        protos = {vid: v / np.linalg.norm(v) for vid, v in zip(ids, vecs)}
+        labels = dict(zip(ids, names))
+        started = {vid: (t0 + timedelta(days=i)).isoformat() for i, vid in enumerate(ids)}
+        units = evalmod.loo_units(protos, labels, started)
+        probes = em.leave_one_visit_out(units, evalmod.appearance_similarity(protos))["probes"]
+        by_day = {vid: i for i, vid in enumerate(ids)}
+        return ([by_day[p["key"]] for p in probes],
+                em.kfold_operating_point(probes, k=2, repeats=2, seed=0)["pooled"])
+
+    order_a, folds_a = run([10, 20, 30, 40, 50, 60, 70, 80])
+    order_b, folds_b = run([80, 3, 55, 7, 41, 600, 2, 90])      # same visits, other ids
+    assert order_a == order_b == list(range(8))
+    assert folds_a == folds_b
+
+
 # ---------------------------------------------------------------------------
 # What may fail the gate: only what auto-assign ships on, judged probe by probe.
 # ---------------------------------------------------------------------------
