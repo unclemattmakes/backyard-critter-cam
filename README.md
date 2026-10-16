@@ -1240,6 +1240,33 @@ Several recipients each get their own copy, addressed only to them — nobody se
 else's address. That is one send per recipient: right for a household list, the wrong shape for a
 real mailing list.
 
+### An opening paragraph from a local AI (optional)
+
+With [Ollama](https://ollama.com) on the rig machine, the issue can open with a short paragraph
+written by a local model (`llm.py`, one stdlib HTTP call, nothing leaves the machine), set in
+italics above the usual lede and labelled *Written by a local AI from the figures below*:
+
+```python
+cfg.llm_enabled = True               # in config_local.py; then: ollama pull qwen3.5:9b
+```
+
+The model gets a fact sheet built from the same digest, never the database, and its paragraph
+is **checked before it runs**. The paragraph is dropped if it has:
+
+- a number that isn't on the sheet;
+- a named animal who wasn't seen;
+- a species that wasn't confirmed;
+- a visit count stated as a headcount ("7 raccoons" for 7 raccoon visits);
+- an animal count that isn't the crowd floor worded as "at least".
+
+It gets three tries, then the issue goes out with the templated lede alone, which is always there
+anyway. On real nights the 9B passed about two draws in three, and the 4B about one in three.
+
+It shares the GPU with the rig, so the call is skipped while any `heavyio` lock is held (the
+nightly batch, a backup), or when less than `cfg.llm_min_free_vram_mb` of VRAM is free (6.5 GB
+for the 9B, so it never spills onto the CPU). The model is unloaded as soon as it answers.
+`newsletter.log` records which of those happened. `python llm.py "hello"` checks the connection.
+
 Try it, then schedule it (runs as you, no admin needed):
 
 ```powershell
