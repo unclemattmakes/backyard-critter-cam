@@ -317,6 +317,23 @@ def allow_system_sleep() -> None:
         pass
 
 
+def _restore_ctrl_c() -> None:
+    """Make Ctrl+C in the log window stop the rig, however it was launched.
+
+    rigwatch starts the rig with CREATE_NEW_PROCESS_GROUP, and Windows answers that by ignoring
+    Ctrl+C in the new process and everything it starts. Any other launcher up the tree can pass
+    the same setting down, so the rig clears it for itself rather than trusting its parent.
+    Call it before any child is spawned: the naming helper inherits the restored setting and
+    stops on the same Ctrl+C, and _stop_naming still reaps whatever is left."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)   # NULL, FALSE: obey Ctrl+C
+    except Exception:       # noqa: BLE001 -- never worth refusing to start the camera over
+        pass
+
+
 # ---- Camera ------------------------------------------------------------------------
 def apply_camera_settings(cap, settings: dict) -> None:
     """Apply a camera-settings dict to an open capture: 'exposure' (None = auto-expose, a
@@ -2289,6 +2306,7 @@ def main() -> int:
     log_path = install_file_logging()
     if log_path is not None:
         print(f"  log: writing this session to {log_path}")
+    _restore_ctrl_c()       # before run() spawns the naming helper, which inherits it
     cfg, args = parse_args()
     if args.list_cameras:
         list_cameras(cfg)

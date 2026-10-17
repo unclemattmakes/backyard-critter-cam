@@ -363,6 +363,7 @@ def start_rig() -> int:
     _record_start()
     # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP -- the rig must outlive this short-lived
     # watchdog process, or Task Scheduler reaping us would take the camera down with it.
+    # The new group also makes the rig ignore Ctrl+C; backyard_cam._restore_ctrl_c undoes that.
     subprocess.Popen(["cmd", "/c", "start", "", str(LAUNCHER)], cwd=str(ROOT),
                      creationflags=0x00000008 | 0x00000200, close_fds=True)
     log(f"rig was down -- started {LAUNCHER.name}")

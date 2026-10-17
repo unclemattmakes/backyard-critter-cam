@@ -22,6 +22,7 @@ import sqlite3
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import cv2
@@ -154,6 +155,61 @@ def test_sweep_swallows_taskkill_failure(monkeypatch):
                         lambda timeout=15: _helper(11, 12, 999))
     monkeypatch.setattr(backyard_cam.subprocess, "run", boom)
     backyard_cam._sweep_stale_naming()   # must not raise: best-effort, silent on failure
+
+
+# ---- Ctrl+C: a rigwatch-started rig must still obey it --------------------------------
+# rigwatch launches with CREATE_NEW_PROCESS_GROUP, so Windows hands the rig "ignore Ctrl+C".
+# A fake kernel32 stands in for the console: no real console state changes here.
+
+class _Kernel32:
+    def __init__(self, fail: bool = False):
+        self.calls, self.fail = [], fail
+
+    def SetConsoleCtrlHandler(self, handler, add):
+        if self.fail:
+            raise OSError("no console")
+        self.calls.append((handler, add))
+        return 1
+
+
+def _fake_ctypes(monkeypatch, kernel32):
+    fake = types.SimpleNamespace(windll=types.SimpleNamespace(kernel32=kernel32))
+    monkeypatch.setitem(sys.modules, "ctypes", fake)
+
+
+def test_restore_ctrl_c_clears_the_inherited_ignore_on_windows(monkeypatch):
+    k32 = _Kernel32()
+    _fake_ctypes(monkeypatch, k32)
+    monkeypatch.setattr(sys, "platform", "win32")
+    backyard_cam._restore_ctrl_c()
+    assert k32.calls == [(None, False)]     # NULL handler + FALSE = process Ctrl+C normally
+
+
+def test_restore_ctrl_c_is_a_no_op_off_windows(monkeypatch):
+    k32 = _Kernel32()
+    _fake_ctypes(monkeypatch, k32)
+    monkeypatch.setattr(sys, "platform", "linux")
+    backyard_cam._restore_ctrl_c()
+    assert k32.calls == []
+
+
+def test_restore_ctrl_c_failure_never_stops_the_rig_starting(monkeypatch):
+    _fake_ctypes(monkeypatch, _Kernel32(fail=True))
+    monkeypatch.setattr(sys, "platform", "win32")
+    backyard_cam._restore_ctrl_c()          # must not raise
+
+
+def test_main_restores_ctrl_c_before_run_spawns_the_naming_helper(monkeypatch):
+    # The helper inherits the setting at spawn, so the order is the point: restored after run()
+    # has started it, Ctrl+C would stop the rig but leave the helper deaf.
+    order = []
+    args = types.SimpleNamespace(list_cameras=False, stats=False, serve_only=False)
+    monkeypatch.setattr(backyard_cam, "install_file_logging", lambda: None)
+    monkeypatch.setattr(backyard_cam, "_restore_ctrl_c", lambda: order.append("restore"))
+    monkeypatch.setattr(backyard_cam, "parse_args", lambda: (config.CONFIG, args))
+    monkeypatch.setattr(backyard_cam, "run", lambda cfg: order.append("run"))
+    assert backyard_cam.main() == 0
+    assert order == ["restore", "run"]
 
 
 # ---- Ignore zones: the static-false-fire filter -------------------------------------
