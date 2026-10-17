@@ -214,9 +214,11 @@ class Publication:
     """A live mDNS registration, and the thread that keeps its address honest.
 
     Held by the caller only to close it. `name` is the published host name, so callers print
-    what was actually announced rather than what they hoped for."""
+    what was actually announced rather than what they hoped for. A rig that starts before the LAN
+    is up holds one with no responder (zc and ip None); the watch announces it once an address
+    appears."""
 
-    def __init__(self, zc, info, name: str, ip: str, port: int):
+    def __init__(self, zc, info, name: str, ip: str | None, port: int):
         self.zc, self.info, self.name, self.ip, self.port = zc, info, name, ip, port
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, name="mdns-refresh", daemon=True)
@@ -271,20 +273,23 @@ class Publication:
                 # failing the name-conflict probe its own replacement is about to run.
                 _tear_down(self.zc, self.info)
                 self.zc, self.info = None, None
+            first = self.ip is None
             try:
                 new_zc, new_info = _register(self.name, now, self.port)
             except Exception as e:
                 # until_verify is spent, so a name still dead here retries on the NEXT tick
                 # rather than waiting out another full verify interval.
-                print(f"  [mdns] could not {'re-announce' if moved else 'revive'} "
-                      f"{self.name} at {now}: {e}")
+                verb = "announce" if first else "re-announce" if moved else "revive"
+                print(f"  [mdns] could not {verb} {self.name} at {now}: {e}")
                 continue
             old_zc, old_info = self.zc, self.info
             self.zc, self.info, self.ip = new_zc, new_info, now
             if old_zc is not None:
                 _tear_down(old_zc, old_info)
             until_verify = VERIFY_S
-            if moved:
+            if first:
+                print(f"  [mdns] the LAN is up -- {self.name} now answers at {now}")
+            elif moved:
                 print(f"  [mdns] address changed -- {self.name} now points at {now}")
             else:
                 print(f"  [mdns] {self.name} had stopped answering -- re-announced at {now}")
@@ -362,13 +367,15 @@ def publish(cfg, port: int | None = None) -> Publication | None:
         print(r"  [mdns] fix: .venv\Scripts\pip install zeroconf")
         return None
 
-    ip = lan_ip()
-    if not ip:
-        print("  [mdns] no LAN address found, so there is nothing to announce (is Wi-Fi up?).")
-        return None
-
     name = host_name(cfg)
     port = port_of(cfg) if port is None else int(port)
+    ip = lan_ip()
+    if not ip:
+        # Not a reason to give up on the name: rigwatch starts the rig at logon, often before
+        # Wi-Fi has an address, and returning None here left the name dead until a restart.
+        print(f"  [mdns] no LAN address yet (is Wi-Fi up?) -- {name} will be announced as soon "
+              "as one appears.")
+        return Publication(None, None, name, None, port)
     try:
         zc, info = _register(name, ip, port)
     except NonUniqueName:
@@ -524,7 +531,8 @@ def main() -> int:
         pub = publish(cfg)
         if pub is None:
             return 1
-        print(f"answering for {pub.name} at {pub.ip} -- Ctrl+C to stop")
+        print(f"answering for {pub.name} at {pub.ip or '(waiting for a LAN address)'} "
+              "-- Ctrl+C to stop")
         try:
             threading.Event().wait()
         except KeyboardInterrupt:

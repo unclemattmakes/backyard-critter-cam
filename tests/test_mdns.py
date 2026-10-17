@@ -436,3 +436,43 @@ def test_watch_still_re_announces_when_the_address_moves(monkeypatch, capsys):
     assert ev["registered"] == [("critter-cam.local", "192.168.1.77", 80)]
     assert ev["torn_down"] == ["original-zc"] and pub.ip == "192.168.1.77"
     assert "address changed" in capsys.readouterr().out
+
+
+# A rig started before Wi-Fi had an address (rigwatch at logon, or a Wi-Fi drop at start-up)
+# used to get None from publish and never announce at all: the dashboard worked by number and
+# critter-cam.local stayed dead for the whole run.
+
+def test_publish_without_a_lan_address_still_returns_a_watcher(monkeypatch, capsys):
+    started = []
+    monkeypatch.setattr(mdns, "lan_ip", lambda: None)
+    monkeypatch.setattr(mdns.Publication, "__init__",
+                        lambda self, zc, info, name, ip, port: started.append((zc, name, ip, port)))
+    monkeypatch.setattr(mdns, "_register", lambda *a, **k: pytest.fail("nothing to register yet"))
+    assert mdns.publish(FakeCfg()) is not None
+    assert started == [(None, "critter-cam.local", None, 80)]
+    assert "will be announced as soon as one appears" in capsys.readouterr().out
+
+
+def test_watch_announces_the_name_once_the_lan_comes_up(monkeypatch, capsys):
+    pub, ev = _watcher(monkeypatch, ticks=1, held=None, ip=None, now="192.168.1.50")
+    pub.zc, pub.info = None, None
+    pub._watch()
+    assert ev["browses"] == 0, "there is no old responder to check on"
+    assert ev["registered"] == [("critter-cam.local", "192.168.1.50", 80)]
+    assert ev["torn_down"] == [], "there was nothing to tear down"
+    assert pub.zc == "zc@192.168.1.50" and pub.ip == "192.168.1.50"
+    assert "the LAN is up" in capsys.readouterr().out
+
+
+def test_watch_keeps_waiting_while_there_is_still_no_lan(monkeypatch):
+    pub, ev = _watcher(monkeypatch, ticks=6, held=None, ip=None)
+    monkeypatch.setattr(mdns, "lan_ip", lambda: None)
+    pub.zc, pub.info = None, None
+    pub._watch()
+    assert ev["registered"] == [] and ev["browses"] == 0 and pub.ip is None
+
+
+def test_closing_a_watcher_that_never_announced_is_harmless():
+    pub = object.__new__(mdns.Publication)
+    pub.zc, pub.info, pub._stop = None, None, mdns.threading.Event()
+    pub.close()
