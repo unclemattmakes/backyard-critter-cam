@@ -151,6 +151,117 @@ def test_lede_counts_names_and_caveats():
     assert "floor" in " ".join(newsletter.compose_lede(mkbundle(d2)))
 
 
+# ---- the model-written lede (llm.py is never called: _ask is a fake) ------------------
+
+FAITHFUL = ("3 raccoon visits kept the yard busy, and Stan + Kits came by. The busiest hour "
+            "was 10pm, under a moon 18% lit.")
+
+
+def llmcfg(**over):
+    return SimpleNamespace(llm_enabled=True, **over)
+
+
+def test_fact_sheet_states_figures_and_fences_off_the_unsure():
+    d = mkdigest(n_surprising=1, crowd={"n": 2, "at": "2026-08-12T02:07:00-07:00", "source": "g",
+                                         "by_species": {"raccoon": 2}},
+                 species=mkdigest()["species"] + [{"species": "domestic cat", "visits": 1,
+                                                   "surprising": True, "novelty": {}}],
+                 first_visitor={"species": "domestic cat", "time": "2026-08-11T21:00:00-07:00"})
+    facts = " ".join(newsletter.lede_facts(mkbundle(d)))
+    assert "First arrival" not in facts                # never names the unconfirmed
+    assert "Last arrival: a Raccoon" in facts
+    assert "Visits: 3." in facts and "Raccoon, 3 visits" in facts
+    assert "NOT a number of animals" in facts          # visits are not a headcount
+    assert "Stan + Kits (1 visit)" in facts
+    assert "at least 2 animals" in facts               # the crowd floor travels as a floor
+    assert "unconfirmed" in facts and "Domestic Cat" in facts
+    assert "Moon: Waning Crescent, 18% lit." in facts
+
+
+def test_a_faithful_paragraph_passes_the_check():
+    b = mkbundle()
+    assert newsletter.check_model_lede(FAITHFUL, newsletter.lede_facts(b), b) is None
+    # The crowd floor's own wording survives an Unidentified row (whose species is "animal").
+    d = mkdigest(crowd={"n": 2, "at": "2026-08-12T02:07:00-07:00", "source": "g", "by_species": {}},
+                 species=mkdigest()["species"] + [{"species": "animal", "visits": 1, "novelty": {}}])
+    b2 = mkbundle(d)
+    assert newsletter.check_model_lede(FAITHFUL + " At least 2 animals shared the yard.",
+                                       newsletter.lede_facts(b2), b2) is None
+
+
+@pytest.mark.parametrize("text, rc, why", [
+    (FAITHFUL.replace("18%", "40%"), None, "number 40"),
+    (FAITHFUL.replace("3 raccoon", "nine raccoon"), None, "number 9"),
+    (FAITHFUL + " Notch stayed away.", {"cast": [{"id": "notch"}]}, "Notch"),
+    (FAITHFUL + " A fox watched from the fence.", None, "fox"),
+    (FAITHFUL + " A cat was there too.", None, "cat"),
+    ("- 3 raccoon visits\n- busiest at 10pm", None, "list"),
+    ("The yard logged 3 visits, all of them 3 raccoons.", None, "headcount"),
+    ("Three hungry raccoons came by.", None, "headcount"),
+    ("The yard logged 3 visits, all by an unidentified raccoon.", None, "unidentified"),
+    ("The yard logged 3 visits, including 3 unidentified animals.", None, "headcount"),
+    ("3 raccoon visits; 3 animals were seen at once.", None, "only headcount"),
+])
+def test_an_invented_detail_sinks_the_paragraph(text, rc, why):
+    b = mkbundle(rc=rc)
+    reason = newsletter.check_model_lede(text, newsletter.lede_facts(b), b)
+    assert reason and why.lower() in reason.lower()
+
+
+def test_the_crowd_floor_may_be_stated_only_as_a_floor():
+    d = mkdigest(crowd={"n": 2, "at": "2026-08-12T02:07:00-07:00", "source": "g", "by_species": {}})
+    b = mkbundle(d)
+    facts = newsletter.lede_facts(b)
+    assert newsletter.check_model_lede(FAITHFUL + " At least two animals met.", facts, b) is None
+    assert "only headcount" in newsletter.check_model_lede(FAITHFUL + " Two animals met.", facts, b)
+
+
+def test_an_unconfirmed_species_may_not_be_stated():
+    d = mkdigest(n_surprising=1, species=mkdigest()["species"] + [
+        {"species": "domestic cat", "visits": 1, "surprising": True, "novelty": {}}])
+    b = mkbundle(d)
+    reason = newsletter.check_model_lede(FAITHFUL + " A cat came too.", newsletter.lede_facts(b), b)
+    assert reason and "cat" in reason
+
+
+def test_model_lede_runs_above_the_template_and_says_who_wrote_it():
+    b = mkbundle()
+    text, note = newsletter.compose_model_lede(llmcfg(), b, _ask=lambda cfg, s, p: (FAITHFUL, "llm ok"))
+    assert text == FAITHFUL and note == "llm ok"
+    b["model_lede"] = text
+    html = text_of(newsletter.render_email(b, {}, lambda cid: None))
+    assert html.index(FAITHFUL) < html.index("the yard logged 3 visits")   # templated lede stays
+    assert "Written by a local AI" in html
+    txt = newsletter.render_text(b)
+    assert FAITHFUL in txt and "Written by a local AI" in txt
+
+
+def test_a_rejected_draw_gets_a_second_try():
+    draws = iter(["Three hungry raccoons came by.", FAITHFUL])
+    text, note = newsletter.compose_model_lede(llmcfg(), mkbundle(),
+                                               _ask=lambda cfg, s, p: (next(draws), "llm ok"))
+    assert text == FAITHFUL and note == "llm ok after 1 rejected"
+
+
+def test_no_model_lede_whenever_it_is_off_busy_wrong_or_quiet():
+    calls = []
+
+    def ask(cfg, s, p):
+        calls.append(p)
+        return None, "llm skipped: heavy-io lock held by batch"
+
+    assert newsletter.compose_model_lede(SimpleNamespace(llm_enabled=False), mkbundle(), _ask=ask) == (None, "llm off")
+    assert newsletter.compose_model_lede(llmcfg(), mkbundle(mkdigest(empty=True)), _ask=ask)[0] is None
+    assert calls == []                                   # off and quiet never reach the model
+    assert newsletter.compose_model_lede(llmcfg(), mkbundle(), _ask=ask) == (
+        None, "llm skipped: heavy-io lock held by batch")
+    text, note = newsletter.compose_model_lede(
+        llmcfg(), mkbundle(), _ask=lambda cfg, s, p: ("A fox came by at 9pm.", "llm ok"))
+    assert text is None and note.startswith("model lede rejected") and note.count(";") == 2
+    html = text_of(newsletter.render_email(mkbundle(), {}, lambda cid: None))
+    assert "Written by a local AI" not in html
+
+
 def test_clock_normalizes_both_time_frames():
     """Period boundaries arrive in the yard's SOLAR zone (-08:00, no DST) while detection rows
     carry the wall clock (-07:00 in a PDT summer). Printed side by side unconverted, the first

@@ -586,6 +586,26 @@ class Config:
     # periods are archived but not sent.
     email_send_quiet: bool = True
 
+    # ---- Local language model (llm.py; optional, off by default) -----------------
+    # An Ollama server (https://ollama.com) on this machine, used for prose only: today, a short
+    # model-written lede over the morning email's own figures. It never writes the DB, never
+    # labels anything, and every caller falls back to the templated words when it is off, busy
+    # or wrong. It shares the GPU with the rig, so a call is skipped while any heavyio lock is
+    # held (the nightly batch, a backup), and the model is unloaded the moment it answers.
+    llm_enabled: bool = False
+    llm_url: str = "http://127.0.0.1:11434"
+    # The 9B, because on real nights the 4B failed newsletter's fact check 3 times in 5 (visit
+    # counts stated as headcounts) where the 9B passed 5 of 5. ~5.6 GB of VRAM at 8K context:
+    # fine at 07:00 beside the rig alone (~0.8 GB), never during the batch (heavyio keeps it out).
+    llm_model: str = "qwen3.5:9b"
+    # Skip the call unless this much VRAM is free, so the model never loads partly onto the CPU
+    # (the load this box hangs under). ~0.9 GB over the 9B's footprint; ~4000 suits the 4B.
+    llm_min_free_vram_mb: int = 6500
+    llm_timeout_s: float = 120.0           # covers a cold load (~5-60 s) plus a few hundred tokens
+    llm_keep_alive: str | int = 0          # 0 = unload right after the answer (Ollama syntax: "5m")
+    llm_num_ctx: int = 8192                # a bigger context spills the 4B onto the CPU on 8 GB
+    llm_num_thread: int = 4                # if any layer does land on the CPU, the naming helper's 4-thread cap
+
     # ---- Live sighting alerts over MQTT (mqttnotify.py) ---------------------------
     # "A raccoon just arrived", published to an MQTT broker the moment species naming is sure of
     # it, for LAN devices to react to (lights, chimes, home automation). Off until mqtt_host is
