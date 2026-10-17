@@ -227,3 +227,26 @@ def test_anthropic_api_key_is_a_secret_field():
     import config
     assert "anthropic_api_key" in config.SECRET_FIELDS
     assert config.Config().anthropic_api_key is None
+
+
+def test_crop_paths_resolve_from_the_database_folder(tmp_path, monkeypatch):
+    # crop_path is stored relative to the project root, the folder backyard.db lives in; a run
+    # from another checkout must not look for the crops beside itself.
+    rig = tmp_path / "rig"
+    (rig / "crops").mkdir(parents=True)
+    from PIL import Image
+    Image.new("RGB", (64, 48)).save(rig / "crops" / "a.jpg")
+    conn = db.connect(rig / "backyard.db")
+    det = db.insert_detection(
+        conn, timestamp=NOW.isoformat(), source=db.SOURCE_GLASS_DOOR_CAM,
+        detection_class="animal", confidence=0.9, bbox=(0, 0, 1, 1), frame_w=10, frame_h=10,
+        crop_path="crops/a.jpg")
+    db.set_species(conn, det, "raccoon", 0.6)
+    db.set_species_verified(conn, det, 1)
+    conn.commit()
+    conn.close()
+    monkeypatch.chdir(tmp_path)
+    assert so.main(["--graded", "--dry-run", "--db", str(rig / "backyard.db")]) == 0
+    assert not (rig / "second_opinion.db").exists()      # a dry run writes nothing
+    (rig / "crops" / "a.jpg").unlink()
+    assert so.main(["--graded", "--dry-run", "--db", str(rig / "backyard.db")]) == 1

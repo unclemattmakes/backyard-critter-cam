@@ -323,20 +323,24 @@ def make_client(cfg):
     return anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
 
 
-def estimate_cost(rows: list[dict], model: str, root: Path = config.ROOT) -> tuple[int, int, float | None]:
-    """(input tokens, output tokens, USD or None) for sending these rows. Reads image headers only."""
+def estimate_cost(rows: list[dict], model: str,
+                  root: Path = config.ROOT) -> tuple[int, int, float | None, int]:
+    """(input tokens, output tokens, USD or None, unreadable crops) for sending these rows. Reads
+    image headers only. Unreadable crops are skipped at send time and cost nothing, but a run
+    where most are unreadable is a wrong root, not a damaged corpus."""
     from PIL import Image
-    tokens_in = 0
+    tokens_in = unreadable = 0
     for r in rows:
         try:
             with Image.open(_resolve(r["crop_path"], root)) as im:
                 w, h = im.size
-        except Exception:   # noqa: BLE001 -- an unreadable crop is skipped at send time, costs nothing
+        except Exception:   # noqa: BLE001 -- counted, and skipped at send time
+            unreadable += 1
             continue
         scale = min(1.0, IMAGE_MAX_SIDE / max(w, h))
         tokens_in += int(w * scale * h * scale / 750) + EST_PROMPT_TOKENS
-    tokens_out = EST_OUTPUT_TOKENS * len(rows)
-    return tokens_in, tokens_out, _usd(model, tokens_in, tokens_out)
+    tokens_out = EST_OUTPUT_TOKENS * (len(rows) - unreadable)
+    return tokens_in, tokens_out, _usd(model, tokens_in, tokens_out), unreadable
 
 
 def _usd(model: str, tokens_in: int, tokens_out: int) -> float | None:
@@ -503,8 +507,17 @@ def main(argv=None) -> int:
         print(f"No database at {args.db}.", file=sys.stderr)
         return 1
     conn.execute("PRAGMA query_only = ON")
-    sidecar = open_sidecar(Path(args.db).with_name("second_opinion.db"))
+    side_path = Path(args.db).with_name("second_opinion.db")
+    # crop_path is relative to the project root, which is where backyard.db lives; resolving from
+    # the database rather than this file keeps a run from a worktree pointed at the rig's crops.
+    root = Path(args.db).resolve().parent
     labels = allowed_labels()
+    # A dry run writes nothing, not even an empty sidecar beside the live database.
+    if args.dry_run and not side_path.exists():
+        sidecar = sqlite3.connect(":memory:")
+        sidecar.executescript(SIDECAR_SCHEMA)
+    else:
+        sidecar = open_sidecar(side_path)
 
     if args.grade:
         from eval import _daynight_fn
@@ -515,15 +528,21 @@ def main(argv=None) -> int:
     rows = candidates(conn, graded=args.graded, max_conf=args.max_conf, recent_hours=args.recent)
     todo = pick(rows, limit=args.limit, already=already_asked(sidecar, args.model),
                 graded=args.graded, seed=args.seed)
-    t_in, t_out, usd = estimate_cost(todo, args.model)
+    t_in, t_out, usd, unreadable = estimate_cost(todo, args.model, root)
     cost = f"about ${usd:.2f}" if usd is not None else "price unknown for this model"
     print(f"[second-opinion] {len(rows)} candidate crops below {args.max_conf}; sending {len(todo)} "
           f"to {args.model} (~{t_in:,} in / ~{t_out:,} out tokens, {cost}).")
+    if unreadable:
+        print(f"[second-opinion] {unreadable} of those crops will not open under {root}.")
+    if todo and unreadable == len(todo):
+        print("[second-opinion] none of the crops open; is --db in the rig's folder?",
+              file=sys.stderr)
+        return 1
     if args.dry_run or not todo:
         return 0
     tally = ask_all(todo, client=make_client(cfg), model=args.model, labels=labels,
-                    sidecar=sidecar)
-    print(f"[second-opinion] done: {dict(tally)}. Answers are in {sidecar_path(cfg).name}.")
+                    sidecar=sidecar, root=root)
+    print(f"[second-opinion] done: {dict(tally)}. Answers are in {side_path}.")
     return 0
 
 
