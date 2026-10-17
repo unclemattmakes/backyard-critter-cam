@@ -286,11 +286,20 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
-It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`
-(at most hourly per alarm): `NAMING IS STALE` when species naming stops, `NIGHTLY BATCH IS
-STALE` when the newest `reports/eval_*.json` is older than `batch_stale_hours` (default 36),
-meaning the nightly batch has not finished a run since, and `rig is down and HELD` while a
-`--hold` is keeping a down rig down, so a forgotten hold still leaves a trace.
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
+`NAMING IS STALE` when species naming stops; `CAPTURE IS STALLED on <camera>` when the rig is up
+but a camera has delivered no frame for 5 minutes (with the line of code its capture thread is
+stuck on), `CAMERA <camera> IS DOWN` when the rig is reconnecting to a camera that has gone away,
+and `CAPTURE STATUS IS STALE` when the rig process itself has stopped reporting. Those repeat on
+every check while they last. At most hourly: `NIGHTLY BATCH IS STALE` when the newest
+`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
+has not finished a run since, and `rig is down and HELD` while a `--hold` is keeping a down rig
+down, so a forgotten hold still leaves a trace.
+
+Inside the rig, a network camera's read that has not returned in `capture_read_timeout_s`
+(default 20 s) is abandoned and the camera reopened, and a capture thread that makes no progress
+for `capture_stall_s` (default 120 s) gets a `CAPTURE STALLED` line with its stack in
+`logs/backyard_cam.log`.
 
 One limit: the scheduled tasks in this README are registered without a stored password, so they
 run only while you are logged on. After a reboot that stops at the lock screen nothing runs (no
