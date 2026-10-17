@@ -222,6 +222,14 @@ def test_starts_older_than_an_hour_do_not_count_against_the_cap():
     assert rigwatch._recent_starts() == 0
 
 
+def test_starts_before_the_last_boot_do_not_count_against_the_cap(monkeypatch):
+    # Two manual restarts, each ending the rig the watchdog had just started, then one more start.
+    now = time.time()
+    rigwatch.STATE_FILE.write_text(json.dumps({"starts": [now - 2400, now - 900, now - 300]}))
+    monkeypatch.setattr(rigwatch, "boot_time", lambda: now - 600)
+    assert rigwatch._recent_starts() == 1
+
+
 # --------------------------------------------------------------------------- stale pause markers
 # 2026-08-21: only start_critter_cam.bat ever cleared the marker, so a rig started by the LAN
 # launcher or straight from python left an old one standing. Being newer than the last boot, it
