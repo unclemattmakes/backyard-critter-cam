@@ -27,6 +27,7 @@ diff is by NAME and the merge is append-only; both halves are pinned below.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import sqlite3
 import zipfile
@@ -1344,7 +1345,8 @@ def test_a_day_pruned_before_it_was_archived_is_reported(project, dest, caplog):
     assert _lost_warnings(caplog) == [
         f"clips for {GLASS}/2026-07-21 were pruned before they were archived"]
     assert f"clips {GLASS}: oldest day on disk 2026-07-20, newest archived 2026-07-22" in notes
-    assert any("2026-07-21 were pruned" in n and "LOST" in n for n in notes)
+    assert any(n.startswith(f"1 clip day lost before archiving (newest {GLASS}/2026-07-21")
+               and n.endswith(f"<-- LOST, new this run: {GLASS}/2026-07-21") for n in notes)
 
 
 def test_empty_days_that_are_not_losses_stay_quiet(project, dest, caplog):
@@ -1409,3 +1411,63 @@ def test_status_txt_carries_the_coverage_notes(project, dest, monkeypatch):
     text = (dest / "STATUS.txt").read_text(encoding="utf-8").splitlines()
     assert text[1] == "backup: ok"
     assert text[2] == "clips x: oldest day on disk none, newest archived never"
+
+
+# --- a lost day is news once -------------------------------------------------------------------
+# The ten days lost in Aug-Sep 2026 were re-listed in STATUS.txt, and re-warned in backup.log, on
+# every daily run. Now each is a WARNING on the first run that sees it and a count after that.
+
+def test_a_lost_day_is_reported_once_then_summarised(project, dest, caplog):
+    _clips(project, ["a.mp4"], day="2026-07-20", source=GLASS)
+    _archive(project, dest)
+    _empty_day(project, "2026-07-21")
+    _empty_day(project, "2026-07-22")
+    ledger: dict = {}
+
+    with caplog.at_level(logging.INFO, logger="backup"):
+        first = backup.report_clip_coverage(project / "clips", dest / "clips", TODAY,
+                                            reported=ledger, now="2026-07-30T03:30:00-07:00")
+    assert len(_lost_warnings(caplog)) == 2
+    assert set(ledger) == {f"{GLASS}/2026-07-21", f"{GLASS}/2026-07-22"}
+    assert first[-1] == (f"2 clip days lost before archiving (newest {GLASS}/2026-07-22, first "
+                         f"reported 2026-07-30)  <-- LOST, new this run: {GLASS}/2026-07-21, "
+                         f"{GLASS}/2026-07-22")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="backup"):
+        second = backup.report_clip_coverage(project / "clips", dest / "clips", TODAY,
+                                             reported=ledger, now="2026-07-31T03:30:00-07:00")
+    assert _lost_warnings(caplog) == []                      # not news any more
+    lost_lines = [n for n in second if "lost" in n.lower() or "pruned" in n]
+    assert lost_lines == [f"2 clip days lost before archiving (newest {GLASS}/2026-07-22, "
+                          f"first reported 2026-07-30)"]
+
+
+def test_the_summary_keeps_days_whose_folders_have_since_gone(project, dest):
+    """The ledger is the record of the loss; deleting an empty folder does not undo it."""
+    _clips(project, ["a.mp4"], day="2026-07-20", source=GLASS)
+    _archive(project, dest)
+    ledger = {f"{GLASS}/2026-07-02": "2026-07-03T03:30:00-07:00"}
+    notes = backup.report_clip_coverage(project / "clips", dest / "clips", TODAY, reported=ledger)
+    assert notes[-1] == (f"1 clip day lost before archiving (newest {GLASS}/2026-07-02, "
+                         f"first reported 2026-07-03)")
+
+
+def test_save_state_records_ok_failed_and_since_when(project, tmp_path):
+    p = tmp_path / ".backup_state.json"
+    st: dict = {}
+    backup.save_state(st, 0, {"x/2026-07-21": "2026-07-30T03:30:00-07:00"}, path=p)
+    ok = json.loads(p.read_text())
+    assert ok["failures"] == 0 and ok["last_ok"] == ok["last_run"]
+    assert ok["failing_since"] is None
+    assert ok["lost_clip_days"] == {"x/2026-07-21": "2026-07-30T03:30:00-07:00"}
+
+    backup.save_state(ok, 2, ok["lost_clip_days"], path=p)
+    bad = json.loads(p.read_text())
+    assert bad["failures"] == 2 and bad["last_ok"] == ok["last_ok"]
+    assert bad["failing_since"] == bad["last_run"]
+    bad["failing_since"] = "2026-07-29T03:30:00-07:00"
+    backup.save_state(bad, 1, bad["lost_clip_days"], path=p)
+    assert json.loads(p.read_text())["failing_since"] == "2026-07-29T03:30:00-07:00"  # the FIRST
+    backup.save_state(json.loads(p.read_text()), 0, {}, path=p)
+    assert json.loads(p.read_text())["failing_since"] is None

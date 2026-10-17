@@ -48,12 +48,14 @@ means no name, a one-line explanation, and a rig that runs exactly as before.
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 import socket
 import sys
 import threading
 import time as _time
 from dataclasses import replace
+from pathlib import Path
 
 # The label the rig answers to, minus the suffix. Overridable per-install (cfg.mdns_name)
 # because a household may end up with two rigs, and "critter-cam" and "front-yard-cam" is a
@@ -162,6 +164,33 @@ def local_candidates(cfg) -> list[int]:
     if fallback and fallback not in ports:
         ports.append(fallback)
     return ports
+
+
+def bound_port_file(cfg) -> Path:
+    """Where the serving rig records the port it actually bound: beside the database it serves."""
+    return Path(cfg.db_path).parent / ".web_bound.json"
+
+
+def record_bound_port(cfg, port: int) -> None:
+    """Note the bound port for processes that cannot ask the socket (the 07:00 email). A probe
+    cannot stand in for this: when 80 was taken it was taken by another web server, which would
+    answer a probe on 80 just as happily. Best-effort."""
+    try:
+        bound_port_file(cfg).write_text(
+            json.dumps({"port": int(port), "ts": _time.time()}), encoding="utf-8")
+    except (OSError, AttributeError, TypeError, ValueError):
+        pass
+
+
+def served_port(cfg) -> int:
+    """The port the rig last bound, or the configured one if it never recorded one."""
+    try:
+        port = int(json.loads(bound_port_file(cfg).read_text(encoding="utf-8"))["port"])
+        if 0 < port < 65536:
+            return port
+    except Exception:                          # noqa: BLE001 -- missing/torn: use the config
+        pass
+    return port_of(cfg)
 
 
 def url(cfg, host: str | None = None, port: int | None = None) -> str:

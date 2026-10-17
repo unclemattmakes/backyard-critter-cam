@@ -40,6 +40,11 @@ NAMING_STATUS_FILE = ROOT / ".naming_status.json"
 # can tell a rig that is up from a rig that is actually watching the yard.
 CAPTURE_STATUS_FILE = ROOT / ".capture_status.json"
 
+# The rig's health record (health.py reads both): rigwatch's state, which carries its active
+# alarms, and backup.py's last-run verdict plus the lost clip days it has already reported.
+RIGWATCH_STATE_FILE = ROOT / ".rigwatch_state.json"
+BACKUP_STATE_FILE = ROOT / ".backup_state.json"
+
 
 # ---- Secrets file -----------------------------------------------------------------
 # Credentials live in a small JSON file OUTSIDE the project, so backup.py's meta zip (which

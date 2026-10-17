@@ -77,7 +77,8 @@ from pathlib import Path
 
 import db
 import heavyio
-from config import CONFIG, ROOT, SECRET_FIELDS, secrets_path
+from config import BACKUP_STATE_FILE, CONFIG, ROOT, SECRET_FIELDS, secrets_path
+from health import now_iso, read_json, write_json
 
 log = logging.getLogger("backup")
 
@@ -103,6 +104,9 @@ SCRATCH_HEADROOM = 2.0
 # guard can check membership without opening a zip on the cloud drive (that pulls the whole file
 # into Drive's cache).
 ARCHIVE_INDEX_DIR = ROOT / ".archive_index"
+
+# This run's verdict and the lost clip days already reported, for health.py (format there).
+STATE_FILE = BACKUP_STATE_FILE
 
 def meta_items() -> tuple[Path, ...]:
     """Small, changing odds-and-ends bundled into one deflated "meta" zip per run: re-ID
@@ -440,8 +444,13 @@ def clip_coverage(clips_root: Path, out_dir: Path, today: date) -> tuple[list[st
     return lines, lost
 
 
-def report_clip_coverage(clips_root: Path, out_dir: Path, today: date) -> list[str]:
-    """Log clip_coverage (lost days at WARNING) and return it as STATUS.txt lines."""
+def report_clip_coverage(clips_root: Path, out_dir: Path, today: date,
+                         reported: dict | None = None, now: str | None = None) -> list[str]:
+    """Log clip_coverage and return it as STATUS.txt lines.
+
+    `reported` is the ledger of lost days already reported ("<camera>/<day>" -> when first seen),
+    updated in place. A lost day stays lost forever, so it is a WARNING only on the run that first
+    sees it; after that it is one count in a single summary line, not a line per day per run."""
     cov = clip_coverage(clips_root, out_dir, today)
     if cov is None:
         log.warning("could not list %s -- clip coverage not checked", out_dir)
@@ -449,9 +458,42 @@ def report_clip_coverage(clips_root: Path, out_dir: Path, today: date) -> list[s
     lines, lost = cov
     for line in lines:
         log.info("%s", line)
-    for d in lost:
+    ledger = reported if reported is not None else {}
+    stamp = now or now_iso()
+    new = [d for d in lost if d not in ledger]
+    for d in new:
         log.warning("clips for %s were pruned before they were archived", d)
-    return lines + [f"clips for {d} were pruned before they were archived  <-- LOST" for d in lost]
+        ledger[d] = stamp
+    return lines + lost_summary(ledger, new)
+
+
+def lost_summary(ledger: dict, new: list[str]) -> list[str]:
+    """The one STATUS.txt line for every clip day lost so far, naming any first seen this run."""
+    if not ledger:
+        return []
+    n = len(ledger)
+    newest = max(ledger, key=lambda d: (d.rsplit("/", 1)[-1], d))
+    line = (f"{n} clip day{'' if n == 1 else 's'} lost before archiving (newest {newest}, "
+            f"first reported {str(ledger[newest])[:10]})")
+    if new:
+        shown = ", ".join(new[:5]) + (f" (+{len(new) - 5} more)" if len(new) > 5 else "")
+        line += f"  <-- LOST, new this run: {shown}"
+    return [line]
+
+
+def save_state(state: dict, failures: int, lost: dict, path: Path | None = None) -> None:
+    """Record this run for health.py: when, ok or not (and since when not), and the lost-day
+    ledger. Best-effort; a backup never fails over its own report."""
+    stamp = now_iso()
+    state["last_run"], state["failures"] = stamp, failures
+    if failures:
+        state["failing_since"] = state.get("failing_since") or stamp
+    else:
+        state["last_ok"], state["failing_since"] = stamp, None
+    state["lost_clip_days"] = lost
+    if not write_json(path or STATE_FILE, state):
+        log.warning("could not write %s -- the morning email will not see this run",
+                    (path or STATE_FILE).name)
 
 
 def _camera_label(prefix: str) -> str:
@@ -1034,10 +1076,9 @@ def export_labels(out_dir: Path, today: date, dry_run: bool) -> None:
 
 
 def write_status(dest: Path, failures: int, dry_run: bool, notes: list[str] | None = None) -> None:
-    """STATUS.txt -- the heartbeat that reaches the owner. The project has no notification
-    channel of any kind; this file, rewritten by every run into the Drive-synced folder,
-    is the cheapest one that already exists: its CONTENTS say how the rig is, and its absence
-    or staleness (mtime on the phone's Drive app) IS the alarm. Everything here is read-only
+    """STATUS.txt -- the heartbeat in the Drive-synced folder, readable from a phone even when
+    the rig is down: its CONTENTS say how the rig is, and its absence or staleness (mtime on the
+    phone's Drive app) IS the alarm. (The morning email reads .backup_state.json instead.) Everything here is read-only
     and best-effort -- a status writer that can crash the backup would be a bad joke."""
     if dry_run:
         log.info("would write STATUS.txt")
@@ -1264,10 +1305,13 @@ def main() -> int:
             log.exception("archiving %s failed", src_root.name)
             failures += 1
 
+    state = read_json(STATE_FILE)
+    lost = state.get("lost_clip_days") if isinstance(state.get("lost_clip_days"), dict) else {}
     notes: list[str] = []
     if CONFIG.clips_dir.is_dir():
         try:
-            notes = report_clip_coverage(CONFIG.clips_dir, dest / CONFIG.clips_dir.name, today)
+            notes = report_clip_coverage(CONFIG.clips_dir, dest / CONFIG.clips_dir.name, today,
+                                         reported=lost)
         except Exception:
             log.exception("clip coverage check failed")   # a report, never a failure of the run
 
@@ -1285,6 +1329,11 @@ def main() -> int:
         write_status(dest, failures, args.dry_run, notes)
     except Exception:
         log.exception("status write failed")     # never let the heartbeat sink the backup
+    if not args.dry_run:
+        try:
+            save_state(state, failures, lost)
+        except Exception:
+            log.exception("backup state write failed")
 
     if not args.dry_run:
         (dest / "README.txt").write_text(README, encoding="utf-8")
