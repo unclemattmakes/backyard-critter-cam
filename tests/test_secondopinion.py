@@ -250,3 +250,26 @@ def test_crop_paths_resolve_from_the_database_folder(tmp_path, monkeypatch):
     assert not (rig / "second_opinion.db").exists()      # a dry run writes nothing
     (rig / "crops" / "a.jpg").unlink()
     assert so.main(["--graded", "--dry-run", "--db", str(rig / "backyard.db")]) == 1
+
+
+def test_a_graded_sample_takes_at_most_three_crops_from_one_visit():
+    rows = ([{"id": i, "visit_id": 7} for i in range(100)]
+            + [{"id": 100 + i, "visit_id": 100 + i} for i in range(20)]
+            + [{"id": 200, "visit_id": None}, {"id": 201, "visit_id": None}])
+    sample = so.pick(rows, limit=None, already=set(), graded=True, seed=0)
+    assert sum(1 for r in sample if r["visit_id"] == 7) == 3
+    assert len(sample) == 3 + 20 + 2            # unstamped crops each count as their own visit
+    uncapped = so.pick(rows, limit=None, already=set(), graded=True, seed=0, per_visit=0)
+    assert len(uncapped) == len(rows)
+
+
+def test_grade_counts_only_the_sample(conn, tmp_path, sidecar):
+    inside = _det(conn, tmp_path, species="raccoon", conf=0.6, verified=1)
+    outside = _det(conn, tmp_path, species="raccoon", conf=0.6, verified=1)
+    _answer(sidecar, inside, "raccoon")
+    _answer(sidecar, outside, NONANIMAL_LABEL)  # left over from an earlier, wider sample
+    sidecar.commit()
+    rep = so.grade(conn, sidecar, "m", LABELS, period_fn=lambda dt: "day", sample_ids={inside})
+    assert rep["slices"]["all:all"]["n"] == 1
+    assert rep["slices"]["all:all"]["claude_acc"] == 1.0
+    assert rep["graded_answers"] == 1 and rep["asked"] == 2

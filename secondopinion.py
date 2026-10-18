@@ -18,6 +18,7 @@ downscaled to IMAGE_MAX_SIDE, along with the capture time and nothing else. See 
 
   python secondopinion.py --graded --dry-run      # how many crops, and roughly what it costs
   python secondopinion.py --graded --limit 200    # ask about human-labelled uncertain crops
+                                                  # (at most --per-visit crops from any one visit)
   python secondopinion.py --grade                 # Claude vs BioCLIP on those crops
   python secondopinion.py --graded --model claude-haiku-5-5   # the same crops, a cheaper model
   python secondopinion.py --recent 24             # unreviewed uncertain crops from the last day
@@ -74,10 +75,16 @@ PRICE_PER_MTOK = {
     "claude-haiku-5-5": (0.10, 0.50),
 }
 
-# Rough per-crop overhead for --dry-run: system prompt, label list and schema in; a short JSON
-# answer plus low-effort thinking out.
-EST_PROMPT_TOKENS = 600
-EST_OUTPUT_TOKENS = 300
+# Per-crop overhead for --dry-run, measured on the first 200-crop graded run (2026-10-17): about
+# 1,100 input tokens of system prompt, label list and schema besides the image, and 67 (Opus) to
+# 79 (Haiku) output tokens of low-effort thinking plus the JSON answer.
+EST_PROMPT_TOKENS = 1100
+EST_OUTPUT_TOKENS = 80
+
+# A graded sample takes at most this many crops from any one visit. A visit labelled as a whole
+# gives every crop in it the same label, and an uncapped random draw once took 100 of 200 crops
+# from a single visit, most of them unreadable smudges.
+PER_VISIT = 3
 
 SYSTEM = (
     "You identify animals in crops from a backyard wildlife camera. Each image is the box an "
@@ -118,7 +125,7 @@ def allowed_labels(species_labels=None) -> list[str]:
 # Which crops to ask about
 # ---------------------------------------------------------------------------
 
-_CANDIDATE_COLS = ("id, crop_path, timestamp, source, species, species_confidence, "
+_CANDIDATE_COLS = ("id, crop_path, timestamp, source, visit_id, species, species_confidence, "
                    "species_verified, species_source, model_species, model_species_confidence")
 
 
@@ -150,14 +157,31 @@ def candidates(conn, *, graded: bool, max_conf: float, recent_hours: float | Non
     return [dict(r) for r in rows]
 
 
-def pick(rows: list[dict], *, limit: int, already: set, graded: bool, seed: int = 0) -> list[dict]:
-    """The crops this run will send. Graded runs shuffle the WHOLE pool with a fixed seed, take the
-    first `limit`, and only then drop crops already answered: a second model asked with the same
-    seed gets the same crops, and a bigger --limit extends the sample rather than redrawing it.
-    Recent runs take the newest first."""
+def cap_per_visit(rows: list[dict], per_visit: int) -> list[dict]:
+    """The first `per_visit` rows of each visit, order kept. A crop not yet stamped with a visit
+    counts as its own visit."""
+    seen: Counter = Counter()
+    out = []
+    for r in rows:
+        key = r.get("visit_id")
+        key = ("crop", r["id"]) if key is None else key
+        if seen[key] < per_visit:
+            seen[key] += 1
+            out.append(r)
+    return out
+
+
+def pick(rows: list[dict], *, limit: int | None, already: set, graded: bool, seed: int = 0,
+         per_visit: int | None = PER_VISIT) -> list[dict]:
+    """The crops this run will send. Graded runs shuffle the WHOLE pool with a fixed seed, keep at
+    most per_visit crops of each visit, take the first `limit`, and only then drop crops already
+    answered: a second model asked with the same seed gets the same crops, and a bigger --limit
+    extends the sample rather than redrawing it. Recent runs take the newest first."""
     if graded:
         pool = list(rows)
         random.Random(seed).shuffle(pool)
+        if per_visit:
+            pool = cap_per_visit(pool, per_visit)
         pool = pool[:limit]
     else:
         pool = list(reversed(rows))[:limit]
@@ -435,9 +459,13 @@ def summarize(graded: list[dict]) -> dict:
             "claude_misses": misses.most_common(10)}
 
 
-def grade(conn, sidecar, model: str, labels: list[str], period_fn) -> dict:
+def grade(conn, sidecar, model: str, labels: list[str], period_fn, sample_ids=None) -> dict:
+    """Grade this model's answers. With sample_ids, only those crops: the sample pick() defines,
+    so answers left over from an earlier, differently drawn sample do not leak into the grade."""
     opinions = {r["detection_id"]: dict(r) for r in sidecar.execute(
         "SELECT * FROM opinions WHERE model = ? AND outcome = 'answered'", (model,))}
+    if sample_ids is not None:
+        opinions = {k: v for k, v in opinions.items() if k in sample_ids}
     ids = sorted(opinions)
     det_rows = []
     for i in range(0, len(ids), 500):
@@ -449,7 +477,9 @@ def grade(conn, sidecar, model: str, labels: list[str], period_fn) -> dict:
     t_in, t_out, n_all = sidecar.execute(
         "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*) "
         "FROM opinions WHERE model = ?", (model,)).fetchone()
-    report.update(model=model, asked=n_all, input_tokens=t_in, output_tokens=t_out,
+    report.update(model=model, asked=n_all, graded_answers=len(opinions),
+                  visits=len({r["visit_id"] for r in det_rows if r["visit_id"] is not None}),
+                  input_tokens=t_in, output_tokens=t_out,
                   usd=_usd(model, t_in, t_out),
                   outcomes=dict(sidecar.execute(
                       "SELECT outcome, COUNT(*) FROM opinions WHERE model = ? GROUP BY outcome",
@@ -460,7 +490,8 @@ def grade(conn, sidecar, model: str, labels: list[str], period_fn) -> dict:
 def print_report(rep: dict) -> None:
     usd = f"${rep['usd']:.2f}" if rep["usd"] is not None else "unknown price"
     print(f"Second opinion: {rep['model']}  ({rep['asked']} asked, outcomes {rep['outcomes']}, "
-          f"{rep['input_tokens']:,} in / {rep['output_tokens']:,} out tokens, about {usd})\n")
+          f"{rep['input_tokens']:,} in / {rep['output_tokens']:,} out tokens, about {usd})")
+    print(f"Grading {rep['graded_answers']} answers in the sample, from {rep['visits']} visits.\n")
 
     def f(x):
         return "  -  " if x is None else f"{x:.3f}"
@@ -493,8 +524,11 @@ def main(argv=None) -> int:
                       help="ask about unreviewed uncertain crops from the last HOURS")
     mode.add_argument("--grade", action="store_true", help="report Claude vs BioCLIP")
     p.add_argument("--model", default=cfg.second_opinion_model)
-    p.add_argument("--limit", type=int, default=cfg.second_opinion_max_crops,
-                   help="most crops to send this run (default second_opinion_max_crops)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="most crops in the sample (asking: default second_opinion_max_crops; "
+                        "grading: the whole capped pool)")
+    p.add_argument("--per-visit", type=int, default=PER_VISIT,
+                   help="most crops from any one visit in a graded sample (0 = no cap)")
     p.add_argument("--max-conf", type=float, default=cfg.second_opinion_max_conf,
                    help="only crops BioCLIP named below this confidence")
     p.add_argument("--seed", type=int, default=0, help="--graded sample seed")
@@ -522,12 +556,16 @@ def main(argv=None) -> int:
     if args.grade:
         from eval import _daynight_fn
         period_fn, _ = _daynight_fn(cfg)
-        print_report(grade(conn, sidecar, args.model, labels, period_fn))
+        pool = candidates(conn, graded=True, max_conf=args.max_conf)
+        sample = {r["id"] for r in pick(pool, limit=args.limit, already=set(), graded=True,
+                                         seed=args.seed, per_visit=args.per_visit)}
+        print_report(grade(conn, sidecar, args.model, labels, period_fn, sample_ids=sample))
         return 0
 
+    limit = cfg.second_opinion_max_crops if args.limit is None else args.limit
     rows = candidates(conn, graded=args.graded, max_conf=args.max_conf, recent_hours=args.recent)
-    todo = pick(rows, limit=args.limit, already=already_asked(sidecar, args.model),
-                graded=args.graded, seed=args.seed)
+    todo = pick(rows, limit=limit, already=already_asked(sidecar, args.model),
+                graded=args.graded, seed=args.seed, per_visit=args.per_visit)
     t_in, t_out, usd, unreadable = estimate_cost(todo, args.model, root)
     cost = f"about ${usd:.2f}" if usd is not None else "price unknown for this model"
     print(f"[second-opinion] {len(rows)} candidate crops below {args.max_conf}; sending {len(todo)} "
