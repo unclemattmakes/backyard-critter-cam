@@ -22,6 +22,8 @@ downscaled to IMAGE_MAX_SIDE, along with the capture time and nothing else. See 
   python secondopinion.py --grade                 # Claude vs BioCLIP on those crops
   python secondopinion.py --graded --model claude-haiku-5-5   # the same crops, a cheaper model
   python secondopinion.py --recent 24             # unreviewed uncertain crops from the last day
+  python secondopinion.py --nightly               # the batch's step: --recent on Haiku, only if
+                                                  # second_opinion_nightly is on in config_local.py
 
 Needs `pip install anthropic` (only this module imports it, so the rig runs without it) and an
 anthropic_api_key in the secrets file, or ANTHROPIC_API_KEY in the environment.
@@ -89,6 +91,10 @@ EST_OUTPUT_TOKENS = 80
 # gives every crop in it the same label, and an uncapped random draw once took 100 of 200 crops
 # from a single visit, most of them unreadable smudges.
 PER_VISIT = 3
+
+# How far back the nightly run looks. A little over a day, because the batch start moves with
+# sunset; crops already answered are never sent twice, so the overlap costs nothing.
+NIGHTLY_HOURS = 26
 
 SYSTEM = (
     "You identify animals in crops from a backyard wildlife camera. Each image is the box an "
@@ -545,6 +551,9 @@ def main(argv=None) -> int:
     mode.add_argument("--recent", type=float, metavar="HOURS",
                       help="ask about unreviewed uncertain crops from the last HOURS")
     mode.add_argument("--grade", action="store_true", help="report Claude vs BioCLIP")
+    mode.add_argument("--nightly", action="store_true",
+                      help="the nightly batch's shadow run; does nothing unless "
+                           "second_opinion_nightly is on")
     p.add_argument("--model", default=cfg.second_opinion_model)
     p.add_argument("--limit", type=int, default=None,
                    help="most crops in the sample (asking: default second_opinion_max_crops; "
@@ -557,6 +566,15 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true", help="count and estimate cost; send nothing")
     p.add_argument("--db", default=str(cfg.db_path))
     args = p.parse_args(argv)
+    if args.nightly:
+        if not getattr(cfg, "second_opinion_nightly", False):
+            print("[second-opinion] nightly run is off (second_opinion_nightly); nothing sent.")
+            return 0
+        # 26 h, not 24: the batch start moves with sunset, and answered crops are never re-sent.
+        args.recent = NIGHTLY_HOURS
+        args.model = cfg.second_opinion_nightly_model
+        if args.limit is None:
+            args.limit = cfg.second_opinion_nightly_max_crops
 
     conn = db.connect_readonly(args.db)
     if conn is None:

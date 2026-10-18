@@ -301,3 +301,23 @@ def test_never_send_labels_add_the_owners_names_to_the_generic_ones():
     got = so.never_send_labels(cfg)
     assert "person" in got and "someone" in got
     assert so.never_send_labels(SimpleNamespace()) == list(so.PERSON_LABELS)
+
+
+def test_the_nightly_step_sends_nothing_unless_switched_on(conn, db_path, tmp_path, monkeypatch):
+    import config
+    # --nightly counts back from the real clock, so stamp these crops relative to it, not NOW
+    shift = (datetime.now(TZ) - NOW).total_seconds() / 3600
+    _det(conn, tmp_path, conf=0.6, hours_ago=1 - shift)
+    _det(conn, tmp_path, conf=0.6, hours_ago=40 - shift)         # outside the nightly window
+    client = FakeClient()
+    monkeypatch.setattr(so, "make_client", lambda cfg: client)
+    monkeypatch.setattr(config.CONFIG, "second_opinion_nightly", False)
+    assert so.main(["--nightly", "--db", str(db_path)]) == 0
+    assert client.requests == []
+    assert not (tmp_path / "second_opinion.db").exists()
+
+    monkeypatch.setattr(config.CONFIG, "second_opinion_nightly", True)
+    assert so.main(["--nightly", "--db", str(db_path)]) == 0
+    assert [r["model"] for r in client.requests] == [config.CONFIG.second_opinion_nightly_model]
+    assert so.main(["--nightly", "--db", str(db_path)]) == 0     # answered crops are not re-sent
+    assert len(client.requests) == 1

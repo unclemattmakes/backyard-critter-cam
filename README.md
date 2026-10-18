@@ -765,6 +765,13 @@ species tracks the new labels with no manual `visits.py` step.
   python secondopinion.py --grade               # Claude vs BioCLIP on those crops
   ```
 
+  A graded sample takes at most three crops per visit, because a visit labelled as a whole
+  gives all its crops one label, readable or not. Set `cfg.second_opinion_nightly = True` in
+  `config_local.py` and the nightly batch asks Haiku about the last day's uncertain crops,
+  about 15 cents a night here. List any household names you label people with in
+  `cfg.second_opinion_never_send`. Crops with those labels, and the rest of their visits, are
+  never sent.
+
 ---
 
 ## Individual re-identification (phase 3)
