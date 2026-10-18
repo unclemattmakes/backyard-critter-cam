@@ -49,6 +49,10 @@ from clipfilter import NONANIMAL_LABEL
 # escape: it must pick a listed species, which is one way it ends up confidently wrong.
 OTHER_LABEL = "other animal"
 
+# Human labels that always mean a person. A crop carrying one, and every crop in its visit, is
+# never sent; config's second_opinion_never_send adds names to these.
+PERSON_LABELS = ("person", "human", "people", "man", "woman", "child")
+
 # A crop's long side is downscaled to this before sending. Image input costs about w*h/750
 # tokens, so 768 px caps a crop near 790 tokens, and most detector boxes are smaller anyway.
 IMAGE_MAX_SIDE = 768
@@ -129,14 +133,25 @@ _CANDIDATE_COLS = ("id, crop_path, timestamp, source, visit_id, species, species
                    "species_verified, species_source, model_species, model_species_confidence")
 
 
+def never_send_labels(cfg) -> list[str]:
+    """PERSON_LABELS plus the owner's own list, lower-cased, de-duplicated."""
+    extra = getattr(cfg, "second_opinion_never_send", None) or []
+    return list(dict.fromkeys(str(x).strip().lower() for x in (*PERSON_LABELS, *extra)))
+
+
 def candidates(conn, *, graded: bool, max_conf: float, recent_hours: float | None = None,
-               now: datetime | None = None) -> list[dict]:
+               now: datetime | None = None, never_send=None) -> list[dict]:
     """Animal crops BioCLIP named below max_conf, oldest first.
 
     graded=True keeps only crops a human has ruled on, which is the eval set. Otherwise it keeps
     only crops nobody has reviewed, optionally from the last recent_hours. Crops a human corrected
     before model_species existed are left out: BioCLIP's confidence on them is gone, so they
-    cannot be placed in a band."""
+    cannot be placed in a band.
+
+    Crops a human labelled with a never_send label (default never_send_labels(config.CONFIG)) are
+    left out, and so is every other crop in the same visit: a person mistaken for an animal is
+    usually in more than the one box somebody labelled."""
+    never = never_send_labels(config.CONFIG) if never_send is None else         [str(x).strip().lower() for x in never_send]
     # BioCLIP's own confidence, even where a human has since overwritten species.
     conf = "COALESCE(model_species_confidence, species_confidence)"
     where = ["detection_class = 'animal'",
@@ -151,6 +166,13 @@ def candidates(conn, *, graded: bool, max_conf: float, recent_hours: float | Non
             cutoff = (now or datetime.now().astimezone()) - timedelta(hours=recent_hours)
             where.append("timestamp >= ?")
             params.append(cutoff.isoformat())
+    if never:
+        marks = ",".join("?" * len(never))
+        person = f"species_source = 'human' AND LOWER(species) IN ({marks})"
+        where.append(f"NOT ({person})")
+        where.append(f"(visit_id IS NULL OR visit_id NOT IN (SELECT visit_id FROM detections "
+                     f"WHERE visit_id IS NOT NULL AND {person}))")
+        params += never + never
     rows = conn.execute(
         f"SELECT {_CANDIDATE_COLS} FROM detections WHERE {' AND '.join(where)} ORDER BY id",
         params).fetchall()

@@ -273,3 +273,31 @@ def test_grade_counts_only_the_sample(conn, tmp_path, sidecar):
     assert rep["slices"]["all:all"]["n"] == 1
     assert rep["slices"]["all:all"]["claude_acc"] == 1.0
     assert rep["graded_answers"] == 1 and rep["asked"] == 2
+
+
+def test_a_person_label_keeps_its_crop_and_its_whole_visit_off_the_network(conn, tmp_path):
+    me = _det(conn, tmp_path, conf=0.6, corrected_to="Someone")       # a household member
+    same_visit = _det(conn, tmp_path, conf=0.6)                       # unreviewed, same visit
+    labelled_same_visit = _det(conn, tmp_path, conf=0.6, verified=1)  # reviewed, same visit
+    other_visit = _det(conn, tmp_path, conf=0.6)
+    generic = _det(conn, tmp_path, conf=0.6, corrected_to="Person")   # always blocked
+    conn.execute("UPDATE detections SET visit_id = 1 WHERE id IN (?, ?, ?)",
+                 (me, same_visit, labelled_same_visit))
+    conn.execute("UPDATE detections SET visit_id = 2 WHERE id = ?", (other_visit,))
+    conn.commit()
+    names = ["someone"]
+    graded = {r["id"] for r in so.candidates(conn, graded=True, max_conf=0.8,
+                                             never_send=[*so.PERSON_LABELS, *names])}
+    recent = {r["id"] for r in so.candidates(conn, graded=False, max_conf=0.8, recent_hours=24,
+                                             now=NOW, never_send=[*so.PERSON_LABELS, *names])}
+    assert graded == set()          # me (by name), labelled_same_visit (by visit), generic
+    assert recent == {other_visit}  # same_visit shares my visit
+    # without the guard the same crops are eligible, so the test above is the guard at work
+    assert so.candidates(conn, graded=True, max_conf=0.8, never_send=[]) != []
+
+
+def test_never_send_labels_add_the_owners_names_to_the_generic_ones():
+    cfg = SimpleNamespace(second_opinion_never_send=[" Someone "])
+    got = so.never_send_labels(cfg)
+    assert "person" in got and "someone" in got
+    assert so.never_send_labels(SimpleNamespace()) == list(so.PERSON_LABELS)

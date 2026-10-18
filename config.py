@@ -1054,6 +1054,16 @@ class Config:
     second_opinion_model: str = "claude-opus-5-5"
     second_opinion_max_conf: float = 0.8
     second_opinion_max_crops: int = 300
+    # Human labels that mean a PERSON (a household member's name, say). A crop with one, and every
+    # crop in its visit, is never sent. Generic words ("person", "human", ...) are always on the
+    # list; add names here in config_local.py, never in this file. The rig stores only 'animal'
+    # boxes, so a person MegaDetector mistook for an animal is caught only once someone labels it.
+    second_opinion_never_send: list | None = None
+    # The nightly batch's shadow run over the last day's uncertain crops. Off by default: it sends
+    # crops off the LAN, so it is an owner's decision. ~650-800 crops a day on Haiku is ~$0.12.
+    second_opinion_nightly: bool = False
+    second_opinion_nightly_model: str = "claude-haiku-5-5"
+    second_opinion_nightly_max_crops: int = 1000
 
     # ---- Timezone convention ----------------------------------------------------
     # Timestamps are stored as LOCAL time WITH the UTC offset, ISO 8601, e.g.
