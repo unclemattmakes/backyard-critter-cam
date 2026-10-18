@@ -1444,6 +1444,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 frame_width=data.get("frame_width"), frame_height=data.get("frame_height"),
                 motion_min_area=data.get("motion_min_area"),
                 record_clips=data.get("record_clips"),
+                snapshot_url=data.get("snapshot_url"),
                 enabled=bool(data.get("enabled", True)))
             conn = db.connect(cfg.db_path)
             try:
@@ -1474,7 +1475,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                             return norm(a) == norm(b)
                         if any(not _same(data.get(k), existing.get(k)) for k in
                                ("kind", "url_scheme", "url_host", "url_port", "url_path",
-                                "username")):
+                                "username", "snapshot_url")):
                             wants_secret = True
                     if wants_secret and not self._is_loopback():
                         self._json({"error":

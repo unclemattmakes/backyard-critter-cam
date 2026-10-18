@@ -153,6 +153,35 @@ Main is affordable — but decode is not the whole cost, and two other things ma
 
 Start on the sub-stream to prove the plumbing; switch when the camera is in its final position.
 
+### Or: keep the sub-stream and take ID crops from a full-resolution still
+
+A camera that serves a single JPEG on request gives you the main stream's pixels without decoding
+it all day. Set the camera's **Hi-res snapshot** field in the dashboard and, each time the stream
+saves an animal, the rig fetches one still, runs the detector on it to find the animal again, and
+points the detection's `crop_path` at a cut from the still. The stream crop stays in
+`stream_crop_path`; naming, re-ID, traits and the dashboard all read the hi-res one. A fetch that
+times out, a still that is not an image, or an animal that has moved off its box leaves the
+stream crop in place. Expect roughly one in several to miss on a fast-moving animal, since the
+still lands ~0.5-1 s after the frame.
+
+For a Reolink:
+
+1. Turn HTTP on: Reolink app -> the camera -> Settings -> Network -> Advanced -> Server Settings
+   -> HTTP (port 80). RTSP being on is not enough; port 80 stays shut without this.
+2. Check it from the rig, with the camera's own `rig` login (not the cloud account):
+   `curl -o snap.jpg "http://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig&password=..."`.
+   A JPEG of the full sensor size is a pass. A small JSON body is a refused login.
+3. In the dashboard, edit the camera and set Hi-res snapshot to
+   `http://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}`.
+   The placeholders are filled from the camera's own address and login at startup, so the stored
+   text never holds the password. Changing this field on a camera with a stored password is a
+   credential change and only works from the rig itself.
+4. Restart the rig. The start-up log says `hi-res crops on (...)`, and the shutdown line counts
+   swapped / not found / failed / skipped-while-busy.
+
+The still must have the stream's aspect ratio (640x360 and 3840x2160 are both 16:9), or boxes
+cannot be mapped between them and the feature idles with one log line saying so.
+
 ## Phase 5: write the spec
 
 **Or do it in the dashboard.** Since 2026-08-22 the camera list lives in the `cameras` DB table

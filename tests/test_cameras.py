@@ -483,18 +483,20 @@ def test_undelete_restores_every_column_not_just_the_ones_we_remembered(conn):
     """A stale value surviving from the tombstoned row would be invisible until the camera
     behaved oddly, so this checks the whole row rather than a sample of it."""
     cam = _net(conn, name="Old", url_port=554, url_path="old_path", frame_width=640,
-               frame_height=360, motion_min_area=200, record_clips=False)
+               frame_height=360, motion_min_area=200, record_clips=False,
+               snapshot_url="http://{host}/old_snap")
     db.remove_camera(conn, cam["id"])
     again = db.add_camera(conn, source="yard_ir", kind="network", name="New",
                           url_host="10.0.0.9", url_port=8554, url_path="new_path",
                           username="rig2", frame_width=1920, frame_height=1080,
-                          motion_min_area=1800, record_clips=True)
+                          motion_min_area=1800, record_clips=True,
+                          snapshot_url="http://{host}/new_snap")
     assert again["id"] == cam["id"]
     for field, want in [("name", "New"), ("url_host", "10.0.0.9"), ("url_port", 8554),
                         ("url_path", "new_path"), ("username", "rig2"),
                         ("frame_width", 1920), ("frame_height", 1080),
                         ("motion_min_area", 1800), ("record_clips", True),
-                        ("enabled", True)]:
+                        ("snapshot_url", "http://{host}/new_snap"), ("enabled", True)]:
         assert again[field] == want, f"{field} kept a stale value from the tombstone"
 
 

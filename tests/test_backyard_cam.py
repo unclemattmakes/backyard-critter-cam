@@ -655,6 +655,57 @@ def _saved_shape(rows):
              r["individual_id"], r["crop_quality"]) for r in rows]
 
 
+class _RecordingCropper:
+    """Stands in for snapshot.SnapshotCropper: records what the capture loop hands it."""
+    made: list = []
+
+    def __init__(self, spec, cfg, detect, det_lock, tag=""):
+        self.jobs, self.closed = [], False
+        _RecordingCropper.made.append(self)
+
+    def start(self):
+        return self
+
+    def submit(self, job):
+        self.jobs.append(job)
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def _drive_spec(cfg, monkeypatch, spec, script):
+    frames = [_yard()] * (backyard_cam.MOTION_WARMUP_FRAMES + len(script))
+    stop = threading.Event()
+    cap = _FakeCap(frames, stop)
+    monkeypatch.setattr(backyard_cam, "open_capture", lambda s, c: cap)
+    _RecordingCropper.made = []
+    monkeypatch.setattr(backyard_cam.snapshot, "SnapshotCropper", _RecordingCropper)
+    backyard_cam._run_camera(spec, cfg, _ScriptedDetector(script), threading.Lock(),
+                             {}, {}, {}, threading.Lock(), stop, {})
+
+
+def test_saved_detections_are_handed_to_the_hires_cropper_after_their_rows_exist(
+        tmp_path, monkeypatch):
+    cfg = _loop_cfg(tmp_path)
+    spec = config.CameraSpec("test_cam", 0, snapshot_url="http://192.168.1.50/snap")
+    _drive_spec(cfg, monkeypatch, spec, [[_animal(FURNITURE), _animal(ELSEWHERE)]])
+    (cropper,) = _RecordingCropper.made
+    rows = _rows(cfg)
+    (job,) = cropper.jobs
+    assert [d[0] for d in job.dets] == [r["id"] for r in rows]
+    assert [d[2] for d in job.dets] == [r["crop_path"] for r in rows]
+    assert (job.frame_w, job.frame_h) == (1280, 720)
+    assert cropper.closed
+
+
+def test_a_camera_without_a_snapshot_url_gets_no_cropper(tmp_path, monkeypatch):
+    cfg = _loop_cfg(tmp_path)
+    _drive_spec(cfg, monkeypatch, cfg.camera_specs()[0], [[_animal(FURNITURE)]])
+    assert _RecordingCropper.made == []
+    assert len(_rows(cfg)) == 1
+
+
 def test_disabled_veto_leaves_the_save_path_exactly_as_it_was(tmp_path, monkeypatch):
     cfg = _loop_cfg(tmp_path / "off")            # refimg_enabled defaults to False
     assert cfg.refimg_enabled is False

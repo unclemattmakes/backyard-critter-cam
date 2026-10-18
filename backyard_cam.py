@@ -39,6 +39,7 @@ import db
 import mdns
 import powerguard
 import quality
+import snapshot
 import stats
 import visits
 import web
@@ -1597,6 +1598,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     cap = None
     recorder = None
     shadow = None                               # refimg shadow veto; stays None when it's off
+    hires = None                                # snapshot cropper; None unless the camera has one
     saved = ignored = 0
     try:
         cap = open_capture(spec, cfg)
@@ -1621,6 +1623,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         db.record_coverage(cfg.db_path, spec.source, "up", "opened")
 
         recorder = clips.ClipRecorder(cfg, conn, source=spec.source) if record else None
+        if spec.snapshot_url:
+            hires = snapshot.SnapshotCropper(spec, cfg, detector.detect, det_lock, tag=tag).start()
 
         # Sun-driven day/night camera profile -- LOCAL cams only (a network stream exposes no UVC
         # exposure controls), and only when no manual exposure/gain is forcing static settings.
@@ -1844,6 +1848,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     if cfg.save_full_frame:
                         fp = save_frame(frame, cfg, day, stamp)
                         frame_path = _rel(fp) if fp else None
+                    hires_dets = []
                     for i, det in enumerate(saved_dets):
                         s = save_crop(frame, det, cfg, day, stamp, i)
                         if s is None:
@@ -1863,11 +1868,15 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                             print(f"  {tag} [{iso}] DB write failed, kept crop {_rel(crop_path)}: {e}")
                             continue
                         saved += 1
+                        hires_dets.append((det_id, det, _rel(crop_path)))
                         print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
                         # SHADOW VETO, strictly AFTER the row and crop exist: it can only ADD
                         # suppression metadata to a detection that was saved exactly as before.
                         if shadow is not None:
                             shadow.judge(conn, det_id, det)
+                    # After the rows exist: the worker only ever upgrades a saved crop.
+                    if hires is not None and hires_dets:
+                        hires.submit(snapshot.Job(hires_dets, w, h))
 
             # --- Annotate for the dashboard feed + the native preview grid (NO cv2 GUI here) ---
             # Presentation only, so it's rate-capped, and the dashboard side runs ONLY while a
@@ -1912,6 +1921,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 pass
         if shadow is not None:
             shadow.close()                          # flush the recurrence ledger (never raises)
+        if hires is not None:
+            hires.close()
         if cap is not None:
             try:
                 cap.release()
