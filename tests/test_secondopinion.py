@@ -293,7 +293,8 @@ def test_a_person_label_keeps_its_crop_and_its_whole_visit_off_the_network(conn,
     assert graded == set()          # me (by name), labelled_same_visit (by visit), generic
     assert recent == {other_visit}  # same_visit shares my visit
     # without the guard the same crops are eligible, so the test above is the guard at work
-    assert so.candidates(conn, graded=True, max_conf=0.8, never_send=[]) != []
+    unguarded = {r["id"] for r in so.candidates(conn, graded=True, max_conf=0.8, never_send=[])}
+    assert unguarded == {me, labelled_same_visit, generic}
 
 
 def test_never_send_labels_add_the_owners_names_to_the_generic_ones():
