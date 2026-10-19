@@ -280,8 +280,9 @@ def capture_health(pids) -> dict:
     return out
 
 
-def check_capture(health: dict) -> bool:
-    """Log a line for each camera that has gone dark while the rig is up. True if any did.
+def check_capture(health: dict, alarms: dict | None = None) -> bool:
+    """Log a line for each camera that has gone dark while the rig is up. True if any did, and
+    each dark camera (or a wedged watch) is recorded in `alarms` for the health record.
 
     A frame age the watch keeps refreshing is trusted; a watch that stopped refreshing is its own
     alarm, because then nothing in the file is current."""
@@ -293,6 +294,9 @@ def check_capture(health: dict) -> bool:
         log(f"CAPTURE STATUS IS STALE: the rig is running but its capture watch last wrote "
             f"{when}, so the process is wedged and nothing is being recorded. "
             f"See logs/backyard_cam.log.")
+        _raise(alarms, "capture_status_stale", "alarm",
+               f"The rig is running but its capture watch last wrote {when}, so the process is "
+               f"wedged and nothing is being recorded. Restart the rig; see logs/backyard_cam.log.")
         return True
     dark = False
     for source, cam in sorted(health["cameras"].items()):
@@ -307,13 +311,24 @@ def check_capture(health: dict) -> bool:
             log(f"CAPTURE IS STALLED on {source}: no frame for {age / 60.0:.0f} min while the rig "
                 f"is up, and its capture thread is stuck at {cam.get('where') or 'an unknown place'}. "
                 f"Nothing is being recorded; restart the rig. The stack is in logs/backyard_cam.log.")
+            _raise(alarms, f"capture_stalled:{source}", "alarm",
+                   f"Capture is stalled on {source}: no frame for {age / 60.0:.0f} min and its "
+                   f"capture thread is stuck, so nothing is being recorded. Restart the rig; the "
+                   f"stack is in logs/backyard_cam.log.")
         elif state == "reconnecting":
             log(f"CAMERA {source} IS DOWN: no frame for {age / 60.0:.0f} min; the rig is "
                 f"reconnecting, so check the camera and its network.")
+            _raise(alarms, f"camera_down:{source}", "warn",
+                   f"Camera {source} is down: no frame for {age / 60.0:.0f} min while the rig "
+                   f"keeps reconnecting. Check the camera and its network.")
         else:
             log(f"CAPTURE IS STALLED on {source}: no frame for {age / 60.0:.0f} min while the rig "
                 f"is up (capture state '{state}'). Nothing is being recorded. "
                 f"See logs/backyard_cam.log.")
+            _raise(alarms, f"capture_stalled:{source}", "alarm",
+                   f"Capture is stalled on {source}: no frame for {age / 60.0:.0f} min while the "
+                   f"rig is up (capture state '{state}'), so nothing is being recorded. "
+                   f"See logs/backyard_cam.log.")
     return dark
 
 
@@ -588,7 +603,7 @@ def _watch_rig(args, pids, alarms: dict | None = None) -> tuple[int, bool]:
         naming_bad = check_naming(health, alarms)
         _record_backlog(health.get("backlog"))
         try:
-            capture_bad = check_capture(capture_health(pids))
+            capture_bad = check_capture(capture_health(pids), alarms)
         except Exception as e:                  # noqa: BLE001 -- never let a report sink the run
             log(f"capture check failed: {type(e).__name__}: {e}")
             capture_bad = True

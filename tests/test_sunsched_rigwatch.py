@@ -623,6 +623,25 @@ def test_naming_alarms_land_in_the_record(monkeypatch):
     assert "CUDA out of memory" in _alarms()["naming_error"]["message"]
 
 
+def test_capture_alarms_land_in_the_record_one_per_camera(monkeypatch):
+    _capture_status({"glass_door_cam": _cam(3240.0, stuck=True, where="detector.py:88"),
+                     "yard_ir": _cam(900.0, state="reconnecting"),
+                     "side_cam": _cam(0.3)})
+    _check_up_rig(monkeypatch)
+    assert set(_alarms()) == {"capture_stalled:glass_door_cam", "camera_down:yard_ir"}
+    stalled = _alarms()["capture_stalled:glass_door_cam"]
+    assert stalled["severity"] == "alarm" and "no frame for 54 min" in stalled["message"]
+    assert _alarms()["camera_down:yard_ir"]["severity"] == "warn"
+
+    _capture_status({"glass_door_cam": _cam(0.4)}, written_s_ago=600.0)
+    _check_up_rig(monkeypatch)
+    assert set(_alarms()) == {"capture_status_stale"}    # the per-camera ones cleared
+
+    _capture_status({"glass_door_cam": _cam(0.4)})
+    _check_up_rig(monkeypatch)
+    assert _alarms() == {}
+
+
 def test_a_corrupt_state_file_is_survived_and_replaced(monkeypatch):
     rigwatch.STATE_FILE.write_text("{torn mid-wri")
     monkeypatch.setattr(rigwatch, "rig_pids", lambda: [123])
