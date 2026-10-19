@@ -1226,12 +1226,18 @@ class Config:
     trailcam_burst_frame_quality: int = 85
 
     def camera_specs(self) -> "list[CameraSpec]":
-        """The cameras to run, as a list of CameraSpec -- ALWAYS at least one. With `cameras` set
-        it's returned as-is; otherwise a single spec is synthesized from the flat single-camera
-        fields, so the legacy one-camera path is just the N=1 case of the multi-camera one (no
-        separate code path, and every existing config keeps working untouched)."""
+        """The cameras to run, as a list of CameraSpec -- at least one unless every listed one is
+        unaddressed (below). With `cameras` set it's returned as-is; otherwise a single spec is
+        synthesized from the flat single-camera fields, so the legacy one-camera path is just the
+        N=1 case of the multi-camera one (no separate code path, and every existing config keeps
+        working untouched).
+
+        A listed spec whose src is None is dropped (see unaddressed_cameras): that is what
+        CameraSpec("yard_ir", secret("yard_ir_url")) becomes once the key leaves secrets.json, and
+        a removed secret must not stop the rig. If that leaves nothing, the answer is [] rather
+        than the synthesized flat spec -- seeding a webcam nobody listed would outlive the fix."""
         if self.cameras:
-            return list(self.cameras)
+            return [s for s in self.cameras if s.src is not None]
         return [CameraSpec(
             source=self.source, src=self.camera_index, name=None,
             frame_width=self.frame_width, frame_height=self.frame_height,
@@ -1241,6 +1247,11 @@ class Config:
             use_time_of_day_profiles=self.use_time_of_day_profiles,
             motion_min_area=self.motion_min_area, record_clips=self.record_clips,
         )]
+
+    def unaddressed_cameras(self) -> "list[CameraSpec]":
+        """The cfg.cameras specs camera_specs() drops because their src is None -- almost always a
+        secret("...") lookup whose key is no longer in secrets.json."""
+        return [s for s in (self.cameras or []) if s.src is None]
 
 
 # The single shared default instance. backyard_cam.py copies this and applies CLI overrides.
