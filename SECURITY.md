@@ -135,7 +135,7 @@ variable points.
  "yard_ir_url": "rtsp://user:pass@192.168.1.50:554/h264Preview_01_sub"}
 ```
 
-`email_resend_api_key`, `operator_token` and `mqtt_password` fill the config automatically; any
+`email_resend_api_key`, `operator_token`, `mqtt_password` and `anthropic_api_key` fill the config automatically; any
 other key is read in `config_local.py` with `config.secret("name")` (that is how a camera URL with
 a password stays out of it — see `config_local.example.py`). A value still set in
 `config_local.py` wins, so an old config keeps working; it just keeps riding into the backups.
@@ -174,6 +174,11 @@ What follows from that:
 
 ## Other things worth knowing
 
+- **`secondopinion.py` sends crops to Anthropic.** It is the one tool that puts pixels on the
+  internet, and it runs only when you run it. It sends `animal` crops BioCLIP was unsure of
+  (never MegaDetector's `person` or `vehicle` boxes), shrunk to at most 768 px, with the capture
+  time. An animal box can still catch part of a person or a house, so look at what your camera
+  sees before you use it. Answers stay on your machine in `second_opinion.db`.
 - **Model weights are executable.** A YOLO `.pt` is a pickle, and Ultralytics loads it with
   `weights_only=False`, so a tampered weight file is remote code execution on your machine.
   `detector.py` therefore verifies every downloaded *and cached* MDv6 weight against a pinned

@@ -752,6 +752,25 @@ species tracks the new labels with no manual `visits.py` step.
   as an animal. Nothing stored changes, human labels always show, and the review queue and the
   species sheet still show the raw guess with its score. The visit card's "✓ species" is not
   offered on an Unidentified visit, so you can't confirm a label you can't see.
+- **A second opinion from Claude (shadow mode, optional).** `secondopinion.py` asks Claude to
+  name the animal in crops BioCLIP called below 0.8. Claude is not shown BioCLIP's guess. It
+  then grades both models against your labels, by confidence band and by day and night. The
+  answers go to `second_opinion.db` beside the database, and nothing in the rig reads them yet.
+  It needs `pip install anthropic` and an `anthropic_api_key` in the secrets file, and it sends
+  crops off your LAN (see [SECURITY.md](SECURITY.md)).
+
+  ```
+  python secondopinion.py --graded --dry-run    # how many crops, roughly what it would cost
+  python secondopinion.py --graded --limit 200  # ask about 200 crops you have already labelled
+  python secondopinion.py --grade               # Claude vs BioCLIP on those crops
+  ```
+
+  A graded sample takes at most three crops per visit, because a visit labelled as a whole
+  gives all its crops one label, readable or not. Set `cfg.second_opinion_nightly = True` in
+  `config_local.py` and the nightly batch asks Haiku about the last day's uncertain crops,
+  about 15 cents a night here. List any household names you label people with in
+  `cfg.second_opinion_never_send`. Crops with those labels, and the rest of their visits, are
+  never sent.
 
 ---
 
