@@ -275,6 +275,17 @@
           <input id="cam-password" type="password" autocomplete="new-password"
                  placeholder="leave blank to keep the stored one"></label>
         <p class="hint cams-note" id="cam-pw-note"></p>
+        <label class="cams-row"><span>Hi-res snapshot</span>
+          <input id="cam-snapshot" maxlength="300" autocomplete="off" spellcheck="false"
+                 placeholder="off"></label>
+        <p class="hint cams-note">Optional. A still at the camera's full resolution, fetched
+          when an animal is detected, so the crop used for naming and individual ID has more
+          pixels than the stream. Write the address as <code>{host}</code>; the rig fills it in.
+          For a Reolink with HTTPS enabled:
+          <code>https://{host}/cgi-bin/api.cgi?cmd=Snap&amp;channel=0&amp;token={token}</code>.
+          <code>{token}</code> logs in with this camera's username and password once an hour, so
+          the password never goes into the URL. (Other cameras can use <code>{user}</code> and
+          <code>{password}</code>, which do.)</p>
       </div>
 
       <details class="cams-adv">

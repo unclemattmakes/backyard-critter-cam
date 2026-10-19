@@ -1192,13 +1192,16 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     off = _qs_int(q, "offset", 0, 0, 1_000_000)
                     md = (q.get("mode") or ["recent"])[0]
                     since = _qs_int(q, "since_h", DEFAULT_QUEUE_WINDOW_H, 0, 24 * 400)
+                    nt = (q.get("night") or [None])[0]
+                    nt = nt if nt and re.fullmatch(r"\d{4}-\d{2}-\d{2}", nt) else None
                     # The heaviest endpoint there is (~10s: a full VisitMatcher rebuild), so it
                     # leans hardest on the cache. Label POSTs clear it, so the queue is always
                     # fresh right after a confirm -- the rebuild then happens once, not per open.
-                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}:{since}",
+                    self._json(_cached(cfg, f"reidq:{sp}:{lim}:{off}:{md}:{since}:{nt}",
                                        lambda: _reid_queue(cfg, species=sp, limit=lim,
                                                            offset=off, mode=md,
-                                                           since_h=since), hold_s=60))
+                                                           since_h=since, night=nt),
+                                       hold_s=60))
                 elif path == "/api/reid/dossier":
                     # One visit, everything about it (see _reid_dossier). Cached per visit id:
                     # it rebuilds the whole VisitMatcher, and the one-at-a-time flow steps
@@ -1450,6 +1453,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 frame_width=data.get("frame_width"), frame_height=data.get("frame_height"),
                 motion_min_area=data.get("motion_min_area"),
                 record_clips=data.get("record_clips"),
+                snapshot_url=data.get("snapshot_url"),
                 enabled=bool(data.get("enabled", True)))
             conn = db.connect(cfg.db_path)
             try:
@@ -1480,7 +1484,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                             return norm(a) == norm(b)
                         if any(not _same(data.get(k), existing.get(k)) for k in
                                ("kind", "url_scheme", "url_host", "url_port", "url_path",
-                                "username")):
+                                "username", "snapshot_url")):
                             wants_secret = True
                     if wants_secret and not self._is_loopback():
                         self._json({"error":
@@ -1554,7 +1558,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             """Assign an individual to an un-blend cluster: {"track_ids": [...], "name": "Notch"}
             labels clip TRACKLETS (clip-space, the clips basis); {"detection_ids": [...], "name":
             ...} stamps still CROPS directly (individual_source='human' -- the stills basis, whose
-            labels survive visit renumbering like every detection-level label). name=""/null
+            labels survive any visit-ledger rebuild like every detection-level label). name=""/null
             clears either way."""
             tids = data.get("track_ids") or []
             dids = data.get("detection_ids") or []
@@ -1579,9 +1583,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             """Confirm/correct a visit's SPECIES and/or name its INDIVIDUAL in one call -- the
             shared backend for the Individuals queue (sends visit_id) and the Explorer Visits
             list (sends source+start+end). Body: {visit_id | source,start,end} plus any of
-            {name (str|null), species (str), verify (bool)}. Deliberately does NOT rebuild visits
-            (a rebuild renumbers ids and would invalidate an open queue; labels live on the
-            detections and survive the next rebuild)."""
+            {name (str|null), species (str), verify (bool)}. Does NOT rebuild visits; labels live
+            on the detections and survive the next rebuild. A visit_id the ledger no longer holds
+            is a 409 with `stale_visit`."""
             kw = {}
             if data.get("visit_id") is not None:
                 try:
@@ -1610,6 +1614,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             conn = db.connect(cfg.db_path)
             try:
                 res = db.apply_visit_label(conn, **kw)
+                if ("visit_id" in kw and not res.get("detections")
+                        and not db.visit_exists(conn, kw["visit_id"])):
+                    self._json(_stale_visit_error(kw["visit_id"]), code=409)
+                    return
             finally:
                 conn.close()
             if (kw.get("verify") and "species" not in kw and "name" not in kw
@@ -1631,8 +1639,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
 
             The visit form takes source+start+end -- _visitTarget's shape, the same one
             /api/visit/label takes -- because a visit id is not a durable handle here (the Visit
-            Log re-clusters visits per request and visits.py renumbers the ledger). Only `start`
-            is the key; `end` is recorded for display. See the `favorites` table in db.py.
+            Log re-clusters visits per request, and a visits.py id changes when its visit
+            regroups). Only `start` is the key; `end` is recorded for display. See the
+            `favorites` table in db.py.
 
             This is the one write in the dashboard that says nothing about WHAT the animal is,
             so it never touches a label, a species or an identity -- and nothing downstream
@@ -1736,10 +1745,10 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             name=""/null clears; add "reject": true to clear AND leave the human's "not them"
             tombstone (individual_source 'human' with a NULL id), which stops the nightly
             auto-assign pass from re-naming the visit. Stamps the visit's species-matching crops
-            (individual_source='human') and mirrors the name onto the visits row. Deliberately
-            does NOT rebuild the visits table -- a rebuild renumbers visit ids and would
-            invalidate every other card in the open review queue; labels live on detections, so
-            the next rebuild inherits them anyway."""
+            (individual_source='human') and mirrors the name onto the visits row. Does NOT
+            rebuild the visits table; labels live on detections, so the next rebuild inherits
+            them. A visit id the ledger no longer holds is a 409 with `stale_visit`, never an ok
+            that stamped nothing."""
             try:
                 vid = int(data.get("visit_id"))
             except (TypeError, ValueError):
@@ -1754,8 +1763,12 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 sp = db.confirm_species(conn, vid, name, str(data.get("species") or "").strip())
                 n = db.label_visit(conn, vid, name, reject=reject,
                                    labeled_by=_labeler(data), species=sp)
-                if sp and not n and conn.execute("SELECT 1 FROM visits WHERE id = ?",
-                                                 (vid,)).fetchone():
+                # Asked AFTER the write, so a rebuild landing between a check and the write
+                # can't turn a dropped confirmation back into an ok.
+                if not n and not db.visit_exists(conn, vid):
+                    self._json(_stale_visit_error(vid), code=409)
+                    return
+                if sp and not n:
                     self._json({"error": f"visit #{vid} has no {sp} crops to "
                                          f"{'name' if name else 'clear'}"}, code=409)
                     return
@@ -2094,18 +2107,25 @@ def _eval_status() -> dict:
     floors = [{"metric": r.get("metric"), "current": r.get("current"), "floor": r.get("floor")}
               for r in ((gate.get("floors") or {}).get("breaches") or [])]
     stale = gate.get("staleness") or {}
+    # The shipped auto-assign point making wrong names on the confirmed corpus (from 2026-10-15).
+    point = gate.get("operating_point") or {}
+    point_bad = ([f"{point.get('metric')}: {point.get('errors')} wrong"]
+                 if point.get("breached") else [])
     ok = diff.get("ok") if diff else None
-    if floors:
+    if floors or point_bad:
         ok = False
     out = {
         "available": True,
         "artifact": p.name,
         "run_at": (art.get("meta") or {}).get("run_at"),
-        # ok True/False when the run diffed a baseline or broke a floor; None = no gate ran.
+        # ok True/False when the run diffed a baseline, broke a floor or failed the operating-point
+        # check; None = no gate ran.
         "ok": ok,
         "regressions": [r.get("metric") for r in (diff.get("regressions") or [])]
-                       + [f["metric"] for f in floors],
+                       + [f["metric"] for f in floors] + point_bad,
         "floor_breaches": floors,
+        # Nights in a row before this one that the gate failed, i.e. auto-assign did not run.
+        "skipped_nights": gate.get("regression_streak"),
         "baseline_run_at": diff.get("baseline_run_at"),
         # Split on both separators: the artifact records a Windows path, and CI reads it on Linux.
         "baseline_artifact": (re.split(r"[\\/]", diff["baseline_path"])[-1]
@@ -2315,6 +2335,16 @@ CROSS_CAMERA_PAD_S = 600
 DOSSIER_MAX_CROPS = 60
 
 
+def _stale_visit_error(visit_id: int) -> dict:
+    """The 409 body for a write aimed at a visit id the ledger no longer holds. Ids are stable
+    across rebuilds, so this means the visit itself changed under an open page: it merged with a
+    neighbour or lost its first crop. Saying so beats an ok that stamped nothing."""
+    return {"error": f"visit #{visit_id} is no longer in the visit list (it merged with another "
+                     f"visit or lost its first crop when the list was rebuilt), so nothing was "
+                     f"saved. Reload and try again.",
+            "stale_visit": True, "visit_id": visit_id}
+
+
 def _reid_dossier(cfg, visit_id: int, species: str = "raccoon") -> dict:
     """EVERYTHING known about ONE visit -- the payload behind the one-at-a-time review flow.
 
@@ -2332,7 +2362,8 @@ def _reid_dossier(cfg, visit_id: int, species: str = "raccoon") -> dict:
     Read-only. Returns {} for an unknown visit."""
     import individuals
 
-    conn = db.connect_readonly(cfg.db_path)
+    # One snapshot: the visit row, the matcher and the neighbours all join on visit ids.
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)
     if conn is None:
         return {}
     try:
@@ -2444,7 +2475,8 @@ DEFAULT_QUEUE_WINDOW_H = 48
 
 
 def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
-                mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H) -> dict:
+                mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H,
+                night: str | None = None) -> dict:
     """The Individuals tab's review queue: visits of `species` with a WHO suggestion each
     (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
     nothing is confirmed yet -- the cold-start visit-groups to name first. Read-only; the heavy
@@ -2454,10 +2486,17 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     `mode` picks WHICH visits (see QUEUE_MODES); `offset`/`limit` PAGINATE within that mode.
     Pagination rather than a bigger limit on purpose: the per-visit work below (clip overlap +
     crop strip) and the matcher rebuild are what cost, so a page stays cheap however deep the
-    filter reaches."""
+    filter reaches.
+
+    `night` (YYYY-MM-DD) picks which night the TONIGHT groups cover; None is the newest night with
+    work left. Those groups ride beside the queue rather than as a mode, because they are a
+    different shape (groups, not visits) and reuse the matcher this call already built."""
     import individuals
 
-    conn = db.connect_readonly(cfg.db_path)
+    # One snapshot for the whole page. The matcher's ids and the visit pool below come from
+    # separate queries; a ledger rebuild between them would leave every card unmatched (no
+    # suggestions, "no embedded crops yet") and the funnel's per-camera counts at zero.
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)
     if conn is None:
         return {"species": species, "queue": [], "cast": [], "bootstrap": [], "mode": "recent",
                 "offset": 0, "limit": limit, "n_matched": 0, "funnel": {}}
@@ -2619,7 +2658,7 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
             r = matcher.refit()
             started = matcher.visit_started
             def _rep_for_visit(vid):
-                # The visit may have been renumbered/removed by a rebuild since refit() listed it,
+                # The visit may have been merged away by a rebuild since refit() listed it,
                 # so guard the row (fetchone() can be None) rather than index None[0] -> 500.
                 row = conn.execute(
                     "SELECT representative_detection_id FROM visits WHERE id=?", (vid,)).fetchone()
@@ -2632,6 +2671,20 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
                                  for g in r["novel_groups"]],
                 "untemplated": r["untemplated"], "n_fit": r["n_fit"], "n_novel": r["n_novel"]}
 
+        # TONIGHT: one night's unreviewed visits grouped within each camera, to name a group at a
+        # time (individuals.VisitMatcher.night_groups). Every member carries its own thumbnail,
+        # because the human unticks the odd one out before anything is written.
+        tonight = None
+        if has_templates:
+            tonight = matcher.night_groups(night=night)
+            for g in tonight["groups"]:
+                g["members"] = [{"visit_id": v, "started": st, "auto_as": a,
+                                 "rep_crop": _rep_for_visit(v)}
+                                for v, st, a in zip(g["visits"], g["started"], g["auto_as"])]
+                if g["suggestion"]:
+                    g["suggestion"]["lapse"] = (
+                        freshness.get(g["suggestion"]["name"]) or {}).get("lapse")
+
         # Heads-up when suggestions are running blind: high-conf crops still missing vectors.
         backlog = conn.execute(
             """SELECT COUNT(*) FROM detections d
@@ -2642,7 +2695,8 @@ def _reid_queue(cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
 
         return {"species": species, "queue": queue,
                 "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
-                "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
+                "bootstrap": bootstrap, "refit": refit, "tonight": tonight,
+                "unembedded": backlog,
                 "novel_threshold": cfg.reid_novel_threshold,
                 "mode": mode, "modes": list(QUEUE_MODES),
                 "offset": offset, "limit": limit, "n_matched": len(matched),
@@ -2667,7 +2721,7 @@ def _reid_unblend(cfg, visit_id: str) -> dict:
         vid = int(visit_id)
     except (TypeError, ValueError):
         return {"visit_id": None, "groups": [], "note": "bad visit_id"}
-    conn = db.connect_readonly(cfg.db_path)
+    conn = db.connect_readonly(cfg.db_path, snapshot=True)   # matcher + this visit's rows agree
     if conn is None:
         return {"visit_id": vid, "groups": []}
     try:

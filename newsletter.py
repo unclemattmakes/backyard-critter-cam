@@ -394,6 +394,174 @@ def compose_lede(bundle) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# The model-written lede (optional; cfg.llm_enabled). A local model gets the SAME figures the
+# templated lede is built from, as a short fact sheet, and writes a warmer opening paragraph.
+# It sits above the templated lede, never instead of it, so every figure in the issue is still
+# one the digest stated. Its paragraph is checked before it is used: a number, a named animal or
+# a species that is not on the sheet means it made something up, and the issue goes out without
+# it rather than with a fluent untruth.
+# ---------------------------------------------------------------------------
+
+# Small models misapply conditional rules ("if the camera was dark, say...") to periods where
+# they don't hold, so every hedge lives in the fact sheet's own wording and the prompt carries
+# one worked example instead. The example's animals are deliberately not this yard's.
+_LEDE_SYSTEM = (
+    "You write the opening paragraph of a small newspaper about animals visiting a backyard, "
+    "seen by a camera. Use ONLY the facts given. Never add an animal, a name, a number, a "
+    "time, the weather, or any behaviour or reason that is not in the facts. Keep every "
+    "hedge the facts use ('at least', 'unidentified'). Write numbers and times as digits, "
+    "exactly as the facts write them. 2 or 3 sentences, under 70 words, warm and plain. "
+    "No lists, headings, quotation marks or emoji.\n\n"
+    "Example facts:\nPeriod: one night, 7:02 PM to 6:40 AM.\nVisits: 5.\n"
+    "Visits by species (a visit count, NOT a number of animals): Beaver, 4 visits.\n"
+    "Named animals seen: Bucky (2 visits).\n"
+    "Busiest hour: 1am, 3 arrivals.\nMoon: Full Moon, 99% lit.\n"
+    "Example paragraph: Under a 99% lit full moon, the yard logged 5 visits between 7:02 PM "
+    "and 6:40 AM, 4 of them by beavers. Bucky came by twice, and 1am was the busy hour, "
+    "with 3 arrivals.")
+
+# Animal words the model might reach for. Any of these that isn't on the sheet is invented.
+_OTHER_ANIMALS = ("deer", "fox", "skunk", "coyote", "bobcat", "bear", "owl", "hawk", "dog",
+                  "mouse", "mice", "rabbit", "bat")
+# "one" is left out: "no one", "the first one" are ordinary prose, not a count.
+_NUM_WORDS = {w: str(i) for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen twenty".split()) if i > 1}
+
+
+def lede_facts(bundle) -> list[str]:
+    """The fact sheet: one line per figure, worded the way the issue itself words it."""
+    d = bundle["d"]
+    word = "night" if (d.get("edition") or "night") == "night" else "day"
+    lines = [f"Period: one {word}, {_clock(d.get('start'))} to {_clock(d.get('end'))}."]
+    rows = d.get("species") or []
+    sure = [s for s in rows if s["species"] != "animal" and not s.get("surprising")]
+    unsure = [s for s in rows if s.get("surprising")]
+    lines.append(f"Visits: {d.get('visits') or 0}.")
+    if sure:
+        # "Raccoon (4 visits)" came back as "four raccoons": a visit count is not a headcount,
+        # so the sheet says so on the line the model reads it from.
+        lines.append("Visits by species (a visit count, NOT a number of animals): " + "; ".join(
+            f"{_name_of(s['species'])}, {s.get('visits') or 0} visit"
+            f"{'' if s.get('visits') == 1 else 's'}" for s in sure) + ".")
+    # Unidentified visits are left off the sheet on purpose. Worded either way ("some visitors
+    # could not be identified", "3 visits by unidentified animals") the 9B turned them into an
+    # "unidentified Virginia opossum" or "3 unidentified animals"; the templated lede and the
+    # visit log below already account for them.
+    if unsure:
+        lines.append("Possible but unconfirmed (do not state as fact): "
+                     + ", ".join(_name_of(s["species"]) for s in unsure) + ".")
+    names = _present_names(d)
+    if names:
+        lines.append("Named animals seen: " + "; ".join(
+            f"{_cap1(nm)} ({k} visit{'' if k == 1 else 's'})" for nm, k in names) + ".")
+    # First/last visitor only when it is a confirmed species: "an unidentified animal at 7:37 PM"
+    # plus "an unidentified animal at 6:13 AM" read to the 9B as one animal that stayed all night.
+    sure_names = {s["species"] for s in sure}
+    for key, label in (("first_visitor", "First arrival"), ("last_visitor", "Last arrival")):
+        fv = d.get(key)
+        if fv and fv.get("species") in sure_names:
+            lines.append(f"{label}: a {_name_of(fv['species'])}, at {_clock(fv.get('time'))}.")
+    crowd = d.get("crowd") or {}
+    if (crowd.get("n") or 0) >= 2:
+        lines.append(f"Most at once: at least {crowd['n']} animals, at {_clock(crowd.get('at'))}.")
+    bh = d.get("busiest_hour")
+    if bh:
+        lines.append(f"Busiest hour: {_fmt_hour(bh['hour'])}, {bh['visits']} arrival"
+                     f"{'' if bh['visits'] == 1 else 's'}.")
+    for sp in d.get("novel") or []:
+        s = next((x for x in rows if x["species"] == sp), None)
+        nov = (s or {}).get("novelty") or {}
+        lines.append(f"Notable: first {_name_of(sp)} ever recorded." if nov.get("first_ever")
+                     else f"Notable: first {_name_of(sp)} in {nov.get('days_since')} days.")
+    quiet = [q["species"] for q in d.get("quiet") or []]
+    if quiet:
+        lines.append("Regulars who did not show: " + ", ".join(_name_of(q) for q in quiet) + ".")
+    moon = d.get("moon")
+    if moon:
+        lines.append(f"Moon: {moon['name']}, {moon['illum_pct']}% lit.")
+    cov = d.get("coverage")
+    if cov and (cov.get("dark_minutes") or 0) >= 30:
+        lines.append(f"The camera was dark for {cov['dark_minutes']} minutes of the period.")
+    return lines
+
+
+def check_model_lede(text: str, facts: list[str], bundle) -> str | None:
+    """Why this paragraph can't run, or None if it can. Cheap and deliberately strict: a
+    rejected lede costs nothing (the templated one still runs), an invented one costs trust."""
+    words = text.split()
+    if len(words) > 90:
+        return f"too long ({len(words)} words)"
+    if re.search(r"^\s*([-*#]|\d+\.)\s", text, re.M):
+        return "list or heading formatting"
+    sheet = " ".join(facts).lower()
+    low = text.lower()
+    nums_ok = set(re.findall(r"\d+", sheet))
+    for n in re.findall(r"\d+", low) + [_NUM_WORDS[w] for w in re.findall(r"[a-z]+", low)
+                                        if w in _NUM_WORDS]:
+        if n not in nums_ok:
+            return f"number {n} is not in the facts"
+    here = {nm.lower() for nm, _k in _present_names(bundle["d"])}
+    for c in (bundle.get("rc") or {}).get("cast") or []:
+        nm = str(c.get("id") or "").lower()
+        if nm and nm not in here and re.search(rf"\b{re.escape(nm)}\b", low):
+            return f"names {c['id']}, who was not seen"
+    # Absent regulars are on the sheet too ("no cottontail tonight" is a fact), unconfirmed
+    # species are not.
+    present = {s["species"].lower() for s in bundle["d"].get("species") or []
+               if not s.get("surprising") and s["species"] != "animal"}   # "animal" = Unidentified
+    present |= {q["species"].lower() for q in bundle["d"].get("quiet") or []}
+    heads_ok = {p.split()[-1] for p in present} | {p for p in present}
+    # "5 raccoons" is a headcount the digest never states: its figures are visits, and a crowd
+    # floor is only ever "at least N animals". "5 visits by raccoons" is fine.
+    count = r"(?:\d+|" + "|".join(_NUM_WORDS) + r")"
+    for h in heads_ok:
+        if re.search(rf"\b{count}\s+(?:[a-z-]+\s+)?{re.escape(h)}s\b", low):
+            return f"states a headcount of {h}s (the figures are visits)"
+        # The 9B's favourite slip on real nights: "an unidentified Virginia opossum".
+        if re.search(rf"\bunidentified\s+(?:[a-z'’-]+\s+)?{re.escape(h)}\b", low):
+            return f"calls a {h} unidentified"
+    if re.search(rf"\b{count}\s+unidentified\s+(?:animals|visitors|critters)\b", low):
+        return "states a headcount of unidentified animals (the figure is visits)"
+    # The only headcount the digest has is the crowd floor, so "N animals" must be that N, and
+    # a floor ("Seven animals were seen at once" passed the number check on the 7 raccoon visits).
+    floor = str((bundle["d"].get("crowd") or {}).get("n") or "")
+    for m in re.finditer(rf"\b({count})\s+(?:[a-z-]+\s+)?(?:animals|visitors|critters)\b", low):
+        n = _NUM_WORDS.get(m.group(1), m.group(1))
+        if n != floor or not low[:m.start()].rstrip().endswith("at least"):
+            return f"states {m.group(0)!r}; the only headcount is 'at least {floor or '?'} animals'"
+    for animal in [k.split()[-1] for k in _LATIN] + list(_OTHER_ANIMALS):
+        stem = animal.replace("’", "'")
+        if stem not in heads_ok and re.search(rf"\b{re.escape(stem)}s?\b", low.replace("’", "'")):
+            return f"mentions {animal}, which is not in the facts"
+    return None
+
+
+def compose_model_lede(cfg, bundle, _ask=None) -> tuple[str | None, str]:
+    """(paragraph, note). None whenever the model is off, busy, failed or failed the check; the
+    note says which, for the log. Quiet periods keep the templated line -- there is no story."""
+    if not getattr(cfg, "llm_enabled", False):
+        return None, "llm off"
+    if bundle["d"].get("empty"):
+        return None, "quiet period: templated lede only"
+    import llm
+    facts = lede_facts(bundle)
+    rejected = []
+    # On real nights the 9B passed the check about 2 times in 3, so three draws nearly always
+    # land one; each is a few seconds of GPU at 07:00, and the model unloads after every answer.
+    for _attempt in range(3):
+        text, note = (_ask or llm.ask)(cfg, _LEDE_SYSTEM, "Facts:\n" + "\n".join(facts))
+        if text is None:
+            return None, note                     # off/busy/unreachable won't fix itself in a retry
+        text = " ".join(text.split())
+        why = check_model_lede(text, facts, bundle)
+        if why is None:
+            return text, note + (f" after {len(rejected)} rejected" if rejected else "")
+        rejected.append(why)
+    return None, "model lede rejected: " + "; ".join(rejected)
+
+
+# ---------------------------------------------------------------------------
 # THE PLATE, RE-JUDGED FOR CUTENESS (2026-08-12). The digest's plate is _shot_score's "sharpest
 # frame", and its sharpness is quality.py's whole-crop Laplacian variance -- which is exactly how
 # the first issue led with a crisp photo of brick pavers wearing a motion-blurred raccoon: high-
@@ -891,6 +1059,11 @@ def render_email(bundle, images, img_src) -> str:
     parts.append(_health_box(bundle.get("health")))
 
     # -- lede + flags -------------------------------------------------------------
+    if bundle.get("model_lede"):
+        parts.append(f'<p style="font-size:16px;line-height:1.6;font-style:italic;margin:18px 2px 2px;">'
+                     f'{_esc(bundle["model_lede"])}</p>'
+                     f'<div style="font-size:11px;color:{_C["faint"]};margin:0 2px 4px;">'
+                     f'Written by a local AI from the figures below.</div>')
     parts.append(f'<p style="font-size:15px;line-height:1.55;margin:18px 2px 10px;">{" ".join(_esc(s) for s in lede)}</p>')
     flags = []
     for sp in d.get("novel") or []:
@@ -1216,6 +1389,8 @@ def render_text(bundle) -> str:
     masthead = "THE MORNING DISPATCH" if ed == "night" else "THE EVENING DISPATCH"
     out = [masthead, d.get("title") or "", ""]
     out += _health_text(bundle.get("health"))
+    if bundle.get("model_lede"):
+        out += [bundle["model_lede"], "(Written by a local AI from the figures below.)", ""]
     out += compose_lede(bundle) + [""]
     for v in d.get("visit_log") or []:
         sp = _species_line(v.get("species"))
@@ -1437,6 +1612,10 @@ def main(argv=None) -> int:
         # No period at all (empty DB / bad --date) -- nothing to render, not even a quiet issue.
         _say(f"[newsletter] nothing to write: {d.get('reason', 'no data')}")
         return 0
+
+    bundle["model_lede"], note = compose_model_lede(cfg, bundle)
+    if getattr(cfg, "llm_enabled", False):
+        _say(f"[newsletter] {note}", always_log=True)
 
     images = gather_images(cfg, d, bundle.get("plate"))
     subject = compose_subject(bundle)

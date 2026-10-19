@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 import cameras
+import capwatch
 import clips
 import config
 import daynight
@@ -38,6 +39,7 @@ import db
 import mdns
 import powerguard
 import quality
+import snapshot
 import stats
 import visits
 import web
@@ -115,6 +117,21 @@ class _Tee:
         except Exception:
             pass
 
+    def log_first(self, text: str) -> None:
+        """The file copy FIRST, then the console. For alarms: a console write can block for as
+        long as the log window is paused (a click in it starts a QuickEdit selection), and an
+        alarm about a stuck thread must not queue behind the thing that may have stuck it."""
+        try:
+            for line in text.split("\n"):
+                self._log.info(line)
+        except Exception:
+            pass
+        try:
+            self._real.write(text + "\n")
+            self._real.flush()
+        except Exception:
+            pass
+
     # Pass-throughs so anything that introspects the stream (cv2, subprocess, faulthandler,
     # isatty checks) still sees a real terminal underneath rather than choking on a bare object.
     def isatty(self) -> bool:
@@ -161,6 +178,16 @@ def install_file_logging() -> Path | None:
         return None
 
 
+def log_first(msg: str) -> None:
+    """Alarm output: the file log first, the console second (see _Tee.log_first). A plain print
+    when the file log is not installed (tests, or install_file_logging failed)."""
+    out = sys.stdout
+    if isinstance(out, _Tee):
+        out.log_first(msg)
+    else:
+        print(msg)
+
+
 # ---- Drawing constants -------------------------------------------------------------
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 BOX_COLORS = {                      # BGR
@@ -176,6 +203,9 @@ MOTION_WARMUP_FRAMES = 15
 # Tolerate this many consecutive bad reads (transient USB hiccups) before we treat the
 # camera as disconnected and try a full reopen.
 READ_FAIL_TOLERANCE = 10
+# Exit code when the run ended because every capture thread exited by itself. Any non-zero code
+# keeps the launchers from writing .rig_pause, so rigwatch restarts the rig.
+EXIT_CAMERAS_STOPPED = 3
 
 
 # ---- Keep the machine awake while we watch -----------------------------------------
@@ -314,6 +344,23 @@ def allow_system_sleep() -> None:
             kernel32.CloseHandle(handle)
         kernel32.SetThreadExecutionState(_ES_CONTINUOUS)   # drop the belt-and-suspenders flag
     except Exception:
+        pass
+
+
+def _restore_ctrl_c() -> None:
+    """Make Ctrl+C in the log window stop the rig, however it was launched.
+
+    rigwatch starts the rig with CREATE_NEW_PROCESS_GROUP, and Windows answers that by ignoring
+    Ctrl+C in the new process and everything it starts. Any other launcher up the tree can pass
+    the same setting down, so the rig clears it for itself rather than trusting its parent.
+    Call it before any child is spawned: the naming helper inherits the restored setting and
+    stops on the same Ctrl+C, and _stop_naming still reaps whatever is left."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)   # NULL, FALSE: obey Ctrl+C
+    except Exception:       # noqa: BLE001 -- never worth refusing to start the camera over
         pass
 
 
@@ -637,8 +684,19 @@ def open_camera(cfg: config.Config) -> cv2.VideoCapture | None:
     return open_capture(cfg.camera_specs()[0], cfg)
 
 
+def with_read_deadline(cap, spec: config.CameraSpec, cfg: config.Config):
+    """Wrap a NETWORK camera's capture so a read that never returns is abandoned after
+    cfg.capture_read_timeout_s (capwatch.DeadlineReader). Local cams keep the plain capture:
+    this thread also drives their cap.set/get, and DirectShow is not handed between threads
+    without testing it on the hardware first."""
+    timeout = cfg.capture_read_timeout_s
+    if cap is None or not spec.is_network or not timeout or timeout <= 0:
+        return cap
+    return capwatch.DeadlineReader(cap, timeout, name=f"cam-{spec.source}-read")
+
+
 def reconnect_capture(spec: config.CameraSpec, cfg: config.Config,
-                      stop_event: threading.Event) -> cv2.VideoCapture | None:
+                      stop_event: threading.Event, beat=None) -> cv2.VideoCapture | None:
     """Re-open a camera after a read failure. NEITHER kind ever gives up: it keeps retrying
     until the camera comes back or we're told to stop. A NETWORK camera (the AP, switch, or
     camera itself rebooted) comes back; a LOCAL USB camera does too -- and crucially, on this
@@ -649,12 +707,15 @@ def reconnect_capture(spec: config.CameraSpec, cfg: config.Config,
     cfg.reopen_delay_s, for brief USB hiccups) then slow exponential backoff, capped, FOREVER.
     Honours stop_event throughout -- it uses stop_event.wait() (not sleep) so Ctrl+C / 'q' / the
     finally-join end the wait instantly and never hang. Returns a working capture, or None only
-    when we're shutting down."""
+    when we're shutting down. `beat` (a capwatch.CaptureBeat) is stamped on every attempt, so
+    the capture watch reads a long outage as "reconnecting", not as a stuck thread."""
     tag = f"[{spec.source}]"
     print(f"{tag} read failed -- reconnecting ...")
     attempt, delay = 0, cfg.reopen_delay_s
     while not stop_event.is_set():
         attempt += 1
+        if beat is not None:
+            beat.tick("reconnecting")
         cap = open_capture(spec, cfg)
         if cap is not None and cap.isOpened():
             ok, _ = cap.read()
@@ -1509,7 +1570,7 @@ def _supervise_naming(state: dict, cfg, tag: str, stop_event) -> None:
 # ---- Per-camera capture worker -----------------------------------------------------
 def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 latest_frames, latest_lock, stop_event, results, powermon=None, healer=None,
-                zone_store=None):
+                zone_store=None, beat=None):
     """One camera's whole capture pipeline, run in its own thread:
         read -> MOG2 motion gate -> (shared) MegaDetector on motion -> save crop + DB row + clip,
         then publish an annotated frame to this camera's web FrameBuffer and the preview grid.
@@ -1517,8 +1578,11 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     row with spec.source -- so N cameras never interfere. The one shared resource is the detector,
     serialized by det_lock (PyTorch inference isn't guaranteed thread-safe, and the motion gate
     keeps detector calls rare, so the lock almost never contends). Does NO cv2 GUI -- the main
-    thread owns the window. Tallies are reported back via results[spec.source]."""
+    thread owns the window. Tallies are reported back via results[spec.source]. `beat` is this
+    camera's capwatch.CaptureBeat, stamped on every frame for the capture watch."""
     tag = f"[{spec.source}]"
+    beat = beat if beat is not None else capwatch.CaptureBeat(spec.source)
+    beat.bind()
     fb = frame_buffers.get(spec.source)         # None when not serving the dashboard
     bridge = control_bridges.get(spec.source)   # None when not serving
     eff_motion_min_area = _eff(spec, cfg, "motion_min_area")
@@ -1534,6 +1598,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     cap = None
     recorder = None
     shadow = None                               # refimg shadow veto; stays None when it's off
+    hires = None                                # snapshot cropper; None unless the camera has one
     saved = ignored = 0
     try:
         cap = open_capture(spec, cfg)
@@ -1545,9 +1610,11 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                   + ("" if spec.is_url else "  (if it never opens, `python backyard_cam.py "
                      "--list-cameras` finds the right index)"))
             db.record_coverage(cfg.db_path, spec.source, "down", "waiting-to-open")
-            cap = reconnect_capture(spec, cfg, stop_event)
+            cap = reconnect_capture(spec, cfg, stop_event, beat)
         if cap is None:
             return                                  # only reached when we're shutting down
+        cap = with_read_deadline(cap, spec, cfg)
+        beat.tick("up")
         print(f"{tag} open ({cameras.safe_src(spec.src)}).")
         # The COVERAGE LEDGER: written at the rare transitions only (open / read-failure /
         # reconnect / stop), so every later absence claim -- "no robin this night", "overdue" --
@@ -1556,6 +1623,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         db.record_coverage(cfg.db_path, spec.source, "up", "opened")
 
         recorder = clips.ClipRecorder(cfg, conn, source=spec.source) if record else None
+        if spec.snapshot_url:
+            hires = snapshot.SnapshotCropper(spec, cfg, detector.detect, det_lock, tag=tag).start()
 
         # Sun-driven day/night camera profile -- LOCAL cams only (a network stream exposes no UVC
         # exposure controls), and only when no manual exposure/gain is forcing static settings.
@@ -1608,17 +1677,28 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
         while not stop_event.is_set():
             ok, frame = cap.read()
             if not ok or frame is None:
+                beat.tick()
                 read_fails += 1
+                timed_out = getattr(cap, "timed_out", False)
+                if timed_out:
+                    # That connection is gone for good (DeadlineReader closed it): reopen now
+                    # rather than spend READ_FAIL_TOLERANCE more reads on it.
+                    beat.abandoned()
+                    print(f"{tag} a read has not returned in {cfg.capture_read_timeout_s:g}s -- "
+                          f"abandoning that connection.")
+                    read_fails = READ_FAIL_TOLERANCE
                 if read_fails >= READ_FAIL_TOLERANCE:
-                    db.record_coverage(cfg.db_path, spec.source, "down", "read-failed")
+                    db.record_coverage(cfg.db_path, spec.source, "down",
+                                       "read-timeout" if timed_out else "read-failed")
                     try:
                         cap.release()
                     except Exception:
                         pass
-                    cap = reconnect_capture(spec, cfg, stop_event)
+                    cap = reconnect_capture(spec, cfg, stop_event, beat)
                     read_fails = 0
                     if cap is None:
                         break                       # only None when we're shutting down
+                    cap = with_read_deadline(cap, spec, cfg)
                     db.record_coverage(cfg.db_path, spec.source, "up", "reconnected")
                     active_period = None            # re-apply the profile after a reconnect
                     last_profile_check = 0.0
@@ -1634,6 +1714,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     wedge.note_reconnect(time.monotonic())
                 continue
             read_fails = 0
+            beat.frame()
             frame_count += 1
             # A lock + tuple fetch per frame: the price of dashboard zone edits landing live.
             ignore_zones = zone_store.rects(spec.source) if zone_store is not None else ()
@@ -1767,6 +1848,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                     if cfg.save_full_frame:
                         fp = save_frame(frame, cfg, day, stamp)
                         frame_path = _rel(fp) if fp else None
+                    hires_dets = []
                     for i, det in enumerate(saved_dets):
                         s = save_crop(frame, det, cfg, day, stamp, i)
                         if s is None:
@@ -1786,11 +1868,15 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                             print(f"  {tag} [{iso}] DB write failed, kept crop {_rel(crop_path)}: {e}")
                             continue
                         saved += 1
+                        hires_dets.append((det_id, det, _rel(crop_path)))
                         print(f"  {tag} [{iso}] {det.class_name} {det.confidence:.2f} -> {_rel(crop_path)}")
                         # SHADOW VETO, strictly AFTER the row and crop exist: it can only ADD
                         # suppression metadata to a detection that was saved exactly as before.
                         if shadow is not None:
                             shadow.judge(conn, det_id, det)
+                    # After the rows exist: the worker only ever upgrades a saved crop.
+                    if hires is not None and hires_dets:
+                        hires.submit(snapshot.Job(hires_dets, w, h))
 
             # --- Annotate for the dashboard feed + the native preview grid (NO cv2 GUI here) ---
             # Presentation only, so it's rate-capped, and the dashboard side runs ONLY while a
@@ -1826,6 +1912,7 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
     except Exception as e:  # never let one camera's crash take down the whole rig
         print(f"{tag} capture thread stopped on error: {e}")
     finally:
+        beat.tick("stopped")
         db.record_coverage(cfg.db_path, spec.source, "down", "stopped")
         if recorder is not None:
             try:
@@ -1834,6 +1921,8 @@ def _run_camera(spec, cfg, detector, det_lock, frame_buffers, control_bridges,
                 pass
         if shadow is not None:
             shadow.close()                          # flush the recurrence ledger (never raises)
+        if hires is not None:
+            hires.close()
         if cap is not None:
             try:
                 cap.release()
@@ -1853,7 +1942,8 @@ def _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads):
     """Composite each camera's latest annotated frame into a grid, show it, and watch for 'q' or a
     window close. ALL cv2 GUI lives on the main thread (imshow/waitKey aren't thread-safe), so the
     capture workers only ever hand frames over. Sets stop_event when the user quits or every camera
-    thread has exited (so a single dead camera still ends the rig instead of hanging on a blank window)."""
+    thread has exited (so a single dead camera still ends the rig instead of hanging on a blank window).
+    Returns True only in the second case: nobody asked for that stop."""
     sources = [s.source for s in specs]
     while not stop_event.is_set():
         with latest_lock:
@@ -1879,15 +1969,21 @@ def _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads):
             pass
         if not any(t.is_alive() for t in threads):
             print("\nAll cameras stopped -- shutting down.")
-            break
+            stop_event.set()
+            return True
     stop_event.set()
+    return False
 
 
 # ---- Main loop ---------------------------------------------------------------------
-def run(cfg: config.Config) -> None:
+def run(cfg: config.Config) -> int:
     """Drive every configured camera at once: one capture thread each, sharing one MegaDetector and
     one dashboard. Single-camera mode is just the N=1 case (cfg.camera_specs() synthesizes one spec
-    from the flat fields), so existing setups behave exactly as before."""
+    from the flat fields), so existing setups behave exactly as before.
+
+    Returns 0 for a stop someone asked for ('q', the window, Ctrl+C) and EXIT_CAMERAS_STOPPED when
+    the run ended because every capture thread exited by itself. The launchers read exit 0 as a
+    deliberate stop and leave a .rig_pause, which keeps rigwatch from restarting the rig."""
     # The DB connection comes FIRST now, because the camera list lives in it: db.connect ensures
     # the schema, then cameras.load_specs seeds that table from config (once per source, ever)
     # and returns what the table says. config_local.py's cfg.cameras is a seed from here on --
@@ -1936,6 +2032,7 @@ def run(cfg: config.Config) -> None:
     latest_frames: dict = {}
     latest_lock = threading.Lock()
     results: dict = {}
+    cameras_died = False
 
     try:
         # Hold the system awake for the lifetime of the run so it can't idle into Modern Standby
@@ -2072,16 +2169,25 @@ def run(cfg: config.Config) -> None:
                       f"  names new crops automatically. Its log: {NAMING_LOG_FILE}\n"
                       "  The dashboard shows when it's ready.\n")
 
-        # One capture thread per camera, all sharing the single detector.
+        # One capture thread per camera, all sharing the single detector. Beats are made here,
+        # after the (possibly minutes-long, first-run) detector load, so that wait is not a stall.
+        beats = {s.source: capwatch.CaptureBeat(s.source) for s in specs}
         for s in specs:
             t = threading.Thread(
                 target=_run_camera, name=f"cam-{s.source}",
                 args=(s, cfg, detector, det_lock, frame_buffers, control_bridges,
                       latest_frames, latest_lock, stop_event, results, powermon, healer,
-                      zone_store),
+                      zone_store, beats[s.source]),
                 daemon=True)
             t.start()
             threads.append(t)
+        # The capture watch: its own thread, so it keeps writing CAPTURE_STATUS_FILE (what rigwatch
+        # reads) and can say where a capture thread is stuck while that thread cannot say anything.
+        watch = capwatch.CaptureWatch(
+            beats, cfg.capture_stall_s, log=log_first,
+            coverage=lambda src, event, why: db.record_coverage(cfg.db_path, src, event, why))
+        threading.Thread(target=watch.run, args=(stop_event,), name="capture-watch",
+                         daemon=True).start()
         print("Watching for critters -- " + ("press 'q' in the window (or close it) to quit.\n"
               if cfg.show_preview else "headless; press Ctrl+C here to quit.\n"))
 
@@ -2091,11 +2197,14 @@ def run(cfg: config.Config) -> None:
             ps = cfg.preview_scale or 1.0
             cv2.resizeWindow(cfg.window_name,
                              max(1, int(cfg.frame_width * ps)), max(1, int(cfg.frame_height * ps)))
-            _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads)
+            cameras_died = _preview_loop(cfg, specs, latest_frames, latest_lock, stop_event, threads)
         else:
             # Headless: idle until Ctrl+C or every camera thread has exited.
             while not stop_event.is_set() and any(t.is_alive() for t in threads):
                 stop_event.wait(0.3)
+            cameras_died = not stop_event.is_set()
+            if cameras_died:
+                print("\nAll cameras stopped -- shutting down.")
     except KeyboardInterrupt:
         print("\nInterrupted -- shutting down.")
     finally:
@@ -2130,6 +2239,11 @@ def run(cfg: config.Config) -> None:
                      f"`python refimg.py --review`)." if total_suppressed else "")
         print(f"Done. Saved {total_saved} detection(s) this session to {cfg.db_path}."
               f"{clips_note}{zone_note}{veto_note}")
+    if cameras_died:
+        print(f"[ERROR] every camera's capture thread exited on its own -- exiting with code "
+              f"{EXIT_CAMERAS_STOPPED} so the watchdog restarts the rig. See the lines above.")
+        return EXIT_CAMERAS_STOPPED
+    return 0
 
 
 def serve_only(cfg: config.Config) -> int:
@@ -2291,6 +2405,7 @@ def main() -> int:
     log_path = install_file_logging()
     if log_path is not None:
         print(f"  log: writing this session to {log_path}")
+    _restore_ctrl_c()       # before run() spawns the naming helper, which inherits it
     cfg, args = parse_args()
     if args.list_cameras:
         list_cameras(cfg)
@@ -2301,7 +2416,7 @@ def main() -> int:
     if args.serve_only:
         return serve_only(cfg)
     try:
-        run(cfg)
+        rc = run(cfg)
     except CudaUnavailableError as e:
         print(f"\n[CUDA ERROR]\n{e}")
         return 2
@@ -2315,7 +2430,7 @@ def main() -> int:
         print("\n[FATAL] uncaught exception -- the run is ending. Traceback:")
         traceback.print_exc()
         return 1
-    return 0
+    return rc or 0
 
 
 if __name__ == "__main__":

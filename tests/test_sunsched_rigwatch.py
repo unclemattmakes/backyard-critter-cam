@@ -106,6 +106,8 @@ def _isolated_rigwatch(tmp_path, monkeypatch):
     monkeypatch.setattr(rigwatch, "STATE_FILE", tmp_path / ".rigwatch_state.json")
     monkeypatch.setattr(rigwatch, "LOG_FILE", tmp_path / "logs" / "rigwatch.log")
     monkeypatch.setattr(rigwatch, "REPORTS_DIR", tmp_path / "reports")
+    # A live rig's capture status must never decide a test, nor a test's reach the rig's.
+    monkeypatch.setattr(config, "CAPTURE_STATUS_FILE", tmp_path / ".capture_status.json")
     # A config_local.py heartbeat_url must never be pinged from a test, and nothing may reach the net.
     monkeypatch.setattr(config.CONFIG, "heartbeat_url", None)
     monkeypatch.setattr(rigwatch.urllib.request, "urlopen",
@@ -218,6 +220,14 @@ def test_restart_storms_are_capped(monkeypatch):
 def test_starts_older_than_an_hour_do_not_count_against_the_cap():
     rigwatch.STATE_FILE.write_text('{"starts": [1, 2, 3]}')   # epoch 1970
     assert rigwatch._recent_starts() == 0
+
+
+def test_starts_before_the_last_boot_do_not_count_against_the_cap(monkeypatch):
+    # Two manual restarts, each ending the rig the watchdog had just started, then one more start.
+    now = time.time()
+    rigwatch.STATE_FILE.write_text(json.dumps({"starts": [now - 2400, now - 900, now - 300]}))
+    monkeypatch.setattr(rigwatch, "boot_time", lambda: now - 600)
+    assert rigwatch._recent_starts() == 1
 
 
 # --------------------------------------------------------------------------- stale pause markers
@@ -345,6 +355,96 @@ def test_status_shows_the_batch_and_changes_nothing(monkeypatch, capsys):
     assert "NIGHTLY BATCH" not in _log_text()
 
 
+# --------------------------------------------------------------------------- capture
+# An up rig with an answering dashboard is not a rig that is recording: the capture watch inside
+# the rig writes each camera's last-frame time, and a dark camera is reported here.
+RIG_PID = 4321
+
+
+def _cam(frame_age_s, state="up", stuck=False, where=None):
+    return {"state": state, "last_frame_ts": time.time() - frame_age_s, "frame_age_s": frame_age_s,
+            "frames": 1000, "reconnects": 0, "abandoned_reads": 0, "stuck": stuck,
+            "stuck_s": frame_age_s if stuck else None, "where": where}
+
+
+def _capture_status(cameras, pid=RIG_PID, written_s_ago=3.0):
+    config.CAPTURE_STATUS_FILE.write_text(json.dumps(
+        {"ts": time.time() - written_s_ago, "pid": pid, "stall_s": 120.0, "cameras": cameras}),
+        encoding="utf-8")
+
+
+def _check_up_rig(monkeypatch, *argv):
+    monkeypatch.setattr(rigwatch, "rig_pids", lambda: [RIG_PID - 1, RIG_PID])   # shim + real
+    monkeypatch.setattr(rigwatch, "start_rig", lambda: pytest.fail("never restart over capture"))
+    monkeypatch.setattr("sys.argv", ["rigwatch.py", *argv])
+    return rigwatch.main()
+
+
+def test_a_camera_delivering_frames_says_nothing(monkeypatch):
+    _capture_status({"glass_door_cam": _cam(0.4)})
+    assert _check_up_rig(monkeypatch) == 0
+    assert "CAPTURE" not in _log_text() and "CAMERA" not in _log_text()
+
+
+def test_a_short_outage_is_not_an_alarm(monkeypatch):
+    # Pi outages reconnect by themselves in 1.5-3.5 min; that is not news.
+    _capture_status({"glass_door_cam": _cam(195.0, state="reconnecting")})
+    assert _check_up_rig(monkeypatch) == 0
+    assert _log_text() == ""
+
+
+def test_a_stuck_capture_thread_is_reported_with_where_it_is_stuck(monkeypatch):
+    where = "backyard_cam.py:1660 in _run_camera: ok, frame = cap.read()"
+    _capture_status({"glass_door_cam": _cam(3240.0, stuck=True, where=where)})
+    assert _check_up_rig(monkeypatch) == 0
+    text = _log_text()
+    assert "CAPTURE IS STALLED on glass_door_cam: no frame for 54 min" in text
+    assert where in text
+
+
+def test_a_camera_that_is_away_is_reported_as_down(monkeypatch):
+    _capture_status({"glass_door_cam": _cam(900.0, state="reconnecting")})
+    assert _check_up_rig(monkeypatch) == 0
+    assert "CAMERA glass_door_cam IS DOWN: no frame for 15 min" in _log_text()
+
+
+def test_only_the_dark_camera_of_several_is_named(monkeypatch):
+    _capture_status({"glass_door_cam": _cam(0.2), "yard_ir": _cam(1200.0, state="stopped")})
+    assert _check_up_rig(monkeypatch) == 0
+    text = _log_text()
+    assert "CAPTURE IS STALLED on yard_ir" in text and "'stopped'" in text
+    assert "glass_door_cam" not in text
+
+
+def test_a_watch_that_stopped_writing_means_the_process_is_wedged(monkeypatch):
+    _capture_status({"glass_door_cam": _cam(0.4)}, written_s_ago=600.0)
+    assert _check_up_rig(monkeypatch) == 0
+    assert "CAPTURE STATUS IS STALE" in _log_text() and "10 min ago" in _log_text()
+
+
+def test_a_status_file_from_an_earlier_run_is_not_evidence(monkeypatch):
+    # The rig was killed and restarted (or the running rig predates the watch): the leftover
+    # file describes a process that no longer exists.
+    _capture_status({"glass_door_cam": _cam(3240.0, stuck=True)}, pid=999, written_s_ago=4000.0)
+    assert _check_up_rig(monkeypatch) == 0
+    assert _log_text() == ""
+
+
+def test_a_torn_or_missing_status_file_is_not_an_alarm(monkeypatch):
+    assert _check_up_rig(monkeypatch) == 0
+    config.CAPTURE_STATUS_FILE.write_text('{"ts": 17', encoding="utf-8")
+    assert _check_up_rig(monkeypatch) == 0
+    assert _log_text() == ""
+
+
+def test_status_shows_each_camera_and_changes_nothing(monkeypatch, capsys):
+    _capture_status({"glass_door_cam": _cam(3240.0, stuck=True, where="detector.py:88 in detect")})
+    assert _check_up_rig(monkeypatch, "--status") == 0
+    out = capsys.readouterr().out
+    assert "capture glass_door_cam" in out and "STUCK at detector.py:88 in detect" in out
+    assert _log_text() == ""
+
+
 # --------------------------------------------------------------------------- off-host heartbeat
 # Every alarm above lives on the same box; when the box is down, only an outside service that
 # notices the pings stopping can tell anyone.
@@ -402,6 +502,12 @@ def test_stale_naming_pings_fail(monkeypatch, pings):
     monkeypatch.setattr(rigwatch, "naming_health", lambda: {
         "present": True, "state": "ready", "age_s": 3600.0, "stale": True, "backlog": None})
     assert _run(monkeypatch, [123]) == 0
+    assert pings == [URL + "/fail"]
+
+
+def test_stalled_capture_pings_fail(monkeypatch, pings):
+    _capture_status({"glass_door_cam": _cam(3240.0, stuck=True)})
+    assert _run(monkeypatch, [RIG_PID]) == 0
     assert pings == [URL + "/fail"]
 
 

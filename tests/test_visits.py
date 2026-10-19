@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
+
 import db
 import visits
 
@@ -421,3 +423,141 @@ def test_conflict_flag_does_not_leak_to_other_visits_or_sources(conn):
     assert (db.SOURCE_GLASS_DOOR_CAM, _ts(0), 1) in flagged
     assert (db.SOURCE_TRAIL_CAM_SD, _ts(0.5), 0) in flagged
     assert (db.SOURCE_GLASS_DOOR_CAM, _ts(90), 0) in flagged
+
+
+# --- stable ids, one transaction ----------------------------------------------------------
+# The naming helper rebuilds the ledger after most naming bursts, while the review queue and its
+# confirm buttons hand visit ids around. An id is the visit's lowest member detection id, so it
+# outlives every rebuild that leaves the visit's first crop in it; and the rebuild is one
+# transaction, so no reader ever sees the ledger empty or half-written.
+
+def _vid_of(conn, det_id):
+    return conn.execute("SELECT visit_id FROM detections WHERE id = ?", (det_id,)).fetchone()[0]
+
+
+def test_a_visit_id_is_its_lowest_member_detection_id(conn):
+    a = _det(conn, minutes=0)
+    b = _det(conn, minutes=2)
+    c = _det(conn, minutes=20)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert {r["id"] for r in _visit_rows(conn)} == {a, c}
+    assert _vid_of(conn, a) == _vid_of(conn, b) == a
+
+
+def test_ids_survive_a_rebuild_that_grows_a_visit_and_adds_another(conn):
+    a = _det(conn, minutes=0)
+    _det(conn, minutes=2)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    grown = _det(conn, minutes=4)          # the animal is still there: same visit, later crop
+    late = _det(conn, minutes=40)          # a new visit
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert {r["id"] for r in _visit_rows(conn)} == {a, late}
+    assert _vid_of(conn, grown) == a
+
+
+def test_an_earlier_crop_imported_later_does_not_move_the_id(conn):
+    """A trail-cam import can add OLDER crops to a visit, but never a lower detection id."""
+    a = _det(conn, minutes=10)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    older = _det(conn, minutes=8)          # earlier timestamp, higher id
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    row = _visit_rows(conn)[0]
+    assert row["id"] == a and row["started_at"] == _ts(8)
+    assert _vid_of(conn, older) == a
+
+
+def test_a_merge_retires_the_later_visits_id(conn):
+    """What a stale id means now: two visits became one, and the later one's id names nothing."""
+    a = _det(conn, minutes=0)
+    b = _det(conn, minutes=10)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert {r["id"] for r in _visit_rows(conn)} == {a, b}
+    visits.build_visits(conn, gap_minutes=30, verbose=False)
+    assert {r["id"] for r in _visit_rows(conn)} == {a}
+    assert _vid_of(conn, b) == a
+    assert not db.visit_exists(conn, b)
+
+
+def test_a_rebuild_that_changes_nothing_restamps_nothing(conn):
+    for m in (0, 2, 20):
+        _det(conn, minutes=m)
+    first = visits.build_visits(conn, gap_minutes=5, verbose=False)
+    again = visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert first["restamped"] == 3
+    assert again["restamped"] == 0 and again["visits"] == 2
+
+
+def test_a_failed_rebuild_leaves_the_old_ledger_standing(conn, monkeypatch):
+    a = _det(conn, minutes=0)
+    _det(conn, minutes=2)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    late = _det(conn, minutes=40)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(db, "insert_visit", boom)
+    with pytest.raises(RuntimeError):
+        visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert not conn.in_transaction
+    assert [r["id"] for r in _visit_rows(conn)] == [a]
+    assert _vid_of(conn, a) == a and _vid_of(conn, late) is None
+
+
+def test_a_reader_mid_rebuild_sees_the_old_ledger_not_an_empty_one(conn, db_path, monkeypatch):
+    """The rebuild used to commit an emptied ledger before refilling it; a reader landing in that
+    window saw no visits and every crop unstamped."""
+    a = _det(conn, minutes=0)
+    _det(conn, minutes=2)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    _det(conn, minutes=40)
+
+    seen = []
+    real = db.insert_visit
+
+    def peeking(*args, **kw):
+        if not seen:                          # mid-rebuild: the old rows are already deleted
+            ro = db.connect_readonly(db_path)
+            try:
+                seen.append((ro.execute("SELECT COUNT(*) FROM visits").fetchone()[0],
+                             ro.execute("SELECT visit_id FROM detections WHERE id = ?",
+                                        (a,)).fetchone()[0]))
+            finally:
+                ro.close()
+        return real(*args, **kw)
+    monkeypatch.setattr(db, "insert_visit", peeking)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert seen == [(1, a)]
+    assert len(_visit_rows(conn)) == 2
+
+
+def test_a_crop_that_arrives_mid_rebuild_never_points_at_a_deleted_visit(conn, db_path,
+                                                                        monkeypatch):
+    """Grouping runs before the write lock, so the rig can add a crop -- and another rebuild can
+    stamp it -- in between. The re-stamp diff is taken under the lock, so that crop ends up
+    unstamped (the next rebuild takes it) rather than pointing at a visit this one deleted."""
+    a = _det(conn, minutes=0)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    real = visits._plan_visits
+    newcomer = []
+
+    def plan_then_race(*args, **kw):
+        out = real(*args, **kw)
+        w = db.connect(db_path)
+        try:
+            d = db.insert_detection(
+                w, timestamp=_ts(90), source=db.SOURCE_GLASS_DOOR_CAM, detection_class="animal",
+                confidence=0.5, bbox=(0, 0, 10, 10), frame_w=100, frame_h=100,
+                crop_path="crops/late.jpg")
+            w.execute("UPDATE detections SET visit_id = ? WHERE id = ?", (d + 777, d))
+            w.commit()
+            newcomer.append(d)
+        finally:
+            w.close()
+        return out
+    monkeypatch.setattr(visits, "_plan_visits", plan_then_race)
+    visits.build_visits(conn, gap_minutes=5, verbose=False)
+    assert _vid_of(conn, newcomer[0]) is None
+    assert _vid_of(conn, a) == a
+    dangling = conn.execute("SELECT COUNT(*) FROM detections WHERE visit_id IS NOT NULL "
+                            "AND visit_id NOT IN (SELECT id FROM visits)").fetchone()[0]
+    assert dangling == 0

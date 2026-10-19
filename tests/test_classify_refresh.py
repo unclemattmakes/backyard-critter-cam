@@ -94,6 +94,45 @@ def test_watch_drain_refreshes_visit_ledger(conn, tmp_path, stub_naming):
     assert [tuple(r) for r in rows] == [("raccoon", 2)]
 
 
+def test_one_busy_write_does_not_wedge_the_namer(conn, db_path, tmp_path, stub_naming,
+                                                 monkeypatch):
+    """Poll 1's write meets a busy database. Poll 2 reads, and while the model runs another
+    connection commits (the rig saving a crop). Unless poll 1's failure was rolled back, poll 2's
+    read pinned an old snapshot and its write fails 'database is locked' -- and so does every poll
+    after it, on the same crops, for as long as the process lives."""
+    det = _unlabeled_det(conn, tmp_path, minutes=0)
+    conn.execute("PRAGMA busy_timeout = 50")           # fail fast instead of waiting 5 s
+    blocker = db.connect(db_path)
+    blocker.execute("BEGIN IMMEDIATE")                 # someone holds the write lock in poll 1
+
+    class _RigSavesACropMidPoll(_StubClassifier):
+        calls = 0
+
+        def predict(self, paths):
+            type(self).calls += 1
+            if type(self).calls == 2:                  # poll 2, between its read and its write
+                w = db.connect(db_path)
+                _unlabeled_det(w, tmp_path, minutes=30)
+                w.close()
+            return super().predict(paths)
+    monkeypatch.setattr(classify, "build_classifier",
+                        lambda device: (_RigSavesACropMidPoll(), "cpu"))
+
+    class _ReleaseAfterPollOne(_StopAfter):
+        def is_set(self):
+            if self.polls == 2:                        # poll 1 is done (and failed)
+                blocker.commit()
+            return super().is_set()
+
+    try:
+        classify.watch_loop(conn, device="cpu", interval=0, stop_event=_ReleaseAfterPollOne(3))
+    finally:
+        blocker.close()
+    assert not conn.in_transaction
+    assert conn.execute("SELECT species FROM detections WHERE id = ?", (det,)).fetchone()[0] \
+        == "raccoon"
+
+
 def test_watch_stop_mid_burst_still_refreshes(conn, tmp_path, stub_naming):
     """Stopped right after a naming pass, before any quiet poll (standalone --watch Ctrl-C during
     a backlog): the exit path must still fold the written labels in rather than strand them."""

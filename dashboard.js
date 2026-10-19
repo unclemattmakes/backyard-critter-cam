@@ -559,7 +559,7 @@ async function refreshEvalStatus(){
   const when=(ev.run_at||'').slice(0,10);
   line.hidden=false;
   line.textContent = ev.ok===false
-    ? `Nightly eval (${when}): REGRESSION — ${evalWhat(ev)}. Auto-naming paused itself; the full diff is in reports/${ev.artifact}.`
+    ? `Nightly eval (${when}): REGRESSION — ${evalWhat(ev)}. Auto-naming paused itself${ev.skipped_nights?`, as it did the ${ev.skipped_nights} night${ev.skipped_nights===1?'':'s'} before`:''}; the full diff is in reports/${ev.artifact}.`
     : ev.stale
     ? `Nightly eval (${when}): STALE — ${evalStaleText(ev)}. Auto-naming still ran.`
     : ev.ok===true
@@ -1259,9 +1259,9 @@ async function loadCastStrip(){
    reads it, it is undone by tapping it again, and it can never be mistaken for a confirmed label.
 
    A crop is kept by its detection id. A VISIT is kept by source + the moment it started, never by
-   a visit id: the Visit Log re-clusters visits out of raw detections on every request and visits.py
-   renumbers the ledger, so an id is not a handle that survives the week (the same reason the ✎
-   label tools post source+start+end). See the `favorites` table comment in db.py. */
+   a visit id: the Visit Log re-clusters visits out of raw detections on every request, and a
+   visits.py id changes whenever its visit regroups, so an id is not a handle that survives the
+   week (the same reason the ✎ label tools post source+start+end). See the `favorites` table comment in db.py. */
 function favHeart(on, call, cls){
   const yes = !!on;
   return `<button class="fav${yes?' on':''}${cls?' '+cls:''}" type="button" aria-pressed="${yes?'true':'false'}"
@@ -1990,7 +1990,8 @@ let __indivSeq=0;
 async function loadIndividuals(){
   const body=$('#indiv-body'); body.innerHTML='<p class="empty">Gathering the suspects…</p>';
   const qs=`?mode=${encodeURIComponent(REID_MODE)}&offset=${REID_OFFSET}&limit=${REID_LIMIT}`
-          +(REID_SINCE_H===null?'':`&since_h=${REID_SINCE_H}`);
+          +(REID_SINCE_H===null?'':`&since_h=${REID_SINCE_H}`)
+          +(REID_NIGHT?`&night=${encodeURIComponent(REID_NIGHT)}`:'');
   const seq=++__indivSeq;
   /* The queue can take SECONDS when the server's cache is cold — 24s measured 2026-08-08 after
      a 2,900-crop family night (the matcher rebuilds whenever the DB changed; the nightly batch
@@ -2257,6 +2258,68 @@ function reidBootCard(g,i){
     <div style="display:flex;gap:6px;align-items:center">${reidInput('rg-'+i,'name this individual…')}<button class="gear" onclick="reidNameGroup(${i})">Name all</button></div>
   </div>`;
 }
+/* NIGHT BY NIGHT: one night's unreviewed visits, grouped by look within each camera (the server's
+   VisitMatcher.night_groups). Inside a night the matcher is good at "same animal again"; across
+   nights it fades in about a week. So the machine groups the night and you say who each group
+   is -- one decision per animal instead of per visit, and every answer is a fresh template.
+   Every member is ticked by default and shown, so the odd one out gets unticked before saving. */
+let REID_NIGHT=null;                  // null = the newest night with work left
+function reidSetNight(n){ if(n===REID_NIGHT) return; REID_NIGHT=n; loadIndividuals(); }
+function reidTonightIds(i){
+  return Array.from(document.querySelectorAll(`input[data-tg="${i}"]`)).filter(x=>x.checked).map(x=>+x.value);
+}
+function reidTonightCard(g,i){
+  const members=(g.members||[]).map(m=>`<label style="display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer" title="visit #${m.visit_id} · ${reidWhen(m.started)}${m.auto_as?` · auto: ${esc(m.auto_as)}`:''}">
+      ${m.rep_crop?`<img src="/media/${encodeURI(m.rep_crop)}" loading="lazy" alt="visit ${m.visit_id} thumbnail" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`:`<span class="lbl" style="width:64px;height:64px;display:flex;align-items:center;justify-content:center;opacity:.6">#${m.visit_id}</span>`}
+      <span class="lbl" style="font-size:11px;opacity:.75"><input type="checkbox" data-tg="${i}" value="${m.visit_id}" checked aria-label="include visit ${m.visit_id}"> ${esc((m.started||'').slice(11,16))}</span></label>`).join('');
+  const s=g.suggestion, n=g.visits.length;
+  let sugg='';
+  if(s&&!s.novel){
+    sugg=`<span class="flag" title="the group's average look against confirmed ${esc(g.source)} visits; the nearest is #${s.via_visit}${s.same_night?', from this same night':''}">looks like <b>${esc(s.name)}</b> ${Math.round(s.similarity*100)}%${s.same_night?' · tonight':''}</span>`+lapseBadge(s.lapse);
+  }else if(s){
+    sugg=`<span class="flag" title="nobody on file looks this close">possibly someone new</span>`;
+  }
+  const keep=(s&&!s.novel)?`<button class="gear" onclick="reidTonightName(${i},${jarg(s.name)},this)" title="confirm every ticked visit as ${esc(s.name)}">✓ ticked are ${esc(s.name)}</button>`:'';
+  return `<div class="panel" style="display:flex;align-items:center;gap:12px;padding:10px 14px;flex-wrap:wrap">
+    <div style="min-width:170px"><div style="font-weight:600">${n===1?'one visit':`${n} look-alike visits`}</div>
+      <div class="lbl" style="opacity:.72">${esc(g.source||'')} · ${reidWhen(g.started[0])}${n>1?` → ${reidWhen(g.started[n-1])} · look-alike ${g.cohesion}`:''}</div>
+      <div style="margin-top:4px">${sugg}</div></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;flex:1">${members}</div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${keep}${reidInput('rt-'+i,'or who…')}<button class="gear" onclick="reidTonightName(${i},null,this)">Name ticked</button></div>
+  </div>`;
+}
+function reidTonightName(i,name,btn){
+  if(!name){
+    const inp=document.getElementById('rt-'+i);
+    name=(inp&&inp.value||'').trim();
+    if(!name){ if(inp) inp.focus(); return; }
+  }
+  const ids=reidTonightIds(i);
+  if(!ids.length) return;
+  // Same two-tap guard as the bulk fit: the first tap arms the button in place, the second commits.
+  if(ids.length>1 && btn && btn.dataset.armed!=='1'){
+    btn.dataset.armed='1'; btn.dataset.label=btn.textContent;
+    btn.textContent=`really name ${ids.length} as ${name}? tap again`;
+    setTimeout(()=>{ if(btn.isConnected&&btn.dataset.armed==='1'){ btn.dataset.armed=''; btn.textContent=btn.dataset.label; } },6000);
+    return;
+  }
+  reidConfirmMany(ids,name,btn);
+}
+function reidTonightHTML(t){
+  if(!t||(!(t.groups||[]).length&&!(t.nights||[]).length)) return '';
+  const on='background:rgba(120,200,255,.18);border-color:rgba(120,200,255,.5);font-weight:600';
+  const chips=(t.nights||[]).map(x=>`<button class="gear" onclick="reidSetNight(${jarg(x.night)})" style="${x.night===t.night?on:''}">${esc(x.night.slice(5))} · ${x.n_visits}</button>`).join(' ');
+  const sk=t.skipped||{}, left=[];
+  if(sk.multi) left.push(`${sk.multi} with 2+ animals (un-blend those in the queue below)`);
+  if(sk.untemplated_source) left.push(`${sk.untemplated_source} from a camera with no confirmed visits yet`);
+  let html=`<h2 class="sec">Night by Night <span class="n">one night's visits, grouped by look — say who each group is</span></h2>`;
+  html+=`<p class="lbl" style="opacity:.75;margin:2px 0 8px">Within one night the matcher is good at spotting the same animal again; across nights it isn't. So these are one night's unreviewed visits, grouped by look on each camera. Untick any that isn't the same animal, then name the group. Every visit you name becomes a fresh template.${left.length?` Left out: ${left.join('; ')}.`:''}</p>`;
+  if(chips) html+=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px">${chips}</div>`;
+  html+=(t.groups||[]).length
+    ? `<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${t.groups.map(reidTonightCard).join('')}</div>`
+    : `<p class="empty">Nothing left to name on ${esc(t.night||'this night')}.</p>`;
+  return html;
+}
 /* Re-fit: once a cast exists, sort the unconfirmed remainder into "looks like <name>" buckets
    (bulk-confirm) and candidate-new-individual groups, and flag anyone named only on a pair visit. */
 let REID_REFIT=null;
@@ -2471,9 +2534,10 @@ function reidModesHTML(q){
    name one is a human noticing the glass door saw the same animal in the same minutes. That
    pairing exists for 109 of 521 glass-door raccoon visits and was shown nowhere until now.
 
-   Visit ids churn: visits.py rebuilds and renumbers from scratch (labels live on DETECTIONS and
-   survive, ids do not). So a dossier that comes back empty is EXPECTED, not an error -- the flow
-   skips it and says the list went stale rather than showing a broken card. */
+   Visit ids hold across rebuilds (an id is the visit's lowest crop id), but a visit that merges
+   with a neighbour or loses its first crop takes its id with it. So a dossier that comes back
+   empty is EXPECTED, not an error -- the flow skips it and says the list went stale rather than
+   showing a broken card. Labels live on the crops, so nothing already saved is lost. */
 let REID_FOCUS={ids:[],i:0,on:false,cache:{},stale:false};
 
 function focusStart(ids){
@@ -2503,12 +2567,12 @@ async function focusRender(){
   const f=REID_FOCUS, vid=f.ids[f.i];
   host.innerHTML=`<div class="panel" style="padding:14px"><p class="empty">Loading visit ${f.i+1} of ${f.ids.length}…</p></div>`;
   const d=await focusFetch(vid);
-  // A renumbered-away visit: skip forward to the next one that still exists.
+  // A visit that changed in a rebuild: skip forward to the next one that still exists.
   if(!d||!d.visit_id){
     f.stale=true;
     if(f.i+1<f.ids.length){ f.i++; focusRender(); return; }
     host.innerHTML=`<div class="panel" style="padding:14px">
-      <p class="empty">This review list is out of date — the visits were renumbered by a rebuild since it was built. Nothing was lost (names live on the crops); the list just needs rebuilding.</p>
+      <p class="empty">This review list is out of date — some of its visits changed (merged with a neighbour) since it was built. Nothing already saved was lost (names live on the crops); the list just needs rebuilding.</p>
       <button class="gear" onclick="focusExit()">↺ rebuild the list</button></div>`;
     return;
   }
@@ -2633,7 +2697,12 @@ async function focusAnswer(name,opts){
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:reidBody(body)}).then(r=>r.json());
     restore();
-    if(r&&r.error){ alert(r.error); return; }
+    if(r&&r.error){
+      alert(r.error);
+      // The visit changed under the list: drop its cached dossier so the re-render skips past it.
+      if(r.stale_visit){ delete f.cache[vid]; focusRender(); }
+      return;
+    }
     delete f.cache[vid];          // its verdict changed; re-fetch if we come back
     if(f.i+1<f.ids.length) focusGo(1); else focusRender();
   }catch(e){ restore(); connFail(); }
@@ -2671,6 +2740,7 @@ function reidQueueHTML(q){
   let html=`<h2 class="sec">Who Is This? <span class="n">confirm or correct — each answer sharpens the next guess</span></h2>`;
   html+=reidFunnelHTML(q.funnel);
   if(q.unembedded>0) html+=`<p class="lbl" style="opacity:.7;margin:2px 0 10px">⚠ ${q.unembedded} recent crops aren't analysed for appearance yet — naming suggestions sharpen once the re-ID step has run (see the README's “Individual re-identification”).</p>`;
+  html+=reidTonightHTML(q.tonight);
   if(q.bootstrap.length){
     html+=`<p class="lbl" style="opacity:.75;margin:4px 0 10px">Nothing confirmed yet, so here are the corpus' look-alike <b>visit groups</b> (each is probably one animal — your eye decides; skip the 2+-animal ones first pass). Naming a group confirms every visit in it.</p>`;
     html+=`<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">${q.bootstrap.map(reidBootCard).join('')}</div>`;
@@ -2728,14 +2798,18 @@ function visitSpeciesCorrect(target, selectId, after){
 }
 async function reidConfirmMany(visitIds,name,btn){
   let done=0;
+  const refused=[];   // the server's reason per visit it would not save (e.g. a visit that changed)
   if(btn) btn.disabled=true;
   try{
     for(const vid of visitIds){
-      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:reidBody({visit_id:vid,name})});
-      done++;
-      if(btn) btn.textContent=`saving ${done}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
+      const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:reidBody({visit_id:vid,name})}).then(r=>r.json());
+      if(r&&r.error) refused.push(r.error); else done++;
+      if(btn) btn.textContent=`saving ${done+refused.length}/${visitIds.length}…`;   // N sequential POSTs deserve a pulse
     }
+    // Every visit is accounted for: a group that half-saved must not read as a group that saved.
+    if(refused.length) alert(`Saved ${done} of ${visitIds.length} as ${name}. Not saved: `
+      +`${refused.length}.\n\n${refused[0]}${refused.length>1?`\n(and ${refused.length-1} more)`:''}`);
     loadIndividuals();
   }catch(e){
     alert(`Could not save: ${e}${done?` — ${done} of ${visitIds.length} were saved before the failure`:''}`);
@@ -2774,7 +2848,7 @@ async function reidConfirm(vid,name,clear,reject){
   try{
     const r=await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:reidBody({visit_id:vid,name:clear?null:name,reject:!!reject})}).then(r=>r.json());
-    if(r.error){ restore(); alert(r.error); return; }
+    if(r.error){ restore(); alert(r.error); if(r.stale_visit) loadIndividuals(); return; }
     loadIndividuals();   // re-renders the whole list (button goes away with it); no restore needed
   }catch(e){ restore(); connFail(); }
 }
@@ -2794,12 +2868,7 @@ async function reidNameGroup(i){
   const name=(inp&&inp.value||'').trim();
   if(!name){ if(inp) inp.focus(); return; }
   const g=REID_BOOT[i]; if(!g) return;
-  try{
-    for(const vid of g.visits)
-      await fetch('/api/reid/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:reidBody({visit_id:vid,name})});
-    loadIndividuals();
-  }catch(e){ alert('Could not save: '+e); }
+  reidConfirmMany(g.visits,name);
 }
 /* THE BADGE FACE. Chosen automatically (stats._avatar_for: human-vouched, sharp, confident,
    well-exposed, squarely framed) but pinnable, because the one thing the picker cannot judge is
@@ -3230,6 +3299,7 @@ function renderCams(){
     if(c.kind==='network') flags.push(c.has_password
       ? '<span class="cam-flag">password set</span>'
       : '<span class="cam-flag warn">no password</span>');
+    if(c.snapshot_url) flags.push('<span class="cam-flag">hi-res crops</span>');
     if(c.created_by==='config') flags.push('<span class="cam-flag">from config</span>');
     return `<div class="cam-row">
       <div class="cam-main">
@@ -3278,7 +3348,7 @@ function camNew(){
   CAMS.editing=null;
   $('#cams-form-title').textContent='New camera';
   ['cam-id','cam-name','cam-source','cam-host','cam-port','cam-path','cam-username',
-   'cam-password','cam-device-index','cam-fw','cam-fh','cam-area'].forEach(id=>{ const el=$('#'+id); if(el) el.value=''; });
+   'cam-password','cam-snapshot','cam-device-index','cam-fw','cam-fh','cam-area'].forEach(id=>{ const el=$('#'+id); if(el) el.value=''; });
   $('#cam-source').disabled=false;
   $('#cam-source-row').hidden=false;
   $('#cam-source-note').hidden=false;
@@ -3304,6 +3374,7 @@ function camEdit(id){
   $('#cam-host').value=c.url_host||''; $('#cam-port').value=(c.url_port!=null?c.url_port:'');
   $('#cam-path').value=c.url_path||''; $('#cam-username').value=c.username||'';
   $('#cam-password').value='';                    // never prefilled: the server does not send it
+  $('#cam-snapshot').value=c.snapshot_url||'';
   $('#cam-fw').value=(c.frame_width!=null?c.frame_width:'');
   $('#cam-fh').value=(c.frame_height!=null?c.frame_height:'');
   $('#cam-area').value=(c.motion_min_area!=null?c.motion_min_area:'');
@@ -3336,6 +3407,7 @@ function camSave(ev){
     body.url_port=num('cam-port');
     body.url_path=($('#cam-path').value||'').trim() || null;
     body.username=($('#cam-username').value||'').trim() || null;
+    body.snapshot_url=($('#cam-snapshot').value||'').trim() || null;
     const pw=$('#cam-password').value||'';
     if(pw) body.password=pw;                      // absent = keep whatever is stored
   }

@@ -78,9 +78,11 @@ replaced-rig-*/
 # ===== Local private config (real coordinates / machine-specific overrides) =====
 config_local.py
 
-# ===== Runtime status (live-naming helper heartbeat; regenerated each run) =====
+# ===== Runtime status (live-naming and capture heartbeats; regenerated each run) =====
 .naming_status.json
 .naming_status.tmp
+.capture_status.json
+.capture_status.tmp
 # Runtime state for the self-healing bits: who holds the heavy-io lock (heavyio.py),
 # whether a human stopped the rig on purpose, and the restart-storm counter (rigwatch.py).
 # All three are about THIS machine right now; none of it means anything in the repo.

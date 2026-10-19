@@ -414,6 +414,9 @@ This machine is not the old machine. Before first launch:
                                        backup continues it and pruned-clip playback works.
     The secrets file (~/.critter-cam/secrets.json, or wherever CRITTER_CAM_SECRETS points) is
     in no backup or bundle on purpose: carry it across by hand, or re-enter the keys.
+    Network camera passwords are scrubbed from every database snapshot for the same reason:
+    open the dashboard ON THIS MACHINE (passwords are loopback-only) and re-enter each one,
+    or that camera will fail to log in.
     No camera on this machine (yet)? Nothing breaks: drop the old machine's USB CameraSpec /
     camera_index so the log isn't an endless reconnect loop, and browse the whole archive with
     `python backyard_cam.py --serve-only` until a camera arrives. History is safe either way --

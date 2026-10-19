@@ -63,6 +63,7 @@ import numpy as np
 
 import config
 import db
+import evalmetrics as em
 import reidutil
 
 EMBED_MODEL = "megadescriptor-l-384"
@@ -250,6 +251,12 @@ def _multi_visit_ids(conn, visit_ids, cfg=None) -> set:
 
 
 def usable_template_visits(conn, species=None, cfg=None, names=None) -> dict:
+    """See _usable_template_visits. Its queries join on visit ids, so they share one snapshot."""
+    with db.read_snapshot(conn):
+        return _usable_template_visits(conn, species, cfg, names)
+
+
+def _usable_template_visits(conn, species=None, cfg=None, names=None) -> dict:
     """{visit_id: (name, started_at)} for every visit that is ACTUALLY USABLE as a template --
     VisitMatcher.templates()' set, derived without loading a single embedding vector.
 
@@ -1074,6 +1081,13 @@ class VisitMatcher:
     def __init__(self, conn, species: str, cfg=None):
         self.cfg = cfg or config.CONFIG
         self.species = species
+        # One snapshot for every query below: they join on visit ids, and a ledger rebuild landing
+        # between two of them would pair one ledger's ids with another's. A caller that reads more
+        # (the review queue's pool) wraps its own db.read_snapshot around this; it nests.
+        with db.read_snapshot(conn):
+            self._load(conn, species)
+
+    def _load(self, conn, species: str) -> None:
         rows = conn.execute(
             """SELECT d.id, d.visit_id, d.timestamp, d.crop_quality, d.confidence,
                       d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2, e.embedding
@@ -1389,6 +1403,75 @@ class VisitMatcher:
                 "untemplated": untemplated,
                 "n_fit": sum(len(l) for l in fits.values()), "n_novel": len(novel)}
 
+    def night_of(self, visit_id: int):
+        """The NIGHT a visit belongs to (timestamp shifted -12h, so 01:10 counts as the evening
+        before), the same key the eval's session blocking uses. None if it has no start time."""
+        ts = self.visit_started.get(visit_id)
+        return em.night_key(db.parse_local(ts)) if ts else None
+
+    def night_groups(self, night=None, distance: float = None, max_nights: int = 14) -> dict:
+        """TONIGHT MODE: one night's unreviewed visits, grouped by appearance within each camera,
+        so the human names a group once instead of visit by visit.
+
+        Why one night: appearance holds inside a night (a template under a day old is right 92.5%
+        of the time) and fades within a week, so grouping inside a night uses the signal where it
+        is good. The human supplies the link it can't make across nights: which animal on file a
+        group is. A group is only a proposal -- the dashboard shows every member's crop and lets
+        each be unticked before anything is written.
+
+        Members are unconfirmed, unrejected, solo visits with a prototype, from a camera that has
+        templates. Multi-animal visits go to un-blend instead, and a camera with no templates is
+        left out (the trail cam's similarity is flat over time, 0.510 near vs 0.514 far, so its
+        groups would be noise). Auto-named visits are members: confirming one is its review.
+        Each group's suggestion ranks the group's mean prototype against its own camera's
+        templates, and says when the winning template is from the same night -- the case the
+        matcher is reliable at.
+
+        `night` is a night key (YYYY-MM-DD); None picks the newest night with work left."""
+        distance = self.cfg.reid_night_group_distance if distance is None else distance
+        template_sources = {self.visit_source.get(vid) for _n, vid, _p in self.templates()}
+        template_sources.discard(None)
+        by_night: dict = defaultdict(list)
+        skipped: dict = defaultdict(lambda: {"multi": 0, "untemplated_source": 0})
+        for v in self.protos:
+            if v in self.confirmed or v in self.rejected:
+                continue
+            n = self.night_of(v)
+            if n is None:
+                continue
+            if self.is_multi(v):
+                skipped[n]["multi"] += 1
+            elif self.visit_source.get(v) not in template_sources:
+                skipped[n]["untemplated_source"] += 1
+            else:
+                by_night[n].append(v)
+        nights = [{"night": n, "n_visits": len(by_night[n])}
+                  for n in sorted(by_night, reverse=True)[:max_nights]]
+        chosen = night or (nights[0]["night"] if nights else None)
+        groups = []
+        vids = by_night.get(chosen, [])
+        for src in sorted({self.visit_source.get(v) for v in vids}):
+            temps = self.templates(src)
+            for g in self._cluster_visits([v for v in vids if self.visit_source.get(v) == src],
+                                          distance):
+                P = np.stack([self.protos[v] for v in g["visits"]])
+                c = P.mean(axis=0)
+                c = c / (np.linalg.norm(c) or 1.0)
+                ranked = rank_templates(c, temps)
+                sug = None
+                if ranked:
+                    name, sim, via = ranked[0]
+                    sug = {"name": name, "similarity": round(sim, 3),
+                           "lead": round(sim - (ranked[1][1] if len(ranked) > 1 else 0.0), 3),
+                           "via_visit": via, "same_night": self.night_of(via) == chosen,
+                           "novel": sim < self.cfg.reid_novel_threshold}
+                groups.append({**g, "source": src, "suggestion": sug,
+                               "auto_as": [self.auto.get(v) for v in g["visits"]]})
+        groups.sort(key=lambda g: (-len(g["visits"]), g["started"][0]))
+        return {"night": chosen, "nights": nights, "groups": groups,
+                "n_visits": len(vids), "distance": distance,
+                "skipped": dict(skipped.get(chosen, {"multi": 0, "untemplated_source": 0}))}
+
     def auto_assign(self, conn, *, threshold: float = None, margin: float = None,
                     min_templates: int = None, dry_run: bool = False) -> dict:
         """The "review by exception" tier: NAME the unambiguous solo visits automatically, so the
@@ -1426,7 +1509,9 @@ class VisitMatcher:
             auto-nameable, and the departed individual is still ranked, suggested and templated
             everywhere else. See is_departed();
           - SPECIES SCOPE: the name is written only onto this matcher's species' crops, never onto
-            the visit's dominant species (`no_matching_species` when there are none).
+            the visit's dominant species (`no_matching_species` when there are none);
+          - `visit_gone`: the visit merged or lost its first crop between loading and writing,
+            so the write found nothing -- counted apart so it never reads as a species problem.
 
         Returns {enabled, assigned: [{visit_id, name, similarity, margin, started}], skipped,
         no_matching_species: [visit_id, ...]}."""
@@ -1489,8 +1574,14 @@ class VisitMatcher:
                 continue
             # The name goes on THIS species' crops only, never the visit's dominant species: a
             # raccoon visit outvoted by 'not an animal' boxes would hand them the name instead.
-            if not self._co_rows.get(vid) or (not dry_run and not db.label_visit(
-                    conn, vid, name, source="auto", species=self.species)):
+            wrote = bool(self._co_rows.get(vid)) and (dry_run or db.label_visit(
+                conn, vid, name, source="auto", species=self.species))
+            if not wrote:
+                # A write that stamped nothing because the visit merged or lost its first crop
+                # since this matcher loaded is not a species problem; say which it was.
+                if not dry_run and not db.visit_exists(conn, vid):
+                    out["skipped"]["visit_gone"] += 1
+                    continue
                 out["skipped"]["no_matching_species"] += 1
                 out["no_matching_species"].append(vid)
                 continue
@@ -1587,6 +1678,10 @@ def main() -> int:
             vid, name = int(args.confirm[0]), args.confirm[1].strip() or None
             sp = db.confirm_species(conn, vid, name, confirm_species)
             n = db.label_visit(conn, vid, name, species=sp)
+            if not n and not db.visit_exists(conn, vid):
+                print(f"Visit #{vid} is not in the visit list (check the id with --queue) "
+                      f"-- nothing written.")
+                return 1
             if sp and not n:
                 print(f"Visit #{vid}: no {sp} crops to name -- nothing written.")
                 return 1

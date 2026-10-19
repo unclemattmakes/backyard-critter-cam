@@ -30,8 +30,12 @@ REM                                weeks because this step was a docstring, not
 REM                                a scheduler line). Read-only over the DB, no
 REM                                GPU: it scores the embeddings already stored.
 REM                                Diffs the pinned baseline (eval.py
-REM                                --pin-baseline), else last night's artifact;
-REM                                exit 1 = regression or floor, 3 = stale.
+REM                                --pin-baseline), else last night's artifact.
+REM                                Only what auto-assign ships on can fail it:
+REM                                exit 1 = a gated metric regressed (paired
+REM                                per probe), a floor broke, or the configured
+REM                                auto-assign point names a visit wrongly;
+REM                                3 = stale.
 REM   6) individuals.py --auto-assign -- name the unambiguous new solo visits
 REM                                (bars from eval.py's sweep; auto names never
 REM                                feed the suggestion templates; review in the
@@ -40,7 +44,12 @@ REM                                reported a regression (not when stale): a
 REM                                matcher that
 REM                                measurably got worse today should not spend
 REM                                tonight writing names.
-REM   7) warm the dashboard's re-ID queue cache -- the first Individuals-tab
+REM   7) secondopinion.py --nightly -- Claude names the last day's crops BioCLIP
+REM                                was unsure of, in SHADOW: answers go to
+REM                                second_opinion.db and nothing reads them yet.
+REM                                Network only, no GPU. Does nothing unless
+REM                                second_opinion_nightly is on in config_local.py.
+REM   8) warm the dashboard's re-ID queue cache -- the first Individuals-tab
 REM                                visit after a big night otherwise eats the
 REM                                full rebuild at the browser (measured 24s on
 REM                                2026-08-08). Rig down = curl fails = fine.
@@ -155,6 +164,9 @@ if "%EVAL_SKIP%"=="1" (
     ".venv\Scripts\python.exe" individuals.py --auto-assign
     if errorlevel 1 (echo [%date% %time%]   *** individuals --auto-assign FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   individuals --auto-assign ok)
 )
+echo [%date% %time%] Claude second opinion on the last day's uncertain crops...
+".venv\Scripts\python.exe" secondopinion.py --nightly
+if errorlevel 1 (echo [%date% %time%]   *** secondopinion FAILED -- continuing with the remaining steps) else (echo [%date% %time%]   secondopinion ok)
 echo [%date% %time%] warming the dashboard re-ID queue cache...
 REM The port is not fixed (web_port, else web_port_fallback): ask mdns.py which one answers.
 set "DASHURL="

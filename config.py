@@ -36,6 +36,9 @@ ROOT = Path(__file__).resolve().parent
 # Where the live species-naming helper (classify.py --watch) writes its status, so the dashboard
 # can show "warming up" vs "naming" vs "stopped". A hidden file in the project root.
 NAMING_STATUS_FILE = ROOT / ".naming_status.json"
+# Where the rig's capture watch (capwatch.py) writes each camera's last-frame time, so rigwatch
+# can tell a rig that is up from a rig that is actually watching the yard.
+CAPTURE_STATUS_FILE = ROOT / ".capture_status.json"
 
 # The rig's health record (health.py reads both): rigwatch's state, which carries its active
 # alarms, and backup.py's last-run verdict plus the lost clip days it has already reported.
@@ -52,7 +55,8 @@ BACKUP_STATE_FILE = ROOT / ".backup_state.json"
 # a value still set there wins. Any other key is readable with secret("name"), e.g. a camera URL
 # in config_local.py: CameraSpec("yard_ir", secret("yard_ir_url")).
 SECRETS_ENV = "CRITTER_CAM_SECRETS"
-SECRET_FIELDS = ("email_resend_api_key", "operator_token", "mqtt_password", "heartbeat_url")
+SECRET_FIELDS = ("email_resend_api_key", "operator_token", "mqtt_password", "heartbeat_url",
+                 "anthropic_api_key")
 _secrets_cache: dict | None = None
 
 
@@ -141,6 +145,12 @@ class CameraSpec:
     # a smaller value than the 1280x720 default -- set it per camera here. None = inherit Config.
     motion_min_area: int | None = None
     record_clips: bool | None = None
+    # Full-resolution still to cut ID crops from (snapshot.py); None = off. Set it in the
+    # dashboard: this is the RESOLVED URL, credentials included, like `src`.
+    snapshot_url: str | None = None
+    # (username, password) when snapshot_url has a {token} to fill by logging in; None otherwise.
+    # repr=False so a printed spec can never show the password in the clear.
+    snapshot_login: tuple | None = field(default=None, repr=False)
 
     @property
     def is_url(self) -> bool:
@@ -196,6 +206,14 @@ class Config:
     camera_controls: dict = field(default_factory=lambda: {"BACKLIGHT": 0})
     reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).
+    # A network camera's read() runs on a helper thread; one that has not returned in this long
+    # is abandoned and the camera reopened. Frames arrive every ~0.1 s, and FFmpeg's own read
+    # timeout is 30 s, so 20 s only ever fires on a read that is not coming back. 0 = off.
+    capture_read_timeout_s: float = 20.0
+    # No frame AND no reconnect attempt for this long means the capture thread is stuck somewhere.
+    # The rig then logs where (the thread's stack) and marks the camera stuck in
+    # CAPTURE_STATUS_FILE. Above the slowest healthy pass (open + clip prune + veto setup, ~30 s).
+    capture_stall_s: float = 120.0
 
     # ---- Auto-white-balance recovery --------------------------------------------
     # Some webcams have a BROKEN manual white balance. Measured on the 2026-07 glass-door cam
@@ -402,6 +420,17 @@ class Config:
                                         # only -- existing crops were already cut at the old pad.
     jpeg_quality: int = 95              # 0-100 for saved JPEGs.
 
+    # ---- Full-resolution snapshot crops (snapshot.py; per camera, off unless a camera has a
+    # snapshot URL). At most one fetch per detector pass, so detector_min_interval_s bounds the rate.
+    snapshot_timeout_s: float = 5.0     # A Reolink Snap answers in ~0.3-1 s; past this, give up.
+    # Lowest IoU between a stream box and the re-detected snapshot box (in stream coordinates) to
+    # call them the same animal. Low on purpose: the still lands ~0.5-1 s after the stream frame
+    # and a walking animal has moved; a miss only means that crop stays at stream resolution.
+    snapshot_match_min_iou: float = 0.1
+    # Long side cap for a snapshot crop. A close raccoon on a 4K still is ~1500 px; the embedders
+    # see 224-448, so past this the disk cost buys nothing.
+    snapshot_crop_max_side: int = 1280
+
     # ---- Content backups (backup.py) ---------------------------------------------
     # Where backup.py archives everything the rig GENERATES: per-day zips of clips/ and crops/
     # (clips especially -- clips_max_gb prunes the live folder, the backup outlives it), plus
@@ -579,6 +608,26 @@ class Config:
     # information too (and the issue says when the camera wasn't watching). False = quiet
     # periods are archived but not sent.
     email_send_quiet: bool = True
+
+    # ---- Local language model (llm.py; optional, off by default) -----------------
+    # An Ollama server (https://ollama.com) on this machine, used for prose only: today, a short
+    # model-written lede over the morning email's own figures. It never writes the DB, never
+    # labels anything, and every caller falls back to the templated words when it is off, busy
+    # or wrong. It shares the GPU with the rig, so a call is skipped while any heavyio lock is
+    # held (the nightly batch, a backup), and the model is unloaded the moment it answers.
+    llm_enabled: bool = False
+    llm_url: str = "http://127.0.0.1:11434"
+    # The 9B, because on real nights the 4B failed newsletter's fact check 3 times in 5 (visit
+    # counts stated as headcounts) where the 9B passed 5 of 5. ~5.6 GB of VRAM at 8K context:
+    # fine at 07:00 beside the rig alone (~0.8 GB), never during the batch (heavyio keeps it out).
+    llm_model: str = "qwen3.5:9b"
+    # Skip the call unless this much VRAM is free, so the model never loads partly onto the CPU
+    # (the load this box hangs under). ~0.9 GB over the 9B's footprint; ~4000 suits the 4B.
+    llm_min_free_vram_mb: int = 6500
+    llm_timeout_s: float = 120.0           # covers a cold load (~5-60 s) plus a few hundred tokens
+    llm_keep_alive: str | int = 0          # 0 = unload right after the answer (Ollama syntax: "5m")
+    llm_num_ctx: int = 8192                # a bigger context spills the 4B onto the CPU on 8 GB
+    llm_num_thread: int = 4                # if any layer does land on the CPU, the naming helper's 4-thread cap
 
     # ---- Live sighting alerts over MQTT (mqttnotify.py) ---------------------------
     # "A raccoon just arrived", published to an MQTT broker the moment species naming is sure of
@@ -821,6 +870,11 @@ class Config:
     # inert while reid_auto_threshold is 0.0 (the shipped default), and this mode is most useful
     # BEFORE the auto tier is turned on. This is the fallback used in that case.
     reid_queue_ambiguous_margin: float = 0.02
+    # TONIGHT: the cosine distance (1 - similarity, average linkage) under which one night's
+    # unreviewed visits on one camera are grouped as probably the same animal, for naming in one
+    # go. The same 0.45 bootstrap and refit cluster at; it was not swept for this use. eval.py's
+    # night-group purity line measures it on your confirmed visits -- read that before trusting it.
+    reid_night_group_distance: float = 0.45
 
     # ---- Nightly eval gate (eval.py, run by run_clipmotion.bat) ---------------------
     # ABSOLUTE FLOORS: a metric below its floor fails the gate (exit 1, auto-assign skipped)
@@ -1032,6 +1086,26 @@ class Config:
     # Which species the dashboard's Individuals (re-ID) tab works on by default. 'raccoon' suits a
     # PNW yard; set it to your most-identifiable mammal (opossum, fox, ...) in config_local.py.
     reid_species: str = "raccoon"
+
+    # ---- Claude second opinion on uncertain species (secondopinion.py) ----------
+    # SHADOW MODE: answers go to their own sidecar DB beside backyard.db and nothing reads them
+    # yet. Only crops BioCLIP named below second_opinion_max_conf are sent; graded against the
+    # human labels, BioCLIP is right 0.906 of the time at >= 0.8 and 0.225 at 0.5-0.8, so the
+    # top band has little to gain. Every send leaves the LAN, so max_crops caps one run's bill.
+    anthropic_api_key: str | None = None       # console.anthropic.com -> API Keys; secrets file
+    second_opinion_model: str = "claude-opus-5-5"
+    second_opinion_max_conf: float = 0.8
+    second_opinion_max_crops: int = 300
+    # Human labels that mean a PERSON (a household member's name, say). A crop with one, and every
+    # crop in its visit, is never sent. Generic words ("person", "human", ...) are always on the
+    # list; add names here in config_local.py, never in this file. The rig stores only 'animal'
+    # boxes, so a person MegaDetector mistook for an animal is caught only once someone labels it.
+    second_opinion_never_send: list | None = None
+    # The nightly batch's shadow run over the last day's uncertain crops. Off by default: it sends
+    # crops off the LAN, so it is an owner's decision. ~650-800 crops a day on Haiku is ~$0.12.
+    second_opinion_nightly: bool = False
+    second_opinion_nightly_model: str = "claude-haiku-5-5"
+    second_opinion_nightly_max_crops: int = 1000
 
     # ---- Timezone convention ----------------------------------------------------
     # Timestamps are stored as LOCAL time WITH the UTC offset, ISO 8601, e.g.

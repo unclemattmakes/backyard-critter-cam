@@ -105,3 +105,39 @@ def test_cluster_cosine_constrained_cannot_link_holds_lookalikes_apart():
 def test_cluster_cosine_constrained_singleton_and_empty():
     assert list(reidutil.cluster_cosine_constrained(np.zeros((1, 1)), 0.3)) == [1]
     assert list(reidutil.cluster_cosine_constrained(np.zeros((0, 0)), 0.3)) == []
+
+
+def test_session_nuisance_basis_finds_the_scene_not_the_animal():
+    # Two animals (dims 0, 1) seen on three nights, each night with its own scene offset (dims
+    # 2-4) and BOTH animals present: the session means differ only by scene, so the basis must
+    # lie entirely in the scene dims.
+    rows, sessions = [], []
+    for night, scene_dim in ((1, 2), (2, 3), (3, 4)):
+        for animal in (0, 1):
+            v = np.zeros(5)
+            v[animal], v[scene_dim] = 1.0, 2.0
+            rows.append(v)
+            sessions.append(("cam", night))
+    U = reidutil.session_nuisance_basis(rows, sessions, 2)
+    assert U.shape == (5, 2)
+    assert np.allclose(U.T @ U, np.eye(2))
+    assert np.allclose(U[:2], 0.0)
+
+
+def test_session_nuisance_basis_skips_lone_visits_and_caps_k():
+    rows = [_unit(1, 0, 0), _unit(0, 1, 0), _unit(1, 1, 0), _unit(0, 0, 1)]
+    # One two-visit session plus two lone visits: a single usable session has no spread.
+    assert reidutil.session_nuisance_basis(rows, ["a", "a", "b", "c"], 4).shape == (3, 0)
+    # Two usable sessions give at most one direction, whatever k asks for; None never counts.
+    U = reidutil.session_nuisance_basis(rows, ["a", "a", "b", "b"], 4)
+    assert U.shape == (3, 1)
+    assert reidutil.session_nuisance_basis(rows, [None] * 4, 2).shape == (3, 0)
+
+
+def test_project_out_removes_the_span_and_renormalizes():
+    U = np.array([[0.0], [0.0], [1.0]])
+    Y = reidutil.project_out(np.stack([_unit(1, 0, 1), _unit(0, 2, 3)]), U)
+    assert np.allclose(Y[:, 2], 0.0)
+    assert np.allclose(np.linalg.norm(Y, axis=1), 1.0)
+    X = np.stack([_unit(1, 2, 3)])
+    assert np.allclose(reidutil.project_out(X, np.zeros((3, 0))), X)
