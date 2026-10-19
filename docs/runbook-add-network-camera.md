@@ -153,6 +153,43 @@ Main is affordable — but decode is not the whole cost, and two other things ma
 
 Start on the sub-stream to prove the plumbing; switch when the camera is in its final position.
 
+### Or: keep the sub-stream and take ID crops from a full-resolution still
+
+A camera that serves a single JPEG on request gives you the main stream's pixels without decoding
+it all day. Set the camera's **Hi-res snapshot** field in the dashboard and, each time the stream
+saves an animal, the rig fetches one still, runs the detector on it to find the animal again, and
+points the detection's `crop_path` at a cut from the still. The stream crop stays in
+`stream_crop_path`; naming, re-ID, traits and the dashboard all read the hi-res one. A fetch that
+times out, a still that is not an image, or an animal that has moved off its box leaves the
+stream crop in place. Expect roughly one in several to miss on a fast-moving animal, since the
+still lands ~0.5-1 s after the frame.
+
+For a Reolink:
+
+1. Turn HTTPS on: Reolink app -> the camera -> Settings -> Network -> Advanced -> Server
+   Settings -> HTTPS (port 443). RTSP being on is not enough; 443 stays shut without this. Use
+   HTTPS, not HTTP: the hourly login carries the password, and over HTTP it crosses the LAN
+   readable.
+2. Check it once from the rig, with the camera's own `rig` login (not the cloud account):
+   `curl -k -o snap.jpg "https://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig&password=..."`.
+   `-k` because the camera's certificate is self-signed. A JPEG of the full sensor size is a
+   pass. A small JSON body is a refused login.
+3. In the dashboard, edit the camera and set Hi-res snapshot to
+   `https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&token={token}`.
+   `{token}` makes the rig log in with the camera's username and password (a POST body, once per
+   hour-long lease) and send only the token on each snapshot, so the password never appears in
+   a URL, where the camera's web server could log it. A refused login waits 5 minutes before
+   trying again, so a wrong password cannot lock the account. The rig encrypts both requests but
+   does not verify the camera's self-signed certificate. That keeps the password from passive
+   sniffing; it does not stop an active impersonator on the LAN. `{host}` is filled from the
+   camera's own address, so the stored text never holds a credential. Changing this field on a
+   camera with a stored password is a credential change and only works from the rig itself.
+4. Restart the rig. The start-up log says `hi-res crops on (...)`, and the shutdown line counts
+   swapped / not found / failed / skipped-while-busy.
+
+The still must have the stream's aspect ratio (640x360 and 3840x2160 are both 16:9), or boxes
+cannot be mapped between them and the feature idles with one log line saying so.
+
 ## Phase 5: write the spec
 
 **Or do it in the dashboard.** Since 2026-08-22 the camera list lives in the `cameras` DB table

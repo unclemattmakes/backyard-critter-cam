@@ -139,6 +139,12 @@ class CameraSpec:
     # a smaller value than the 1280x720 default -- set it per camera here. None = inherit Config.
     motion_min_area: int | None = None
     record_clips: bool | None = None
+    # Full-resolution still to cut ID crops from (snapshot.py); None = off. Set it in the
+    # dashboard: this is the RESOLVED URL, credentials included, like `src`.
+    snapshot_url: str | None = None
+    # (username, password) when snapshot_url has a {token} to fill by logging in; None otherwise.
+    # repr=False so a printed spec can never show the password in the clear.
+    snapshot_login: tuple | None = field(default=None, repr=False)
 
     @property
     def is_url(self) -> bool:
@@ -407,6 +413,17 @@ class Config:
                                         # breathing room around the animal). Applies to NEW captures
                                         # only -- existing crops were already cut at the old pad.
     jpeg_quality: int = 95              # 0-100 for saved JPEGs.
+
+    # ---- Full-resolution snapshot crops (snapshot.py; per camera, off unless a camera has a
+    # snapshot URL). At most one fetch per detector pass, so detector_min_interval_s bounds the rate.
+    snapshot_timeout_s: float = 5.0     # A Reolink Snap answers in ~0.3-1 s; past this, give up.
+    # Lowest IoU between a stream box and the re-detected snapshot box (in stream coordinates) to
+    # call them the same animal. Low on purpose: the still lands ~0.5-1 s after the stream frame
+    # and a walking animal has moved; a miss only means that crop stays at stream resolution.
+    snapshot_match_min_iou: float = 0.1
+    # Long side cap for a snapshot crop. A close raccoon on a 4K still is ~1500 px; the embedders
+    # see 224-448, so past this the disk cost buys nothing.
+    snapshot_crop_max_side: int = 1280
 
     # ---- Content backups (backup.py) ---------------------------------------------
     # Where backup.py archives everything the rig GENERATES: per-day zips of clips/ and crops/

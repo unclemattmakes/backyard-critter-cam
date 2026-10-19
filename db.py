@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -34,7 +35,7 @@ log = logging.getLogger("db")
 
 # Stored in PRAGMA user_version. connect() runs SCHEMA + _migrate only while a DB is below it, so
 # ANY change to either (a table, column, index or data step) must bump this or no existing DB sees it.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 -- One row per detected object above the confidence threshold.
@@ -81,6 +82,12 @@ CREATE TABLE IF NOT EXISTS detections (
     -- so the dashboard can lead a visit with its CUTEST/sharpest frame, not just the most confident
     -- one. NULL until scored (live at capture time, or backfilled by `python quality.py`).
     crop_quality        REAL,
+
+    -- Set only when crop_path was REPLACED by a cut from the camera's full-resolution snapshot
+    -- (snapshot.py): the original stream crop, kept beside it. NULL = crop_path is the stream crop.
+    -- crop_quality stays the stream crop's score, because Laplacian sharpness depends on pixel
+    -- scale and mixing the two would bias every "best shot" pick toward one resolution.
+    stream_crop_path    TEXT,
 
     -- WHEN individual_id was last written onto this crop (local ISO 8601 w/ offset). Every OTHER
     -- timestamp in this schema is an OBSERVATION time -- when the animal was in front of the
@@ -469,6 +476,9 @@ CREATE TABLE IF NOT EXISTS cameras (
     frame_height  INTEGER,                  -- exactly as a CameraSpec field left at None does.
     motion_min_area INTEGER,                -- FULL-FRAME pixels, so it is resolution-dependent.
     record_clips  INTEGER,                  -- NULL = inherit; 0 = off; 1 = on.
+    snapshot_url  TEXT,                     -- full-res still for ID crops; NULL = off. A template:
+                                            -- {host} {user} {password} are filled at startup, so
+                                            -- the stored text never holds a credential.
     enabled       INTEGER NOT NULL DEFAULT 1,  -- 0 keeps the row but stops the rig opening it.
     created_by    TEXT    NOT NULL DEFAULT 'web',  -- 'web' (dashboard) | 'config' (seeded).
     created_at    TEXT    NOT NULL,         -- local ISO 8601 w/ offset.
@@ -691,6 +701,18 @@ def insert_detection(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def set_snapshot_crop(conn: sqlite3.Connection, detection_id: int, crop_path: str) -> bool:
+    """Point a detection at its full-resolution snapshot crop, keeping the stream crop in
+    stream_crop_path. Once only: a row that already has one is left alone, so the stream crop
+    can never be overwritten by a second swap. Returns True if the row changed."""
+    cur = conn.execute(
+        "UPDATE detections SET stream_crop_path = crop_path, crop_path = ? "
+        "WHERE id = ? AND stream_crop_path IS NULL",
+        (str(crop_path), int(detection_id)))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def insert_clip(conn: sqlite3.Connection, *, source: str, clip_path: str, started_at: str,
@@ -1005,6 +1027,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("suppress_ref_id", "INTEGER"), ("suppress_detail", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE detections ADD COLUMN {col} {decl}")
+    # Full-resolution snapshot crops (schema 2). Both nullable, so every existing row and camera
+    # reads as "stream crop, snapshots off".
+    if "stream_crop_path" not in cols:
+        conn.execute("ALTER TABLE detections ADD COLUMN stream_crop_path TEXT")
+    if "snapshot_url" not in {r[1] for r in conn.execute("PRAGMA table_info(cameras)")}:
+        conn.execute("ALTER TABLE cameras ADD COLUMN snapshot_url TEXT")
     # 2026-09-30: a removed camera keeps no password (see remove_camera). Rows tombstoned before
     # that still hold one; erase it. (The read-first check dates from when _migrate ran on every
     # connect, where an UPDATE took the write lock even when it matched nothing.)
@@ -2516,7 +2544,7 @@ def seed_ignore_zones(conn: sqlite3.Connection, zones_by_source) -> int:
 _CAMERA_COLS = ("id, source, name, kind, device_index, url_scheme, url_host, url_port, "
                 "url_path, username, frame_width, frame_height, motion_min_area, "
                 "record_clips, enabled, created_by, created_at, updated_at, "
-                "(password IS NOT NULL AND password != '') AS has_password")
+                "(password IS NOT NULL AND password != '') AS has_password, snapshot_url")
 
 CAMERA_KINDS = ("local", "network")
 CAMERA_URL_SCHEMES = ("rtsp", "http", "https")
@@ -2533,7 +2561,7 @@ def _camera_row(row) -> dict:
             "motion_min_area": None if row[12] is None else int(row[12]),
             "record_clips": None if row[13] is None else bool(row[13]),
             "enabled": bool(row[14]), "created_by": row[15], "created_at": row[16],
-            "updated_at": row[17], "has_password": bool(row[18])}
+            "updated_at": row[17], "has_password": bool(row[18]), "snapshot_url": row[19]}
 
 
 def clean_camera_source(source) -> str:
@@ -2586,8 +2614,45 @@ def _clean_camera_int(value, field: str, lo=None, hi=None):
     return n
 
 
+_SNAPSHOT_PLACEHOLDERS = ("{host}", "{user}", "{password}", "{token}")
+_SNAPSHOT_SECRET_QS = re.compile(
+    r"(?i)(?<=[?&])(pass(?:word)?|passwd|pwd|token|auth|secret|key)=([^&]*)")
+
+
+def clean_snapshot_url(value):
+    """Validate a camera's full-resolution snapshot URL TEMPLATE (None/'' = off).
+
+    The stored text must never hold a credential, for the same reason url_path may not: listings,
+    API payloads and logs all carry this column. So the login goes in as placeholders filled from
+    the row at startup (cameras.resolve_snapshot_url), and a literal value after a secret-looking
+    key is refused. {token} asks for Reolink's token login (snapshot.ReolinkToken): the password
+    goes once an hour in a request body and never into this URL, so prefer it to {password}."""
+    s = _clean_camera_text(value, "snapshot URL", 300)
+    if s is None:
+        return None
+    low = s.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise ValueError("snapshot URL must start with http:// or https://")
+    if "@" in s:
+        raise ValueError("snapshot URL may not contain '@' -- use {user} and {password} for the "
+                         "login; they are filled in from this camera's username and password")
+    rest = s
+    for ph in _SNAPSHOT_PLACEHOLDERS:
+        rest = rest.replace(ph, "")
+    if "{" in rest or "}" in rest:
+        raise ValueError("snapshot URL placeholders are {host}, {user}, {password} and "
+                         "{token} only")
+    for m in _SNAPSHOT_SECRET_QS.finditer(s):
+        if m.group(2) not in _SNAPSHOT_PLACEHOLDERS:
+            raise ValueError(f"snapshot URL carries a literal {m.group(1)}= -- use a "
+                             f"placeholder ({{token}} for a Reolink) and it is filled in from "
+                             f"this camera's login")
+    return s
+
+
 def _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
-                         username, name, frame_width, frame_height, motion_min_area) -> dict:
+                         username, name, frame_width, frame_height, motion_min_area,
+                         snapshot_url=None) -> dict:
     """Everything except source/password/record_clips/enabled, validated by kind."""
     k = str(kind or "").strip().lower()
     if k not in CAMERA_KINDS:
@@ -2597,7 +2662,7 @@ def _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url
            "frame_height": _clean_camera_int(frame_height, "frame height", 16, 16384),
            "motion_min_area": _clean_camera_int(motion_min_area, "motion area", 1, 100_000_000),
            "device_index": None, "url_scheme": None, "url_host": None,
-           "url_port": None, "url_path": None, "username": None}
+           "url_port": None, "url_path": None, "username": None, "snapshot_url": None}
     if k == "local":
         idx = _clean_camera_int(device_index, "device index", 0, 64)
         if idx is None:
@@ -2627,6 +2692,7 @@ def _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url
                                  "username and password fields instead")
         out["url_path"] = path
         out["username"] = _clean_camera_text(username, "username", 100)
+        out["snapshot_url"] = clean_snapshot_url(snapshot_url)
     return out
 
 
@@ -2668,7 +2734,7 @@ def camera_password(conn: sqlite3.Connection, source: str) -> Optional[str]:
 def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_index=None,
                url_scheme=None, url_host=None, url_port=None, url_path=None,
                username=None, password=None, frame_width=None, frame_height=None,
-               motion_min_area=None, record_clips=None, enabled=True,
+               motion_min_area=None, record_clips=None, enabled=True, snapshot_url=None,
                created_by: str = "web") -> dict:
     """Insert one camera and return its stored row (without the password).
 
@@ -2678,7 +2744,8 @@ def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_inde
     carried it. A live duplicate is refused outright."""
     src = clean_camera_source(source)
     fields = _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
-                                  username, name, frame_width, frame_height, motion_min_area)
+                                  username, name, frame_width, frame_height, motion_min_area,
+                                  snapshot_url)
     pw = None if password is None or password == "" else str(password)
     _require_username_for_password(fields["kind"], fields["username"], pw)
     rc = None if record_clips is None else (1 if record_clips else 0)
@@ -2696,12 +2763,12 @@ def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_inde
         # and `args` below must stay in lockstep; a test asserts the whole row, not a sample.
         sets = ("name = ?, kind = ?, device_index = ?, url_scheme = ?, url_host = ?, "
                 "url_port = ?, url_path = ?, username = ?, frame_width = ?, frame_height = ?, "
-                "motion_min_area = ?, record_clips = ?, enabled = ?, updated_at = ?, "
-                "deleted_at = NULL")
+                "motion_min_area = ?, record_clips = ?, enabled = ?, snapshot_url = ?, "
+                "updated_at = ?, deleted_at = NULL")
         args = [fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
                 fields["url_host"], fields["url_port"], fields["url_path"], fields["username"],
                 fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
-                rc, 1 if enabled else 0, at]
+                rc, 1 if enabled else 0, fields["snapshot_url"], at]
         if pw is not None:
             sets += ", password = ?"
             args.append(pw)
@@ -2712,12 +2779,12 @@ def add_camera(conn: sqlite3.Connection, *, source, kind, name=None, device_inde
         cur = conn.execute(
             "INSERT INTO cameras (source, name, kind, device_index, url_scheme, url_host, "
             "url_port, url_path, username, password, frame_width, frame_height, "
-            "motion_min_area, record_clips, enabled, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "motion_min_area, record_clips, enabled, snapshot_url, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (src, fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
              fields["url_host"], fields["url_port"], fields["url_path"], fields["username"], pw,
              fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
-             rc, 1 if enabled else 0, created_by, at))
+             rc, 1 if enabled else 0, fields["snapshot_url"], created_by, at))
     except sqlite3.IntegrityError:
         # The SELECT above is a check-then-act; UNIQUE(source) is the real guarantee. Two saves
         # racing must both get the same readable "already exists" message, not one 400 and one
@@ -2731,7 +2798,7 @@ def update_camera(conn: sqlite3.Connection, camera_id, *, kind, name=None, devic
                   url_scheme=None, url_host=None, url_port=None, url_path=None,
                   username=None, password=None, clear_password: bool = False,
                   frame_width=None, frame_height=None, motion_min_area=None,
-                  record_clips=None, enabled=True) -> Optional[dict]:
+                  record_clips=None, enabled=True, snapshot_url=None) -> Optional[dict]:
     """Edit one camera. Returns the stored row, or None for an unknown/deleted id.
 
     `source` is NOT a parameter and cannot be changed -- see the schema comment. An omitted or
@@ -2743,7 +2810,8 @@ def update_camera(conn: sqlite3.Connection, camera_id, *, kind, name=None, devic
     if row is None:
         return None
     fields = _clean_camera_fields(kind, device_index, url_scheme, url_host, url_port, url_path,
-                                  username, name, frame_width, frame_height, motion_min_area)
+                                  username, name, frame_width, frame_height, motion_min_area,
+                                  snapshot_url)
     stored = conn.execute("SELECT password FROM cameras WHERE id = ?",
                           (int(camera_id),)).fetchone()
     keeps_password = bool(stored and stored[0]) and not clear_password
@@ -2752,11 +2820,12 @@ def update_camera(conn: sqlite3.Connection, camera_id, *, kind, name=None, devic
     rc = None if record_clips is None else (1 if record_clips else 0)
     sets = ("name = ?, kind = ?, device_index = ?, url_scheme = ?, url_host = ?, url_port = ?, "
             "url_path = ?, username = ?, frame_width = ?, frame_height = ?, "
-            "motion_min_area = ?, record_clips = ?, enabled = ?, updated_at = ?")
+            "motion_min_area = ?, record_clips = ?, enabled = ?, snapshot_url = ?, "
+            "updated_at = ?")
     args = [fields["name"], fields["kind"], fields["device_index"], fields["url_scheme"],
             fields["url_host"], fields["url_port"], fields["url_path"], fields["username"],
             fields["frame_width"], fields["frame_height"], fields["motion_min_area"],
-            rc, 1 if enabled else 0, now_local_iso()]
+            rc, 1 if enabled else 0, fields["snapshot_url"], now_local_iso()]
     if clear_password:
         sets += ", password = NULL"
     elif password is not None and password != "":

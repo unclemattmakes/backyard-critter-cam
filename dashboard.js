@@ -3288,6 +3288,7 @@ function renderCams(){
     if(c.kind==='network') flags.push(c.has_password
       ? '<span class="cam-flag">password set</span>'
       : '<span class="cam-flag warn">no password</span>');
+    if(c.snapshot_url) flags.push('<span class="cam-flag">hi-res crops</span>');
     if(c.created_by==='config') flags.push('<span class="cam-flag">from config</span>');
     return `<div class="cam-row">
       <div class="cam-main">
@@ -3336,7 +3337,7 @@ function camNew(){
   CAMS.editing=null;
   $('#cams-form-title').textContent='New camera';
   ['cam-id','cam-name','cam-source','cam-host','cam-port','cam-path','cam-username',
-   'cam-password','cam-device-index','cam-fw','cam-fh','cam-area'].forEach(id=>{ const el=$('#'+id); if(el) el.value=''; });
+   'cam-password','cam-snapshot','cam-device-index','cam-fw','cam-fh','cam-area'].forEach(id=>{ const el=$('#'+id); if(el) el.value=''; });
   $('#cam-source').disabled=false;
   $('#cam-source-row').hidden=false;
   $('#cam-source-note').hidden=false;
@@ -3362,6 +3363,7 @@ function camEdit(id){
   $('#cam-host').value=c.url_host||''; $('#cam-port').value=(c.url_port!=null?c.url_port:'');
   $('#cam-path').value=c.url_path||''; $('#cam-username').value=c.username||'';
   $('#cam-password').value='';                    // never prefilled: the server does not send it
+  $('#cam-snapshot').value=c.snapshot_url||'';
   $('#cam-fw').value=(c.frame_width!=null?c.frame_width:'');
   $('#cam-fh').value=(c.frame_height!=null?c.frame_height:'');
   $('#cam-area').value=(c.motion_min_area!=null?c.motion_min_area:'');
@@ -3394,6 +3396,7 @@ function camSave(ev){
     body.url_port=num('cam-port');
     body.url_path=($('#cam-path').value||'').trim() || null;
     body.username=($('#cam-username').value||'').trim() || null;
+    body.snapshot_url=($('#cam-snapshot').value||'').trim() || null;
     const pw=$('#cam-password').value||'';
     if(pw) body.password=pw;                      // absent = keep whatever is stored
   }
