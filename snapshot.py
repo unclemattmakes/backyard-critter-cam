@@ -17,6 +17,7 @@ detection that arrives while a fetch is in flight keeps its stream crop rather t
 from __future__ import annotations
 
 import queue
+import ssl
 import threading
 import urllib.request
 from dataclasses import dataclass
@@ -41,10 +42,21 @@ class Job:
     frame_h: int
 
 
+# Encrypted but unverified, for https snapshot URLs. A camera's certificate is self-signed, so
+# verifying it fails every fetch; skipping the check still keeps the password (which a Reolink
+# takes in the query string, on every detection) away from anyone passively sniffing the LAN.
+# It does not stop an active impersonator, which would need the camera's certificate pinned.
+# Scoped to snapshot fetches only: nothing else in the rig uses this context.
+_CAMERA_TLS = ssl.create_default_context()
+_CAMERA_TLS.check_hostname = False
+_CAMERA_TLS.verify_mode = ssl.CERT_NONE
+
+
 def fetch_jpeg(url: str, timeout: float):
     """GET one still and decode it, or None. A Reolink answers a bad login with HTTP 200 and a JSON
     error body, so the bytes are decoded rather than trusting the status."""
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    tls = _CAMERA_TLS if url.lower().startswith("https://") else None
+    with urllib.request.urlopen(url, timeout=timeout, context=tls) as resp:
         data = resp.read()
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     return img

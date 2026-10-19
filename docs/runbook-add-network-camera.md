@@ -166,13 +166,18 @@ still lands ~0.5-1 s after the frame.
 
 For a Reolink:
 
-1. Turn HTTP on: Reolink app -> the camera -> Settings -> Network -> Advanced -> Server Settings
-   -> HTTP (port 80). RTSP being on is not enough; port 80 stays shut without this.
+1. Turn HTTPS on: Reolink app -> the camera -> Settings -> Network -> Advanced -> Server
+   Settings -> HTTPS (port 443). RTSP being on is not enough; 443 stays shut without this. Use
+   HTTPS, not HTTP: the Snap API takes the password in the URL, and the rig sends it on every
+   detection, so over HTTP it crosses the LAN readable all night.
 2. Check it from the rig, with the camera's own `rig` login (not the cloud account):
-   `curl -o snap.jpg "http://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig&password=..."`.
-   A JPEG of the full sensor size is a pass. A small JSON body is a refused login.
+   `curl -k -o snap.jpg "https://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig&password=..."`.
+   `-k` because the camera's certificate is self-signed. A JPEG of the full sensor size is a
+   pass. A small JSON body is a refused login.
 3. In the dashboard, edit the camera and set Hi-res snapshot to
-   `http://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}`.
+   `https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}`.
+   The rig encrypts the fetch but does not verify the camera's self-signed certificate. That
+   keeps the password from passive sniffing; it does not stop an active impersonator on the LAN.
    The placeholders are filled from the camera's own address and login at startup, so the stored
    text never holds the password. Changing this field on a camera with a stored password is a
    credential change and only works from the rig itself.

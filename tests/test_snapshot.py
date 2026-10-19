@@ -1,6 +1,7 @@
 """Full-resolution snapshot crops (snapshot.py): matching, cutting, the worker's swap, and the
 snapshot URL template's validation and resolution. No network: the fetcher is a stub that returns
 a synthetic still."""
+import ssl
 import threading
 
 import cv2
@@ -190,16 +191,59 @@ def test_the_running_worker_swaps_in_the_background(tmp_path):
     assert _row(cfg, det_id)["crop_path"].endswith("_hires.jpg")
 
 
+# ---- fetching ------------------------------------------------------------------------
+
+class _Reply:
+    def __init__(self, data):
+        self.data = data
+
+    def read(self):
+        return self.data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize("url, unverified", [("https://192.168.1.50/snap", True),
+                                             ("HTTPS://192.168.1.50/snap", True),
+                                             ("http://192.168.1.50/snap", False)])
+def test_https_fetches_are_encrypted_without_checking_the_self_signed_cert(
+        monkeypatch, url, unverified):
+    seen = {}
+    jpeg = cv2.imencode(".jpg", _still(64, 36))[1].tobytes()
+
+    def urlopen(u, timeout, context=None):
+        seen["context"] = context
+        return _Reply(jpeg)
+
+    monkeypatch.setattr(snapshot.urllib.request, "urlopen", urlopen)
+    assert snapshot.fetch_jpeg(url, 5).shape[:2] == (36, 64)
+    ctx = seen["context"]
+    if unverified:
+        assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
+    else:
+        assert ctx is None
+
+
+def test_a_json_error_reply_is_not_an_image(monkeypatch):
+    monkeypatch.setattr(snapshot.urllib.request, "urlopen",
+                        lambda u, timeout, context=None: _Reply(b'[{"code": 1, "error": {}}]'))
+    assert snapshot.fetch_jpeg("https://192.168.1.50/snap", 5) is None
+
+
 # ---- the URL template ----------------------------------------------------------------
 
-REOLINK_SNAP = "http://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}"
+REOLINK_SNAP = "https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}"
 
 
 def test_the_template_is_filled_from_the_row_and_percent_encoded():
     row = {"kind": "network", "url_host": "192.168.1.50", "username": "rig",
            "snapshot_url": REOLINK_SNAP}
     url = cameras.resolve_snapshot_url(row, "p&ss#1")
-    assert url == ("http://192.168.1.50/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig"
+    assert url == ("https://192.168.1.50/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig"
                    "&password=p%26ss%231")
     assert "p%26ss" not in cameras.safe_src(url)
 

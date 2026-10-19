@@ -280,8 +280,10 @@
           when an animal is detected, so the crop used for naming and individual ID has more
           pixels than the stream. Write the login as <code>{user}</code> and
           <code>{password}</code> and the address as <code>{host}</code>; the rig fills them in.
-          For a Reolink with HTTP enabled:
-          <code>http://{host}/cgi-bin/api.cgi?cmd=Snap&amp;channel=0&amp;user={user}&amp;password={password}</code></p>
+          For a Reolink with HTTPS enabled:
+          <code>https://{host}/cgi-bin/api.cgi?cmd=Snap&amp;channel=0&amp;user={user}&amp;password={password}</code>.
+          Prefer https: the password rides in this URL on every detection, and plain http sends
+          it across the network readable.</p>
       </div>
 
       <details class="cams-adv">
