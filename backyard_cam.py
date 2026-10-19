@@ -2142,6 +2142,7 @@ def run(cfg: config.Config) -> int:
                 # bind can lose, in which case web.py has already moved to the fallback and cfg is
                 # describing a rig that does not exist.
                 cfg = replace(cfg, web_port=server.server_address[1])
+                mdns.record_bound_port(cfg, cfg.web_port)     # for the morning email's links
                 mdns_pub = mdns.publish(cfg)
                 print("  dashboard:")
                 for line in mdns.connect_lines(cfg, ip=mdns.lan_ip(),
@@ -2281,6 +2282,7 @@ def serve_only(cfg: config.Config) -> int:
         print("[web] is another rig already serving? Try --port N.")
         return 1
     cfg = replace(cfg, web_port=server.server_address[1])   # the socket, not the wish -- see above
+    mdns.record_bound_port(cfg, cfg.web_port)
     mdns_pub = mdns.publish(cfg)
     print("Dashboard (serve-only):")
     for line in mdns.connect_lines(cfg, ip=mdns.lan_ip(), name=mdns_pub.name if mdns_pub else None):
