@@ -995,16 +995,22 @@ def test_species_count_falls_back_without_n_species():
 # The one channel the owner reads every day. A box above the lede when health.rig_health has
 # anything; nothing at all when it does not.
 
+def _local_iso(*ymdhm) -> str:
+    """A stamp in the machine's own zone, as health.now_iso writes them: the email prints the
+    machine's wall clock, so a fixed -07:00 would read 11:55 AM on a UTC CI runner."""
+    return datetime(*ymdhm).astimezone().isoformat(timespec="seconds")
+
+
 TWO_ALARMS = [
     {"severity": "alarm", "kind": "naming_stale",
      "message": "Species naming has stopped: its heartbeat was last written 95 min ago, so new "
                 "crops are not being named (and visits, re-ID and the nightly eval stall). "
                 "See logs/naming.log.",
-     "since": "2026-08-12T04:55:00-07:00"},
+     "since": _local_iso(2026, 8, 12, 4, 55)},
     {"severity": "warn", "kind": "clips_lost",
      "message": "1 day of clips was pruned before the backup archived it "
                 "(glass_door_cam/2026-08-10); that footage is gone. 11 such days in all.",
-     "since": "2026-08-12T03:34:00-07:00"},
+     "since": _local_iso(2026, 8, 12, 3, 34)},
 ]
 
 
