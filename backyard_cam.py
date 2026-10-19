@@ -1990,6 +1990,8 @@ def run(cfg: config.Config) -> int:
     # the dashboard owns the list, and load_specs' notes say so out loud when the two disagree.
     conn = db.connect(cfg.db_path)                  # also reused for the shutdown rebuild
     specs, camera_notes = cameras.load_specs(cfg, conn)
+    if not specs:                                   # else the dashboard dies on an empty pane list
+        raise RuntimeError("No camera to run.\n  " + "\n  ".join(camera_notes))
     seen = set()
     for s in specs:                                 # a duplicate source would silently merge two cams
         if s.source in seen:

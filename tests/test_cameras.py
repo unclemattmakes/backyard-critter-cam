@@ -433,6 +433,47 @@ def test_the_single_camera_rig_seeds_its_synthesized_spec(conn):
     assert db.list_cameras(conn)[0]["source"] == cfg.source
 
 
+# ---- a config camera whose secret was removed -------------------------------------------
+# CameraSpec("yard_ir", secret("yard_ir_url")) has src None once that key leaves secrets.json.
+# That used to raise TypeError in spec_to_row and keep the whole rig from starting.
+
+def test_a_spec_with_no_address_is_skipped_not_fatal(conn):
+    cfg = _cfg([config.CameraSpec("glass_door_cam", 1), config.CameraSpec("yard_ir", None)])
+    specs, notes = cameras.load_specs(cfg, conn)
+    assert [s.source for s in specs] == ["glass_door_cam"]
+    assert [c["source"] for c in db.list_cameras(conn)] == ["glass_door_cam"]
+    note = [n for n in notes if "yard_ir" in n]
+    assert len(note) == 1
+    assert "has no address" in note[0] and "not running" in note[0]
+
+
+def test_the_dashboard_row_still_runs_when_its_config_secret_is_gone(conn):
+    cameras.load_specs(_cfg([config.CameraSpec("glass_door_cam", 1),
+                             config.CameraSpec("yard_ir", REOLINK)]), conn)
+    cfg = _cfg([config.CameraSpec("glass_door_cam", 1), config.CameraSpec("yard_ir", None)])
+    specs, notes = cameras.load_specs(cfg, conn)
+    by_src = {s.source: s for s in specs}
+    assert set(by_src) == {"glass_door_cam", "yard_ir"}
+    assert by_src["yard_ir"].src == REOLINK
+    yard_notes = [n for n in notes if "yard_ir" in n]
+    assert len(yard_notes) == 1 and "running the dashboard's row" in yard_notes[0]
+    assert not any("differs from config_local.py" in n for n in notes)
+
+
+def test_camera_specs_drops_unaddressed_specs_without_inventing_a_webcam():
+    """Falling back to the flat single-camera spec would seed a camera nobody listed, for good."""
+    cfg = _cfg([config.CameraSpec("yard_ir", None)])
+    assert cfg.camera_specs() == []
+    assert [s.source for s in cfg.unaddressed_cameras()] == ["yard_ir"]
+
+
+def test_nothing_to_run_says_so_instead_of_crashing(conn):
+    specs, notes = cameras.load_specs(_cfg([config.CameraSpec("yard_ir", None)]), conn)
+    assert specs == []
+    assert any("no camera to run" in n for n in notes)
+    assert any("yard_ir" in n and "has no address" in n for n in notes)
+
+
 # ---- fixes from the adversarial review, 2026-08-22 ------------------------------------
 
 def test_an_at_sign_in_the_stream_path_does_not_become_a_credential():

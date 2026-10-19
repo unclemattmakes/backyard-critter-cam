@@ -191,6 +191,8 @@ def load_specs(cfg, conn) -> tuple[list, list]:
 
       * a config-listed camera whose stored row now DIFFERS from config -- because after the
         first seed the table owns it and editing config_local.py has no effect;
+      * a config camera with no address (src None: its secrets.json key is gone), which is
+        skipped rather than allowed to stop the rig -- its DB row, if any, still runs;
       * the safety net below.
 
     THE SAFETY NET: if the table ends up with no live, enabled camera -- every one deleted or
@@ -237,15 +239,21 @@ def load_specs(cfg, conn) -> tuple[list, list]:
             notes.append("camera list: WARNING -- no enabled cameras in the database. Falling "
                          f"back to {len(revived)} camera(s) from config so the rig keeps "
                          "watching; re-enable one in the dashboard to stop this.")
-            return revived, notes
+            return revived, notes + _unaddressed_notes(cfg, revived)
         # Nothing survives even after honouring the tombstones. Running deleted cameras is wrong,
         # and running none is worse -- the rig would exit at startup with no camera thread alive,
         # from a box whose whole job is to be watching. So it runs them and says exactly that,
         # rather than quietly undoing a deletion or quietly refusing to start.
-        notes.append("camera list: WARNING -- every camera has been deleted or disabled. Running "
-                     "the config list anyway, INCLUDING cameras removed in the dashboard, "
-                     "because a rig with no camera stops at startup. Add one in the dashboard.")
-        return cfg_specs, notes
+        if cfg_specs:
+            notes.append("camera list: WARNING -- every camera has been deleted or disabled. "
+                         "Running the config list anyway, INCLUDING cameras removed in the "
+                         "dashboard, because a rig with no camera stops at startup. Add one in "
+                         "the dashboard.")
+        else:
+            notes.append("camera list: WARNING -- no camera to run: none is enabled in the "
+                         "database and config_local.py lists none with an address. Add one in "
+                         "the dashboard (python backyard_cam.py --serve-only).")
+        return cfg_specs, notes + _unaddressed_notes(cfg, cfg_specs)
 
     specs = [row_to_spec(r, db.camera_password(conn, r["source"])) for r in rows]
 
@@ -259,4 +267,15 @@ def load_specs(cfg, conn) -> tuple[list, list]:
     for spec in unstorable:
         notes.append(f"camera list: {spec.source} runs from config ({safe_src(spec.src)}) -- a "
                      f"file source is not a database camera and cannot be edited in the dashboard")
-    return specs + unstorable, notes
+    return specs + unstorable, notes + _unaddressed_notes(cfg, specs)
+
+
+def _unaddressed_notes(cfg, running) -> list[str]:
+    """One note per config camera dropped for having no address, saying whether the dashboard's
+    row for that source is running in its place."""
+    live = {s.source for s in running}
+    return [f"camera list: {s.source} in config_local.py has no address (src is None -- its "
+            "secret is missing from secrets.json?) -- skipped; "
+            + ("running the dashboard's row for it" if s.source in live else
+               "the dashboard has no enabled row for it either, so it is not running")
+            for s in cfg.unaddressed_cameras()]
