@@ -371,6 +371,15 @@ def watch_loop(conn, *, device="cpu", interval=5.0, min_confidence=0.0, batch_si
                 # escapes one poll (a locked DB, a vanished crop, a model hiccup) is logged and
                 # retried on the next one; only stop_event ends this loop.
                 print(f"[naming] poll failed, continuing: {type(e).__name__}: {e}")
+                # Retrying is only safe on a clean connection. A write that met a busy database
+                # leaves this one inside an open transaction; the next poll's read then pins an old
+                # WAL snapshot, and once anything else commits every later write fails "database
+                # is locked" -- on the same crops, forever, with the WAL unable to checkpoint past
+                # it. Rolling back is what makes "continue" mean continue.
+                try:
+                    conn.rollback()
+                except Exception:   # noqa: BLE001 -- a dead connection has nothing to roll back
+                    pass
                 _write_naming_status("error", device=device, named=sum(session.values()),
                                      detail=f"{type(e).__name__}: {e}")
             stop_event.wait(interval)   # interruptible sleep -- wakes instantly when stop is set

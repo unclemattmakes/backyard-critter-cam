@@ -30,7 +30,8 @@ RESTART STORMS ARE CAPPED
 -------------------------
 If the rig is crashing on startup (bad config, wedged camera, no GPU), retrying forever would
 spawn a log window and a browser tab every cycle. Three starts in a rolling hour is the ceiling;
-after that it writes a loud line and waits the hour out.
+after that it writes a loud line and waits the hour out. Only starts since the last boot count: a
+reboot ends the rig it interrupts, so a start before it says nothing about a crash.
 
 USAGE
     python rigwatch.py            # one check -- what the scheduled task runs, every 5 min
@@ -87,6 +88,10 @@ USER_AGENT = "backyard-critter-cam-rigwatch/1.0"
 # to fix a helper is the wrong hammer -- but a stuck namer stops being invisible.
 NAMING_STALE_S = 900.0          # heartbeat is every ~5s; 15 min without one is unambiguous
 NAMING_BACKLOG_ALARM = 200      # a backlog this big that is not shrinking is stuck, not busy
+# The same question for capture: the rig's capture watch (capwatch.py) rewrites its status file
+# every ~5 s with each camera's last-frame time. Like naming, this alarms and never restarts.
+CAPTURE_DARK_S = 300.0          # Pi outages here reconnect in 1.5-3.5 min; 5 min without a frame is dark
+CAPTURE_STATUS_STALE_S = 120.0  # the watch itself silent for 2 min: the whole process is wedged
 
 
 def log(msg: str) -> None:
@@ -239,6 +244,67 @@ def check_naming(health: dict) -> bool:
     return False
 
 
+def capture_health(pids) -> dict:
+    """What the rig's capture watch says about each camera. Returns {present, age_s, stale, cameras}.
+
+    Only a file written by one of `pids` counts: one left by an earlier run (or a rig too old to
+    write it) is not evidence about the rig running now. `stale` means that rig's watch has gone
+    quiet, which no healthy rig does."""
+    out = {"present": False, "age_s": None, "stale": False, "cameras": {}}
+    try:
+        raw = json.loads(config.CAPTURE_STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:                          # noqa: BLE001 -- no file yet, or a torn write
+        return out
+    if not isinstance(raw, dict) or raw.get("pid") not in (pids or []):
+        return out
+    out["present"] = True
+    cams = raw.get("cameras")
+    out["cameras"] = cams if isinstance(cams, dict) else {}
+    try:
+        out["age_s"] = max(0.0, time.time() - float(raw.get("ts") or 0.0))
+        out["stale"] = out["age_s"] > CAPTURE_STATUS_STALE_S
+    except (TypeError, ValueError):
+        out["stale"] = True
+    return out
+
+
+def check_capture(health: dict) -> bool:
+    """Log a line for each camera that has gone dark while the rig is up. True if any did.
+
+    A frame age the watch keeps refreshing is trusted; a watch that stopped refreshing is its own
+    alarm, because then nothing in the file is current."""
+    if not health["present"]:
+        return False
+    if health["stale"]:
+        age = health["age_s"]
+        when = f"{age / 60.0:.0f} min ago" if age is not None else "at an unreadable time"
+        log(f"CAPTURE STATUS IS STALE: the rig is running but its capture watch last wrote "
+            f"{when}, so the process is wedged and nothing is being recorded. "
+            f"See logs/backyard_cam.log.")
+        return True
+    dark = False
+    for source, cam in sorted(health["cameras"].items()):
+        if not isinstance(cam, dict):
+            continue
+        age = cam.get("frame_age_s")
+        if not isinstance(age, (int, float)) or age <= CAPTURE_DARK_S:
+            continue
+        dark = True
+        state = cam.get("state")
+        if cam.get("stuck"):
+            log(f"CAPTURE IS STALLED on {source}: no frame for {age / 60.0:.0f} min while the rig "
+                f"is up, and its capture thread is stuck at {cam.get('where') or 'an unknown place'}. "
+                f"Nothing is being recorded; restart the rig. The stack is in logs/backyard_cam.log.")
+        elif state == "reconnecting":
+            log(f"CAMERA {source} IS DOWN: no frame for {age / 60.0:.0f} min; the rig is "
+                f"reconnecting, so check the camera and its network.")
+        else:
+            log(f"CAPTURE IS STALLED on {source}: no frame for {age / 60.0:.0f} min while the rig "
+                f"is up (capture state '{state}'). Nothing is being recorded. "
+                f"See logs/backyard_cam.log.")
+    return dark
+
+
 def batch_health() -> dict:
     """How old the nightly batch's newest eval artifact is. Returns {present, newest, age_s, stale}.
 
@@ -314,7 +380,9 @@ def _record_start() -> None:
 
 
 def _recent_starts() -> int:
-    return len([t for t in _state().get("starts", []) if time.time() - t < 3600])
+    """Starts in the last hour and in this boot: a reboot ends the rig, it does not crash it."""
+    since = max(time.time() - 3600, boot_time())
+    return len([t for t in _state().get("starts", []) if t > since])
 
 
 def _record_backlog(backlog) -> None:
@@ -363,6 +431,7 @@ def start_rig() -> int:
     _record_start()
     # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP -- the rig must outlive this short-lived
     # watchdog process, or Task Scheduler reaping us would take the camera down with it.
+    # The new group also makes the rig ignore Ctrl+C; backyard_cam._restore_ctrl_c undoes that.
     subprocess.Popen(["cmd", "/c", "start", "", str(LAUNCHER)], cwd=str(ROOT),
                      creationflags=0x00000008 | 0x00000200, close_fds=True)
     log(f"rig was down -- started {LAUNCHER.name}")
@@ -408,6 +477,21 @@ def main() -> int:
             flag = "  <-- STALE, the loop is not running" if h["stale"] else ""
             print(f"species naming  : {h['state']} on {h['device']}, heartbeat {age}{flag}")
             print(f"  named this run: {h['named']}   backlog: {h['backlog']}")
+        c = capture_health(pids)
+        if not c["present"]:
+            print("capture         : no status from the running rig")
+        elif c["stale"]:
+            print(f"capture         : watch last wrote {c['age_s'] / 60.0:.0f} min ago"
+                  f"  <-- STALE, the rig process is wedged")
+        for source, cam in sorted(c["cameras"].items()):
+            if not isinstance(cam, dict):
+                continue
+            age = cam.get("frame_age_s")
+            flag = ("  <-- STUCK at " + str(cam.get("where")) if cam.get("stuck")
+                    else "  <-- DARK" if isinstance(age, (int, float)) and age > CAPTURE_DARK_S
+                    else "")
+            print(f"capture {source}: {cam.get('state')}, last frame {age}s ago, "
+                  f"{cam.get('reconnects')} reconnect(s){flag}")
         b = batch_health()
         if not b["present"]:
             print("nightly batch   : no reports/eval_*.json yet (it has never finished here)")
@@ -433,7 +517,8 @@ def main() -> int:
 def _watch_rig(args, pids) -> tuple[int, bool]:
     """The restart decision: start the rig if it is down and nothing says to leave it.
 
-    Returns (exit code, healthy). Healthy = up with naming OK, or down because a human said so."""
+    Returns (exit code, healthy). Healthy = up with naming and capture OK, or down because a
+    human said so."""
     if pids is None:
         # "No pids" and "cannot see pids" are the same value to a caller that only checks
         # emptiness, and acting on the second would restart a healthy rig every five minutes
@@ -448,7 +533,12 @@ def _watch_rig(args, pids) -> tuple[int, bool]:
         health = naming_health()
         naming_bad = check_naming(health)
         _record_backlog(health.get("backlog"))
-        return 0, not naming_bad
+        try:
+            capture_bad = check_capture(capture_health(pids))
+        except Exception as e:                  # noqa: BLE001 -- never let a report sink the run
+            log(f"capture check failed: {type(e).__name__}: {e}")
+            capture_bad = True
+        return 0, not (naming_bad or capture_bad)
     if held():
         # --hold: a human is debugging, even across reboots. Still say so, or a dead rig under a
         # forgotten hold leaves no trace at all.

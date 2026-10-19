@@ -85,3 +85,43 @@ def cluster_cosine_constrained(dist, threshold, cannot=()):
         for i in members:
             labels[i] = l
     return labels
+
+
+def session_nuisance_basis(vectors, sessions, k: int, *, min_per_session: int = 2) -> np.ndarray:
+    """The top-`k` directions along which per-SESSION mean vectors spread -> a (d, k) orthonormal
+    basis. A session is one camera on one night: one light, one white balance, one camera angle.
+    Different animals seen in the same session share all of that, so the spread of session means
+    is mostly scene, and projecting it out (project_out) removes what a probe would otherwise
+    match on when it matches the yard rather than the animal. Label-free, so it can learn from
+    every visit, named or not.
+
+    Sessions with fewer than `min_per_session` vectors are skipped: a lone visit's "session mean"
+    is just that animal, which would teach the basis identity. Two visits can still be the same
+    animal, so on a night one raccoon owns, some identity leaks into the basis anyway; that is
+    what the eval arm measures rather than assumes. k is capped at (usable sessions - 1)."""
+    X = np.asarray(vectors, dtype=np.float64)
+    d = X.shape[1] if X.ndim == 2 else 0
+    groups: dict = {}
+    for i, s in enumerate(sessions):
+        if s is not None:
+            groups.setdefault(s, []).append(i)
+    keep = [ii for ii in groups.values() if len(ii) >= min_per_session]
+    k = min(int(k), len(keep) - 1)
+    if k <= 0:
+        return np.zeros((d, 0))
+    means = np.stack([X[ii].mean(axis=0) for ii in keep])
+    n = np.array([len(ii) for ii in keep], dtype=np.float64)
+    grand = (means * n[:, None]).sum(axis=0) / n.sum()
+    _, _, vt = np.linalg.svd((means - grand) * np.sqrt(n)[:, None], full_matrices=False)
+    return vt[:k].T
+
+
+def project_out(X, U) -> np.ndarray:
+    """Remove span(U) from each row of `X` and re-L2-normalize, so a dot product is still a
+    cosine. An empty basis (k = 0) returns the rows unchanged."""
+    X = np.atleast_2d(np.asarray(X, dtype=np.float64))
+    if U.shape[1]:
+        X = X - (X @ U) @ U.T
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (X / norms).astype(np.float32)

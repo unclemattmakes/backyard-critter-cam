@@ -1409,3 +1409,102 @@ def test_status_txt_carries_the_coverage_notes(project, dest, monkeypatch):
     text = (dest / "STATUS.txt").read_text(encoding="utf-8").splitlines()
     assert text[1] == "backup: ok"
     assert text[2] == "clips x: oldest day on disk none, newest archived never"
+
+
+# ---- camera passwords stay out of the db snapshot -----------------------------------------
+# backup.py's own help text used to warn that the snapshot "carries your live cameras' passwords".
+# The scrub works on the scratch copy only, and the tests read the archived file's RAW BYTES,
+# because a NULL column says nothing about the old row still sitting in the page's free space.
+
+import db  # noqa: E402  (kept beside the tests that need the real schema)
+
+LIVE_PW = "correct-horse-battery-staple"
+OLD_PW = "previous-password-0001"
+
+
+def _rig_db(path: Path) -> Path:
+    """A database with the real schema and a camera whose password was changed, so the cameras
+    page holds a stale copy of the old one in its free space, as the live rig's does."""
+    conn = db.connect(path)
+    try:
+        cam = db.add_camera(conn, source="yard_ir", kind="network", url_host="192.168.1.50",
+                            url_port=554, url_path="h264Preview_01_sub", username="rig",
+                            password=OLD_PW)
+        db.add_camera(conn, source="door", kind="local", device_index=0)
+        for _ in range(3):
+            db.update_camera(conn, cam["id"], kind="network", url_host="192.168.1.50",
+                             url_port=554, url_path="h264Preview_01_sub", username="rig",
+                             password=LIVE_PW)
+    finally:
+        conn.close()
+    return path
+
+
+def _archived_db(tmp_path, src) -> Path:
+    dest, out = tmp_path / "dest", tmp_path / "out"
+    backup.snapshot_db(src, dest, date(2026, 10, 18), False)
+    with zipfile.ZipFile(dest / "backyard-db-2026-10-18.zip") as zf:
+        zf.extract(src.name, out)
+    return out / src.name
+
+
+def test_no_camera_password_survives_anywhere_in_the_archived_bytes(tmp_path):
+    archived = _archived_db(tmp_path, _rig_db(tmp_path / "backyard.db"))
+    raw = archived.read_bytes()
+    assert LIVE_PW.encode() not in raw
+    assert OLD_PW.encode() not in raw, "a stale copy in free space made it into the backup"
+
+
+def test_the_scrub_never_touches_the_live_database(tmp_path):
+    src = _rig_db(tmp_path / "backyard.db")
+    _archived_db(tmp_path, src)
+    conn = db.connect(src)
+    try:
+        assert db.camera_password(conn, "yard_ir") == LIVE_PW
+    finally:
+        conn.close()
+
+
+def test_the_archived_cameras_table_is_otherwise_the_same(tmp_path):
+    src = _rig_db(tmp_path / "backyard.db")
+    archived = _archived_db(tmp_path, src)
+
+    def shape(path):
+        c = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            rows = c.execute("SELECT * FROM cameras ORDER BY id").fetchall()
+            cols = [r[1] for r in c.execute("PRAGMA table_info(cameras)")]
+            seq = c.execute("SELECT seq FROM sqlite_sequence WHERE name = 'cameras'").fetchone()
+            idx = sorted(r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cameras'"))
+            pw = cols.index("password")
+            return [r[:pw] + r[pw + 1:] for r in rows], [r[pw] for r in rows], cols, seq, idx
+        finally:
+            c.close()
+
+    live_rows, live_pw, *live_rest = shape(src)
+    arch_rows, arch_pw, *arch_rest = shape(archived)
+    assert arch_rows == live_rows and arch_rest == live_rest
+    assert LIVE_PW in live_pw and arch_pw == [None, None]
+
+
+def test_a_password_stored_in_another_table_is_reported_and_the_backup_still_made(
+        tmp_path, caplog):
+    src = _rig_db(tmp_path / "backyard.db")
+    conn = sqlite3.connect(src)
+    try:
+        conn.execute("CREATE TABLE stray_notes (body TEXT)")
+        conn.execute("INSERT INTO stray_notes VALUES (?)", (f"rtsp://rig:{LIVE_PW}@cam/x",))
+        conn.commit()
+    finally:
+        conn.close()
+    with caplog.at_level(logging.WARNING, logger=backup.log.name):
+        archived = _archived_db(tmp_path, src)
+    assert archived.exists()
+    assert "STILL in the db snapshot" in caplog.text
+    assert LIVE_PW not in caplog.text
+
+
+def test_a_database_without_a_cameras_table_snapshots_as_before(tmp_path):
+    archived = _archived_db(tmp_path, _live_db(tmp_path / "backyard.db"))
+    assert archived.exists()

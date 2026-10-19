@@ -331,7 +331,8 @@ def _dwell(a, b):
 
 
 def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
-          mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H) -> dict:
+          mode: str = "recent", since_h: int = DEFAULT_QUEUE_WINDOW_H,
+          night: str | None = None) -> dict:
     """The Individuals tab's review queue: visits of `species` with a WHO suggestion each
     (nearest confirmed visit / novelty flag / 2+-animals badge), the confirmed cast, and -- while
     nothing is confirmed yet -- the cold-start visit-groups to name first. The heavy lifting
@@ -341,7 +342,11 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     `mode` picks WHICH visits (see QUEUE_MODES); `offset`/`limit` PAGINATE within that mode.
     Pagination rather than a bigger limit on purpose: the per-visit work below (clip overlap +
     crop strip) and the matcher rebuild are what cost, so a page stays cheap however deep the
-    filter reaches."""
+    filter reaches.
+
+    `night` (YYYY-MM-DD) picks which night the TONIGHT groups cover; None is the newest night with
+    work left. Those groups ride beside the queue rather than as a mode, because they are a
+    different shape (groups, not visits) and reuse the matcher this call already built."""
     import individuals
 
     matcher = individuals.VisitMatcher(conn, species, cfg)
@@ -489,7 +494,7 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
     refit = None
     if has_templates:
         r = matcher.refit()
-        # The visit may have been renumbered/removed by a rebuild since refit() listed it, so a
+        # The visit may have been merged away by a rebuild since refit() listed it, so a
         # missing row is a None crop, not an error.
         rep_of = {row["id"]: row["representative_detection_id"] for row in _rows_in(
             conn, "SELECT id, representative_detection_id FROM visits WHERE id IN ({})",
@@ -504,6 +509,24 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
                              for g in r["novel_groups"]],
             "untemplated": r["untemplated"], "n_fit": r["n_fit"], "n_novel": r["n_novel"]}
 
+    # TONIGHT: one night's unreviewed visits grouped within each camera, to name a group at a
+    # time (individuals.VisitMatcher.night_groups). Every member carries its own thumbnail,
+    # because the human unticks the odd one out before anything is written.
+    tonight = None
+    if has_templates:
+        tonight = matcher.night_groups(night=night)
+        night_rep = {row["id"]: row["representative_detection_id"] for row in _rows_in(
+            conn, "SELECT id, representative_detection_id FROM visits WHERE id IN ({})",
+            [v for g in tonight["groups"] for v in g["visits"]])}
+        night_crops = _rep_crops(conn, night_rep.values())
+        for g in tonight["groups"]:
+            g["members"] = [{"visit_id": v, "started": st, "auto_as": a,
+                             "rep_crop": night_crops.get(night_rep.get(v))}
+                            for v, st, a in zip(g["visits"], g["started"], g["auto_as"])]
+            if g["suggestion"]:
+                g["suggestion"]["lapse"] = (
+                    freshness.get(g["suggestion"]["name"]) or {}).get("lapse")
+
     # Heads-up when suggestions are running blind: high-conf crops still missing vectors.
     backlog = conn.execute(
         """SELECT COUNT(*) FROM detections d
@@ -514,7 +537,8 @@ def queue(conn, cfg, species: str = "raccoon", limit: int = 30, offset: int = 0,
 
     return {"species": species, "queue": cards,
             "cast": sorted(cast.values(), key=lambda c: -c["n_visits"]),
-            "bootstrap": bootstrap, "refit": refit, "unembedded": backlog,
+            "bootstrap": bootstrap, "refit": refit, "tonight": tonight,
+            "unembedded": backlog,
             "novel_threshold": cfg.reid_novel_threshold,
             "mode": mode, "modes": list(QUEUE_MODES),
             "offset": offset, "limit": limit, "n_matched": len(matched),

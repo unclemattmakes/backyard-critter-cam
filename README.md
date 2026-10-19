@@ -286,11 +286,20 @@ machine), use the hold:
 .\.venv\Scripts\python.exe rigwatch.py --status    # what it sees, including the hold
 ```
 
-It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`
-(at most hourly per alarm): `NAMING IS STALE` when species naming stops, `NIGHTLY BATCH IS
-STALE` when the newest `reports/eval_*.json` is older than `batch_stale_hours` (default 36),
-meaning the nightly batch has not finished a run since, and `rig is down and HELD` while a
-`--hold` is keeping a down rig down, so a forgotten hold still leaves a trace.
+It also watches what the rig is supposed to be getting done, and says so in `logs/rigwatch.log`:
+`NAMING IS STALE` when species naming stops; `CAPTURE IS STALLED on <camera>` when the rig is up
+but a camera has delivered no frame for 5 minutes (with the line of code its capture thread is
+stuck on), `CAMERA <camera> IS DOWN` when the rig is reconnecting to a camera that has gone away,
+and `CAPTURE STATUS IS STALE` when the rig process itself has stopped reporting. Those repeat on
+every check while they last. At most hourly: `NIGHTLY BATCH IS STALE` when the newest
+`reports/eval_*.json` is older than `batch_stale_hours` (default 36), meaning the nightly batch
+has not finished a run since, and `rig is down and HELD` while a `--hold` is keeping a down rig
+down, so a forgotten hold still leaves a trace.
+
+Inside the rig, a network camera's read that has not returned in `capture_read_timeout_s`
+(default 20 s) is abandoned and the camera reopened, and a capture thread that makes no progress
+for `capture_stall_s` (default 120 s) gets a `CAPTURE STALLED` line with its stack in
+`logs/backyard_cam.log`.
 
 One limit: the scheduled tasks in this README are registered without a stored password, so they
 run only while you are logged on. After a reboot that stops at the lock screen nothing runs (no
@@ -590,9 +599,9 @@ has grown from a single live feed into **nine tabs**:
   an optional note ("the night the kits came out") and the name of whoever kept it. Unlike every
   other verdict on the dashboard, a ♡ is **only taste** — it changes no label and nothing
   downstream reads it, so keeping the cutest photo of Stan can never become evidence that it *is*
-  Stan. A kept visit is remembered as a moment on a camera rather than a visit id (those get
-  renumbered), so it survives re-clustering — star a visit while the animal is still on camera
-  and the card grows to the finished span. A favourite whose crops are later purged is listed as
+  Stan. A kept visit is remembered as a moment on a camera rather than a visit id (those change
+  when a visit regroups), so it survives re-clustering — star a visit while the animal is still on
+  camera and the card grows to the finished span. A favourite whose crops are later purged is listed as
   gone rather than quietly disappearing.
 - **The Creature Report** — a newspaper-style **period digest** (☾ Night / ☀ Day,
   with ‹ › arrows to walk back through earlier days). It leads with a **condensed highlight
@@ -615,7 +624,8 @@ has grown from a single live feed into **nine tabs**:
   itself, or is the cast known?).
 - **Individuals** — the "name the cast" workspace (see
   [phase 3](#individual-re-identification-phase-3)): a *Who is this?* review queue with
-  one-click confirm / correct / clear, bulk **Fit to the Cast**, per-individual **Poses** and
+  one-click confirm / correct / clear, **Night by Night** group naming, bulk **Fit to the
+  Cast**, per-individual **Poses** and
   **Clips**, and **Un-blend** for multi-animal visits. If you named the visit live (above),
   Un-blend reads that log: it shows *"📓 you logged Notch + Elliot here"* and, once one cluster
   matches a known template, names the **other by elimination** — so a never-solo pair member gets
@@ -742,6 +752,25 @@ species tracks the new labels with no manual `visits.py` step.
   as an animal. Nothing stored changes, human labels always show, and the review queue and the
   species sheet still show the raw guess with its score. The visit card's "✓ species" is not
   offered on an Unidentified visit, so you can't confirm a label you can't see.
+- **A second opinion from Claude (shadow mode, optional).** `secondopinion.py` asks Claude to
+  name the animal in crops BioCLIP called below 0.8. Claude is not shown BioCLIP's guess. It
+  then grades both models against your labels, by confidence band and by day and night. The
+  answers go to `second_opinion.db` beside the database, and nothing in the rig reads them yet.
+  It needs `pip install anthropic` and an `anthropic_api_key` in the secrets file, and it sends
+  crops off your LAN (see [SECURITY.md](SECURITY.md)).
+
+  ```
+  python secondopinion.py --graded --dry-run    # how many crops, roughly what it would cost
+  python secondopinion.py --graded --limit 200  # ask about 200 crops you have already labelled
+  python secondopinion.py --grade               # Claude vs BioCLIP on those crops
+  ```
+
+  A graded sample takes at most three crops per visit, because a visit labelled as a whole
+  gives all its crops one label, readable or not. Set `cfg.second_opinion_nightly = True` in
+  `config_local.py` and the nightly batch asks Haiku about the last day's uncertain crops,
+  about 15 cents a night here. List any household names you label people with in
+  `cfg.second_opinion_never_send`. Crops with those labels, and the rest of their visits, are
+  never sent.
 
 ---
 
@@ -823,6 +852,14 @@ The **dashboard's Individuals tab** is the intended surface: a "Who is this?" re
 with one-click confirm / correct / clear, plus cold-start *visit-groups* to name before
 anything is confirmed. Once you've named a few, it adds:
 
+- **Night by Night** — one night's unreviewed visits, grouped by look on each camera, newest
+  night first (chips step back through the last two weeks). Appearance is reliable *within* a
+  night and fades *across* nights, so the matcher groups the night and you say who each group is:
+  one decision per animal instead of per visit, and every visit you name is a fresh template.
+  Every visit is shown with a tick box, so untick the odd one out before naming. Multi-animal
+  visits and cameras with no confirmed visits are left out and counted. `python eval.py --reid`
+  replays the grouping on nights you've already named and reports how many visits naming a whole
+  group would have got wrong; read that before trusting `reid_night_group_distance`.
 - **Fit to the Cast** — re-fits the unconfirmed remainder against your confirmed individuals:
   "12 more visits look like Stan" with a one-click **bulk confirm**, plus the leftovers that
   *look like nobody on file* clustered into **candidate new individuals**. It also flags anyone
@@ -882,13 +919,25 @@ then `BATCH EXIT <code>`.
 
 **The eval gate.** Before auto-assign, the batch runs `eval.py` against a **pinned baseline**
 (`python eval.py --pin-baseline latest` copies the newest artifact to
-`reports/pinned_baseline.json`; without one it diffs last night's). It exits **1** when a
-headline metric falls more than the tolerance below the baseline or below an absolute floor in
-`eval_floors` (set your own from your own artifact; the shipped floors are this yard's), and
-then auto-assign is **skipped** that night. It exits **3** when the scored corpus and every metric
-have not changed for `eval_stale_nights` (default 7) nights, which is what a dead naming helper
-looks like; that is logged and auto-assign still runs. **0** is a pass. The dashboard's eval chip
-shows the same verdict.
+`reports/pinned_baseline.json`; without one it diffs last night's). Only the numbers auto-assign
+actually ships on can fail it: session-blocked top-1 now and at a 7-day embargo, and the blocked
+pair AUC. Every other row (centroid templates, the unblocked view, the sweep procedure, species)
+is a diagnostic that is flagged when it gets worse and never skips anything. The two top-1 rows
+are compared **probe by probe** on the visits both runs scored (an exact sign test on the probes
+that flipped), so one new visit the matcher can't place yet does not read as a slide; against an
+older baseline without per-probe outcomes they fall back to the tolerance, and the diff says so.
+When the corpus changed and the code did not, a worse number is reported as a corpus shift, not a
+regression.
+
+It exits **1** when a gated metric regresses, when anything drops below an absolute floor in
+`eval_floors` (set your own from your own artifact; the shipped floors are this yard's), or when
+the **configured auto-assign point makes a wrong name** on the confirmed corpus. Auto-assign is
+then **skipped** that night, and the gate says how many nights in a row that has happened. A
+regression measured against a corpus that is not changing repeats every night until something
+changes, so the gate says that too, and how to re-pin if the baseline is what is wrong. It exits
+**3** when the scored corpus and every metric have not changed for `eval_stale_nights`
+(default 7) nights, which is what a dead naming helper looks like; that is logged and auto-assign
+still runs. **0** is a pass. The dashboard's eval chip shows the same verdict.
 
 **Auto-assign** is the *review by exception* tier: a solo visit whose best match clears **both**
 an eval-measured similarity bar *and* a lead-over-the-runner-up margin gets named automatically,
@@ -1231,6 +1280,33 @@ Several recipients each get their own copy, addressed only to them — nobody se
 else's address. That is one send per recipient: right for a household list, the wrong shape for a
 real mailing list.
 
+### An opening paragraph from a local AI (optional)
+
+With [Ollama](https://ollama.com) on the rig machine, the issue can open with a short paragraph
+written by a local model (`llm.py`, one stdlib HTTP call, nothing leaves the machine), set in
+italics above the usual lede and labelled *Written by a local AI from the figures below*:
+
+```python
+cfg.llm_enabled = True               # in config_local.py; then: ollama pull qwen3.5:9b
+```
+
+The model gets a fact sheet built from the same digest, never the database, and its paragraph
+is **checked before it runs**. The paragraph is dropped if it has:
+
+- a number that isn't on the sheet;
+- a named animal who wasn't seen;
+- a species that wasn't confirmed;
+- a visit count stated as a headcount ("7 raccoons" for 7 raccoon visits);
+- an animal count that isn't the crowd floor worded as "at least".
+
+It gets three tries, then the issue goes out with the templated lede alone, which is always there
+anyway. On real nights the 9B passed about two draws in three, and the 4B about one in three.
+
+It shares the GPU with the rig, so the call is skipped while any `heavyio` lock is held (the
+nightly batch, a backup), or when less than `cfg.llm_min_free_vram_mb` of VRAM is free (6.5 GB
+for the 9B, so it never spills onto the CPU). The model is unloaded as soon as it answers.
+`newsletter.log` records which of those happened. `python llm.py "hello"` checks the connection.
+
 Try it, then schedule it (runs as you, no admin needed):
 
 ```powershell
@@ -1336,6 +1412,9 @@ window on one `source`, so the detections captured during it join by timestamp �
 A fourth table, **`visits`** (phase 4, built by `visits.py`), holds one row per collapsed visit
 event — `source`, dominant `species`/`individual_id`, `started_at`/`ended_at` (→ dwell),
 `detection_count`, and a `representative_detection_id`. Detections point back via `visit_id`.
+A visit's `id` is its lowest member detection id, so it stays put across rebuilds (the rig
+rebuilds the table after most naming bursts) until the visit itself regroups: merges with a
+neighbour, or loses its first crop.
 
 Two further tables back the clip-based behaviour and un-blend work. **`clip_tracks`** (built by
 `clipmotion.py`) holds one **motion fingerprint per animal per clip** — duration, path length,
@@ -1354,7 +1433,7 @@ Smaller tables, each one a fact the code could not otherwise know:
 | `live_sightings` | Your real-time "who's here NOW" log — the strongest label class. Two-plus names (or one `X + Kits` group string) mean several animals, so no single name is stamped across them. Re-logging a span supersedes the earlier row rather than deleting it: the correction sequence is itself signal. |
 | `individual_status` | Residency — `departed` with the last day the animal was resident, or `resident` written back to undo it. Keeps the nightly assigner from naming an animal that has left. |
 | `life_events` | The cast's story as dated free text ("kits first emerged", "limping on the left front"). Append-only; nothing machine-side reads it. |
-| `favorites` | What a human kept — a crop (by `detection_id`) or a visit (by `source` + the moment it started, because visit ids are renumbered on every rebuild), plus an optional note and who kept it. Taste, not evidence: nothing machine-side reads it either. |
+| `favorites` | What a human kept — a crop (by `detection_id`) or a visit (by `source` + the moment it started, because a visit id changes whenever its visit regroups), plus an optional note and who kept it. Taste, not evidence: nothing machine-side reads it either. |
 | `coverage_events` | When each camera was actually **watching** (`up`/`down` at open, read-failure, reconnect, stop). The effort ledger every absence claim needs — without it a wedged camera reads as an empty yard. Windows before the ledger existed are *unknown*, never "covered". |
 | `ignore_zones` | Dashboard-drawn spots the detector should disregard, with tombstoned deletes so a config seed can't resurrect one. |
 | `reference_images`, `view_epochs` | Certified-empty frames of each camera and the "the camera moved" events that retire them (`refimg.py`). |
@@ -1446,8 +1525,9 @@ everyone-operates behaviour.
   that no backup touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
   `~/.critter-cam/secrets.json` elsewhere, or `$CRITTER_CAM_SECRETS` (format and `config.secret()`
   in `config_local.example.py`). A key still set in `config_local.py` keeps working and still
-  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`, and
-  the database snapshot still carries your live cameras' passwords. See
+  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`.
+  The database snapshot does not carry camera passwords: they are scrubbed from the copy, and a
+  restore asks for them again at the rig. See
   [SECURITY.md → Where secrets live](SECURITY.md#where-secrets-live-the-secrets-file).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without

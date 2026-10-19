@@ -182,10 +182,10 @@ def test_representative_crops_are_fetched_once_per_page_with_the_same_answers(co
         out = reidqueue.queue(conn, _cfg(db_path), since_h=0, limit=100)
     finally:
         conn.set_trace_callback(None)
-    # One batched lookup each for the page, the refit fits and each novel group -- never one per
-    # visit (there are 11 visits here).
+    # One batched lookup each for the page, the refit fits, each novel group and tonight's
+    # members -- never one per visit (there are 11 visits here).
     by_id = [q for q in seen if "SELECT id, crop_path FROM detections WHERE id IN" in q]
-    assert 1 <= len(by_id) <= 2 + len(out["refit"]["novel_groups"])
+    assert 1 <= len(by_id) <= 3 + len(out["refit"]["novel_groups"])
     assert not [q for q in seen if "SELECT crop_path FROM detections WHERE id =" in q]
 
     for card in out["queue"]:
@@ -198,6 +198,11 @@ def test_representative_crops_are_fetched_once_per_page_with_the_same_answers(co
         assert x["rep_crop"] == _rep_by_hand(conn, x["visit_id"])
     for g in out["refit"]["novel_groups"]:
         assert g["crops"] == _group_by_hand(conn, g["visits"])
+    members = [m for g in out["tonight"]["groups"] for m in g["members"]]
+    assert {m["visit_id"] for m in members} >= {ids["probe"], ids["norep"], ids["auto"]}
+    for m in members:
+        assert m["rep_crop"] == _rep_by_hand(conn, m["visit_id"])
+    assert next(m for m in members if m["visit_id"] == ids["norep"])["rep_crop"] is None
 
 
 def test_bootstrap_group_crops_match_the_per_visit_lookup(conn, db_path):
@@ -224,7 +229,10 @@ def test_the_queue_endpoint_serves_reidqueue_output_byte_for_byte(conn, db_path)
         for path, kw in (("/api/reid/queue?since_h=0", {"since_h": 0}),
                          ("/api/reid/queue?mode=unreviewed_auto", {"mode": "unreviewed_auto"}),
                          ("/api/reid/queue?since_h=0&limit=2&offset=1",
-                          {"since_h": 0, "limit": 2, "offset": 1})):
+                          {"since_h": 0, "limit": 2, "offset": 1}),
+                         (f"/api/reid/queue?night={NOW.date().isoformat()}",
+                          {"night": NOW.date().isoformat()}),
+                         ("/api/reid/queue?night=not-a-date", {})):
             with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=30) as r:
                 body = r.read()
             ro = db.connect_readonly(db_path)

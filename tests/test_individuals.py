@@ -1615,3 +1615,76 @@ def test_max_separated_is_a_greedy_lower_bound():
     assert individuals.max_separated(boxes) == 3
     assert individuals.max_separated([(0, 0, 10, 10), (1, 1, 11, 11)]) == 1   # one animal, twice
     assert individuals.max_separated([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# One ledger per read. The live rig's naming helper rebuilds the visit ledger after most naming
+# bursts; a matcher whose queries straddle a rebuild must not pair one ledger's ids with another's.
+# ---------------------------------------------------------------------------
+
+def _renumber_every_visit(db_path, by=1000):
+    """The worst case a rebuild could do to an open reader: every visit id changes at once."""
+    w = db.connect(db_path)
+    try:
+        w.execute("UPDATE visits SET id = id + ?", (by,))
+        w.execute("UPDATE detections SET visit_id = visit_id + ? WHERE visit_id IS NOT NULL", (by,))
+        w.commit()
+    finally:
+        w.close()
+
+
+def test_matcher_loads_one_ledger_even_if_a_rebuild_lands_mid_load(conn, cfg, db_path,
+                                                                  monkeypatch):
+    stan = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    probe = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)
+    db.label_visit(conn, stan, "Stan")
+
+    real = db.confirmed_visit_labels
+    fired = []
+
+    def rebuild_then_read(*a, **k):           # called after the embeddings query, mid-load
+        if not fired:
+            fired.append(1)
+            _renumber_every_visit(db_path)
+        return real(*a, **k)
+    monkeypatch.setattr(db, "confirmed_visit_labels", rebuild_then_read)
+
+    m = VisitMatcher(conn, "raccoon", cfg)
+    assert fired
+    assert set(m.protos) == {stan, probe}                  # the ledger it started with...
+    assert set(m.protos) <= set(m.visit_source)            # ...and the rest of it agrees
+    assert m.confirmed == {stan: "Stan"}
+    assert m.suggest(probe)["candidates"][0]["name"] == "Stan"
+    assert not conn.in_transaction                         # the snapshot ended with the load
+
+
+def test_auto_assign_says_visit_gone_when_the_visit_changed_after_loading(conn, cfg):
+    stan = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, stan, "Stan")
+    probe = _three_crop_visit(conn, [1, 0.05, 0], start_min=60)
+    m = VisitMatcher(conn, "raccoon", cfg)
+    # A rebuild merged the probe away between loading and writing: its id names nothing now.
+    conn.execute("DELETE FROM visits WHERE id = ?", (probe,))
+    conn.execute("UPDATE detections SET visit_id = NULL WHERE visit_id = ?", (probe,))
+    conn.commit()
+
+    r = m.auto_assign(conn, threshold=0.75, margin=0.25, min_templates=1)
+    assert r["assigned"] == []
+    assert r["skipped"].get("visit_gone") == 1
+    assert "no_matching_species" not in r["skipped"] and r["no_matching_species"] == []
+    assert conn.execute("SELECT COUNT(*) FROM detections WHERE individual_source = 'auto'"
+                        ).fetchone()[0] == 0
+
+
+def test_usable_template_visits_reads_one_ledger(conn, db_path, monkeypatch):
+    v = _three_crop_visit(conn, [1, 0, 0], start_min=0)
+    db.label_visit(conn, v, "Stan")
+    real = db.confirmed_visit_labels
+
+    def read_then_rebuild(*a, **k):           # the ids it returns feed every later query
+        out = real(*a, **k)
+        _renumber_every_visit(db_path)
+        return out
+    monkeypatch.setattr(db, "confirmed_visit_labels", read_then_rebuild)
+    usable = individuals.usable_template_visits(conn, "raccoon")
+    assert set(usable) == {v} and usable[v][1] == _ts(0)   # embeddings + started_at, same ledger

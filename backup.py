@@ -542,6 +542,90 @@ def _sweep_snapshot_scratch(out_dir: Path) -> None:
             log.warning("could not remove stray scratch file %s: %s", stale.name, e)
 
 
+def _scrub_camera_passwords(conn: sqlite3.Connection) -> list[str]:
+    """Remove every camera password from a SNAPSHOT copy (never the live DB). Returns them, so
+    the finished file can be checked for leftovers.
+
+    A plain UPDATE is not enough. SQLite leaves a rewritten row's old bytes in the page's free
+    space, and the live DB's cameras page already holds such copies from earlier edits, which
+    the backup API carries over page for page. So the table is rebuilt instead: with
+    secure_delete on, dropping it zeroes its old pages, and the rows go back without passwords
+    into fresh ones. The table is a handful of rows, so this costs nothing next to the copy."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'cameras'").fetchone():
+        return []
+    passwords = [r[0] for r in conn.execute(
+        "SELECT password FROM cameras WHERE password IS NOT NULL AND password != ''")]
+    table_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' "
+                             "AND name = 'cameras'").fetchone()[0]
+    index_sql = [r[0] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cameras' "
+        "AND sql IS NOT NULL")]
+    seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'cameras'").fetchone()
+    conn.isolation_level = None
+    conn.execute("PRAGMA secure_delete = ON")
+    conn.execute("PRAGMA temp_store = MEMORY")      # the staging copy never touches a temp file
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("CREATE TEMP TABLE scrub_cameras AS SELECT * FROM main.cameras")
+        conn.execute("UPDATE scrub_cameras SET password = NULL")
+        conn.execute("DROP TABLE main.cameras")
+        conn.execute(table_sql)
+        for sql in index_sql:
+            conn.execute(sql)
+        conn.execute("INSERT INTO main.cameras SELECT * FROM scrub_cameras")
+        conn.execute("DROP TABLE scrub_cameras")
+        if seq is not None:
+            # DROP TABLE forgot the AUTOINCREMENT high-water mark; a restore must not reuse an id.
+            conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'cameras'", (seq[0],))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    if passwords:
+        log.info("blanked %d camera password(s) in the db snapshot", len(passwords))
+    return passwords
+
+
+def _file_contains(path: Path, needles: list[bytes], chunk: int = 64 << 20) -> bool:
+    overlap = max(len(n) for n in needles) - 1
+    tail = b""
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                return False
+            buf = tail + block
+            if any(n in buf for n in needles):
+                return True
+            tail = buf[-overlap:] if overlap else b""
+
+
+def _verify_passwords_gone(db_file: Path, passwords: list[str]) -> None:
+    """Search the finished snapshot's raw bytes for each scrubbed password; if one survived
+    somewhere (another table, an old free page), VACUUM the copy and look again.
+
+    Passwords under 8 bytes are not searched for: a 4-byte string turns up by chance in a few GB
+    of binary about half the time, and a false hit would VACUUM every week for nothing."""
+    needles = [p.encode("utf-8") for p in passwords if len(p.encode("utf-8")) >= 8]
+    if not needles:
+        return
+    if not _file_contains(db_file, needles):
+        return
+    log.warning("a camera password survived the scrub; compacting the snapshot copy")
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    if _file_contains(db_file, needles):
+        # Archived anyway: losing the weekly database backup is the worse failure. The password
+        # is in some other table's data, so the fix is to find that row, not to stop backing up.
+        log.error("a camera password is STILL in the db snapshot after compacting -- it is "
+                  "stored in some other table. Find it, and rotate that camera's password.")
+
+
 def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> None:
     """Consistent point-in-time copy of the live WAL database via the SQLite backup API, then
     quick_check'd -- a snapshot that doesn't open cleanly is worse than none, because it looks
@@ -584,6 +668,7 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
             dst = sqlite3.connect(tmp_db)
             try:
                 src.backup(dst)
+                passwords = _scrub_camera_passwords(dst)
                 verdict = dst.execute("PRAGMA quick_check").fetchone()[0]
                 if verdict != "ok":
                     raise RuntimeError(f"snapshot failed quick_check: {verdict}")
@@ -599,6 +684,7 @@ def snapshot_db(db_path: Path, out_dir: Path, today: date, dry_run: bool) -> Non
         if wal.exists() and wal.stat().st_size > 0:
             raise RuntimeError(f"snapshot left an un-checkpointed WAL ({wal.stat().st_size} bytes) "
                                f"-- refusing to archive an incomplete database")
+        _verify_passwords_gone(tmp_db, passwords)
         staged = Path(td) / out_zip.name
         with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_db, db_path.name)
@@ -1157,11 +1243,13 @@ archived every run; everything in snapshots/ is written weekly.
                                         and any key or password still written in that file,
                                         unencrypted (the secrets file outside the project is
                                         never copied here -- that is where they belong). The
-                                        database snapshot beside it carries your live cameras'
-                                        passwords the same way. Wherever this folder syncs to
-                                        holds all of that -- share the folder accordingly, and
-                                        rotate those secrets if it ever went somewhere it
-                                        shouldn't have.
+                                        database snapshot beside it does NOT carry camera
+                                        passwords: they are scrubbed from the copy, so a
+                                        restore asks for them again at the rig. Wherever this
+                                        folder syncs to holds the rest -- share the folder
+                                        accordingly, and rotate those secrets if it ever went
+                                        somewhere it shouldn't have. Snapshots made before
+                                        2026-10 still hold camera passwords.
               Old db and meta snapshots are thinned only if backup_snapshot_retention is
               set in config_local.py (the newest 3 are always kept).
               weights-archive.zip     = ONE-TIME model-weights mirror (MDv6 + the Hugging

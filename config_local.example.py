@@ -154,6 +154,11 @@ def apply(cfg):
     # ...or change where a failed bind lands (0 = no fallback, a failed bind is fatal):
     # cfg.web_port_fallback = 8080
     # cfg.email_send_quiet = False                           # skip the email on visitor-less nights
+    # A local AI's opening paragraph over the email's own figures (llm.py; needs Ollama with the
+    # model pulled: `ollama pull qwen3.5:9b`). Checked against the figures and dropped if it
+    # invents anything; skipped while the nightly batch or a backup holds the machine.
+    # cfg.llm_enabled = True
+    # cfg.llm_model = "qwen3.5:4b"; cfg.llm_min_free_vram_mb = 4000   # for a card under ~7 GB free
 
     # Live sighting alerts over MQTT (mqttnotify.py): "raccoon arrived" / "raccoon left" events
     # for LAN devices (LED controllers, Home Assistant, ...). Needs an MQTT broker such as
