@@ -2614,7 +2614,7 @@ def _clean_camera_int(value, field: str, lo=None, hi=None):
     return n
 
 
-_SNAPSHOT_PLACEHOLDERS = ("{host}", "{user}", "{password}")
+_SNAPSHOT_PLACEHOLDERS = ("{host}", "{user}", "{password}", "{token}")
 _SNAPSHOT_SECRET_QS = re.compile(
     r"(?i)(?<=[?&])(pass(?:word)?|passwd|pwd|token|auth|secret|key)=([^&]*)")
 
@@ -2623,9 +2623,10 @@ def clean_snapshot_url(value):
     """Validate a camera's full-resolution snapshot URL TEMPLATE (None/'' = off).
 
     The stored text must never hold a credential, for the same reason url_path may not: listings,
-    API payloads and logs all carry this column. So the login goes in as {user} / {password},
-    which cameras.resolve_snapshot_url fills from the row at startup, and a literal value after a
-    secret-looking key is refused."""
+    API payloads and logs all carry this column. So the login goes in as placeholders filled from
+    the row at startup (cameras.resolve_snapshot_url), and a literal value after a secret-looking
+    key is refused. {token} asks for Reolink's token login (snapshot.ReolinkToken): the password
+    goes once an hour in a request body and never into this URL, so prefer it to {password}."""
     s = _clean_camera_text(value, "snapshot URL", 300)
     if s is None:
         return None
@@ -2639,11 +2640,13 @@ def clean_snapshot_url(value):
     for ph in _SNAPSHOT_PLACEHOLDERS:
         rest = rest.replace(ph, "")
     if "{" in rest or "}" in rest:
-        raise ValueError("snapshot URL placeholders are {host}, {user} and {password} only")
+        raise ValueError("snapshot URL placeholders are {host}, {user}, {password} and "
+                         "{token} only")
     for m in _SNAPSHOT_SECRET_QS.finditer(s):
         if m.group(2) not in _SNAPSHOT_PLACEHOLDERS:
-            raise ValueError(f"snapshot URL carries a literal {m.group(1)}= -- write "
-                             f"{m.group(1)}={{password}} and the stored password is filled in")
+            raise ValueError(f"snapshot URL carries a literal {m.group(1)}= -- use a "
+                             f"placeholder ({{token}} for a Reolink) and it is filled in from "
+                             f"this camera's login")
     return s
 
 

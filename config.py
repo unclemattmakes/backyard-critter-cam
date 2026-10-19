@@ -142,6 +142,9 @@ class CameraSpec:
     # Full-resolution still to cut ID crops from (snapshot.py); None = off. Set it in the
     # dashboard: this is the RESOLVED URL, credentials included, like `src`.
     snapshot_url: str | None = None
+    # (username, password) when snapshot_url has a {token} to fill by logging in; None otherwise.
+    # repr=False so a printed spec can never show the password in the clear.
+    snapshot_login: tuple | None = field(default=None, repr=False)
 
     @property
     def is_url(self) -> bool:

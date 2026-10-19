@@ -282,3 +282,136 @@ def test_a_camera_round_trips_its_snapshot_url_and_the_spec_resolves_it(conn):
 def test_a_local_camera_never_has_a_snapshot_url(conn):
     db.add_camera(conn, source="door", kind="local", device_index=0, snapshot_url=REOLINK_SNAP)
     assert db.list_cameras(conn)[0]["snapshot_url"] is None
+
+
+# ---- Reolink token login ---------------------------------------------------------------
+
+TOKEN_SNAP = "https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&token={token}"
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class _Camera:
+    """A Reolink's login and snapshot endpoints: hands out numbered tokens, and returns a still
+    only for the token it currently honours."""
+
+    def __init__(self, lease=3600, refuse=False):
+        self.lease, self.refuse = lease, refuse
+        self.logins, self.fetched, self.honoured = [], [], None
+
+    def post(self, url, payload, timeout):
+        self.logins.append((url, payload))
+        if self.refuse:
+            return [{"cmd": "Login", "code": 1, "error": {"detail": "login failed",
+                                                          "rspCode": -7}}]
+        self.honoured = f"tok{len(self.logins)}"
+        return [{"cmd": "Login", "code": 0,
+                 "value": {"Token": {"leaseTime": self.lease, "name": self.honoured}}}]
+
+    def fetch(self, url, timeout):
+        self.fetched.append(url)
+        return _still() if url.endswith(f"token={self.honoured}") else None
+
+
+def _token(cam, clock=None):
+    return snapshot.ReolinkToken("https://192.168.1.50/cgi-bin/api.cgi?cmd=Snap&channel=0"
+                                 "&token={token}", ("rig", "hunter2"), post=cam.post,
+                                 clock=clock or _Clock())
+
+
+def test_the_password_goes_in_one_login_body_and_never_into_a_snapshot_url():
+    cam = _Camera()
+    tok = _token(cam)
+    assert tok.fetch(cam.fetch, 5) is not None
+    assert tok.fetch(cam.fetch, 5) is not None
+    assert len(cam.logins) == 1                                   # the token is reused
+    url, body = cam.logins[0]
+    assert url == "https://192.168.1.50/cgi-bin/api.cgi?cmd=Login"
+    assert body[0]["param"]["User"] == {"Version": "0", "userName": "rig", "password": "hunter2"}
+    assert all("hunter2" not in u and u.endswith("token=tok1") for u in cam.fetched)
+
+
+def test_the_token_is_renewed_before_its_lease_runs_out():
+    cam, clock = _Camera(lease=3600), _Clock()
+    tok = _token(cam, clock)
+    tok.fetch(cam.fetch, 5)
+    clock.t += 3600 - snapshot.ReolinkToken.RENEW_EARLY_S - 1
+    tok.fetch(cam.fetch, 5)
+    assert len(cam.logins) == 1
+    clock.t += 2
+    tok.fetch(cam.fetch, 5)
+    assert len(cam.logins) == 2
+
+
+def test_a_dropped_token_is_replaced_once_and_the_still_still_arrives():
+    cam, clock = _Camera(), _Clock()
+    tok = _token(cam, clock)
+    tok.fetch(cam.fetch, 5)
+    clock.t += 600
+    cam.honoured = "rebooted"                       # the camera forgot tok1
+    assert tok.fetch(cam.fetch, 5) is not None
+    assert len(cam.logins) == 2
+
+
+def test_a_camera_failing_right_after_login_does_not_get_a_login_per_detection():
+    """Every login opens a camera session; a camera that keeps answering with something other
+    than a still must not have its session table filled one detection at a time."""
+    cam, clock = _Camera(), _Clock()
+    tok = _token(cam, clock)
+    broken = lambda url, timeout: None
+    for _ in range(5):
+        assert tok.fetch(broken, 5) is None
+        clock.t += 3
+    assert len(cam.logins) == 1
+
+
+def test_a_refused_login_backs_off_and_never_echoes_the_password():
+    cam, clock = _Camera(refuse=True), _Clock()
+    tok = _token(cam, clock)
+    with pytest.raises(RuntimeError) as e:
+        tok.fetch(cam.fetch, 5)
+    assert "hunter2" not in str(e.value) and "login failed" in str(e.value)
+    for _ in range(10):                              # a detection every 3 s for half a minute
+        clock.t += 3
+        with pytest.raises(RuntimeError, match="backing off"):
+            tok.fetch(cam.fetch, 5)
+    assert len(cam.logins) == 1                      # no lockout-by-retry
+    clock.t += snapshot.ReolinkToken.LOGIN_BACKOFF_S
+    cam.refuse = False
+    assert tok.fetch(cam.fetch, 5) is not None
+
+
+def test_a_token_camera_spec_carries_the_login_apart_from_the_url(conn):
+    db.add_camera(conn, source="yard_ir", kind="network", url_host="192.168.1.50",
+                  url_port=554, url_path="h264Preview_01_sub", username="rig",
+                  password="hunter2", snapshot_url=TOKEN_SNAP)
+    spec = cameras.row_to_spec(db.list_cameras(conn)[0], db.camera_password(conn, "yard_ir"))
+    assert spec.snapshot_url == "https://192.168.1.50/cgi-bin/api.cgi?cmd=Snap&channel=0&token={token}"
+    assert spec.snapshot_login == ("rig", "hunter2")
+    assert "snapshot_login" not in repr(spec)
+
+
+def test_the_cropper_uses_the_token_login_when_the_spec_asks_for_it(tmp_path):
+    cfg = _cfg(tmp_path)
+    det_id, det, rel = _detection_row(cfg)
+    cam = _Camera()
+    spec = config.CameraSpec("yard_ir", "rtsp://h/x",
+                             snapshot_url="https://192.168.1.50/cgi-bin/api.cgi?cmd=Snap"
+                                          "&channel=0&token={token}",
+                             snapshot_login=("rig", "hunter2"))
+    c = snapshot.SnapshotCropper(spec, cfg, lambda img: [_animal((1206, 606, 1806, 1206))],
+                                 threading.Lock(), fetch=cam.fetch, post=cam.post)
+    assert c.process(snapshot.Job([(det_id, det, rel)], STREAM_W, STREAM_H)) == 1
+    assert len(cam.logins) == 1
+
+
+def test_a_token_placeholder_is_accepted_and_a_literal_token_is_not():
+    assert db.clean_snapshot_url(TOKEN_SNAP) == TOKEN_SNAP
+    with pytest.raises(ValueError, match="literal"):
+        db.clean_snapshot_url("https://{host}/cgi-bin/api.cgi?cmd=Snap&token=abc123")

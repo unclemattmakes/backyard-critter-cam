@@ -16,11 +16,14 @@ detection that arrives while a fetch is in flight keeps its stream crop rather t
 """
 from __future__ import annotations
 
+import json
 import queue
 import ssl
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass
+from urllib.parse import quote, urlsplit
 
 import cv2
 import numpy as np
@@ -52,14 +55,88 @@ _CAMERA_TLS.check_hostname = False
 _CAMERA_TLS.verify_mode = ssl.CERT_NONE
 
 
+def _tls_for(url: str):
+    return _CAMERA_TLS if url.lower().startswith("https://") else None
+
+
 def fetch_jpeg(url: str, timeout: float):
     """GET one still and decode it, or None. A Reolink answers a bad login with HTTP 200 and a JSON
     error body, so the bytes are decoded rather than trusting the status."""
-    tls = _CAMERA_TLS if url.lower().startswith("https://") else None
-    with urllib.request.urlopen(url, timeout=timeout, context=tls) as resp:
+    with urllib.request.urlopen(url, timeout=timeout, context=_tls_for(url)) as resp:
         data = resp.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    return img
+    if not data:
+        return None
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def post_json(url: str, payload, timeout: float):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=_tls_for(url)) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class ReolinkToken:
+    """Reolink's token login, so the camera password never rides in a snapshot URL.
+
+    The Snap command takes either user=&password= in the query string or a token= from a Login
+    call. A query string is the part of a request that web servers log, and the rig fetches on
+    every saved detection; a Login POST carries the password in its body, once per lease (3600 s
+    on current firmware). The token is renewed a minute before the lease ends, and once on any
+    reply that is not an image, which is how a Reolink answers a token it has dropped (a reboot,
+    or its session table filling)."""
+
+    RENEW_EARLY_S = 60.0
+    # After a refused login, wait this long before trying again. Without it a wrong password is
+    # retried on every detector pass, and a Reolink locks the account after a few failures.
+    LOGIN_BACKOFF_S = 300.0
+
+    def __init__(self, snap_url: str, login: tuple, *, post=None, clock=time.monotonic):
+        self.snap_url = snap_url
+        self.user, self.password = login
+        parts = urlsplit(snap_url)
+        self.login_url = f"{parts.scheme}://{parts.netloc}{parts.path}?cmd=Login"
+        self.post = post
+        self.clock = clock
+        self._token = None
+        self._expires = 0.0
+        self._retry_at = 0.0
+        self._logged_in_at = float("-inf")
+
+    def _login(self, timeout: float) -> None:
+        self._token = None
+        if self.clock() < self._retry_at:
+            raise RuntimeError("Reolink login backing off after a refusal")
+        self._retry_at = self.clock() + self.LOGIN_BACKOFF_S   # cleared below on success
+        reply = (self.post or post_json)(self.login_url, [{
+            "cmd": "Login", "param": {"User": {"Version": "0", "userName": self.user,
+                                               "password": self.password}}}], timeout)
+        head = reply[0] if isinstance(reply, list) and reply and isinstance(reply[0], dict) else {}
+        tok = ((head.get("value") or {}).get("Token") or {}) if head.get("code") == 0 else {}
+        if not tok.get("name"):
+            # Never echo the request, which holds the password; the reply's error detail is safe.
+            detail = head.get("error")
+            raise RuntimeError(f"Reolink login refused{f' ({detail})' if detail else ''}")
+        name, lease = str(tok["name"]), float(tok.get("leaseTime") or 3600)
+        self._token = name
+        self._expires = self.clock() + max(0.0, lease - self.RENEW_EARLY_S)
+        self._retry_at = 0.0
+        self._logged_in_at = self.clock()
+
+    def _url(self) -> str:
+        return self.snap_url.replace("{token}", quote(self._token or "", safe=""))
+
+    def fetch(self, fetch, timeout: float):
+        if self._token is None or self.clock() >= self._expires:
+            self._login(timeout)
+        img = fetch(self._url(), timeout)
+        # A non-image may mean a dropped token, so log in again -- but not if we just did: each
+        # login opens a camera session, and a camera that is failing for some other reason would
+        # otherwise fill its session table and lock the Reolink app out.
+        if img is None and self.clock() - self._logged_in_at > self.RENEW_EARLY_S:
+            self._login(timeout)
+            img = fetch(self._url(), timeout)
+        return img
 
 
 def scale_box(bbox, sx: float, sy: float):
@@ -123,9 +200,11 @@ class SnapshotCropper:
     """One camera's snapshot worker. `detect` is the shared detector's detect(), called under
     `det_lock`; `fetch` is injectable so the tests never touch a network."""
 
-    def __init__(self, spec, cfg, detect, det_lock, *, fetch=None, tag: str = ""):
+    def __init__(self, spec, cfg, detect, det_lock, *, fetch=None, post=None, tag: str = ""):
         self.spec, self.cfg, self.detect, self.det_lock = spec, cfg, detect, det_lock
         self.fetch = fetch
+        self._token = (ReolinkToken(spec.snapshot_url, spec.snapshot_login, post=post)
+                       if spec.snapshot_login else None)
         self.tag = tag or f"[{spec.source}]"
         self._q: queue.Queue = queue.Queue(maxsize=1)
         self._stop = threading.Event()
@@ -186,8 +265,12 @@ class SnapshotCropper:
 
     def process(self, job: Job) -> int:
         """Fetch, re-detect, cut and swap. Returns how many detections got a hi-res crop."""
+        fetch = self.fetch or fetch_jpeg
         try:
-            img = (self.fetch or fetch_jpeg)(self.spec.snapshot_url, self.cfg.snapshot_timeout_s)
+            if self._token is not None:
+                img = self._token.fetch(fetch, self.cfg.snapshot_timeout_s)
+            else:
+                img = fetch(self.spec.snapshot_url, self.cfg.snapshot_timeout_s)
         except Exception as e:
             img = None
             err = e

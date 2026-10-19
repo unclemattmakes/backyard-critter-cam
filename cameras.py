@@ -158,19 +158,29 @@ def row_to_spec(row: dict, password=None) -> config.CameraSpec:
         source=row["source"], src=build_src(row, password), name=row.get("name"),
         frame_width=row.get("frame_width"), frame_height=row.get("frame_height"),
         motion_min_area=row.get("motion_min_area"), record_clips=row.get("record_clips"),
-        snapshot_url=resolve_snapshot_url(row, password))
+        snapshot_url=resolve_snapshot_url(row, password),
+        snapshot_login=snapshot_login(row, password))
 
 
 def resolve_snapshot_url(row: dict, password=None):
     """The camera's snapshot URL template with {host}, {user} and {password} filled in, or None
     when snapshots are off. Values are percent-encoded, so a password with '&' or '#' in it
-    cannot end the query parameter early."""
+    cannot end the query parameter early. {token} is left for snapshot.ReolinkToken, which fills
+    it per request."""
     tpl = row.get("snapshot_url")
     if not tpl or row.get("kind") != "network":
         return None
     return (tpl.replace("{host}", row.get("url_host") or "")
                .replace("{user}", quote(str(row.get("username") or ""), safe=""))
                .replace("{password}", quote(str(password or ""), safe="")))
+
+
+def snapshot_login(row: dict, password=None):
+    """(username, password) for a token-login snapshot URL, else None."""
+    tpl = row.get("snapshot_url")
+    if not tpl or "{token}" not in tpl or row.get("kind") != "network":
+        return None
+    return (str(row.get("username") or ""), str(password or ""))
 
 
 def load_specs(cfg, conn) -> tuple[list, list]:

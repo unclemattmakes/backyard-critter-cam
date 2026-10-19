@@ -168,19 +168,22 @@ For a Reolink:
 
 1. Turn HTTPS on: Reolink app -> the camera -> Settings -> Network -> Advanced -> Server
    Settings -> HTTPS (port 443). RTSP being on is not enough; 443 stays shut without this. Use
-   HTTPS, not HTTP: the Snap API takes the password in the URL, and the rig sends it on every
-   detection, so over HTTP it crosses the LAN readable all night.
-2. Check it from the rig, with the camera's own `rig` login (not the cloud account):
+   HTTPS, not HTTP: the hourly login carries the password, and over HTTP it crosses the LAN
+   readable.
+2. Check it once from the rig, with the camera's own `rig` login (not the cloud account):
    `curl -k -o snap.jpg "https://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=rig&password=..."`.
    `-k` because the camera's certificate is self-signed. A JPEG of the full sensor size is a
    pass. A small JSON body is a refused login.
 3. In the dashboard, edit the camera and set Hi-res snapshot to
-   `https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={user}&password={password}`.
-   The rig encrypts the fetch but does not verify the camera's self-signed certificate. That
-   keeps the password from passive sniffing; it does not stop an active impersonator on the LAN.
-   The placeholders are filled from the camera's own address and login at startup, so the stored
-   text never holds the password. Changing this field on a camera with a stored password is a
-   credential change and only works from the rig itself.
+   `https://{host}/cgi-bin/api.cgi?cmd=Snap&channel=0&token={token}`.
+   `{token}` makes the rig log in with the camera's username and password (a POST body, once per
+   hour-long lease) and send only the token on each snapshot, so the password never appears in
+   a URL, where the camera's web server could log it. A refused login waits 5 minutes before
+   trying again, so a wrong password cannot lock the account. The rig encrypts both requests but
+   does not verify the camera's self-signed certificate. That keeps the password from passive
+   sniffing; it does not stop an active impersonator on the LAN. `{host}` is filled from the
+   camera's own address, so the stored text never holds a credential. Changing this field on a
+   camera with a stored password is a credential change and only works from the rig itself.
 4. Restart the rig. The start-up log says `hi-res crops on (...)`, and the shutdown line counts
    swapped / not found / failed / skipped-while-busy.
 
