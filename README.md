@@ -1479,8 +1479,9 @@ everyone-operates behaviour.
   that no backup touches — `%USERPROFILE%\.critter-cam\secrets.json` on Windows,
   `~/.critter-cam/secrets.json` elsewhere, or `$CRITTER_CAM_SECRETS` (format and `config.secret()`
   in `config_local.example.py`). A key still set in `config_local.py` keeps working and still
-  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`, and
-  the database snapshot still carries your live cameras' passwords. See
+  wins; each backup run names any it finds. Your latitude/longitude stay in `config_local.py`.
+  The database snapshot does not carry camera passwords: they are scrubbed from the copy, and a
+  restore asks for them again at the rig. See
   [SECURITY.md → Where secrets live](SECURITY.md#where-secrets-live-the-secrets-file).
 - **Retention is asymmetric, and only half of it is bounded.** Clips roll off on their own
   (`clips_max_gb` / `clips_max_gb_by_source`), but **`crops/` and the SQLite database grow without

@@ -65,8 +65,8 @@ software stores, and it gets narrower rules than everything else above.
   delete — the row is tombstoned so a config-listed camera can't come back on the next start — but
   its stored password is erased, so a tombstone is not a credential. Re-adding the name undeletes
   the row without one; set it again at the rig. Rows removed before 2026-09-30 are cleaned on the
-  rig's next start. Older database snapshots in your backups still hold them: rotate those
-  passwords on the camera if that matters.
+  rig's next start. Database snapshots written before 2026-10 still hold them (newer ones are
+  scrubbed): rotate those passwords on the camera if that matters.
 - **Give the camera its own account.** Make a dedicated user on the camera rather than reusing
   its admin login — most cameras support this, and it means the credential on disk cannot also
   reconfigure the camera.
@@ -150,9 +150,12 @@ question is not who can read your disk — it is who can read that folder, and w
 
 Every `snapshots/meta-<date>.zip` contains **`config_local.py`**, unencrypted: your latitude and
 longitude, your camera list, and any key or password still written in it rather than in the
-secrets file. Every `snapshots/backyard-db-<date>.zip` contains the database, and therefore your
-live cameras' passwords. Both are there on purpose: a restore without them is a rig with no
-location and no cameras, which is not a restore. `backup.py` names, on every run, each secret
+secrets file. Every `snapshots/backyard-db-<date>.zip` contains the database, minus camera
+passwords: `backup.py` rebuilds the copy's `cameras` table without them, zeroes the old pages, and
+then searches the finished file's bytes for each one. A restore keeps every camera and asks for
+its password again at the rig. Snapshots written before 2026-10 still hold them. The config is
+there on purpose: a restore without it is a rig with no location and no camera list, which is
+not a restore. `backup.py` names, on every run, each secret
 `config_local.py` still spells out (by kind, never by value), so moving them to the secrets file
 is what makes that warning go quiet. Zips written before you moved them still hold them.
 
