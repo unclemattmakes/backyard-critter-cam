@@ -44,8 +44,8 @@ skipped forever, which is worse than no test. They do need cv2, numpy and (CPU) 
 `tests/test_clipfilter.py` is skipped without torch.
 
 **Python versions.** The declared floor is 3.10 (`pyproject.toml`, and `config.py` refuses
-anything older). CI runs the suite on 3.12 only (`.github/workflows/tests.yml`); the live rig
-runs 3.14. Code that needs something newer than 3.10 has to say so.
+anything older). CI runs the suite on ubuntu + 3.12 and Windows + 3.14
+(`.github/workflows/tests.yml`); the live rig runs 3.14. Code that needs something newer than 3.10 has to say so.
 
 CI runs the suite on ubuntu + Python 3.12 and on Windows + Python 3.14 (the rig's platform),
 installing the exact versions in `requirements-lock.txt`, then runs `ruff check .` (lint only,
