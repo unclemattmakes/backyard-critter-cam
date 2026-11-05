@@ -4,6 +4,10 @@ version: 2
 updates:
   - package-ecosystem: pip
     directory: "/"
+    # The lock is uv output: universal markers, +cpu torch, a second index. Dependabot rewrites it
+    # as a single-platform pip resolve, which drops all three and cannot install on Windows.
+    exclude-paths:
+      - "requirements-lock.txt"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
