@@ -130,7 +130,10 @@ def rig_pids() -> list[int] | None:
     for p in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             cmd = " ".join(p.info.get("cmdline") or [])
-            if "backyard_cam.py" in cmd and "rigwatch" not in cmd:
+            # Python only: the launcher's cmd /k window has this command line too, and it stays
+            # open after a crash, which would read as a running rig and block the restart.
+            if ("python" in (p.info.get("name") or "").lower()
+                    and "backyard_cam.py" in cmd and "rigwatch" not in cmd):
                 out.append(p.info["pid"])
         except Exception:
             continue

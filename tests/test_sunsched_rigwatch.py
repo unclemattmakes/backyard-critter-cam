@@ -7,8 +7,11 @@ just stopped, or parking the batch on top of the raccoon peak."""
 from __future__ import annotations
 
 import json
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -663,3 +666,41 @@ def test_status_lists_the_active_alarms_and_writes_nothing(monkeypatch, capsys):
     assert rigwatch.main() == 0
     assert "[warn] rig_held: The rig is down and held." in capsys.readouterr().out
     assert rigwatch.STATE_FILE.read_text() == before
+
+
+# --- what counts as a running rig --------------------------------------------------------
+
+class _Proc:
+    def __init__(self, pid, name, cmdline):
+        self.info = {"pid": pid, "name": name, "cmdline": cmdline}
+
+
+def _processes(monkeypatch, *procs):
+    monkeypatch.setitem(sys.modules, "psutil",
+                        SimpleNamespace(process_iter=lambda attrs: list(procs)))
+
+
+def test_the_rig_is_its_python_process(monkeypatch):
+    _processes(monkeypatch,
+               _Proc(1, "python.exe", [".venv/Scripts/python.exe", "backyard_cam.py", "--serve"]),
+               _Proc(2, "python", ["python", "rigwatch.py", "backyard_cam.py"]),
+               _Proc(3, "python.exe", ["python", "classify.py", "--watch"]))
+    assert rigwatch.rig_pids() == [1]
+
+
+def test_the_window_a_crash_leaves_open_is_not_a_running_rig(monkeypatch):
+    """The cmd /k window stays open on an abnormal exit, carrying python's command line. Counting
+    it as the rig meant a crashed rig was never restarted."""
+    _processes(monkeypatch, _Proc(9, "cmd.exe", ["cmd", "/k", ".venv/Scripts/python.exe "
+                                                 "backyard_cam.py --serve & echo stopped"]))
+    assert rigwatch.rig_pids() == []
+
+
+@pytest.mark.parametrize("launcher", ["start_critter_cam.bat", "start_critter_cam_lan.bat"])
+def test_only_exit_zero_writes_the_pause_marker(launcher):
+    """'errorlevel 1' means >= 1, so a native crash (a negative code) took the else branch, wrote
+    .rig_pause and read as a deliberate stop: no restart and no alarm."""
+    text = (Path(rigwatch.__file__).parent / launcher).read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.startswith("start ") and "cmd /k" in ln)
+    assert "(if errorlevel 0 if not errorlevel 1 (echo stopped" in line
+    assert ") else (echo stopped" not in line
