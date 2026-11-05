@@ -14,9 +14,11 @@ tests at the end bind a real loopback socket to smoke the GET and POST endpoints
 """
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -1923,6 +1925,76 @@ def test_health_endpoint_serves_the_rig_health_list(corpus, db_path, monkeypatch
         monkeypatch.setattr(web.health, "rig_health", boom)
         status, body = _get(port, "/api/health")
         assert status == 200 and body == {"items": []}
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+# --- hostile requests ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "%5C%5Cevil.example%5Cshare%5Ca.jpg", "//evil.example/share/a.jpg", "%5C%5C?%5CUNC%5Cevil%5Ca",
+])
+def test_a_unc_name_never_reaches_resolve_as_a_network_path(url):
+    """On Windows resolve() opens the path, so this has to hold before containment is checked."""
+    clean = web._safe_rel(url)
+    assert clean is not None and not clean.startswith(("/", "\\"))
+    assert "\\" not in clean
+
+
+@pytest.mark.parametrize("url", ["C:/windows/win.ini", "C%3A%5Cx.jpg", "crops/a.jpg:hidden"])
+def test_a_drive_or_stream_name_is_refused(url):
+    assert web._safe_rel(url) is None
+
+
+def test_ordinary_media_paths_are_untouched():
+    assert web._safe_rel("crops/2026-10-28/2026-10-28T20-37-09-972_0_animal_0.84.jpg") == (
+        "crops/2026-10-28/2026-10-28T20-37-09-972_0_animal_0.84.jpg")
+    assert web._safe_rel("clips/yard_ir/a%20b.mp4") == "clips/yard_ir/a b.mp4"
+    assert web._safe_rel("") == ""
+
+
+def test_a_negative_content_length_is_refused(api_port):
+    """read(-1) reads to EOF, so -1 used to walk past the cap and stream into memory."""
+    c = http.client.HTTPConnection("127.0.0.1", api_port, timeout=5)
+    c.putrequest("POST", "/api/live/sighting", skip_accept_encoding=True)
+    c.putheader("Origin", f"http://127.0.0.1:{api_port}")
+    c.putheader("Content-Type", "application/json")
+    c.putheader("Content-Length", "-1")
+    c.endheaders()
+    assert c.getresponse().status == 413
+    c.close()
+
+
+def test_a_non_ascii_token_is_a_viewer_not_a_crash():
+    assert web._operator_decision("secret", "192.168.1.50", "caf\xe9") is False
+    assert web._operator_decision("caf\xe9", "192.168.1.50", "caf\xe9") is True
+
+
+def test_a_viewer_of_a_frameless_camera_gives_their_slot_back(db_path, monkeypatch):
+    """A camera down since startup has no frame to send, so nothing used to be written and a
+    closed tab was never noticed. Each one held a stream slot until the rig restarted."""
+    def no_frame(self, last_seq, timeout=4.0):
+        time.sleep(0.02)
+        return None, last_seq
+
+    monkeypatch.setattr(web.FrameBuffer, "wait", no_frame)
+    cfg = _rq_cfg(db_path, web_host="127.0.0.1", web_port=0)
+    buf = web.FrameBuffer()
+    server = web.make_server(cfg, {cfg.source: buf}, {cfg.source: web.CameraControlBridge()})
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        s = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
+        s.sendall(b"GET /stream.mjpg HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        assert b"200" in s.recv(64)
+        assert buf._clients == 1
+        s.close()
+        deadline = time.monotonic() + 5
+        while buf._clients and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert buf._clients == 0
     finally:
         server.shutdown()
         server.server_close()

@@ -28,7 +28,7 @@ import db
 
 # Secret-looking query parameters (an ESP32-CAM or a DVR may carry the login there instead of in
 # the netloc): ?pwd=... / &token=... . The name is kept, the value is not.
-_URL_SECRET_QS = re.compile(r"(?i)(?<=[?&])(pass(?:word)?|pwd|token|auth|secret|key)=[^&]*")
+_URL_SECRET_QS = re.compile(r"(?i)(?<=[?&])(pass(?:word|wd)?|pwd|token|auth|secret|key)=[^&]*")
 
 # Characters that must be percent-encoded inside a URL's userinfo, or the URL reparses wrongly.
 _USERINFO_NEEDS_ENCODING = set("@:/?#[] ")
