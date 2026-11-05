@@ -533,7 +533,15 @@ def _publish(local: Path, out: Path) -> None:
     except OSError as e:
         if e.errno != errno.EXDEV:                  # not a cross-filesystem move: a real failure
             raise
-    shutil.copyfile(local, out)
+    try:
+        shutil.copyfile(local, out)
+    except BaseException:
+        # Left in place, the name alone would pass it off as this week's snapshot.
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     landed = out.stat().st_size
     if landed != size:
         # Caught while we are still here to say so, rather than found at restore time.
@@ -739,20 +747,26 @@ DB_SNAPSHOT_RE = re.compile(r"^backyard-db-(\d{4}-\d{2}-\d{2})\.zip$")
 
 
 def newest_db_snapshot_day(out_dir: Path) -> date | None:
-    """The date in the newest backyard-db-<date>.zip's name, or None if there is none. The name,
-    not the mtime: a copied or re-synced file keeps its name."""
+    """The date in the newest READABLE backyard-db-<date>.zip's name, or None if there is none.
+    The name, not the mtime: a copied or re-synced file keeps its name. A host that dies mid-copy
+    leaves a short zip behind, and counting it would skip the real snapshot for a whole cycle."""
     days = []
     try:
         for q in out_dir.iterdir():
             m = DB_SNAPSHOT_RE.match(q.name)
             if m:
                 try:
-                    days.append(date.fromisoformat(m.group(1)))
+                    days.append((date.fromisoformat(m.group(1)), q))
                 except ValueError:
                     pass
     except OSError:
         return None
-    return max(days, default=None)
+    # Newest first, stopping at the first good one: is_zipfile reads only the end of the file.
+    for day, q in sorted(days, reverse=True):
+        if zipfile.is_zipfile(q):
+            return day
+        log.warning("%s will not open as a zip -- not counting it as a snapshot", q.name)
+    return None
 
 
 def snapshots_due(out_dir: Path, today: date, every_days: int, force: bool = False) -> bool:
