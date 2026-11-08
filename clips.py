@@ -32,6 +32,7 @@ import argparse
 import re
 import shutil
 import subprocess
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -232,6 +233,34 @@ def prune_clips(cfg: config.Config, conn) -> int:
     return removed
 
 
+# One walk at a time across every camera. A clip that finishes mid-walk waits for the next one.
+_prune_lock = threading.Lock()
+
+
+def prune_clips_soon(cfg: config.Config) -> threading.Thread | None:
+    """Run prune_clips on its own thread and connection, because it stats every clip on disk:
+    2m40s on a cold cache, and the camera sees nothing while the capture thread does that.
+    Returns the thread, or None when a prune is already running."""
+    if not _prune_lock.acquire(blocking=False):
+        return None
+
+    def run() -> None:
+        try:
+            conn = db.connect(cfg.db_path)
+            try:
+                prune_clips(cfg, conn)
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 -- a failed prune must not take the recorder down
+            print(f"[clips] prune failed, retrying after the next clip: {e}")
+        finally:
+            _prune_lock.release()
+
+    t = threading.Thread(target=run, name="clip-prune", daemon=True)
+    t.start()
+    return t
+
+
 def _archive_guard(cfg: config.Config, key):
     """A `path -> bool` "is it safe to delete this?" test for an IRREPLACEABLE source, or None
     when this source is replaceable and the budget alone decides.
@@ -415,7 +444,7 @@ class ClipRecorder:
         self.max_conf = 0.0
         self.clips_saved = 0
         self._loop_fps = None          # the capture loop's sustained fps (best clip-rate estimate)
-        prune_clips(cfg, conn)         # enforce the disk budget left over from previous runs
+        prune_clips_soon(cfg)          # enforce the disk budget left over from previous runs
 
     # -- frame ingestion -----------------------------------------------------------
     def _prep(self, frame):
@@ -597,7 +626,7 @@ class ClipRecorder:
             self.clips_saved += 1
             print(f"[clips] saved {rel}  ({self.frame_count} frames, {dur:.1f}s, "
                   f"{self.detection_count} det)")
-            prune_clips(self.cfg, self.conn)   # keep the rolling window inside the disk budget
+            prune_clips_soon(self.cfg)         # keep the rolling window inside the disk budget
         elif self.clip_path is not None:
             if self.frame_count > 0:
                 # Frames were handed to a writer but nothing usable landed on disk: the encoder

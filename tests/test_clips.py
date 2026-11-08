@@ -20,6 +20,7 @@ import dataclasses
 import os
 import shutil
 import subprocess
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -882,3 +883,59 @@ def test_missing_ffmpeg_is_announced_once_per_process_not_once_per_camera(
     for source in ("glass_door_cam", "yard_ir", "cam02"):
         clips.ClipRecorder(cfg, clip_conn, source=source)
     assert capsys.readouterr().out.count("ffmpeg not found on PATH") == 1
+
+
+# --- the prune stays off the capture thread ----------------------------------------------
+
+def _prune_thread():
+    return next(t for t in threading.enumerate() if t.name == "clip-prune")
+
+
+def test_recorder_does_not_wait_for_the_prune(clip_cfg, clip_conn, monkeypatch):
+    """A cold-cache prune took 2m40s on the capture thread, and the camera was blind throughout."""
+    started, release = threading.Event(), threading.Event()
+
+    def slow_prune(cfg, conn):
+        started.set()
+        assert release.wait(10)
+        return 0
+
+    monkeypatch.setattr(clips, "prune_clips", slow_prune)
+    clips.ClipRecorder(clip_cfg, clip_conn)    # returns with the prune still blocked
+    assert started.wait(10)
+    worker = _prune_thread()
+    assert clips.prune_clips_soon(clip_cfg) is None    # one walk at a time
+    release.set()
+    worker.join(10)
+    assert not worker.is_alive()
+
+
+def test_a_failed_background_prune_does_not_block_the_next(clip_cfg, clip_conn, monkeypatch):
+    calls = []
+
+    def broken_prune(cfg, conn):
+        calls.append(1)
+        raise OSError("drive went away")
+
+    monkeypatch.setattr(clips, "prune_clips", broken_prune)
+    clips.prune_clips_soon(clip_cfg).join(10)
+    clips.prune_clips_soon(clip_cfg).join(10)
+    assert len(calls) == 2
+
+
+def test_background_prune_stamps_rows_on_its_own_connection(clip_cfg, clip_conn):
+    clip_cfg.clips_dir.mkdir(parents=True)
+    old = clip_cfg.clips_dir / "old.mp4"
+    old.write_bytes(b"x" * 1024 * 1024)
+    rel = clips._rel(old)
+    db.insert_clip(clip_conn, source="glass_door_cam", clip_path=rel,
+                   started_at="2026-06-20T14:00:00-07:00", ended_at="2026-06-20T14:00:10-07:00",
+                   fps=15.0, width=64, height=48, frame_count=10, detection_count=1,
+                   max_confidence=0.9)
+    cfg = dataclasses.replace(clip_cfg, clips_max_gb=0.5 / 1024)
+
+    clips.prune_clips_soon(cfg).join(10)
+
+    assert not old.exists()
+    stamp = clip_conn.execute("SELECT pruned_at FROM clips WHERE clip_path = ?", (rel,)).fetchone()
+    assert stamp[0] is not None
