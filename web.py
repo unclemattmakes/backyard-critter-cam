@@ -407,7 +407,7 @@ _MAKINGOF_TYPES = {
     ".js": "application/javascript; charset=utf-8", ".json": "application/json",
     ".svg": "image/svg+xml", ".ico": "image/x-icon", ".md": "text/plain; charset=utf-8",
 }
-_RANGE_CHUNK = 4 * 1024 * 1024   # cap an open-ended range so a clip is never read whole into RAM
+_RANGE_CHUNK = 4 * 1024 * 1024   # cap every range so a clip is never read whole into RAM
 _MAX_POST_BYTES = 1 << 20        # dashboard POST bodies are tiny JSON; reject anything larger (413)
 _MAX_STREAMS = 6                 # base cap on concurrent MJPEG viewers (one LAN client can't exhaust
                                  # threads); make_server scales it up with the number of cameras.
@@ -1248,7 +1248,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._makingof(path[len("/making-of"):].lstrip("/"))
                 else:
                     self._send(404, "text/plain", b"not found")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             except Exception as e:
                 try:                            # log detail server-side; don't leak it to the client
@@ -1268,7 +1268,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 length = int(self.headers.get("Content-Length", 0) or 0)
             except (TypeError, ValueError):     # a non-numeric Content-Length must not 500 us
                 length = 0
-            if length > _MAX_POST_BYTES:
+            if length < 0 or length > _MAX_POST_BYTES:   # read(-1) would read to EOF, uncapped
                 self._send(413, "text/plain", b"payload too large")
                 return
             raw = self.rfile.read(length) if length else b"{}"
@@ -1360,7 +1360,7 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                     self._detection_action(int(path.rsplit("/", 1)[-1]), data)
                 else:
                     self._send(404, "text/plain", b"not found")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             except Exception as e:
                 try:                            # log detail server-side; don't leak it to the client
@@ -1856,6 +1856,9 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 while not stop_event.is_set():
                     frame, last = frame_buffer.wait(last, timeout=4.0)
                     if frame is None:
+                        # Multipart preamble, which viewers ignore. Without a write, a viewer who
+                        # left is never noticed and their stream slot is held for good.
+                        self.wfile.write(b"\r\n")
                         continue
                     self.wfile.write(b"--FRAME\r\nContent-Type: image/jpeg\r\n")
                     self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
@@ -1919,7 +1922,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             if not root.is_dir():
                 self._send(404, "text/plain", b"the making-of site isn't in this checkout")
                 return
-            target = (root / urllib.parse.unquote(rel)).resolve() if rel else root
+            clean = _safe_rel(rel)
+            if clean is None:
+                self._send(404, "text/plain", b"not found")
+                return
+            target = (root / clean).resolve() if clean else root
             if not _is_within(target, root):
                 self._send(404, "text/plain", b"not found")
                 return
@@ -1932,7 +1939,11 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
             self._serve_file(target, ctype)
 
         def _media(self, rel):
-            target = (config.ROOT / urllib.parse.unquote(rel)).resolve()
+            clean = _safe_rel(rel)
+            if clean is None:
+                self._send(404, "text/plain", b"not found")
+                return
+            target = (config.ROOT / clean).resolve()
             if not any(_is_within(target, d) for d in allowed_dirs) or not target.is_file():
                 self._send(404, "text/plain", b"not found")
                 return
@@ -1970,9 +1981,8 @@ def make_server(cfg, frame_buffers: dict, control_bridges: dict, zone_store=None
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.end_headers()
                 return
-            start, end, open_ended = parsed
-            if open_ended:                          # serve a bounded chunk; the player asks for more
-                end = min(end, start + _RANGE_CHUNK - 1)
+            start, end, _open_ended = parsed
+            end = min(end, start + _RANGE_CHUNK - 1)    # a bounded chunk; the player asks for more
             with open(serve, "rb") as f:
                 f.seek(start)
                 body = f.read(end - start + 1)
@@ -2057,6 +2067,14 @@ def _is_loopback_client(peer_host) -> bool:
         return False
 
 
+def _safe_rel(rel: str) -> str | None:
+    """A URL's path as a relative path, or None if it cannot be one. This runs BEFORE resolve():
+    containment is only proved after it, and on Windows resolve() opens the path, so a UNC name
+    would have the rig connect to that host over SMB and offer it the logged-on user's NTLM."""
+    rel = urllib.parse.unquote(rel).replace("\\", "/").lstrip("/")
+    return None if ":" in rel else rel
+
+
 def _operator_decision(token_cfg, peer_host, sent_token) -> bool:
     """The operator/viewer rule, pure (unit-testable without a socket). No token configured =
     everyone is an operator -- the historical behaviour and the fresh-clone default. With a
@@ -2071,7 +2089,7 @@ def _operator_decision(token_cfg, peer_host, sent_token) -> bool:
             return True
     except ValueError:
         pass
-    return hmac.compare_digest(str(sent_token or ""), str(token_cfg))
+    return hmac.compare_digest(str(sent_token or "").encode(), str(token_cfg).encode())
 
 
 _EVAL_STATUS_CACHE = {"key": None, "value": None}

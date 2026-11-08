@@ -568,3 +568,7 @@ def test_two_config_cameras_sharing_a_source_still_raise(conn):
                 config.CameraSpec("yard_ir", "rtsp://rig:pw@10.0.0.9:554/x")])
     with pytest.raises(RuntimeError, match="Duplicate camera source"):
         cameras.load_specs(cfg, conn)
+
+
+def test_a_passwd_query_key_is_masked():
+    assert "hunter2" not in cameras.safe_src("http://192.168.1.60/snap?passwd=hunter2")
