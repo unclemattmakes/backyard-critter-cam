@@ -1004,7 +1004,7 @@ def family(monkeypatch, tmp_path):
 
 def _old_snapshot(out_dir: Path, day: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"backyard-db-{day}.zip").write_bytes(b"PK")
+    zipfile.ZipFile(out_dir / f"backyard-db-{day}.zip", "w").close()
 
 
 def test_snapshots_are_skipped_while_the_newest_db_snapshot_is_recent(tmp_path, family, caplog):
@@ -1570,3 +1570,38 @@ def test_a_password_stored_in_another_table_is_reported_and_the_backup_still_mad
 def test_a_database_without_a_cameras_table_snapshots_as_before(tmp_path):
     archived = _archived_db(tmp_path, _live_db(tmp_path / "backyard.db"))
     assert archived.exists()
+
+
+# --- a broken snapshot does not count -----------------------------------------------------
+
+def test_a_truncated_snapshot_does_not_satisfy_the_cadence(tmp_path):
+    """A host that died mid-copy leaves a short zip under the real name. Trusting the name would
+    skip the real snapshot for a week and let the backup report success."""
+    _old_snapshot(tmp_path, "2026-08-01")
+    (tmp_path / "backyard-db-2026-08-20.zip").write_bytes(b"PK\x03\x04 truncated")
+    assert backup.newest_db_snapshot_day(tmp_path) == date(2026, 8, 1)
+    assert backup.snapshots_due(tmp_path, date(2026, 8, 20), 7)
+
+
+def test_only_truncated_snapshots_means_there_is_none(tmp_path):
+    (tmp_path / "backyard-db-2026-08-20.zip").write_bytes(b"not a zip")
+    assert backup.newest_db_snapshot_day(tmp_path) is None
+
+
+def test_a_copy_that_dies_leaves_nothing_under_the_real_name(tmp_path, monkeypatch):
+    local, out = tmp_path / "local.zip", tmp_path / "dest" / "backyard-db-2026-08-20.zip"
+    out.parent.mkdir()
+    local.write_bytes(b"x" * 100)
+
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    def dies_midway(src, dst):
+        Path(dst).write_bytes(b"x" * 10)
+        raise OSError("drive went away")
+
+    monkeypatch.setattr(backup.os, "replace", cross_device)
+    monkeypatch.setattr(backup.shutil, "copyfile", dies_midway)
+    with pytest.raises(OSError, match="drive went away"):
+        backup._publish(local, out)
+    assert not out.exists()
