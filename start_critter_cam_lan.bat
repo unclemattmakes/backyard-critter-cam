@@ -38,7 +38,9 @@ if exist ".rig_pause" del /q ".rig_pause"
 REM Run python INSIDE a cmd /k so the log window stays open on an abnormal exit instead of
 REM vanishing without a trace; on a normal stop ('q' / closing the video window) python exits 0,
 REM we drop the pause marker so the watchdog leaves it alone, and close the window ourselves.
-start "Backyard Critter Cam - log (you can ignore or minimize this)" /min cmd /k ".venv\Scripts\python.exe backyard_cam.py --serve --host 0.0.0.0 & if errorlevel 1 (echo. & echo   *** The app exited abnormally -- the error is above and in logs\backyard_cam.log. & echo   *** This window is kept open on purpose; close it when you are done reading. & echo.) else (echo stopped from the video window > .rig_pause & exit)"
+REM Only exit code 0 is a stop someone asked for. A native crash exits NEGATIVE, which "errorlevel 1"
+REM (meaning >= 1) misses. The parentheses matter: without them the abnormal echoes join the if.
+start "Backyard Critter Cam - log (you can ignore or minimize this)" /min cmd /k ".venv\Scripts\python.exe backyard_cam.py --serve --host 0.0.0.0 & (if errorlevel 0 if not errorlevel 1 (echo stopped from the video window > .rig_pause & exit)) & echo. & echo   *** The app exited abnormally -- the error is above and in logs\backyard_cam.log. & echo   *** This window is kept open on purpose; close it when you are done reading. & echo."
 
 REM Wait until the dashboard is actually answering (poll it) rather than guessing a fixed delay --
 REM the very first run downloads the detector model and can take a while, and we never want to open
