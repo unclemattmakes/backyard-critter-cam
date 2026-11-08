@@ -10,8 +10,9 @@ behaviour, a stdlib web dashboard. One maintainer. **Public repo, AGPL-3.0.** St
   **Do dev work in a git worktree** (`git worktree add ../<name> -b claude/<topic> origin/main`).
   Never `checkout`/`switch`/`stash`/`reset`/`rebase` in the rig's folder: a branch switch rewrites
   files under a running process. A checkout once left `run_clipmotion.bat` hung for two days.
-  This matters most while the nightly batch runs, roughly **16:20–18:00** local (it tracks
-  sunset; `sunsched.py --show` prints the exact time).
+  This matters most while the nightly batch runs: it starts 2.5 h before sunset, so about
+  **14:00 in November** and as late as 19:30 in summer, and takes about 2 h. `sunsched.py --show`
+  prints the exact time.
 - **Never write the live `backyard.db`** (several GB, irreplaceable). Don't open it for writing,
   don't run migrations against it by hand. Read-only queries only, and only when asked. Tests use
   `tmp_path` via the `conn`/`db_path` fixtures. Schema changes go through `db._migrate` and bump
@@ -27,8 +28,8 @@ behaviour, a stdlib web dashboard. One maintainer. **Public repo, AGPL-3.0.** St
 ## Ground truth
 
 - **Cameras:** the `cameras` table in the DB is authoritative. `config_local.py` only seeds it
-  once per source (`cameras.load_specs`). `glass_door_cam` is a Raspberry Pi serving MJPEG over
-  HTTP, not a USB webcam.
+  once per source (`cameras.load_specs`). The rig has run one camera, `yard_ir` (a Reolink on
+  RTSP), since the glass-door Pi was removed on 2026-10-27.
 - **Config:** every knob is in `config.py`; machine-specific overrides in `config_local.py`
   (gitignored). Secrets (API keys, `operator_token`, `mqtt_password`, `heartbeat_url`, camera
   URLs with passwords) live in `~/.critter-cam/secrets.json` (or `$CRITTER_CAM_SECRETS`), read
@@ -42,8 +43,8 @@ behaviour, a stdlib web dashboard. One maintainer. **Public repo, AGPL-3.0.** St
 .venv\Scripts\python.exe -m pytest tests/test_backup.py -q     # prefer one file
 ```
 
-Pure logic: no GPU, camera, network or model download. Keep it that way. CI runs Python 3.12;
-the rig runs 3.14; the floor is 3.10.
+Pure logic: no GPU, camera, network or model download. Keep it that way. CI runs ubuntu + 3.12
+and Windows + 3.14; the rig runs 3.14; the floor is 3.10.
 
 ## Public repo hygiene
 

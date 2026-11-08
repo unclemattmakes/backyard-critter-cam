@@ -7,18 +7,16 @@ authority on *what the rig does with them*. This is the operational sequence —
 what order, and how to tell which step you are stuck on.
 
 Calibrated against the first one: a Reolink RLC-810A added 2026-08-21, alongside the glass-door
-USB webcam. The numbers cited are that camera's; the sequence is not vendor-specific.
+camera, then still a USB webcam. The numbers cited are that camera's; the sequence is not vendor-specific.
 
-## What this rig actually runs today (2026-08-23)
+## What this rig actually runs today (2026-11-05)
 
-**One live camera: `glass_door_cam` — and it is a *network* camera now.** The USB webcam it used
-to be moved onto a **Raspberry Pi serving MJPEG over HTTP**, because the rig is migrating to a
-machine with nowhere to plug a webcam in. A camera bolted to one PC cannot outlive it. The
-Reolink above and a second `cam02` were both removed on 2026-08-21 and survive only as tombstoned
-rows — the hardware is not on the network.
+**One live camera: `yard_ir`, a Reolink on RTSP** (`h264Preview_01_sub`, with hi-res snapshot crops
+on). It was removed on 2026-08-21 and restored on 2026-10-18 on its old row. `glass_door_cam` was a
+webcam on a **Raspberry Pi serving MJPEG over HTTP** until it was removed on 2026-10-27, and `cam02`
+is still removed; both survive as tombstoned rows.
 
-That reframes, but does not invalidate, everything below. Read the RTSP phases as **the worked
-example they are**, not as a description of what is plugged in:
+The RTSP phases below are the `yard_ir` path. This table says which ones apply to an HTTP camera:
 
 | Phase | RTSP camera | HTTP (MJPEG) camera |
 |---|---|---|
@@ -39,7 +37,8 @@ restart, and all of Phase 7 — apply unchanged whatever the protocol.
 `/api/cameras` and grids them automatically (`.live-grid` is `auto-fit, minmax(300px, 1fr)`);
 the `single` class only exists to keep a one-camera rig looking exactly as it did. So there is
 nothing to switch on in the UI, and no "combined" view to configure. Everything is decided by
-one thing: **the camera list the rig reads at startup**, `cfg.cameras`.
+one thing: **the `cameras` table in the database**, read once at startup (`cfg.cameras` only
+seeds it).
 
 Two consequences worth knowing before you start:
 
@@ -229,7 +228,7 @@ cfg.cameras = [
 - **Setting `cfg.cameras` replaces `camera_index` as the thing the rig reads**, so the existing
   camera must now be spelled out explicitly. It does not lose its tuning: every field a spec
   does not name inherits the same-named `Config` value, so the glass door keeps its
-  `motion_min_area` 1800 — and `backend=None` on an int `src` still resolves to DirectShow on
+  `motion_min_area`, and `backend=None` on an int `src` still resolves to DirectShow on
   Windows. **Inheriting a value is not the same as it applying**: on a URL `src` the UVC-only ones
   (`camera_controls`, `exposure`, `gain`, the requested fourcc and fps, the DirectShow backend)
   inherit and then do nothing, because there is no UVC control channel over a stream. That is what
@@ -245,7 +244,7 @@ cfg.cameras = [
   on a ~640 px-wide downscaled copy but converts blob areas *back* to full-frame pixels before
   comparing, so the knob always means the same thing — which is exactly why a new camera at a
   different resolution needs its own value. `camprobe` computes it by holding the reference
-  camera's trigger fraction (1800 px at 1920×1080 = 0.087% of frame).
+  camera's trigger fraction (800 px at 1280×720 by default = 0.087% of frame; 1800 px at 1920×1080 is the same fraction).
 - **Set `frame_width`/`frame_height` explicitly** on a network camera. They are a no-op for an
   RTSP stream (the stream dictates resolution), but leaving them to inherit makes the config
   claim 1080p for a 640×360 camera.
@@ -275,8 +274,8 @@ current cameras actually use before picking the number; `clips/<source>/` is the
 
 ### Where the password lives
 
-`config_local.py` in the URL for a camera seeded from config, and the `cameras.password` column of
-`backyard.db` for one set in the dashboard. Four paths it could escape by:
+the secrets file for a URL seeded through `secret("yard_ir_url")`, and the `cameras.password`
+column of `backyard.db` once it is seeded or set in the dashboard. Four paths it could escape by:
 
 - **Git** — `config_local.py` is gitignored.
 - **The dashboard** — the **password** never leaves the process: `db.list_cameras` does not select
@@ -288,13 +287,13 @@ current cameras actually use before picking the number; `clips/<source>/` is the
   non-loopback LAN address: the host came back in full. Set `operator_token` if the camera's
   address and username should be operator-only; a LAN address is not really a secret, but a
   document that promises it is one is worse than no promise.
-- **The backup, and the migration pack** — `backup.py` snapshots the whole database into
-  `backup_dest`, and `migrate.py pack` carries it to another machine. A dashboard-set camera
-  password rides along in both. One more reason Phase 3 says to make the rig a throwaway camera
+- **The backup, and the migration pack** — `backup.py` blanks camera passwords in each DB snapshot
+  copy, then searches the raw bytes for them, and a restore asks for each password again at the
+  rig. Snapshots written before 2026-10 still hold them. One more reason Phase 3 says to make the rig a throwaway camera
   user rather than reusing admin.
 - **The log** — the startup banner, the could-not-open retry and every open/reconnect notice
   print the src, and `logs/` is swept into the backup by `backup.py`. All three go through
-  `backyard_cam._safe_src`, which masks the password and keeps the username (a rejected login
+  `cameras.safe_src`, which masks the password and keeps the username (a rejected login
   is the failure you most need that line to explain). If you add a new print of a `src`, use
   it — a test fails the build if a raw `src!r` reappears.
 

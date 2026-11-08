@@ -128,7 +128,7 @@ class CameraSpec:
     URL for an IP/PoE camera (best for night: real IR + one-cable PoE), or an http .../stream
     MJPEG URL for an ESP32-CAM (a fun daytime angle; weak in the dark). A networked camera is
     opened through OpenCV's FFMPEG backend with a 1-frame buffer and reconnected with indefinite
-    backoff (a network blip is transient; a USB unplug is not -- see backyard_cam.py)."""
+    backoff, as a USB camera is (backyard_cam.reconnect_capture gives up on neither)."""
     source: str                              # DB 'source' label; MUST be unique across cameras.
     src: int | str = 0                       # cv2.VideoCapture arg: int webcam index OR stream URL.
     name: str | None = None                  # Display name in the dashboard (defaults to `source`).
@@ -204,7 +204,7 @@ class Config:
     # a persisted manual nudge from a past session can't haunt the rig. To deliberately lock a
     # control, set it HERE (e.g. {"AUTOFOCUS": 0, "FOCUS": 200}): this dict wins over the baseline.
     camera_controls: dict = field(default_factory=lambda: {"BACKLIGHT": 0})
-    reopen_max_retries: int = 30    # On a read failure, how many reopen attempts before giving up.
+    reopen_max_retries: int = 30    # Fast reopens after a read failure, before the capped backoff.
     reopen_delay_s: float = 1.0     # Wait between reopen attempts (camera disconnect handling).
     # A network camera's read() runs on a helper thread; one that has not returned in this long
     # is abandoned and the camera reopened. Frames arrive every ~0.1 s, and FFmpeg's own read
@@ -544,7 +544,7 @@ class Config:
     web_port_fallback: int = 8000
     # A NAME on the network, so nobody has to be handed a number (mdns.py). With the LAN
     # launcher the rig answers multicast DNS for "<mdns_name>.local", and everyone opens
-    # http://critter-cam.local:8000 instead of an IP that changes with the DHCP lease. Also
+    # http://critter-cam.local instead of an IP that changes with the DHCP lease. Also
     # advertised as an _http._tcp service, so the rig turns up by name in network browsers.
     # Only published when web_host is a wildcard bind -- in localhost mode there is nobody to
     # tell. Needs the `zeroconf` package; without it the rig runs exactly as before, on numbers.
@@ -561,7 +561,7 @@ class Config:
     # never throttles capture itself: detection, crops and clips run at full camera rate.
     display_max_fps: float = 12.0
     # OPERATOR/VIEWER SPLIT (opt-in). Unset (None) = today's behaviour: every LAN client is a
-    # full operator. Set a token string (config_local.py) and un-tokened clients become VIEWERS:
+    # full operator. Set a token string (the secrets file) and un-tokened clients become VIEWERS:
     # they can read everything, play everything, and log "who's here" as ATTRIBUTED testimony
     # (recorded, reviewable, never stamped as ground truth) -- but every other write is refused
     # server-side. A device becomes operator by entering the token once in the dashboard footer
@@ -1014,10 +1014,9 @@ class Config:
     traits_static_thumb_side: int = 48
 
     # ---- Live species naming (phase 2, folded into the live rig) -----------------
-    # The live rig names each new crop by species ITSELF, in a background thread, so a single
-    # process -- and a single window -- does both detection and naming. That's the whole reason
-    # you can shut the rig down with one 'q' (or by closing the video window): there's no second
-    # classifier console left running. Naming uses the CPU by default so it never competes with
+    # The live rig names each new crop by species through a child process (classify.py --watch)
+    # that it starts, supervises and stops with itself, so one 'q' (or closing the video window)
+    # stops both. Naming uses the CPU by default so it never competes with
     # the live detector for the GPU. Set classify_live = False (or pass --no-classify) to run
     # detection only; you can still fill species in later with `python classify.py`.
     classify_live: bool = True

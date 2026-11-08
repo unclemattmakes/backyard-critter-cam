@@ -135,7 +135,7 @@ MegaDetector v6 is distributed via Microsoft's
 [PytorchWildlife](https://github.com/microsoft/Pytorch-Wildlife) framework, which is the
 package most docs point to. In practice PytorchWildlife eagerly imports a bioacoustics stack
 (`soundfile`), a classifier stack (`timm`), the legacy `yolov5`, and a `gradio` web UI —
-heavy, brittle on Python 3.14, and at odds with this project's lean / no-web-server rule.
+heavy, brittle on Python 3.14, and at odds with this project's lean, stdlib-first rule.
 
 The MDV6 weights themselves are ordinary [Ultralytics](https://docs.ultralytics.com/) YOLO
 models — PytorchWildlife runs them through Ultralytics internally. So this rig downloads the
@@ -180,8 +180,8 @@ through Ultralytics: same model, same GPU inference, a fraction of the dependenc
 >
 > | Your NVIDIA GPU | Compute capability | torch build to install |
 > |---|---|---|
-> | RTX 50-series (Blackwell — this rig's 5050) | sm_120 | **cu130** (a stock cu126 dies at the first real op) |
-> | RTX 20/30/40-series, GTX 16 (Turing→Ada) | sm_75–sm_89 | cu126 **or** cu130 — both carry kernels |
+> | RTX 50-series (Blackwell) | sm_120 | **cu130** (a stock cu126 dies at the first real op) |
+> | RTX 20/30/40-series, GTX 16 (Turing→Ada; this rig's RTX 3070) | sm_75–sm_89 | cu126 **or** cu130 — both carry kernels |
 > | GTX 9/10-series, Titan V (Maxwell/Pascal/Volta) | sm_50–sm_70 | **cu126** — cu130 has NO kernels for these; installing it silently costs you the GPU |
 > | none / AMD / Intel | — | CPU wheels (`--index-url .../whl/cpu`); macOS uses the default wheel (MPS/CPU) |
 >
@@ -520,8 +520,7 @@ and you have also answered the Protocol dropdown's question.
 
 - **Networked cameras** are opened through OpenCV's FFMPEG backend with a 1-frame buffer (so the
   stream can't lag behind the detector), forced to **TCP** transport, and reconnected with
-  **indefinite backoff** (a network blip is transient — unlike a USB unplug, which gives up after
-  a few tries). Use a camera's **sub-stream** (lower resolution) for the motion gate to keep
+  **indefinite backoff**, and so is a USB webcam: the rig gives up on neither. Use a camera's **sub-stream** (lower resolution) for the motion gate to keep
   decode cheap. In the dashboard, click a pane to make the **Instrument Panel** and **Who's
   visiting now?** act on that camera; a networked camera's exposure/focus are set on the camera
   itself, so its panel shows a note instead of sliders.
@@ -1590,7 +1589,7 @@ It's a camera pointed at the outdoors, which makes a few things worth saying pla
 A pure-logic test suite covers the data-shaping code — visit collapsing, behaviour profiles,
 the two-axis readout, the non-animal gate's scoring, clip motion + embeddings, shot-quality, and
 the DB layer — with **no GPU, camera, network, or model download needed** (CI runs it on
-Python 3.12; the rig runs 3.14):
+ubuntu + Python 3.12 and Windows + Python 3.14; the rig runs 3.14):
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\ -q

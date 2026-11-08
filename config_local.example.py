@@ -131,7 +131,7 @@ def apply(cfg):
 
     # Where backup.py archives the rig's generated content (clips/crops/db). Point it at a
     # folder your cloud client syncs (Google Drive, Dropbox, OneDrive) so uploads are automatic;
-    # schedule `python backup.py` weekly. Clips especially want this: the live clips/ folder is
+    # schedule `python backup.py` daily. Clips especially want this: the live clips/ folder is
     # a rolling window (clips_max_gb) -- the backup is what outlives the pruning.
     # from pathlib import Path
     # cfg.backup_dest = Path(r"C:\cloud-synced-folder\backyard")

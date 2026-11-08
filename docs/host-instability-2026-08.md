@@ -3,10 +3,10 @@
 **Status:** open. **The PSU was replaced on 2026-09-13 and the box hung again 11 minutes after
 the rig came back up.** Power delivery *at the PSU* is effectively excluded; see *Results*.
 **Machine:** OLVR (ASUS PRIME X299-DELUXE, i7-7820X, RTX 3070, 64 GB, BIOS 1401 / 2018-05-09).
-**2026-10-01 status:** since the naming helper was capped to AVX2 on 4 threads (2026-09-23), there
-have been no Kernel-Power 41 events through 2026-10-01: 8+ days, against a previous best of 8.8
-days. Encouraging, not conclusive. See *2026-10-01: eight days on the AVX2 cap*.
-**Last updated:** 2026-10-01. Before that 2026-09-23 — see *2026-09-23: interval result*. Earlier: 2026-09-13 23:30 — supersedes both the 2026-08-26 reading and the earlier
+**2026-11-05 status:** the AVX2 cap helped but did not fix it. Six unclean boots since 2026-10-07,
+four of them on 2026-10-28. The one of those with telemetry was an instant reset at near-idle, not
+a hang under load. The two gaps cost about 81 hours of dark yard. See *2026-11-05: the cap is not the fix*.
+**Last updated:** 2026-11-05. Before that 2026-10-01, and before that 2026-09-23 — see *2026-09-23: interval result*. Earlier: 2026-09-13 23:30 — supersedes both the 2026-08-26 reading and the earlier
 2026-09-13 one. See *The recorder's blind spot*, which is now the most important section here.
 
 This is not a bug in the rig. It is written down here because the rig is what surfaced it, the
@@ -219,7 +219,7 @@ board, and those are exactly what hypotheses 2 and 3 turn on. Re-confirmed 2026-
 readings, so no ordinary program can see them — reading them needs a tool that ships its own
 kernel driver.
 
-**HWiNFO64 8.52 portable is installed at `C:\Users\MatthewS\HWiNFO64`** (downloaded 2026-09-13,
+**HWiNFO64 8.52 portable is installed at `%USERPROFILE%\HWiNFO64`** (downloaded 2026-09-13,
 Authenticode verified: EV certificate issued to REALiX, s.r.o., DigiCert-timestamped). Portable
 rather than installed, so removing it is deleting the folder. It must be launched **as
 Administrator** or it cannot load its driver and the sensors that matter stay invisible. Run it
@@ -314,6 +314,37 @@ as encouraging, not conclusive: the cap is not proven to be the fix until the bo
 actually up rather than held, so check `logs/rigwatch.log` for `HELD` lines before quoting it.
 The BIOS update and HWiNFO logging below are still the next steps. (The rigwatch naming check
 that *The collateral damage* below calls uncommitted has since been committed.)
+
+## 2026-11-05: the cap is not the fix
+
+Kernel-Power 41 events since the cap, with the last `hosthealth` sample before each:
+
+| boot logged | power button | last sample before it |
+|---|---|---|
+| 2026-10-07 19:41:52 | yes | 19:41:24: GPU P8, 22 W, 19%; CPU 7% |
+| 2026-10-08 22:44:43 | yes | telemetry not running |
+| 2026-10-28 02:21:48 | **no** | 02:21:27: GPU P8, 16 W, 0%; CPU 6% |
+| 2026-10-28 02:24:19 | **no** | telemetry not running |
+| 2026-10-28 03:57:58 | **no** | telemetry not running |
+| 2026-10-28 19:43:33 | yes | telemetry not running |
+
+What this changes:
+
+- **The cap bought time.** 2026-09-23 to 10-07 is 14 days and 10-10 to 10-28 is 17.6 days, the two
+  longest runs on record against the old best of 8.8. It did not end the failures.
+- **2026-10-28 02:21 was a reset, not a hang.** Telemetry was still sampling 21 seconds before the
+  next boot was logged, so there was no frozen interval. It then reset twice more with no power
+  button press, overnight. The older failures in *What happens* froze and needed a human.
+- **It was not under load.** The GPU sat in P8 for all 41 samples of the preceding 3.5 minutes and
+  the rig logged nothing from 02:15 on, so this was not mid-visit. A detector wake that found
+  nothing is not logged, and `nvidia-smi` polling cannot see one, so a GPU wake is not excluded.
+- **Still no error record.** No WHEA events since 2026-09-01, no minidumps, bugcheck 0 on all six,
+  and no `nvlddmkm` event since 2026-09-13. A reset at idle with nothing logged fits power delivery
+  or firmware (hypotheses 1 and 2) and argues against thermals and against sustained load.
+
+The BIOS is still 1401 (2018), and HWiNFO logging is still not running, so *Next actions* stands.
+The outages lasted as long as they did because each boot stopped at the lock screen, where nothing
+runs: the watchdog first restarted the rig 64 hours after 10-07, and 17.5 hours after 10-28.
 
 ## The detector-interval experiment — ran 2026-09-14 21:16 to 2026-09-23 (see above)
 
